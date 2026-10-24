@@ -2,6 +2,7 @@
 #include "NCG76StartDiagnostic.h"
 #include <algorithm> // for std::abs, std::sqrt, std::max, std::min
 #include <cstring>
+#include <type_traits>
 #include <iostream>  // for debug prints if needed
 #include <limits>
 #include "EtherCatMaster.h"
@@ -106,6 +107,16 @@ namespace
         return timed ? EDM130::ValidHistoryRecipeBinding(fixture,recipe) :
             (!EDM149::IsProgramHistoryFixture(fixture) && !recipe.commissioningProfile && !recipe.planRows && !recipe.planMovementMask &&
                 EDM149::ValidHistoryBinding(fixture,recipe.diagnosticControlSource));
+    }
+    bool E247OrdinaryDurationRecipeFits(unsigned program,unsigned fixture,const EDM130::Recipe& recipe) noexcept
+    {
+        if(!program)return true;
+        return (program==247U||program==248U)&&fixture==EDM149::ProgramHistoryFixture&&
+            EDM130::ValidHistoryRecipeBinding(fixture,recipe)&&recipe.commissioningProfile==0U&&
+            recipe.planRows==4U&&recipe.planMovementMask==7U&&recipe.diagnosticControlSource==3U&&
+            recipe.workTimeUs==500000ULL&&recipe.jumpHeightScaled==1000ULL&&
+            recipe.jumpSpeedPercentScaled==100000000ULL&&!recipe.flushHoldTest&&!recipe.holdRetreatMode&&
+            !recipe.deepFlushCycleInterval&&recipe.deepFlushHeightMultiplierScaled==1000000ULL;
     }
     bool E156ProgramRowFits(unsigned fixture, bool timed, const EDM130::Recipe& recipe,
         unsigned step, int code, const std::array<double,6U>& increment) noexcept
@@ -2345,7 +2356,7 @@ EDM174Comm::MotionObservation MotionCore::GetEDM174CommunicationObservation() co
     return observation;
 }
 std::uint32_t MotionCore::GetEDM173ImplementationRevision() const noexcept
-{ return 37U; }
+{ return 70U; }
 
 bool MotionCore::IsEDM173HandoffCurrent() const noexcept
 {
@@ -2376,8 +2387,9 @@ bool MotionCore::IsEDM173CommandCurrent(bool bound) const noexcept
 {
     if(!IsEDM173Profile() || !m_edm173 || !m_edm173->sealed || !m_pContexts || m_pContexts->size()!=6U) return false;
     const auto& seal=m_edm173->current; const auto& plan=seal.plan; const auto& c=m_Group.currentCmd;
-    if(!IsMotionEDMCommissioningMarkerEncodingValid(c) || !c.edm173G76Gap || c.edm173ChildCount!=25U ||
-        c.edm173ChildOrdinal>=25U || !c.pathCoreRetainedTraversal || c.pathCoreRetainedReverse || c.pathCorePlanarCircle ||
+    const unsigned count=EDM173::CountForRecipe(plan.recipe);
+    if(!IsMotionEDMCommissioningMarkerEncodingValid(c) || !c.edm173G76Gap || c.edm173ChildCount!=count || plan.nominal.count!=count ||
+        c.edm173ChildOrdinal>=count || !c.pathCoreRetainedTraversal || c.pathCoreRetainedReverse || c.pathCorePlanarCircle ||
         c.mode!=InterpolationMode::LINEAR || c.mem_transformOrigin[0]!=0.0 || c.mem_transformOrigin[1]!=1.0 ||
         c.mem_transformOrigin[2]!=2.0 || c.commandPathMode!=MotionCommandPathMode::EXACT_STOP ||
         m_Group.pathMode!=PathMode::EXACT_STOP || m_Group.enableHistory || m_Group.enableTransform ||
@@ -2453,8 +2465,9 @@ bool MotionCore::IsEDM173GroupGeometrySupported() const noexcept
         !m_pContexts || m_pContexts->size()!=6U || !m_Group.isActive) return false;
     const auto& state=*m_edm173;const auto& seal=state.current;const auto& plan=seal.plan;
     const auto& guard=m_edm94.Current();const auto& c=m_Group.currentCmd;
+    const unsigned count=EDM173::CountForRecipe(plan.recipe);
     if(!IsMotionEDMCommissioningMarkerEncodingValid(c) || !c.edm173G76Gap ||
-        c.edm173ChildCount!=25U || c.edm173ChildOrdinal>=25U ||
+        c.edm173ChildCount!=count || plan.nominal.count!=count || c.edm173ChildOrdinal>=count ||
         !IsMotionCommandConsumerGeometryValid(c,m_pContexts) ||
         !c.pathCoreRetainedTraversal || c.pathCoreRetainedReverse || c.pathCorePlanarCircle ||
         c.mode!=InterpolationMode::LINEAR || m_Group.mode!=c.mode ||
@@ -2536,6 +2549,7 @@ void MotionCore::ServiceEDM173Handoff(bool freshMotionFrame) noexcept
     if(!state.sealed){
         for(unsigned attempt=0U;attempt<2U && state.messages.ConsumerTryPop(state.current);++attempt){
             const auto& seal=state.current;const auto& plan=seal.plan;
+            const unsigned count=EDM173::CountForRecipe(plan.recipe);
             if(plan.scope.session!=m_edm126Current.session)continue;
             bool valid=EDM173::Valid(plan,state.validation) && plan.scope.armEpoch==m_edm126Current.armEpoch &&
                 plan.scope.owner.generation==m_edm126Current.ownerGeneration &&
@@ -2543,7 +2557,7 @@ void MotionCore::ServiceEDM173Handoff(bool freshMotionFrame) noexcept
                 (!EDM173::UsesNominalMovementMask(plan.recipe)||(m_edm94.Current().boundedProgram&&
                     m_edm94.Current().requiredMovementMask==EDM130::ProgramMovementMask(plan.recipe))) &&
                 seal.epoch==(plan.scope.armEpoch==(std::numeric_limits<MotionExecutionEpoch>::max)()?1U:plan.scope.armEpoch+1U);
-            for(unsigned i=0U;valid&&i<25U;++i){const auto& id=seal.identities[i];
+            for(unsigned i=0U;valid&&i<count;++i){const auto& id=seal.identities[i];
                 valid=id.IsAssigned()&&id.epoch==seal.epoch&&id.source==MotionCommandSource::NC_MEMORY&&
                     id.sourceBlockId==static_cast<MotionSourceBlockId>(plan.scope.sourcePC);
                 for(unsigned j=0U;valid&&j<i;++j)valid=id.segmentId!=seal.identities[j].segmentId;
@@ -2552,12 +2566,18 @@ void MotionCore::ServiceEDM173Handoff(bool freshMotionFrame) noexcept
                 const double ppu=axis<6U?m_edm94.FrozenConfig().axis[axis].pulsePerUnit:0.0;
                 valid=seal.pulsePerUnit[axis]==ppu;
                 double previous=seal.startPulse[axis];
-                for(unsigned k=0U;valid && k<25U;++k){const double point=plan.nominal.pointsMCS[k][axis];
+                for(unsigned k=0U;valid && k<count;++k){const double point=plan.nominal.pointsMCS[k][axis];
                     const double before=k?plan.nominal.pointsMCS[k-1U][axis]:plan.nominal.startMCS[axis];
                     const double expected=axis>=3U?seal.startPulse[axis]:point==before?previous:
                         point==plan.nominal.startMCS[axis]?seal.startPulse[axis]:point*ppu;
                     valid=std::isfinite(expected)&&expected==seal.endPulse[k][axis];previous=expected;
                 }
+            }
+            // The legacy parent leaves the one extra seal slot empty. A reused
+            // producer object may not smuggle a child from an earlier parent.
+            for(unsigned k=count;valid&&k<EDM173::MaximumNominalCount;++k){
+                valid=MotionExecutionIdentityExactlyMatches(seal.identities[k],MotionExecutionIdentity{});
+                for(double value:seal.endPulse[k])valid=valid&&EDM97::DoubleBits(value)==EDM97::DoubleBits(0.0);
             }
             if(!valid){TripEDM94(EDM94::Reason::Identity);return;}
             state.sealed=true;state.nextChild=0U;state.terminalMask=0U;state.handshakeUs=m_edmZMonotonicUs;
@@ -2568,20 +2588,21 @@ void MotionCore::ServiceEDM173Handoff(bool freshMotionFrame) noexcept
     }
     if(!state.sealed){if(observedEpoch!=m_edm94ExpectedEpoch)TripEDM94(EDM94::Reason::Identity);return;}
     const auto& c=m_Group.currentCmd;
+    const unsigned count=EDM173::CountForRecipe(state.current.plan.recipe);
     // A bound child has finished its prepare/bind handoff. The ordinary
     // Step/Map and serialized-send fences own its continuing authority,
     // including the sender's own reservation. This no-op grants no output.
     // Keep the retired child until its successor is loaded; its completed
     // machining time must not be reused as the next handoff's timeout.
     if(!state.handshaking && !m_edm94HandoffPending && !m_edm94.HandoffZero() &&
-        m_edm114Current.geometryValid && c.edm173G76Gap && c.edm173ChildCount==25U &&
-        c.edm173ChildOrdinal<25U && c.edm173ChildOrdinal+1U==state.nextChild &&
+        m_edm114Current.geometryValid && c.edm173G76Gap && c.edm173ChildCount==count &&
+        c.edm173ChildOrdinal<count && c.edm173ChildOrdinal+1U==state.nextChild &&
         MotionExecutionIdentityExactlyMatches(c.execution,m_edm114Command) &&
         MotionExecutionIdentityExactlyMatches(c.execution,state.current.identities[c.edm173ChildOrdinal]) &&
         (m_Group.isActive || (state.terminalMask&(1U<<c.edm173ChildOrdinal))!=0U)) return;
     if(!IsEDM173HandoffCurrent()){TripEDM94(EDM94::Reason::Identity,EDM94::FaultSite::G76Handoff);return;}
     if(!m_Group.isActive){
-        if(state.nextChild==25U)return;
+        if(state.nextChild==count)return;
         // A validated first prepare must hold a zero bridge before the
         // producer's epoch CAS/queue publish. Fresh PDO authority may observe
         // that bounded pending publication before the first child is loaded.
@@ -2603,6 +2624,7 @@ void MotionCore::ServiceEDM173Handoff(bool freshMotionFrame) noexcept
         a.lease=plan.scope.owner;a.tuning=plan.tuning;a.timerRecipe=plan.recipe;a.historyFixture=14U;
         a.gapSegment=a.proportional=a.physicalCurve=a.historyServo=a.historyModeFlush=a.workTimeFlush=true;
         a.flushProfile=m_edm107ArmFlushProfile;a.modePolicy.fixture=EDM116::Fixture::ModalG76Gap173;
+        a.modePolicy.g76Rows=EDM173::CountForRecipe(plan.recipe);
         a.modePolicy.mode=EDM173::ExpectedMode(plan.recipe);a.modePolicy.profile=a.flushProfile;a.modePolicy.revision=ordinal+1ULL;
         a.modePolicy.selectorPC=a.modePolicy.modeOriginPC=plan.scope.sourcePC;
         a.modePolicy.selectorDispatch=a.modePolicy.modeOriginDispatch=plan.scope.dispatch;a.modePolicy.modeOriginRevision=1ULL;
@@ -2629,8 +2651,10 @@ void MotionCore::ServiceEDM173Handoff(bool freshMotionFrame) noexcept
 bool MotionCore::SubmitEDM130Arm(std::uint64_t session, MotionExecutionEpoch epoch,
     const MotionOwnerLease& lease, const EDM97::Tuning& tuning,
     const EDM107::FlushProfile& flushProfile, unsigned fixture, const EDM130::Recipe& recipe,
-    std::uint64_t manualRun, std::uint64_t manualCache, bool rejectBeforeArm) noexcept
+    std::uint64_t manualRun, std::uint64_t manualCache, bool rejectBeforeArm, unsigned ordinarySequenceProgram) noexcept
 {
+    if(!E247OrdinaryDurationRecipeFits(ordinarySequenceProgram,fixture,recipe)||
+        (ordinarySequenceProgram&&(manualRun||manualCache||rejectBeforeArm)))return false;
     // EDM216 is a per-request rejection fixture for SIM B3/B4 only. All
     // normal admission checks still run; it can only remove permission.
     if (rejectBeforeArm && (fixture != EDM173::HistoryFixture ||
@@ -2648,6 +2672,7 @@ bool MotionCore::SubmitEDM130Arm(std::uint64_t session, MotionExecutionEpoch epo
     request.physicalAd=EDM130::RequiresPhysicalVoltage(recipe);
     request.workTimeFlush=true; request.timerRecipe=recipe;
     request.rejectionProbe=rejectBeforeArm;
+    request.ordinarySequenceProgram=ordinarySequenceProgram;
     if (recipe.diagnosticControlSource == 5U) { request.manualRun=manualRun; request.manualCache=manualCache; }
     request.tuning=tuning; request.flushProfile=flushProfile; request.historyFixture=fixture;
     if (m_edm94ArmRequests.ProducerTryPush(request)) return true;
@@ -2898,18 +2923,28 @@ bool MotionCore::IsEDM130TimingCurrent() const noexcept
     const auto& mode=m_edm128Current; const auto& event=m_edm128.Evidence(); const auto& work=event.work;
     // EDM143: Evidence() is the coordinator's committed receipt. While active,
     // its private-state validator checks that same receipt plus any proposal.
-    // Keep the independent published mode.coordinator receipt check below.
     // This choice is call-local; no proof survives a state change or PDO cycle.
     const bool coordinatorActive=m_edm128.Active();
+    // EDM231 FIX1: only captured B3/B4 geometry can reuse the successful
+    // private validator below for a byte-identical published receipt. Every
+    // differing receipt still takes its independent proof path. This includes
+    // padding differences; equality never replaces the private/pending checks.
+    static_assert(std::is_trivially_copyable<EDM128::Feedback>::value,
+        "EDM231 receipt equality requires a value-only feedback object.");
+    const bool sameCapturedReceipt=coordinatorActive && m_edm130Profile &&
+        EDM116::IsCenterMode(event.policy.mode) && event.targetCaptured &&
+        std::memcmp(&event,&mode.coordinator,sizeof(event))==0;
     // EDM175: the sealed recipe selects one mode for every genuine child.
     if(IsEDM173Profile() && m_edm126Current.authorizedRows &&
         (event.policy.mode!=EDM173::ExpectedMode(m_edm130ArmRecipe) ||
-            mode.rowPolicy.mode!=EDM173::ExpectedMode(m_edm130ArmRecipe)))return false;
+            mode.rowPolicy.mode!=EDM173::ExpectedMode(m_edm130ArmRecipe) ||
+            event.policy.g76Rows!=EDM173::CountForRecipe(m_edm130ArmRecipe) ||
+            mode.rowPolicy.g76Rows!=EDM173::CountForRecipe(m_edm130ArmRecipe)))return false;
     if(mode.workTimeFlush!=m_edm130Profile || !EDM130::SameRecipe(mode.timerRecipe,m_edm130ArmRecipe) ||
         !EDM130::ValidWorkEvidence(work) ||
         !(coordinatorActive ? m_edm128.IsFlushStagesCurrent(m_edm130ArmRecipe.flushStages) :
             EDM128::ValidSpeedProof(event,m_edm130ArmRecipe.flushStages)) ||
-        !EDM128::ValidSpeedProof(mode.coordinator,m_edm130ArmRecipe.flushStages) ||
+        (!sameCapturedReceipt && !EDM128::ValidSpeedProof(mode.coordinator,m_edm130ArmRecipe.flushStages)) ||
         (mode.authorizedRows==m_edm126Current.authorizedRows &&
             !EDM128::SameB3Proof(event,mode.coordinator)) ||
         (mode.authorizedRows==m_edm126Current.authorizedRows&&
@@ -2935,16 +2970,21 @@ bool MotionCore::IsEDM130TimingCurrent() const noexcept
             !matchesFlushBinding(m_edm94Handoff.authorization.modePolicy.profile)))) return false;
     if(!coordinatorActive) return work.workTimeUs==0ULL && EDM128::ValidHeightProof(event,0.0);
     const double heightMm=EDM130::FrozenJumpHeightMm(m_edm130ArmRecipe);
-    if(!EDM128::ValidHeightProof(mode.coordinator,mode.authorizedRows?heightMm:0.0,
-            mode.authorizedRows?m_edm130ArmRecipe.deepFlushCycleInterval:0U,
-            mode.authorizedRows?EDM130::FrozenDeepMultiplier(m_edm130ArmRecipe):0.0,
-            mode.authorizedRows && EDM130::HasBoundDeep(m_edm130ArmRecipe)) ||
-        // IsHeightCurrent includes ValidHeightProof(event, ...) with these
-        // exact bound values, retained geometry, and the pending proposal.
-        !m_edm128.IsHeightCurrent(heightMm,m_edm130ArmRecipe.deepFlushCycleInterval,
-            EDM130::FrozenDeepMultiplier(m_edm130ArmRecipe),EDM130::HasBoundDeep(m_edm130ArmRecipe))) return false;
+    // IsHeightCurrent includes ValidHeightProof(event, ...) with these exact
+    // bound values, retained geometry, and the pending proposal. The published
+    // height uses those values only after row authorization; zero rows retain
+    // their independent zero-height proof even for byte-identical receipts.
+    if(!m_edm128.IsHeightCurrent(heightMm,m_edm130ArmRecipe.deepFlushCycleInterval,
+            EDM130::FrozenDeepMultiplier(m_edm130ArmRecipe),EDM130::HasBoundDeep(m_edm130ArmRecipe)) ||
+        (!(sameCapturedReceipt && mode.authorizedRows!=0U) &&
+            !EDM128::ValidHeightProof(mode.coordinator,mode.authorizedRows?heightMm:0.0,
+                mode.authorizedRows?m_edm130ArmRecipe.deepFlushCycleInterval:0U,
+                mode.authorizedRows?EDM130::FrozenDeepMultiplier(m_edm130ArmRecipe):0.0,
+                mode.authorizedRows && EDM130::HasBoundDeep(m_edm130ArmRecipe)))) return false;
     if(!matchesFlushBinding(mode.rowPolicy.profile) ||
-        !matchesFlushBinding(event.policy.profile)) return false;
+        !matchesFlushBinding(event.policy.profile) ||
+        !m_edm128.IsEventLimitCurrent(EDM130::G76EventLimit(m_edm130ArmRecipe)) ||
+        (IsEDM173Profile() && work.triggeredEvents>EDM130::G76EventLimit(m_edm130ArmRecipe))) return false;
     std::uint64_t modeEventCount=0ULL;
     for(const auto count:event.modeEvents) modeEventCount+=count;
     if(work.workTimeUs!=m_edm130ArmRecipe.workTimeUs || event.eventCount!=work.completedEvents ||
@@ -2965,8 +3005,8 @@ bool MotionCore::IsEDM130TimingCurrent() const noexcept
 
 bool MotionCore::IsEDM128FeedPolicyCurrent(const EDM94FeedAuthorization& a) const noexcept
 {
-    if(IsEDM173Profile()) return m_edm173 && m_edm173->sealed && a.session==m_edm173->current.plan.scope.session && a.dispatch==m_edm173->current.plan.scope.dispatch && a.sourcePC==m_edm173->current.plan.scope.sourcePC && a.step<25U && EDM116::ValidPolicy(a.modePolicy) &&
-        a.modePolicy.fixture==EDM116::Fixture::ModalG76Gap173 &&
+    if(IsEDM173Profile()) return m_edm173 && m_edm173->sealed && a.session==m_edm173->current.plan.scope.session && a.dispatch==m_edm173->current.plan.scope.dispatch && a.sourcePC==m_edm173->current.plan.scope.sourcePC && a.step<EDM173::CountForRecipe(a.timerRecipe) && EDM116::ValidPolicy(a.modePolicy) &&
+        a.modePolicy.fixture==EDM116::Fixture::ModalG76Gap173 && a.modePolicy.g76Rows==EDM173::CountForRecipe(a.timerRecipe) &&
         a.modePolicy.mode==EDM173::ExpectedMode(a.timerRecipe) &&
         EDM116::PolicyMatchesBinding(a.modePolicy,a.step,a.sourcePC,a.dispatch) && EDM130::SameRecipe(a.timerRecipe,m_edm130ArmRecipe);
     EDM128::MotionFeedback mode{};
@@ -3091,7 +3131,9 @@ bool MotionCore::BeginEDM126Arm(const EDM94ArmRequest& arm) noexcept
 {
     if (!E156HistoryRecipeFits(arm.historyFixture,arm.workTimeFlush,arm.timerRecipe)) return false;
     if(m_edm173){m_edm173->sealed=m_edm173->handshaking=false;m_edm173->nextChild=0U;m_edm173->terminalMask=0U;m_edm173->currentFeedback=EDM173::Feedback{};}
-    m_edm157Pause.Clear();m_edm157ZeroOutputTick=m_edm157QualifySeedTick=0ULL;PublishEDM157Feedback();
+    m_edm157Pause.Clear();m_edm157ZeroOutputTick=m_edm157QualifySeedTick=0ULL;
+    m_edm157PhysicalDiagnosticTick=0ULL;
+    m_edm157PhysicalEvaluated=m_edm157PhysicalFailures=m_edm157PhysicalAxisMask=0U;PublishEDM157Feedback();
     g_edm147PhysicalGap=EDM147::Collector{};
     g_edm147PublishedRevision=g_edm147PublishedTick=0ULL;
     E147PublishPhysicalGap(true);
@@ -3135,7 +3177,7 @@ bool MotionCore::BeginEDM126Arm(const EDM94ArmRequest& arm) noexcept
         m_edm126SourceConfig=EDM88::SimulatedSource(arm.session); m_edm126SourceConfig.samplePeriodUs=250ULL;
         m_edm126SourceConfig.maxAgeUs=EDM126::MaximumSourceAgeUs;
         const bool software=EDM130::UsesSoftwareVoltage(arm.timerRecipe);
-        if (!(software ? (EDM130::IsG76Gap173(arm.timerRecipe) ? m_edm149Voltage.BeginCompound(arm.session,arm.timerRecipe.diagnosticControlSource,EDM130::FrozenGapReferenceVoltageV(arm.timerRecipe),25U) : m_edm149Voltage.Begin(arm.session,arm.timerRecipe.diagnosticControlSource,
+        if (!(software ? (EDM130::IsG76Gap173(arm.timerRecipe) ? m_edm149Voltage.BeginCompound(arm.session,arm.timerRecipe.diagnosticControlSource,EDM130::FrozenGapReferenceVoltageV(arm.timerRecipe),EDM173::CountForRecipe(arm.timerRecipe)) : m_edm149Voltage.Begin(arm.session,arm.timerRecipe.diagnosticControlSource,
                 EDM130::FrozenGapReferenceVoltageV(arm.timerRecipe))) :
             (m_edm128Profile ? m_edm128Voltage.Begin(arm.historyFixture) : m_edm126Voltage.Begin(arm.historyFixture))) ||
             !m_edm126Source.Begin(m_edm126SourceConfig) || !m_edm126Decision.Begin(EDM97::MakeProfile(arm.tuning,arm.timerRecipe))) return false;
@@ -3582,7 +3624,7 @@ bool MotionCore::BeginEDM126Segment() noexcept
             h.targetPulse[i]!=m_edm94.FrozenConfig().axis[i].commandAnchor)return false;
     EDM126::Point excursionLow{},excursionHigh{},tangentShift{},centerShift{},centerLow{},centerHigh{};
     if(centerFlush) {
-        if(!IsEDM173Profile()||!m_edm173||!m_edm173->sealed||a.step>=25U||
+        if(!IsEDM173Profile()||!m_edm173||!m_edm173->sealed||a.step>=EDM173::CountForRecipe(a.timerRecipe)||
             a.historyFixture!=EDM173::HistoryFixture||
             a.modePolicy.mode!=EDM173::ExpectedMode(a.timerRecipe)||curve.kind!=EDM112::Kind::Line)return false;
         const auto& seal=m_edm173->current;
@@ -3676,10 +3718,10 @@ bool MotionCore::BeginEDM126Segment() noexcept
     source.epoch=h.nextEpoch; source.segment=p.source.segment; source.sourcePC=a.sourcePC;
     const bool compound=IsEDM173Profile();
     if ((!a.step && !(compound?m_edm126.BeginCompound(source.scope,EDM126::Settings{0.025,200U},
-            m_edm173->current.plan.fingerprint,a.dispatch,h.nextEpoch,a.sourcePC,25U):
+            m_edm173->current.plan.fingerprint,a.dispatch,h.nextEpoch,a.sourcePC,EDM173::CountForRecipe(a.timerRecipe)):
             m_edm126.Begin(source.scope,EDM126::Settings{0.025,200U}))) ||
         !(compound?m_edm126.BindCompoundCurrent(curve,source,limits,m_ncSettleRuntimeCycleTick,m_edmZMonotonicUs,
-            m_edm173->current.plan.fingerprint,a.step,25U):
+            m_edm173->current.plan.fingerprint,a.step,EDM173::CountForRecipe(a.timerRecipe)):
             m_edm126.BindCurrent(curve,source,limits,m_ncSettleRuntimeCycleTick,m_edmZMonotonicUs))) return false;
     if(m_edm128Profile) {
         const bool centerMode=compound && EDM173::IsCenterRecipe(m_edm130ArmRecipe);
@@ -3691,7 +3733,7 @@ bool MotionCore::BeginEDM126Segment() noexcept
             m_edm130Profile?m_edm130ArmRecipe.deepFlushCycleInterval:0U,
             m_edm130Profile?EDM130::FrozenDeepMultiplier(m_edm130ArmRecipe):0.0,
             m_edm130Profile && EDM130::HasBoundDeep(m_edm130ArmRecipe),m_edm130ArmRecipe.flushStages,
-            centerMode?&m_edm173->b3Orbit:nullptr)) return false;
+            centerMode?&m_edm173->b3Orbit:nullptr,EDM130::G76EventLimit(m_edm130ArmRecipe))) return false;
         m_edm128Current.rowPolicy=a.modePolicy;
     }
     m_edm126Curve=curve; m_edm126Limits=limits; m_edm126Current.authorizedSource=source;
@@ -3887,14 +3929,22 @@ bool MotionCore::MapEDM126Traversal(AxisCommand& command) noexcept
         // new channel copy on every deceleration or stopped dwell callback.
         E147PublishPhysicalGap(!stopping && mapped.completeReady);
     }
-    if(IsEDM173Profile() && m_edm173 && !m_edm173->currentFeedback.eventRetained &&
-        m_edm128.Evidence().work.completedEvents==1ULL){
+    if(IsEDM173Profile() && m_edm173 &&
+        m_edm128.Evidence().work.completedEvents>m_edm173->currentFeedback.retainedEvents){
         const auto& event=m_edm128.Evidence();
+        auto& receipt=m_edm173->currentFeedback;
+        const unsigned ordinal=receipt.retainedEvents+1U;
+        if(ordinal>EDM130::G76EventLimit(m_edm130ArmRecipe) ||
+            event.work.completedEvents!=ordinal || event.eventIndex!=ordinal ||
+            event.work.lastCompleteTick!=f.tick || event.work.lastCompleteUs!=f.nowUs ||
+            !EDM130::ValidWorkEvidence(event.work)){
+            TripEDM94(EDM94::Reason::Identity);return false;
+        }
         const bool b2=EDM173::IsB2Recipe(m_edm130ArmRecipe);
         const bool centerMode=EDM173::IsCenterRecipe(m_edm130ArmRecipe);
         const unsigned eventMode=static_cast<unsigned>(EDM173::ExpectedMode(m_edm130ArmRecipe));
         for(unsigned modeIndex=0U;modeIndex<EDM116::ModeCount;++modeIndex)
-            if(event.modeEvents[modeIndex]!=(modeIndex==eventMode?1U:0U)){
+            if(event.modeEvents[modeIndex]!=(modeIndex==eventMode?ordinal:0U)){
                 TripEDM94(EDM94::Reason::Identity);return false;
             }
         // Event crossings start at the captured braking anchor. Earlier GAP
@@ -3907,22 +3957,26 @@ bool MotionCore::MapEDM126Traversal(AxisCommand& command) noexcept
         const std::uint64_t backward=f.backwardCrossings-event.anchor.backwardCrossings;
         const std::uint64_t forward=f.forwardCrossings-event.anchor.forwardCrossings;
         const std::uint64_t expectedCrossings=b2?event.anchor.cursorSource.ordinal-event.targetSource.ordinal:0ULL;
-        if(event.eventCount!=1U || event.work.triggeredEvents!=1ULL || !event.exactReturn ||
+        if(event.eventCount!=ordinal || event.work.triggeredEvents!=ordinal || !event.exactReturn ||
             !event.rowEventComplete || !event.topCaptured || event.phase!=EDM128::Phase::Gap ||
             event.policy.mode!=EDM173::ExpectedMode(m_edm130ArmRecipe) ||
             (b2 && event.detached) ||
             (EDM173::IsB0Recipe(m_edm130ArmRecipe)&&(event.detached||event.qualifiedDwells!=3U)) ||
             (centerMode && (event.detached ||
-                !event.centerCaptured || event.centerLegsCompleted!=15U || event.qualifiedDwells!=5U ||
+                !event.centerCaptured || event.centerLegsCompleted!=15U || event.qualifiedDwells!=5U*ordinal ||
                 event.centerReturnMmMin!=m_edm173->current.plan.centerReturnFeedMmMin)) ||
             backward!=expectedCrossings || forward!=expectedCrossings ||
             !EDM128::ValidHeightProof(event,EDM173::FrozenHeightMm(m_edm130ArmRecipe),0U,1.0,true) ||
             !EDM128::ValidSpeedProof(event,m_edm130ArmRecipe.flushStages)){
             TripEDM94(EDM94::Reason::Identity);return false;
         }
-        m_edm173->currentFeedback.eventBackwardCrossings=backward;
-        m_edm173->currentFeedback.eventForwardCrossings=forward;
-        m_edm173->currentFeedback.completedEvent=event;m_edm173->currentFeedback.eventRetained=true;
+        if(ordinal==2U && (!receipt.eventRetained || receipt.retainedEvents!=1U ||
+            !EDM173::FollowsCompletedEvent230(receipt.firstCompletedEvent,event))){
+            TripEDM94(EDM94::Reason::Identity);return false;
+        }
+        if(ordinal==1U)receipt.firstCompletedEvent=event;
+        receipt.eventBackwardCrossings=backward;receipt.eventForwardCrossings=forward;
+        receipt.completedEvent=event;receipt.retainedEvents=ordinal;receipt.eventRetained=true;
     }
     m_edm126MappedZero=f.velocityPps==EDM126::Point{};
     m_edm114LastPosition=command.instantCmdPos; m_edm114LastVelocity=command.instantCmdVel;
@@ -3959,9 +4013,11 @@ bool MotionCore::MapEDM126Traversal(AxisCommand& command) noexcept
     // A moving flush changes that receipt on its first braking cycle.
     if(!stopping && m_edm157Pause.DemandZero()) {
         const auto priorPhase=m_edm157Pause.Current().phase;
-        if(!IsEDM157ScopeCurrent(m_edm157Pause.Current().scope) ||
-            !m_edm157Pause.ObserveMapped(CurrentEDM157Scope(),EDM126CommittedImage())) {
-            RejectEDM157Pause();return false;
+        if(!IsEDM157ScopeCurrent(m_edm157Pause.Current().scope)) {
+            RejectEDM157Pause(EDM157::RejectSite::MapScope,priorPhase);return false;
+        }
+        if(!m_edm157Pause.ObserveMapped(CurrentEDM157Scope(),EDM126CommittedImage())) {
+            RejectEDM157Pause(EDM157::RejectSite::MappedReceipt,priorPhase);return false;
         }
         if(m_edm157Pause.NeedsRetreatPlan()) {
             const auto& paused=m_edm157Pause.Current();
@@ -3974,7 +4030,7 @@ bool MotionCore::MapEDM126Traversal(AxisCommand& command) noexcept
                     m_edm126.EvaluateCursorAtRest(target,position,&resolved)&&
                     m_edm157Pause.PlanRetreat(target,position,resolved);
             }
-            if(!planned){RejectEDM157Pause();return false;}
+            if(!planned){RejectEDM157Pause(EDM157::RejectSite::RetreatPlan,m_edm157Pause.Current().phase);return false;}
         }
         if(m_edm157Pause.ZeroOutput()) {
             m_edm157ZeroOutputTick=m_ncSettleRuntimeCycleTick;
@@ -4027,34 +4083,46 @@ void MotionCore::ObserveEDM126PhysicalSettle(bool complete,const EDM94::RuntimeD
 {
     if (!m_edm126Profile || !m_edm126Participating) {m_edm126PhysicalSettled=m_edm126PhysicalRange=false;return;}
     const auto& frame=m_edm94Frame; const auto& sent=m_edm94.Current(); const auto& f=EDM126CommittedImage();
-    bool valid=complete && frame.clockValid && frame.pdoValid && frame.sourceFresh && frame.healthy && frame.authorityCurrent &&
-        frame.allCommandZero && !m_safetyControlledStopInProgress && !m_edm94.ForceZero() && !m_edm94.HandoffZero() &&
-        !sent.faulted && sent.lastTick==frame.tick && frame.tick>1ULL && sent.lastSentTick==frame.tick-1ULL &&
-        sent.lastTransportTick==frame.tick-1ULL && sent.lastTransportSealed && sent.lastTransportAttempted && sent.lastTransportAccepted &&
-        proof.proofTick==frame.tick-1ULL && (proof.flags&EDM94::RuntimeFlag_PROOF_CONTEXT_VALID)!=0U && proof.proofGeneration &&
-        UnpackMotionOwnerState(proof.proofOwnerState).owner==MotionOwner::AUTO &&
+    const bool diagnose=m_edm157Pause.DemandZero()&&
+        m_edm157Pause.Current().scope.historyFixture==EDM149::G76GapHistoryFixture;
+    std::uint32_t evaluated=0U,failed=0U,axisMask=0U;
+    const auto gate=[&](std::uint32_t bit,bool passed) noexcept {
+        if(diagnose){evaluated|=bit;if(!passed)failed|=bit;}return passed;
+    };
+    bool valid=gate(EDM157::PhysicalComplete,complete) &&
+        gate(EDM157::PhysicalFrame,frame.clockValid && frame.pdoValid && frame.sourceFresh && frame.healthy && frame.authorityCurrent) &&
+        gate(EDM157::PhysicalZeroMode,frame.allCommandZero && !m_safetyControlledStopInProgress && !m_edm94.ForceZero() && !m_edm94.HandoffZero() &&
+        !sent.faulted) && gate(EDM157::PhysicalTransport,sent.lastTick==frame.tick && frame.tick>1ULL && sent.lastSentTick==frame.tick-1ULL &&
+        sent.lastTransportTick==frame.tick-1ULL && sent.lastTransportSealed && sent.lastTransportAttempted && sent.lastTransportAccepted) &&
+        gate(EDM157::PhysicalPriorProof,proof.proofTick==frame.tick-1ULL && (proof.flags&EDM94::RuntimeFlag_PROOF_CONTEXT_VALID)!=0U && proof.proofGeneration) &&
+        gate(EDM157::PhysicalIdentity,UnpackMotionOwnerState(proof.proofOwnerState).owner==MotionOwner::AUTO &&
         UnpackMotionOwnerState(proof.proofOwnerState).generation==m_edm126Current.ownerGeneration &&
         UnpackExecutionEpochPublication(proof.proofExecutionPublication)==m_edm126Current.liveEpoch &&
         frame.identity.session==m_edm126Current.session && frame.identity.epoch==m_edm126Current.liveEpoch &&
-        frame.identity.ownerGeneration==m_edm126Current.ownerGeneration && f.tick==frame.tick && f.velocityMmSec==0.0 &&
-        f.velocityPps==EDM126::Point{} && m_edm114MappedTick==frame.tick && m_edm126SameReferencePriorTick && IsEDM126Current() &&
-        (m_edm126PhysicalTick==0ULL || frame.tick==m_edm126PhysicalTick+1ULL);
+        frame.identity.ownerGeneration==m_edm126Current.ownerGeneration) &&
+        gate(EDM157::PhysicalMapped,f.tick==frame.tick && f.velocityMmSec==0.0 && f.velocityPps==EDM126::Point{} && m_edm114MappedTick==frame.tick) &&
+        gate(EDM157::PhysicalReference,m_edm126SameReferencePriorTick) && gate(EDM157::PhysicalCurrent,IsEDM126Current()) &&
+        gate(EDM157::PhysicalContinuity,m_edm126PhysicalTick==0ULL || frame.tick==m_edm126PhysicalTick+1ULL);
     const bool same=valid && m_edm126PhysicalRange && m_edm126PhysicalTick+1ULL==frame.tick &&
         m_edm126PhysicalReference==f.positionPulse;
     for(unsigned i=0U;valid && i<6U;++i) {
         const auto& axis=frame.axis[i];const auto& config=m_edm94.FrozenConfig().axis[i];
-        valid=axis.healthy && axis.writable && axis.configFingerprint==config.configFingerprint &&
-            axis.mappingFingerprint==config.mappingFingerprint && axis.hardwareSign==config.hardwareSign &&
-            axis.commandPulse==f.positionPulse[i] && std::isfinite(axis.actualPulse) && std::isfinite(axis.followingErrorPulse) &&
-            std::fabs(axis.actualPulse-f.positionPulse[i])<=config.followingWindowPulse && std::fabs(axis.followingErrorPulse)<=config.followingWindowPulse;
-        if(!valid)break;
+        valid=gate(EDM157::PhysicalAxisState,axis.healthy && axis.writable && axis.configFingerprint==config.configFingerprint &&
+            axis.mappingFingerprint==config.mappingFingerprint && axis.hardwareSign==config.hardwareSign) &&
+            gate(EDM157::PhysicalAxisPosition,axis.commandPulse==f.positionPulse[i] && std::isfinite(axis.actualPulse) && std::isfinite(axis.followingErrorPulse)) &&
+            gate(EDM157::PhysicalAxisWindow,std::fabs(axis.actualPulse-f.positionPulse[i])<=config.followingWindowPulse && std::fabs(axis.followingErrorPulse)<=config.followingWindowPulse);
+        if(!valid){if(diagnose)axisMask|=1U<<i;break;}
         const double low=same?(std::min)(m_edm126PhysicalMin[i],axis.actualPulse):axis.actualPulse;
         const double high=same?(std::max)(m_edm126PhysicalMax[i],axis.actualPulse):axis.actualPulse;
-        if(high-low>EDM94::StopRangeLimitPulse(i,config)) {valid=false;break;}
+        if(!gate(EDM157::PhysicalAxisRange,!(high-low>EDM94::StopRangeLimitPulse(i,config)))) {
+            valid=false;if(diagnose)axisMask|=1U<<i;break;
+        }
         m_edm126PhysicalMin[i]=low;m_edm126PhysicalMax[i]=high;
     }
     m_edm126PhysicalSettled=m_edm126PhysicalRange=valid;m_edm126PhysicalTick=frame.tick;
     if(valid)m_edm126PhysicalReference=f.positionPulse;
+    if(diagnose){m_edm157PhysicalDiagnosticTick=frame.tick;m_edm157PhysicalEvaluated=evaluated;
+        m_edm157PhysicalFailures=failed;m_edm157PhysicalAxisMask=axisMask;}
 }
 
 bool MotionCore::ReadEDM157Feedback(EDM157::Feedback& feedback) const noexcept
@@ -4140,15 +4208,25 @@ EDM157::Scope MotionCore::CurrentEDM157Scope() const noexcept
 
 bool MotionCore::IsEDM157ScopeCurrent(const EDM157::Scope& scope) const noexcept
 {
+    // This const call retains one current-command validation. On G76 that
+    // validation also checks the frozen profile; source age and live authority
+    // are still checked below. No result survives this call or PDO cycle.
+    const bool g76=IsEDM173Profile();
     const auto& p=m_edm126Current;const auto& mode=m_edm128.Evidence();const auto& guard=m_edm94.Current();
+    // EDM231 FIX5: only the exact retained center-flush scope can use the
+    // PauseModeAllowed check already inside FlushContextCurrent below.
+    // Both checks see the same objects in this const call; no result is
+    // retained across mapping, guard updates, or PDO cycles.
+    const bool modeCheckedByFlushContext=g76&&m_edm157Pause.DemandZero()&&m_edm157Pause.FlushPause()&&
+        &scope==&m_edm157Pause.Current().scope&&EDM157::IsG76CenterNominalPause(scope);
     return EDM157::ValidScope(scope)&&EDM157::SameScope(scope,CurrentEDM157Scope())&&
         m_edm126Profile&&m_edm128Profile&&m_edm130Profile&&p.active&&p.rowActive&&!p.rowCompleted&&!p.faulted&&
         m_edm114Current.geometryValid&&!m_edm114Current.rowComplete&&!m_edm114Current.failed&&
-        EDM157::PauseModeAllowed(scope,mode)&&
-        (!EDM157::IsG76NominalPause(scope)||IsEDM173CommandCurrent(true))&&
+        (modeCheckedByFlushContext||EDM157::PauseModeAllowed(scope,mode))&&
+        (!EDM157::IsG76NominalPause(scope)||g76)&&
         (!m_edm157Pause.DemandZero()||(m_edm157Pause.FlushContextCurrent(mode)&&
             (m_edm157Pause.FlushPause()||(mode.phase==EDM128::Phase::Gap&&!mode.detached))))&&
-        EDM116::SamePolicy(mode.policy,scope.policy)&&IsEDM126Current()&&IsEDM126SourceCurrent(m_edmZMonotonicUs)&&
+        EDM116::SamePolicy(mode.policy,scope.policy)&&IsEDM126Current()&&IsEDM126SourceCurrent(m_edmZMonotonicUs,g76)&&
         GetCurrentExecutionEpoch()==p.liveEpoch&&IsMotionOwnerLeaseCurrent(m_Group.currentCmd.ownerLease)&&
         m_Group.currentCmd.ownerLease.owner==MotionOwner::AUTO&&
         GetCommandAuthorizationFailure(m_Group.currentCmd)==MotionRejectReason::NONE&&
@@ -4166,8 +4244,24 @@ void MotionCore::PublishEDM157Feedback() noexcept
     }
 }
 
-void MotionCore::RejectEDM157Pause() noexcept
+void MotionCore::RejectEDM157Pause(EDM157::RejectSite site,EDM157::Phase priorPhase,
+    std::uint32_t proofEvaluated,std::uint32_t proofFailures,std::uint64_t proofTick) noexcept
 {
+    const auto& paused=m_edm157Pause.Current();
+    if(paused.scope.historyFixture==EDM149::G76GapHistoryFixture&&!m_edm94.Current().faulted&&
+        paused.firstFailure.site==EDM157::RejectSite::None) {
+        EDM157::FailureDiagnostic d{};
+        d.site=site;d.priorPhase=priorPhase;d.tick=m_ncSettleRuntimeCycleTick;d.nowUs=m_edmZMonotonicUs;
+        d.guardContextTick=m_edm94.CurrentRuntimeDiagnostic().tick;
+        d.physicalDiagnosticTick=m_edm157PhysicalDiagnosticTick;
+        d.physicalEvaluated=m_edm157PhysicalEvaluated;d.physicalFailures=m_edm157PhysicalFailures;
+        d.physicalAxisMask=m_edm157PhysicalAxisMask;d.proofEvaluated=proofEvaluated;d.proofFailures=proofFailures;
+        d.qualifySeedTick=m_edm157QualifySeedTick;
+        d.resumeSeedTick=paused.phase==EDM157::Phase::Rejected?paused.firstFailure.resumeSeedTick:paused.resumeSeedTick;
+        d.physicalTick=m_edm126PhysicalTick;d.mappedTick=EDM126CommittedImage().tick;
+        d.sentTick=m_edm94.Current().lastSentTick;d.transportTick=m_edm94.Current().lastTransportTick;d.proofTick=proofTick;
+        m_edm157Pause.CaptureFirstFailure(d);
+    }
     m_edm157Pause.Reject(m_ncSettleRuntimeCycleTick,m_edmZMonotonicUs);
     PublishEDM157Feedback();TripEDM94(EDM94::Reason::Identity);
 }
@@ -4198,7 +4292,7 @@ bool MotionCore::ServiceEDM157Requests() noexcept
                 m_edm128.Evidence().phase==EDM128::Phase::Gap?nullptr:&m_edm128.Evidence(),
                 m_edm128.Evidence().phase==EDM128::Phase::Gap&&EDM157::IsG76NominalPause(request.scope)?
                     &m_edm128.Evidence():nullptr)) {
-            RejectEDM157Pause();return false;
+            RejectEDM157Pause(EDM157::RejectSite::HoldRequest,m_edm157Pause.Current().phase);return false;
         }
         m_edm157QualifySeedTick=0ULL;
         if(haveResume)m_edm157Pause.RejectStart(m_edm157ResumeRequest.startSequence);
@@ -4208,7 +4302,7 @@ bool MotionCore::ServiceEDM157Requests() noexcept
         // An already consumed ticket cannot be resurrected after a newer HOLD.
         if(request.holdSequence==paused.holdSequence) {
             if(!IsEDM157ScopeCurrent(request.scope)||!EDM157::SameScope(request.scope,paused.scope)) {
-                RejectEDM157Pause();return false;
+                RejectEDM157Pause(EDM157::RejectSite::ResumeScope,m_edm157Pause.Current().phase);return false;
             }
             const bool fresh=request.issuedTick&&m_ncSettleRuntimeCycleTick>=request.issuedTick&&
                 m_ncSettleRuntimeCycleTick-request.issuedTick<=8ULL&&m_edmZMonotonicUs>=request.issuedUs&&
@@ -4219,7 +4313,7 @@ bool MotionCore::ServiceEDM157Requests() noexcept
         }
     }
     if(m_edm157Pause.DemandZero()&&!IsEDM157ScopeCurrent(m_edm157Pause.Current().scope)) {
-        RejectEDM157Pause();return false;
+        RejectEDM157Pause(EDM157::RejectSite::ServiceScope,m_edm157Pause.Current().phase);return false;
     }
     return m_edm157Pause.Current().phase!=EDM157::Phase::Rejected;
 }
@@ -4227,27 +4321,42 @@ bool MotionCore::ServiceEDM157Requests() noexcept
 void MotionCore::ObserveEDM157PauseProof(bool complete,const EDM94::RuntimeDiagnostic& proof) noexcept
 {
     if(!m_edm157Pause.DemandZero())return;
-    if(!IsEDM157ScopeCurrent(m_edm157Pause.Current().scope)) {RejectEDM157Pause();return;}
+    const auto priorPhase=m_edm157Pause.Current().phase;
+    if(!IsEDM157ScopeCurrent(m_edm157Pause.Current().scope)) {
+        RejectEDM157Pause(EDM157::RejectSite::ProofScope,priorPhase,0U,0U,proof.proofTick);return;
+    }
     if(!m_edm157Pause.ZeroOutput())return;
     const auto& frame=m_edm94Frame;const auto& sent=m_edm94.Current();const auto& mapped=EDM126CommittedImage();
     // PhysicalSettle already checks six frozen axis mappings, writable/healthy
     // encoders, following windows and cumulative encoder ranges. This receipt
     // also requires the actual prior whole CSV image to have been accepted zero.
-    const bool valid=complete&&m_edm126PhysicalSettled&&m_edm126PhysicalRange&&
-        m_edm126PhysicalTick==frame.tick&&m_edm126SameReferencePriorTick&&
-        frame.clockValid&&frame.pdoValid&&frame.sourceFresh&&frame.healthy&&frame.authorityCurrent&&frame.allCommandZero&&
-        frame.tick>1ULL&&frame.tick==m_ncSettleRuntimeCycleTick&&frame.nowUs==m_edmZMonotonicUs&&
-        m_edm157QualifySeedTick&&frame.tick>m_edm157QualifySeedTick&&
-        sent.lastTick==frame.tick&&sent.lastSentTick==frame.tick-1ULL&&sent.lastTransportTick==frame.tick-1ULL&&
+    std::uint32_t evaluated=0U,failed=0U;
+    const bool diagnose=m_edm157Pause.Current().scope.historyFixture==EDM149::G76GapHistoryFixture;
+    const auto gate=[&](std::uint32_t bit,bool passed) noexcept {
+        if(diagnose){evaluated|=bit;if(!passed)failed|=bit;}return passed;
+    };
+    const bool valid=gate(EDM157::ProofComplete,complete)&&
+        gate(EDM157::ProofPhysical,m_edm126PhysicalSettled&&m_edm126PhysicalRange)&&
+        gate(EDM157::ProofPhysicalTick,m_edm126PhysicalTick==frame.tick)&&
+        gate(EDM157::ProofReference,m_edm126SameReferencePriorTick)&&
+        gate(EDM157::ProofFrame,frame.clockValid&&frame.pdoValid&&frame.sourceFresh&&frame.healthy&&frame.authorityCurrent&&frame.allCommandZero)&&
+        gate(EDM157::ProofClock,frame.tick>1ULL&&frame.tick==m_ncSettleRuntimeCycleTick&&frame.nowUs==m_edmZMonotonicUs)&&
+        gate(EDM157::ProofSeed,m_edm157QualifySeedTick&&frame.tick>m_edm157QualifySeedTick)&&
+        gate(EDM157::ProofSent,sent.lastTick==frame.tick&&sent.lastSentTick==frame.tick-1ULL&&sent.lastTransportTick==frame.tick-1ULL)&&
+        gate(EDM157::ProofTransport,
         sent.lastTransportTick>=m_edm157QualifySeedTick&&
-        sent.lastTransportSealed&&sent.lastTransportAttempted&&sent.lastTransportAccepted&&sent.lastTransportAllZero&&
-        proof.proofTick==frame.tick-1ULL&&(proof.flags&EDM94::RuntimeFlag_PROOF_CONTEXT_VALID)!=0U&&proof.proofGeneration&&
-        UnpackMotionOwnerState(proof.proofOwnerState).owner==MotionOwner::AUTO&&
+        sent.lastTransportSealed&&sent.lastTransportAttempted&&sent.lastTransportAccepted&&sent.lastTransportAllZero)&&
+        gate(EDM157::ProofPrior,proof.proofTick==frame.tick-1ULL&&(proof.flags&EDM94::RuntimeFlag_PROOF_CONTEXT_VALID)!=0U&&proof.proofGeneration)&&
+        gate(EDM157::ProofIdentity,UnpackMotionOwnerState(proof.proofOwnerState).owner==MotionOwner::AUTO&&
         UnpackMotionOwnerState(proof.proofOwnerState).generation==m_edm126Current.ownerGeneration&&
-        UnpackExecutionEpochPublication(proof.proofExecutionPublication)==m_edm126Current.liveEpoch&&
-        mapped.tick==frame.tick&&mapped.nowUs==frame.nowUs&&mapped.velocityMmSec==0.0&&mapped.velocityPps==EDM126::Point{};
+        UnpackExecutionEpochPublication(proof.proofExecutionPublication)==m_edm126Current.liveEpoch)&&
+        gate(EDM157::ProofMapped,mapped.tick==frame.tick&&mapped.nowUs==frame.nowUs&&mapped.velocityMmSec==0.0&&mapped.velocityPps==EDM126::Point{});
     m_edm157Pause.ObserveProof(valid,frame.tick,frame.nowUs);
-    if(m_edm157Pause.Current().phase==EDM157::Phase::Rejected) {RejectEDM157Pause();return;}
+    if(valid&&diagnose)evaluated|=EDM157::ProofTransaction;
+    if(m_edm157Pause.Current().phase==EDM157::Phase::Rejected) {
+        if(valid&&diagnose)failed|=EDM157::ProofTransaction;
+        RejectEDM157Pause(EDM157::RejectSite::ProofReceipt,priorPhase,evaluated,failed,proof.proofTick);return;
+    }
     PublishEDM157Feedback();
 }
 
@@ -4488,8 +4597,115 @@ bool MotionCore::RequestEDM94CompletionRelease(std::uint64_t session,
     return true;
 }
 
+bool MotionCore::RequestEDM233ParentRelease(std::uint64_t session,
+    MotionExecutionEpoch armEpoch, const MotionOwnerLease& armLease) noexcept
+{
+    const EDM94::Identity identity{session,static_cast<std::uint64_t>(armEpoch),armLease.generation};
+    EDM94::Feedback feedback{};
+    if (!EDM94::ValidIdentity(identity) || armLease.owner != MotionOwner::AUTO ||
+        !armLease.IsValid() || !ReadEDM94Feedback(feedback) ||
+        !EDM94::SameIdentity(feedback.identity,identity)) return false;
+    if (feedback.parentReleased && feedback.parentReleasePhase == EDM94::ParentReleasePhase::Released)
+        return true; // A duplicate observes the immutable completed receipt.
+    if (EDM94::SameIdentity(m_edm233ParentReleaseSubmitted,identity))
+        return feedback.parentReleasePhase != EDM94::ParentReleasePhase::Revoked;
+    const auto liveEpoch=GetCurrentExecutionEpoch();
+    if (!feedback.active || !feedback.armAccepted || !feedback.finishRequested || !feedback.pass ||
+        !feedback.stopped || !feedback.forceZero || feedback.cancelled || feedback.faulted ||
+        feedback.currentIdentity.session != session || feedback.currentIdentity.epoch != liveEpoch ||
+        feedback.currentIdentity.ownerGeneration != armLease.generation ||
+        !IsMotionOwnerLeaseCurrent(armLease) || m_edm94Claim.load(std::memory_order_acquire) != session ||
+        m_edm94CompletionDecision.load(std::memory_order_acquire) != 0U ||
+        HasPendingSafetyOrRecoveryRequests() || HasUnacknowledgedSafetyMotionRequest()) return false;
+    EDM233ParentReleaseRequest request{};
+    request.armIdentity=identity;request.lease=armLease;request.liveEpoch=liveEpoch;
+    request.safetyIntent=m_frameSafetyIntentState.load(std::memory_order_acquire);
+    AlarmManager& alarms=AlarmManager::GetInstance();
+    request.alarmIntent=alarms.GetMotionSafetyIntentState();request.alarmRevision=alarms.GetUpdateCount();
+    if (static_cast<std::uint32_t>(request.safetyIntent) != 0U ||
+        static_cast<std::uint32_t>(request.alarmIntent) != 0U || alarms.HasAlarm() ||
+        !m_edm233ParentReleaseRequests.ProducerTryPush(request)) return false;
+    m_edm233ParentReleaseSubmitted=identity;
+    return true;
+}
+
 bool MotionCore::ReadEDM94Feedback(EDM94::Feedback& feedback) const noexcept
 { return m_edm94Feedback.Read(feedback).Ready(); }
+
+bool MotionCore::RequestEDM234ParentRelease(std::uint64_t session, MotionExecutionEpoch armEpoch,
+    const MotionOwnerLease& armLease, unsigned kind, std::uint64_t run, std::uint64_t cache,
+    int parentPC, std::uint64_t parentDispatch, const EDM130::Recipe& recipe, unsigned program) noexcept
+{
+    const EDM94::Identity identity{session,static_cast<std::uint64_t>(armEpoch),armLease.generation};
+    const bool centerStage = ((program == 239U || program == 240U || program == 241U || program == 242U || program == 243U || program == 244U) && (kind == 6U || kind == 7U)) ||
+        ((program == 245U || program == 247U) && kind == 6U) || ((program == 246U || program == 248U) && kind == 7U);
+    const bool orbitStage = kind == 2U || centerStage;
+    const bool stage = program == 234U ? (kind == 1U || kind == 2U) :
+        program == 235U ? (kind == 2U || kind == 3U || kind == 4U) :
+        program == 236U ? kind >= 1U && kind <= 4U :
+        (program == 237U || program == 238U) ? (kind == 2U || kind == 5U) :
+        centerStage || (program == 240U && kind == 5U) ||
+        ((program == 241U || program == 242U || program == 243U || program == 244U || program == 245U || program == 246U || program == 247U || program == 248U) && (kind == 2U || kind == 5U));
+    const bool stageRecipe = kind == 1U ? recipe.commissioningProfile == 0U &&
+        recipe.planRows == 1U && recipe.planMovementMask == 4U : kind == 2U ?
+        recipe.commissioningProfile == 5U && recipe.planRows == 25U && recipe.planMovementMask == 7U :
+        kind == 5U ? recipe.commissioningProfile == 0U && recipe.planRows == 4U && recipe.planMovementMask == 7U :
+        centerStage ? recipe.commissioningProfile == kind && recipe.planRows == 25U && recipe.planMovementMask == 7U :
+        (kind == 3U || kind == 4U) && recipe.commissioningProfile == 0U && recipe.planRows == 1U && recipe.planMovementMask == 3U;
+    EDM94::Feedback feedback{};
+    if (!EDM94::ValidIdentity(identity) || armLease.owner != MotionOwner::AUTO || !armLease.IsValid() ||
+        !run || !cache || parentPC < 0 || !parentDispatch || !stage || !stageRecipe ||
+        !EDM130::ValidHistoryRecipeBinding(orbitStage ? 14U : 9U,recipe) ||
+        recipe.diagnosticControlSource != 3U || recipe.workTimeUs != 500000ULL ||
+        recipe.jumpHeightScaled != (centerStage ? 200000ULL : 1000ULL) || recipe.jumpSpeedPercentScaled != 100000000ULL ||
+        recipe.holdRetreatMode || (centerStage ? (program == 239U ?
+            !EDM130::IsG76CenterSequence239(recipe) : program == 240U ?
+            !EDM130::IsG76CenterSequence240(recipe) : program == 241U ?
+            !EDM130::IsG76CenterSequence241(recipe) : program == 242U ?
+            !EDM130::IsG76CenterSequence242(recipe) : program == 243U ?
+            !EDM130::IsG76CenterSequence243(recipe) : program == 244U ?
+            !EDM130::IsG76CenterSequence244(recipe) : program == 245U ?
+            !EDM130::IsG76CenterSequence245(recipe) : program == 246U ?
+            !EDM130::IsG76CenterSequence246(recipe) : program == 247U ?
+            !EDM130::IsG76CenterSequence247(recipe) : !EDM130::IsG76CenterSequence248(recipe)) : recipe.flushHoldTest != 0U) ||
+        recipe.deepFlushCycleInterval ||
+        recipe.deepFlushHeightMultiplierScaled != 1000000ULL ||
+        !ReadEDM94Feedback(feedback) || !EDM94::SameIdentity(feedback.identity,identity) ||
+        (feedback.config.ordinarySequenceProgram&&
+            (program!=feedback.config.ordinarySequenceProgram||kind!=5U)) ||
+        feedback.config.commissioningProfile != recipe.commissioningProfile ||
+        feedback.config.visibleZFlush158 != centerStage || feedback.requiredMovementMask != recipe.planMovementMask) return false;
+    const auto& submitted = m_edm234ParentReleaseSubmitted;
+    if (EDM94::SameIdentity(submitted.armIdentity,identity))
+        return submitted.kind == kind && submitted.program == program && submitted.run == run && submitted.cache == cache &&
+            submitted.parentPC == parentPC && submitted.parentDispatch == parentDispatch &&
+            submitted.lease.Matches(armLease) && EDM130::SameRecipe(submitted.recipe,recipe) &&
+            feedback.parentReleasePhase != EDM94::ParentReleasePhase::Revoked &&
+            (!feedback.parentReleased || (feedback.parentReleaseProgram == program && feedback.parentReleaseKind == kind));
+    const auto liveEpoch = GetCurrentExecutionEpoch();
+    if (!feedback.active || !feedback.armAccepted || !feedback.boundedProgram || !feedback.finishTargetBound ||
+        !feedback.finishRequested || !feedback.pass || !feedback.stopped || !feedback.forceZero ||
+        feedback.settledCycles < EDM94::RequiredStableCycles || feedback.cancelled || feedback.faulted ||
+        feedback.currentIdentity.session != session || feedback.currentIdentity.epoch != liveEpoch ||
+        feedback.currentIdentity.ownerGeneration != armLease.generation ||
+        !IsMotionOwnerLeaseCurrent(armLease) || m_edm94Claim.load(std::memory_order_acquire) != session ||
+        m_edm94CompletionDecision.load(std::memory_order_acquire) != 0U ||
+        feedback.parentReleasePhase != EDM94::ParentReleasePhase::None ||
+        feedback.completionPhase != EDM94::CompletionReleasePhase::None ||
+        HasPendingSafetyOrRecoveryRequests() || HasUnacknowledgedSafetyMotionRequest()) return false;
+    EDM234ParentReleaseRequest request{};
+    request.armIdentity = identity; request.lease = armLease; request.liveEpoch = liveEpoch;
+    request.kind = kind; request.program = program; request.run = run; request.cache = cache; request.parentPC = parentPC;
+    request.parentDispatch = parentDispatch; request.recipe = recipe;
+    request.safetyIntent = m_frameSafetyIntentState.load(std::memory_order_acquire);
+    AlarmManager& alarms = AlarmManager::GetInstance();
+    request.alarmIntent = alarms.GetMotionSafetyIntentState(); request.alarmRevision = alarms.GetUpdateCount();
+    if (static_cast<std::uint32_t>(request.safetyIntent) != 0U ||
+        static_cast<std::uint32_t>(request.alarmIntent) != 0U || alarms.HasAlarm() ||
+        !m_edm234ParentReleaseRequests.ProducerTryPush(request)) return false;
+    m_edm234ParentReleaseSubmitted = request;
+    return true;
+}
 
 bool MotionCore::CheckEDM94Endpoint(const std::array<double, 6U>& nativePulse,
     MotionExecutionEpoch epoch, const MotionOwnerLease& lease) const noexcept
@@ -5387,19 +5603,22 @@ bool MotionCore::CaptureEDM204CenterEnvelope(const EDM94::Frame& frame,EDM94::Ce
         frame.identity.session!=scope.session||frame.identity.ownerGeneration!=scope.owner.generation||
         !EDM116::SamePolicy(e.policy,m_edm128Current.rowPolicy)||
         e.policy.fixture!=EDM116::Fixture::ModalG76Gap173||e.policy.mode!=EDM173::ExpectedMode(plan.recipe)||
+        e.policy.g76Rows!=EDM173::CountForRecipe(plan.recipe)||
         !e.detached||!e.anchorCaptured||!e.targetCaptured||!e.centerCaptured||(!radial&&!axial)||
         e.centerReturnMmMin!=plan.centerReturnFeedMmMin||!EDM128::ValidHeightProof(e,EDM173::FrozenHeightMm(plan.recipe),0U,1.0,true)||
-        e.work.triggeredEvents!=1ULL||e.work.completedEvents!=0ULL||
+        !e.eventIndex||e.eventIndex!=e.work.triggeredEvents||
+        e.eventIndex>EDM130::G76EventLimit(plan.recipe)||e.work.completedEvents+1ULL!=e.work.triggeredEvents||
+        !EDM130::ValidWorkEvidence(e.work)||
         !a.active||a.faulted||a.stopRequested||a.stopped||a.awaitingSeam||a.awaitingCurrent||a.completeReady||
         (!interiorAnchor&&!terminalAnchor)||a.velocityMmSec!=0.0||a.accelerationMmSec2!=0.0||
         a.velocityPps!=EDM126::Point{}||a.accelerationPps2!=EDM126::Point{}||
         !a.tick||!a.nowUs||a.tick>=frame.tick||a.nowUs>=frame.nowUs||
-        source.ordinal>=25ULL||source.ordinal>a.authorizedSource.ordinal||
+        source.ordinal>=EDM173::CountForRecipe(plan.recipe)||source.ordinal>a.authorizedSource.ordinal||
         !EDM126::SameSource(a.authorizedSource,f.authorizedSource)||
         !EDM109::SameScope(source.scope,a.authorizedSource.scope))return false;
     const unsigned child=static_cast<unsigned>(source.ordinal);
     const auto sourceFits=[&](const EDM126::Source& value)->bool {
-        if(!EDM126::ValidSource(value)||value.ordinal>=25ULL)return false;
+        if(!EDM126::ValidSource(value)||value.ordinal>=EDM173::CountForRecipe(plan.recipe))return false;
         const auto& identity=seal.identities[static_cast<unsigned>(value.ordinal)];
         return value.scope.session==scope.session&&value.scope.run==scope.run&&value.scope.cache==scope.cache&&
             value.scope.ownerGeneration==scope.owner.generation&&
@@ -5439,11 +5658,11 @@ bool MotionCore::CaptureEDM204CenterEnvelope(const EDM94::Frame& frame,EDM94::Ce
     candidate.liveEpoch=frame.identity.epoch;candidate.run=scope.run;candidate.cache=scope.cache;
     candidate.dispatch=scope.dispatch;candidate.fingerprint=plan.fingerprint;
     candidate.sourceEpoch=source.epoch;candidate.segment=source.segment;candidate.child=child;candidate.sourcePC=scope.sourcePC;
-    candidate.leg=axial?1U:0U;
-    if(!EDM204::Build(a.positionPulse,center,axisPulse,scale,EDM173::FrozenHeightMm(plan.recipe),mode,candidate.geometry)||
+    candidate.childCount=EDM173::CountForRecipe(plan.recipe);candidate.leg=axial?1U:0U;
+    if(!EDM94::BuildCenterEnvelopeGeometry(candidate,m_edm94.FrozenConfig(),
+            a.positionPulse,center,axisPulse,scale,EDM173::FrozenHeightMm(plan.recipe),mode)||
         !EDM109::SamePulse(candidate.geometry.centerPulse,e.centerPositionPulse)||
-        (e.topCaptured&&!EDM109::SamePulse(candidate.geometry.topPulse,e.topPositionPulse))||
-        !EDM94::ValidCenterEnvelope(candidate,m_edm94.FrozenConfig()))return false;
+        (e.topCaptured&&!EDM109::SamePulse(candidate.geometry.topPulse,e.topPositionPulse)))return false;
     // EDM205: carry only this committed sample's motion witness. Capture is
     // called before the full frame's axis loop; the guard binds this witness
     // to the completed frame and validates its direction and speed there.
@@ -5866,7 +6085,7 @@ double MotionCore::GuardEDM94Velocity(int axisIndex, double value) noexcept
         if(m_edm157ZeroOutputTick!=m_ncSettleRuntimeCycleTick || !m_edm126Participating ||
             m_edm126Current.fixture!=pauseScope.historyFixture ||
             !EDM157::SupportsFixture(pauseScope.historyFixture,pauseScope.policy.fixture)) {
-            RejectEDM157Pause();return 0.0;
+            RejectEDM157Pause(EDM157::RejectSite::OutputZero,m_edm157Pause.Current().phase);return 0.0;
         }
         return 0.0;
     }
@@ -7498,7 +7717,7 @@ bool MotionCore::BindEDM114Mapping(double length) noexcept
         configTag ? configTag : 1ULL, mappingTag ? mappingTag : 1ULL, m_Group.currentCmd.sourceTranslation.generation};
     p.source.dispatch = a.dispatch; p.source.epoch = h.nextEpoch;
     p.source.segment = m_Group.currentCmd.execution.segmentId; p.source.sourcePC = a.sourcePC; p.source.step = a.step;
-    if (!EDM114::ValidSource(p.source) && !(IsEDM173Profile() && a.step<25U && m_edm173 && m_edm173->sealed && a.dispatch==m_edm173->current.plan.scope.dispatch && a.sourcePC==m_edm173->current.plan.scope.sourcePC)) return false;
+    if (!EDM114::ValidSource(p.source) && !(IsEDM173Profile() && a.step<EDM173::CountForRecipe(a.timerRecipe) && m_edm173 && m_edm173->sealed && a.dispatch==m_edm173->current.plan.scope.dispatch && a.sourcePC==m_edm173->current.plan.scope.sourcePC)) return false;
     p.startPulse = g.startPulse; p.endPulse = g.endPulse; p.pulsePerNative = g.pulsePerNative;
     p.centerPulse = g.centerPulse; p.radiusPulse = g.radiusPulse; p.startAngle = g.startAngle;
     p.sweepRadians = g.sweepRadians; p.pulseLength = g.pulseLength; p.kind = g.kind;
@@ -8485,7 +8704,10 @@ void MotionCore::ServiceEDM94MotionPass(bool complete) noexcept
         identity.ownerGeneration = static_cast<std::uint32_t>(arm.lease.generation);
         // EDM216 L216 enters the same terminal pre-engine rejection path.
         // The flag is copied in this request only; no persistent test mode.
-        if (arm.rejectionProbe || (EDM149::IsManualSource(arm.timerRecipe.diagnosticControlSource) ?
+        if (!E247OrdinaryDurationRecipeFits(arm.ordinarySequenceProgram,arm.historyFixture,arm.timerRecipe) ||
+            (arm.ordinarySequenceProgram&&(!arm.historyServo||!arm.historyModeFlush||!arm.workTimeFlush||
+                arm.physicalAd||arm.manualRun||arm.manualCache)) ||
+            arm.rejectionProbe || (EDM149::IsManualSource(arm.timerRecipe.diagnosticControlSource) ?
                 (!arm.manualRun || !arm.manualCache) : (arm.manualRun || arm.manualCache)) ||
             (arm.historyServo && (!E156HistoryRecipeFits(arm.historyFixture,arm.workTimeFlush,arm.timerRecipe) || !arm.gapSegment || !arm.proportional || !arm.physicalCurve ||
             arm.gapBoundary || arm.noise || arm.burst || arm.continuous || arm.endurance || arm.paired || arm.flush ||
@@ -8552,6 +8774,7 @@ void MotionCore::ServiceEDM94MotionPass(bool complete) noexcept
             E159VisibleHistoryProfileMatches(arm.historyFixture,arm.timerRecipe.commissioningProfile);
         EDM94::Config armConfig=m_edm94ObservedConfig;
         armConfig.visibleZFlush158=visibleFlush;
+        armConfig.ordinarySequenceProgram=0U;
         const bool g76B2=boundedProgram && arm.historyFixture==EDM173::HistoryFixture &&
             EDM130::IsG76B2Flush175(arm.timerRecipe);
         const bool g76B0=boundedProgram && arm.historyFixture==EDM173::HistoryFixture &&
@@ -8559,7 +8782,19 @@ void MotionCore::ServiceEDM94MotionPass(bool complete) noexcept
         const bool g76Center=boundedProgram && arm.historyFixture==EDM173::HistoryFixture &&
             EDM173::IsCenterRecipe(arm.timerRecipe);
         armConfig.commissioningProfile=(visibleFlush||g76B2||g76B0)?static_cast<std::uint8_t>(arm.timerRecipe.commissioningProfile):0U;
+        const bool g76SquareB1=boundedProgram&&visibleFlush&&arm.historyFixture==EDM173::HistoryFixture&&
+            armConfig.commissioningProfile==EDM130::VisibleFlushProfile173&&
+            (EDM130::IsG76SquareB1_250(arm.timerRecipe)||EDM130::IsG76DiamondB1_255(arm.timerRecipe)||
+                EDM130::IsG76OneMmB1_260(arm.timerRecipe)||
+                EDM130::IsG76Expansion263(arm.timerRecipe));
         if(g76B2||g76B0)armConfig.maxDurationUs=EDM94::MaximumDurationUs;
+        if((arm.ordinarySequenceProgram==247U||arm.ordinarySequenceProgram==248U)&&boundedProgram&&requiredMovementMask==7U&&
+            !visibleFlush&&!armConfig.commissioningProfile&&
+            E247OrdinaryDurationRecipeFits(arm.ordinarySequenceProgram,arm.historyFixture,arm.timerRecipe))
+        {
+            armConfig.ordinarySequenceProgram=static_cast<std::uint16_t>(arm.ordinarySequenceProgram);
+            armConfig.maxDurationUs=EDM94::OrdinarySequenceMaximumDurationUs247;
+        }
         bool visibleHeadroomFits=!(visibleFlush||g76B0);
         if (visibleFlush||g76B0)
         {
@@ -8578,7 +8813,9 @@ void MotionCore::ServiceEDM94MotionPass(bool complete) noexcept
                         frozen.pulsePerUnit*EDM94::NativeVelocityLimit(axis)));
                     // Center withdrawal can use every XYZ component. Z uses
                     // the same bounded PI output and rollback as X/Y.
-                    const bool axisFlushHeadroom=g76B0||(g76Center&&axis<3U);
+                    // Exact B1 commissioning recipes keep the native Z cap and integral
+                    // rollback; only its exact commissioning recipe opts in.
+                    const bool axisFlushHeadroom=g76B0||(g76Center&&axis<3U)||(g76SquareB1&&axis==2U);
                     const bool boundedXY=!axisFlushHeadroom&&armConfig.commissioningProfile>=2U&&axis<2U;
                     const bool boundedRotary=armConfig.commissioningProfile==3U&&axis>=3U;
                     if(visibleHeadroomFits) {
@@ -17526,7 +17763,7 @@ bool MotionCore::PublishMotionFeedback(
     if(IsEDM173Profile() && m_edm173 && m_edm173->sealed && event.type==MotionFeedbackType::COMPLETED &&
         event.rejectReason==MotionRejectReason::NONE && event.errorCode==0U && event.owner==MotionOwner::AUTO &&
         event.ownerGeneration==m_edm173->current.plan.scope.owner.generation){
-        for(unsigned i=0U;i<25U;++i)if(MotionExecutionIdentityExactlyMatches(event.identity,m_edm173->current.identities[i])){
+        for(unsigned i=0U;i<EDM173::CountForRecipe(m_edm173->current.plan.recipe);++i)if(MotionExecutionIdentityExactlyMatches(event.identity,m_edm173->current.identities[i])){
             if(i+1U==m_edm173->nextChild && m_edm114Current.rowComplete &&
                 MotionExecutionIdentityExactlyMatches(event.identity,m_edm114Command))m_edm173->terminalMask|=1U<<i;
             else {TripEDM94(EDM94::Reason::Identity);return false;}
@@ -20687,6 +20924,8 @@ void MotionCore::FinishEDM94Send(ServoOutputFrameReservation& reservation,
                     m_edm94.ForceZero(), commandGroupIdle, sourceFrame.allCommandZero);
         }
         // EDM206_ACCEPTED_OBSERVATION_END
+        FinishEDM233ParentRelease(reservation, exactSent, handedOff);
+        FinishEDM234ParentRelease(reservation, exactSent, handedOff);
         FinishEDM94CompletionRelease(reservation, exactSent, handedOff);
         // FIX13_RELEASE_BEGIN
         // EndServoOutputFrameAfterSend retired the generic reservations.
@@ -20750,6 +20989,576 @@ void MotionCore::FinishEDM94Send(ServoOutputFrameReservation& reservation,
         PublishEDM94Feedback();
     }
     receipt.held = false;
+}
+
+void MotionCore::FinishEDM233ParentRelease(ServoOutputFrameReservation& reservation,
+    bool exactSent, bool handedOff) noexcept
+{
+    if (!m_edm94.Active()) return;
+    const auto& receipt=reservation.edm94;
+    const auto& feedback=m_edm94.Current();
+    if (m_edm233ParentReleaseRequest.armIdentity.session != receipt.session) {
+        m_edm233ParentReleaseRequest=EDM233ParentReleaseRequest{};
+        m_edm233ParentReleasePending=false;
+    }
+    EDM233ParentReleaseRequest request{};
+    for (unsigned attempt=0U;attempt<2U && m_edm233ParentReleaseRequests.ConsumerTryPop(request);++attempt) {
+        // A stale parent request cannot revoke or acknowledge a newer parent.
+        if (request.armIdentity.session != receipt.session || m_edm233ParentReleasePending) continue;
+        m_edm233ParentReleaseRequest=request;m_edm233ParentReleasePending=true;
+        m_edm94.ObserveParentRelease(EDM94::ParentReleasePhase::Requested);
+    }
+    if (!m_edm233ParentReleasePending ||
+        feedback.parentReleasePhase == EDM94::ParentReleasePhase::Revoked) return;
+    const auto& pending=m_edm233ParentReleaseRequest;
+    AlarmManager& alarms=AlarmManager::GetInstance();
+    const std::uint64_t ownerState=m_motionOwnerState.load(std::memory_order_acquire);
+    const std::uint64_t execution=m_executionEpochPublication.load(std::memory_order_acquire);
+    const MotionOwnerLease owner=UnpackMotionOwnerState(ownerState);
+    const auto revoke=[&]() noexcept {
+        m_edm94.ObserveParentRelease(EDM94::ParentReleasePhase::Revoked);
+        m_edm233ParentReleasePending=false;
+    };
+    const auto safetyCurrent=[&]() noexcept -> bool {
+        return m_frameSafetyIntentState.load(std::memory_order_acquire) == pending.safetyIntent &&
+            alarms.GetMotionSafetyIntentState() == pending.alarmIntent &&
+            alarms.GetUpdateCount() == pending.alarmRevision &&
+            static_cast<std::uint32_t>(pending.safetyIntent) == 0U &&
+            static_cast<std::uint32_t>(pending.alarmIntent) == 0U && !alarms.HasAlarm() &&
+            !HasPendingSafetyOrRecoveryRequests() && !HasUnacknowledgedSafetyMotionRequest() &&
+            m_edm94CancelSession.load(std::memory_order_acquire) < receipt.session &&
+            m_edm94ReleaseSession.load(std::memory_order_acquire) < receipt.session;
+    };
+    if (!EDM94::SameIdentity(feedback.identity,pending.armIdentity) ||
+        feedback.currentIdentity.session != receipt.session ||
+        feedback.currentIdentity.epoch != pending.liveEpoch ||
+        feedback.currentIdentity.ownerGeneration != pending.lease.generation ||
+        pending.lease.owner != MotionOwner::AUTO || !owner.Matches(pending.lease) ||
+        !IsMotionOwnerLeaseCurrent(pending.lease) ||
+        UnpackExecutionEpochPublication(execution) != pending.liveEpoch ||
+        (execution & EXECUTION_EPOCH_PUBLICATION_PENDING) != 0ULL ||
+        UnpackMotionOwnerSafetyHandshake(ownerState) || UnpackMotionOwnerSafetyActionPending(ownerState) ||
+        UnpackMotionOwnerSafetyRequestTicket(ownerState) != m_safetyRequestAcknowledgedTicket.load(std::memory_order_acquire) ||
+        m_edm94Claim.load(std::memory_order_acquire) != receipt.session ||
+        m_edm94CompletionDecision.load(std::memory_order_acquire) != 0U ||
+        feedback.cancelled || feedback.faulted || !safetyCurrent() ||
+        !IsEDM173Profile() || !EDM130::IsG76ParentSequence233(m_edm130ArmRecipe) ||
+        !m_edm173 || !m_edm173->sealed || m_edm173->handshaking ||
+        m_edm173->current.plan.scope.session != receipt.session ||
+        m_edm173->current.plan.scope.armEpoch != pending.armIdentity.epoch ||
+        !m_edm173->current.plan.scope.owner.Matches(pending.lease) ||
+        !EDM130::SameRecipe(m_edm173->current.plan.recipe,m_edm130ArmRecipe) ||
+        m_edm157Pause.DemandZero()) {revoke();return;}
+    if (reservation.acquired || (ownerState & MOTION_OWNER_ANY_OUTPUT_RESERVATION) != 0ULL ||
+        (execution & EXECUTION_EPOCH_PUBLICATION_COMMIT_RESERVED) != 0ULL) return;
+    const bool parentComplete=m_edm173->nextChild == 25U && m_edm173->terminalMask == 0x01ffffffU &&
+        m_edm126Current.authorizedRows == 25U && m_edm126Current.completedRows == 25U &&
+        !m_edm126Current.faulted && !m_edm128Current.faulted &&
+        m_edm173->currentFeedback.eventRetained && m_edm173->currentFeedback.retainedEvents == 1U &&
+        m_edm173->currentFeedback.completedEvent.exactReturn &&
+        m_edm173->currentFeedback.completedEvent.rowEventComplete &&
+        m_edm173->currentFeedback.completedEvent.work.triggeredEvents == 1ULL &&
+        m_edm173->currentFeedback.completedEvent.work.completedEvents == 1ULL &&
+        m_edm128.Evidence().phase == EDM128::Phase::Gap && !m_edm128.Evidence().detached &&
+        m_edm128.Evidence().work.triggeredEvents == 1ULL && m_edm128.Evidence().work.completedEvents == 1ULL &&
+        EDM126CommittedImage().velocityPps == EDM126::Point{} &&
+        IsGroupDone() && IsGroupNCDrained() && GetCommandIngressSize() == 0U &&
+        GetCommandReplaySize() == 0U && GetAxisCommandMailboxDepth() == 0U;
+    if (!parentComplete || !exactSent || !handedOff || !receipt.allZero || !ValidateEDM94SendClock()) return;
+    const EDM94::Frame completed=CaptureEDM94Frame(m_ncSettleMotionPassCompleted);
+    bool frameCurrent=m_ncSettleMotionPassCompleted && receipt.sourceTick == m_ncSettleRuntimeCycleTick &&
+        completed.tick == receipt.sourceTick && completed.tick == m_edm94.LastFrame().tick &&
+        completed.tick == feedback.lastSentTick && completed.groupIdle && completed.allCommandZero &&
+        completed.healthy && completed.clockValid && completed.pdoValid && completed.sourceFresh &&
+        completed.authorityCurrent && EDM94::SameIdentity(completed.identity,feedback.currentIdentity) &&
+        completed.visibleZFlushActive158 == m_edm94.LastFrame().visibleZFlushActive158 &&
+        completed.mappedFlushProfile == m_edm94.LastFrame().mappedFlushProfile;
+    for (unsigned axis=0U;frameCurrent && axis<6U;++axis) {
+        const auto& frozen=m_edm94.FrozenConfig().axis[axis];
+        frameCurrent=completed.axis[axis].actualPulse == m_edm94.LastFrame().axis[axis].actualPulse &&
+            completed.axis[axis].commandPulse == m_edm94.LastFrame().axis[axis].commandPulse &&
+            completed.axis[axis].configFingerprint == frozen.configFingerprint &&
+            completed.axis[axis].mappingFingerprint == frozen.mappingFingerprint &&
+            completed.axis[axis].healthy &&
+            std::isfinite(completed.axis[axis].followingErrorPulse) &&
+            std::fabs(completed.axis[axis].followingErrorPulse) <= frozen.followingWindowPulse;
+    }
+    if (!frameCurrent || !m_edm94.CanReleaseFinishedParent(completed.identity,completed,true)) return;
+    if (!safetyCurrent() || m_motionOwnerState.load(std::memory_order_acquire) != ownerState ||
+        m_executionEpochPublication.load(std::memory_order_acquire) != execution ||
+        m_frameSafetyIntentState.load(std::memory_order_acquire) != pending.safetyIntent ||
+        alarms.GetMotionSafetyIntentState() != pending.alarmIntent ||
+        alarms.GetUpdateCount() != pending.alarmRevision || alarms.HasAlarm()) {revoke();return;}
+    unsigned open=0U;
+    if (!m_edm94CompletionDecision.compare_exchange_strong(open,3U,
+        std::memory_order_acq_rel,std::memory_order_acquire)) {revoke();return;}
+    // This CAS is the cancellation ordering point. The same RT owner now
+    // retires only this proven finished parent; AUTO, epoch, pose and PID stay.
+    if (!m_edm94.ReleaseFinishedParent(completed.identity,completed,true)) {revoke();return;}
+    m_edm94Claim.store(0ULL,std::memory_order_release);
+    m_edm94FormalStopRequested=false;m_edm233ParentReleasePending=false;
+    // Retain published completion evidence, but retire the old plan's runtime
+    // routing before ordinary NC can continue under the retained AUTO lease.
+    m_edm126Profile=m_edm126Participating=m_edm128Profile=m_edm130Profile=false;
+    m_edm114Profile=m_edm97Profile=m_edm96Profile=false;
+    m_edm173->sealed=m_edm173->handshaking=false;
+}
+
+void MotionCore::FinishEDM234ParentRelease(ServoOutputFrameReservation& reservation,
+    bool exactSent, bool handedOff) noexcept
+{
+    if (!m_edm94.Active()) return;
+    const auto& receipt=reservation.edm94;
+    const auto& feedback=m_edm94.Current();
+    if (m_edm234ParentReleaseRequest.armIdentity.session != receipt.session) {
+        m_edm234ParentReleaseRequest=EDM234ParentReleaseRequest{};
+        m_edm234ParentReleasePending=false;
+    }
+    EDM234ParentReleaseRequest request{};
+    for (unsigned attempt=0U;attempt<2U && m_edm234ParentReleaseRequests.ConsumerTryPop(request);++attempt) {
+        // A stale parent request cannot revoke or acknowledge a newer parent.
+        if (request.armIdentity.session != receipt.session || m_edm234ParentReleasePending) continue;
+        m_edm234ParentReleaseRequest=request;m_edm234ParentReleasePending=true;
+        m_edm94.ObserveParentRelease234(request.kind,request.program);
+    }
+    if (!m_edm234ParentReleasePending ||
+        feedback.parentReleasePhase == EDM94::ParentReleasePhase::Revoked) return;
+    const auto& pending=m_edm234ParentReleaseRequest;
+    const bool centerStage=((pending.program == 239U || pending.program == 240U || pending.program == 241U || pending.program == 242U || pending.program == 243U || pending.program == 244U) && (pending.kind == 6U || pending.kind == 7U)) ||
+        ((pending.program == 245U || pending.program == 247U) && pending.kind == 6U) || ((pending.program == 246U || pending.program == 248U) && pending.kind == 7U);
+    const bool orbitStage=pending.kind == 2U || centerStage;
+    AlarmManager& alarms=AlarmManager::GetInstance();
+    const std::uint64_t ownerState=m_motionOwnerState.load(std::memory_order_acquire);
+    const std::uint64_t execution=m_executionEpochPublication.load(std::memory_order_acquire);
+    const MotionOwnerLease owner=UnpackMotionOwnerState(ownerState);
+    const auto revoke=[&]() noexcept {
+        m_edm94.ObserveParentRelease(EDM94::ParentReleasePhase::Revoked);
+        m_edm234ParentReleasePending=false;
+    };
+    const auto safetyCurrent=[&]() noexcept -> bool {
+        return m_frameSafetyIntentState.load(std::memory_order_acquire) == pending.safetyIntent &&
+            alarms.GetMotionSafetyIntentState() == pending.alarmIntent &&
+            alarms.GetUpdateCount() == pending.alarmRevision &&
+            static_cast<std::uint32_t>(pending.safetyIntent) == 0U &&
+            static_cast<std::uint32_t>(pending.alarmIntent) == 0U && !alarms.HasAlarm() &&
+            !HasPendingSafetyOrRecoveryRequests() && !HasUnacknowledgedSafetyMotionRequest() &&
+            m_edm94CancelSession.load(std::memory_order_acquire) < receipt.session &&
+            m_edm94ReleaseSession.load(std::memory_order_acquire) < receipt.session;
+    };
+    if (!EDM94::SameIdentity(feedback.identity,pending.armIdentity) ||
+        feedback.currentIdentity.session != receipt.session ||
+        feedback.currentIdentity.epoch != pending.liveEpoch ||
+        feedback.currentIdentity.ownerGeneration != pending.lease.generation ||
+        pending.lease.owner != MotionOwner::AUTO || !owner.Matches(pending.lease) ||
+        !IsMotionOwnerLeaseCurrent(pending.lease) ||
+        UnpackExecutionEpochPublication(execution) != pending.liveEpoch ||
+        (execution & EXECUTION_EPOCH_PUBLICATION_PENDING) != 0ULL ||
+        UnpackMotionOwnerSafetyHandshake(ownerState) || UnpackMotionOwnerSafetyActionPending(ownerState) ||
+        UnpackMotionOwnerSafetyRequestTicket(ownerState) != m_safetyRequestAcknowledgedTicket.load(std::memory_order_acquire) ||
+        m_edm94Claim.load(std::memory_order_acquire) != receipt.session ||
+        m_edm94CompletionDecision.load(std::memory_order_acquire) != 0U ||
+        feedback.cancelled || feedback.faulted || !safetyCurrent() ||
+        feedback.parentReleaseProgram != pending.program || feedback.parentReleaseKind != pending.kind ||
+        !m_edm126Profile || !m_edm128Profile || !m_edm130Profile || m_edm129Profile ||
+        !EDM130::SameRecipe(pending.recipe,m_edm130ArmRecipe) ||
+        !EDM130::ValidHistoryRecipeBinding(orbitStage ? 14U : 9U,pending.recipe) ||
+        pending.recipe.diagnosticControlSource != 3U || pending.recipe.workTimeUs != 500000ULL ||
+        pending.recipe.jumpHeightScaled != (centerStage ? 200000ULL : 1000ULL) || pending.recipe.jumpSpeedPercentScaled != 100000000ULL ||
+        pending.recipe.holdRetreatMode || (centerStage ? (pending.program == 239U ?
+            !EDM130::IsG76CenterSequence239(pending.recipe) : pending.program == 240U ?
+            !EDM130::IsG76CenterSequence240(pending.recipe) : pending.program == 241U ?
+            !EDM130::IsG76CenterSequence241(pending.recipe) : pending.program == 242U ?
+            !EDM130::IsG76CenterSequence242(pending.recipe) : pending.program == 243U ?
+            !EDM130::IsG76CenterSequence243(pending.recipe) : pending.program == 244U ?
+            !EDM130::IsG76CenterSequence244(pending.recipe) : pending.program == 245U ?
+            !EDM130::IsG76CenterSequence245(pending.recipe) : pending.program == 246U ?
+            !EDM130::IsG76CenterSequence246(pending.recipe) : pending.program == 247U ?
+            !EDM130::IsG76CenterSequence247(pending.recipe) : !EDM130::IsG76CenterSequence248(pending.recipe)) : pending.recipe.flushHoldTest != 0U) ||
+        pending.recipe.deepFlushCycleInterval ||
+        pending.recipe.deepFlushHeightMultiplierScaled != 1000000ULL ||
+        !pending.run || !pending.cache || pending.parentPC < 0 || !pending.parentDispatch ||
+        !m_edm126Current.enabled || !m_edm128Current.enabled ||
+        m_edm126Current.physicalAd || m_edm128Current.physicalAd || !m_edm128Current.workTimeFlush ||
+        m_edm126Current.session != receipt.session || m_edm128Current.session != receipt.session ||
+        m_edm126Current.armEpoch != pending.armIdentity.epoch || m_edm128Current.armEpoch != pending.armIdentity.epoch ||
+        m_edm126Current.ownerGeneration != pending.lease.generation || m_edm128Current.ownerGeneration != pending.lease.generation ||
+        m_edm126Current.liveEpoch != pending.liveEpoch || m_edm128Current.liveEpoch != pending.liveEpoch ||
+        !EDM130::SameRecipe(m_edm128Current.timerRecipe,pending.recipe) ||
+        !EDM126::ValidSource(m_edm126Current.authorizedSource) ||
+        m_edm126Current.authorizedSource.scope.session != receipt.session ||
+        m_edm126Current.authorizedSource.scope.run != pending.run ||
+        m_edm126Current.authorizedSource.scope.cache != pending.cache ||
+        m_edm126Current.authorizedSource.scope.ownerGeneration != pending.lease.generation ||
+        m_edm126Current.authorizedSource.sourcePC != pending.parentPC ||
+        m_edm126Current.authorizedSource.dispatch != pending.parentDispatch ||
+        m_edm126Current.authorizedSource.epoch != pending.liveEpoch ||
+        m_edm157Pause.DemandZero()) {revoke();return;}
+    if (reservation.acquired || (ownerState & MOTION_OWNER_ANY_OUTPUT_RESERVATION) != 0ULL ||
+        (execution & EXECUTION_EPOCH_PUBLICATION_COMMIT_RESERVED) != 0ULL) return;
+    const auto& recipe=pending.recipe;
+    const auto& mode=m_edm128Current;
+    const auto& event=m_edm128.Evidence();
+    // Later G76 children correctly reset the row-local anchor flags. Their
+    // first completed E5 return is retained independently by the RT mapper.
+    const auto& finishedEvent=!orbitStage || !m_edm173 ? event : m_edm173->currentFeedback.completedEvent;
+    const auto& source=m_edm126Current.authorizedSource;
+    const auto& image=EDM126CommittedImage();
+    const unsigned rows=orbitStage ? 25U : pending.kind == 5U ? 4U : 1U;
+    const unsigned fixture=orbitStage ? 14U : 9U;
+    const EDM116::Fixture policyFixture=!orbitStage ?
+        EDM116::Fixture::ModalProgram156 : EDM116::Fixture::ModalG76Gap173;
+    const EDM116::Mode policyMode=centerStage ? (pending.kind == 6U ? EDM116::Mode::B3 : EDM116::Mode::B4) :
+        pending.kind == 2U || pending.kind == 5U ? EDM116::Mode::B2 : EDM116::Mode::B1;
+    const unsigned dwells=centerStage ? 5U : 3U;
+    const bool stage=pending.program == 234U ? (pending.kind == 1U || pending.kind == 2U) :
+        pending.program == 235U ? (pending.kind == 2U || pending.kind == 3U || pending.kind == 4U) :
+        pending.program == 236U ? pending.kind >= 1U && pending.kind <= 4U :
+        (pending.program == 237U || pending.program == 238U) ? (pending.kind == 2U || pending.kind == 5U) :
+        centerStage || (pending.program == 240U && pending.kind == 5U) ||
+        ((pending.program == 241U || pending.program == 242U || pending.program == 243U || pending.program == 244U || pending.program == 245U || pending.program == 246U || pending.program == 247U || pending.program == 248U) && (pending.kind == 2U || pending.kind == 5U));
+    const bool recipeKind=pending.kind == 1U ?
+        recipe.commissioningProfile == 0U && recipe.planRows == 1U && recipe.planMovementMask == 4U :
+        pending.kind == 2U ? recipe.commissioningProfile == 5U && recipe.planRows == 25U && recipe.planMovementMask == 7U :
+        pending.kind == 5U ? recipe.commissioningProfile == 0U && recipe.planRows == 4U && recipe.planMovementMask == 7U :
+        centerStage ? recipe.commissioningProfile == pending.kind && recipe.planRows == 25U && recipe.planMovementMask == 7U :
+        (pending.kind == 3U || pending.kind == 4U) && recipe.commissioningProfile == 0U && recipe.planRows == 1U && recipe.planMovementMask == 3U;
+    const std::uint64_t events=event.work.completedEvents;
+    const bool homogeneousEventComplete=pending.kind != 5U && events && (!orbitStage || events == 1ULL) &&
+        events <= (std::numeric_limits<unsigned>::max)()/dwells &&
+        EDM130::ValidWorkEvidence(event.work) && event.work.workTimeUs == recipe.workTimeUs &&
+        event.work.triggeredEvents == events && event.eventCount == events &&
+        event.modeEvents[static_cast<unsigned>(policyMode)] == events &&
+        event.qualifiedDwells == dwells*events && event.phase == EDM128::Phase::Gap &&
+        !event.detached && !event.faulted && !event.stopped &&
+        event.policy.fixture == policyFixture && event.policy.mode == policyMode &&
+        mode.rowPolicy.fixture == policyFixture && mode.rowPolicy.mode == policyMode &&
+        EDM116::SamePolicy(event.policy,mode.rowPolicy) &&
+        EDM116::PolicyMatchesBinding(event.policy,rows-1U,pending.parentPC,pending.parentDispatch) &&
+        finishedEvent.anchorCaptured && finishedEvent.exactReturn && finishedEvent.rowEventComplete &&
+        !finishedEvent.detached && !finishedEvent.faulted && !finishedEvent.stopped &&
+        finishedEvent.phase == EDM128::Phase::Gap && finishedEvent.work.triggeredEvents == events &&
+        finishedEvent.work.completedEvents == events && finishedEvent.policy.fixture == policyFixture &&
+        finishedEvent.policy.mode == policyMode &&
+        EDM130::ValidWorkEvidence(finishedEvent.work) && finishedEvent.work.workTimeUs == recipe.workTimeUs &&
+        finishedEvent.eventCount == events && finishedEvent.qualifiedDwells == dwells*events &&
+        finishedEvent.modeEvents[static_cast<unsigned>(policyMode)] == events &&
+        EDM126::ValidSource(finishedEvent.anchor.authorizedSource) &&
+        EDM109::SameScope(finishedEvent.anchor.authorizedSource.scope,source.scope) &&
+        EDM109::SameScope(finishedEvent.anchor.cursorSource.scope,source.scope) &&
+        finishedEvent.anchor.authorizedSource.dispatch == pending.parentDispatch &&
+        finishedEvent.anchor.authorizedSource.sourcePC == pending.parentPC &&
+        finishedEvent.anchor.authorizedSource.epoch == pending.liveEpoch &&
+        finishedEvent.anchor.authorizedSource.ordinal < rows &&
+        EDM116::PolicyMatchesBinding(finishedEvent.policy,
+            static_cast<unsigned>(finishedEvent.anchor.authorizedSource.ordinal),pending.parentPC,pending.parentDispatch) &&
+        finishedEvent.work.lastCompleteTick && finishedEvent.work.lastCompleteTick <= m_edm126Current.lastMappingTick &&
+        finishedEvent.work.lastCompleteUs && finishedEvent.work.lastCompleteUs <= m_edm126Current.lastMappingUs &&
+        EDM128::ValidHeightProof(finishedEvent,centerStage ? 0.2 : 0.001,0U,1.0,true) &&
+        EDM128::ValidSpeedProof(finishedEvent,recipe.flushStages);
+    // EDM247/248's adjacent B2 parents must retain their own completed E5 clocks.
+    const bool b2ClockProof=(pending.program != 247U && pending.program != 248U) || pending.kind != 2U ||
+        (finishedEvent.work.lastTriggerTick < finishedEvent.anchor.tick &&
+        finishedEvent.work.lastTriggerUs < finishedEvent.anchor.nowUs &&
+        finishedEvent.anchor.tick < finishedEvent.work.lastCompleteTick &&
+        finishedEvent.anchor.nowUs < finishedEvent.work.lastCompleteUs &&
+        finishedEvent.work.lastTriggerTick == event.work.lastTriggerTick &&
+        finishedEvent.work.lastTriggerUs == event.work.lastTriggerUs &&
+        finishedEvent.work.lastCompleteTick == event.work.lastCompleteTick &&
+        finishedEvent.work.lastCompleteUs == event.work.lastCompleteUs);
+    // EDM237 keeps one work clock and history through B0, B1, B2 and an
+    // inherited B2 row. Counts are cumulative; only this final row's actual
+    // completed return may supply its anchor, height and speed receipt.
+    const bool mixedEventComplete=[&]() noexcept -> bool {
+        if (pending.kind != 5U) return false;
+        // EDM245-248 bind the ordinary parent's E5 clocks to its own anchor.
+        if ((pending.program == 245U || pending.program == 246U || pending.program == 247U || pending.program == 248U) &&
+            (event.work.lastTriggerTick >= event.anchor.tick || event.work.lastTriggerUs >= event.anchor.nowUs ||
+            event.anchor.tick >= event.work.lastCompleteTick || event.anchor.nowUs >= event.work.lastCompleteUs))
+            return false;
+        EDM126::Cursor previous{};
+        // The inherited mode belongs to the actual preceding retained row,
+        // not merely any earlier NC PC or dispatch in this parent.
+        if (!m_edm126.PreviousCursorTarget(1.0,previous) ||
+            !EDM126::ValidSource(previous.source) || previous.source.ordinal != 2ULL ||
+            !EDM109::SameScope(previous.source.scope,source.scope) ||
+            previous.source.sourcePC != pending.parentPC-1 ||
+            previous.source.dispatch >= pending.parentDispatch || previous.source.epoch >= pending.liveEpoch ||
+            previous.source.segment >= source.segment ||
+            event.policy.modeOriginPC != previous.source.sourcePC ||
+            event.policy.modeOriginDispatch != previous.source.dispatch) return false;
+        if (!events || events > (std::numeric_limits<unsigned>::max)()/3U ||
+            !EDM130::ValidWorkEvidence(event.work) || event.work.workTimeUs != recipe.workTimeUs ||
+            event.work.triggeredEvents != events || event.eventCount != events ||
+            !event.modeEvents[0U] || !event.modeEvents[1U] || !event.modeEvents[2U] ||
+            event.modeEvents[3U] || event.modeEvents[4U] ||
+            static_cast<std::uint64_t>(event.modeEvents[0U])+event.modeEvents[1U]+event.modeEvents[2U] != events ||
+            event.qualifiedDwells != 3ULL*events || event.phase != EDM128::Phase::Gap ||
+            event.detached || event.faulted || event.stopped || !event.liveAnchor ||
+            event.policy.fixture != EDM116::Fixture::ModalProgram156 || event.policy.mode != EDM116::Mode::B2 ||
+            !EDM116::SamePolicy(event.policy,mode.rowPolicy) ||
+            !EDM116::PolicyMatchesBinding(event.policy,3U,pending.parentPC,pending.parentDispatch) ||
+            event.policy.modeOriginRevision != 4ULL || event.policy.modeOriginPC >= pending.parentPC ||
+            event.policy.modeOriginDispatch >= pending.parentDispatch ||
+            !event.anchorCaptured || !event.exactReturn || !event.rowEventComplete ||
+            !EDM126::SameSource(event.anchor.authorizedSource,source) ||
+            !EDM126::SameSource(event.anchor.cursorSource,source) ||
+            event.anchor.historyCount != 3U || event.anchor.completedRows != 3ULL ||
+            !event.work.lastCompleteTick || event.work.lastCompleteTick > m_edm126Current.lastMappingTick ||
+            !event.work.lastCompleteUs || event.work.lastCompleteUs > m_edm126Current.lastMappingUs ||
+            !EDM128::ValidHeightProof(event,0.001,0U,1.0,true) ||
+            !EDM128::ValidSpeedProof(event,recipe.flushStages)) return false;
+        // Earlier B2 anchors can legally be in retained geometry. Require the
+        // whole parent to return all crossed seams, without rebinding those
+        // earlier events or their target to the last NC source.
+        return source.ordinal == 3ULL && EDM126::SameSource(image.cursorSource,source) &&
+            image.historyCount == 3U && image.completedRows == 3ULL && !image.historyDepth &&
+            image.maximumHistoryDepth && image.maximumHistoryDepth <= 3U &&
+            image.backwardCrossings && image.backwardCrossings == image.forwardCrossings &&
+            image.active && image.atCurrentEnd && image.completeReady &&
+            !image.awaitingCurrent && !image.awaitingSeam && !image.stopRequested &&
+            !image.stopped && !image.faulted && image.reason == EDM126::Reason::None;
+    }();
+    // EDM239-248 retain the completed native B3/B4 return independently of the
+    // final child. Rebuild its anchor and center from the immutable RT seal;
+    // self-consistent detached coordinates alone cannot release a parent.
+    const bool centerProof=[&]() noexcept -> bool {
+        if (!centerStage) return true;
+        if (!m_edm173 || !m_edm173->sealed || m_edm173->handshaking) return false;
+        const auto& seal=m_edm173->current;
+        const auto& plan=seal.plan;
+        const auto& e=finishedEvent;
+        const auto& anchor=e.anchor;
+        // EDM244-248 bind retained E5 clocks to the current coordinator event
+        // and the captured anchor's strict time order.
+        if ((pending.program == 244U || pending.program == 245U || pending.program == 246U || pending.program == 247U || pending.program == 248U) &&
+            (e.work.lastTriggerTick >= anchor.tick || e.work.lastTriggerUs >= anchor.nowUs ||
+            anchor.tick >= e.work.lastCompleteTick || anchor.nowUs >= e.work.lastCompleteUs ||
+            e.work.lastTriggerTick != event.work.lastTriggerTick ||
+            e.work.lastTriggerUs != event.work.lastTriggerUs ||
+            e.work.lastCompleteTick != event.work.lastCompleteTick ||
+            e.work.lastCompleteUs != event.work.lastCompleteUs)) return false;
+        if (!plan.fingerprint || seal.epoch != pending.liveEpoch ||
+            (pending.program == 239U ? !EDM130::IsG76CenterSequence239(plan.recipe) : pending.program == 240U ?
+                !EDM130::IsG76CenterSequence240(plan.recipe) : pending.program == 241U ?
+                !EDM130::IsG76CenterSequence241(plan.recipe) : pending.program == 242U ?
+                !EDM130::IsG76CenterSequence242(plan.recipe) : pending.program == 243U ?
+                !EDM130::IsG76CenterSequence243(plan.recipe) : pending.program == 244U ?
+                !EDM130::IsG76CenterSequence244(plan.recipe) : pending.program == 245U ?
+                !EDM130::IsG76CenterSequence245(plan.recipe) : pending.program == 246U ?
+                !EDM130::IsG76CenterSequence246(plan.recipe) : pending.program == 247U ?
+                !EDM130::IsG76CenterSequence247(plan.recipe) : !EDM130::IsG76CenterSequence248(plan.recipe)) ||
+            !EDM173::ValidCenterReturnFeed(plan.recipe,plan.centerReturnFeedMmMin) ||
+            !EDM128::ValidB3Proof(e) || !e.centerCaptured || !e.targetCaptured || !e.topCaptured ||
+            e.centerLegsCompleted != 15U || e.qualifiedDwells != 5U || e.eventIndex != 1ULL ||
+            e.centerReturnMmMin != plan.centerReturnFeedMmMin ||
+            !EDM109::SameScope(anchor.authorizedSource.scope,anchor.cursorSource.scope) ||
+            anchor.cursorSource.ordinal > anchor.authorizedSource.ordinal ||
+            !std::isfinite(anchor.localMm) || anchor.localMm < 0.0 ||
+            !std::isfinite(anchor.lengthMm) || anchor.lengthMm <= 0.0 || anchor.localMm > anchor.lengthMm)
+            return false;
+        const auto sourceFits=[&](const EDM126::Source& value) noexcept -> bool {
+            if (!EDM126::ValidSource(value) || value.ordinal >= 25ULL) return false;
+            const auto& identity=seal.identities[static_cast<unsigned>(value.ordinal)];
+            return value.scope.session == pending.armIdentity.session &&
+                value.scope.run == pending.run && value.scope.cache == pending.cache &&
+                value.scope.ownerGeneration == pending.lease.generation &&
+                value.scope.translationGeneration == plan.nominal.translationGeneration &&
+                value.dispatch == pending.parentDispatch && value.sourcePC == pending.parentPC &&
+                value.epoch == pending.liveEpoch && value.epoch == identity.epoch &&
+                value.segment == identity.segmentId && identity.source == MotionCommandSource::NC_MEMORY &&
+                identity.sourceBlockId == static_cast<MotionSourceBlockId>(pending.parentPC);
+        };
+        if (!sourceFits(anchor.authorizedSource) || !sourceFits(anchor.cursorSource) || !sourceFits(source)) return false;
+        const unsigned child=static_cast<unsigned>(anchor.cursorSource.ordinal);
+        EDM126::Point from{},to{},scale{},expectedAnchor{},center{},axisNative{},axisPulse{};
+        for (unsigned axis=0U;axis<6U;++axis) {
+            from[axis]=child ? seal.endPulse[child-1U][axis] : seal.startPulse[axis];
+            to[axis]=seal.endPulse[child][axis];scale[axis]=seal.pulsePerUnit[axis];
+            if (scale[axis] != e.heightPulsePerNative[axis] ||
+                m_edm114Current.endPulse[axis] != seal.endPulse[24U][axis] ||
+                (axis >= 3U && (from[axis] != to[axis] || from[axis] != seal.startPulse[axis]))) return false;
+        }
+        EDM109::Line line{};EDM112::Curve curve{};
+        NCG76::Point8 centerFrom{},centerTo{};
+        if (!EDM109::BuildLine(from,to,scale,line) || !EDM112::BuildLine(line,curve) ||
+            anchor.lengthMm != curve.lengthMm ||
+            !EDM112::EvaluateUnit(curve,anchor.localMm/curve.lengthMm,expectedAnchor) ||
+            !EDM173::CenterBoundary(plan,child,centerFrom) ||
+            !EDM173::CenterBoundary(plan,child+1U,centerTo) ||
+            !EDM173::MachiningAxisNative(plan,axisNative)) return false;
+        const double ratio=anchor.localMm/curve.lengthMm;
+        for (unsigned axis=0U;axis<6U;++axis) {
+            const double budget=64.0*(std::numeric_limits<double>::epsilon)()*
+                (std::max)(1.0,std::fabs(expectedAnchor[axis]));
+            if (!std::isfinite(anchor.positionPulse[axis]) ||
+                std::fabs(anchor.positionPulse[axis]-expectedAnchor[axis]) > budget) return false;
+            const double a=axis >= 3U || centerFrom[axis] == plan.nominal.startMCS[axis] ?
+                seal.startPulse[axis] : centerFrom[axis]*scale[axis];
+            const double b=axis >= 3U || centerTo[axis] == plan.nominal.startMCS[axis] ?
+                seal.startPulse[axis] : centerTo[axis]*scale[axis];
+            center[axis]=ratio == 0.0 ? a : ratio == 1.0 ? b : a+(b-a)*ratio;
+            axisPulse[axis]=axisNative[axis]*scale[axis];
+            if (!std::isfinite(center[axis]) || !std::isfinite(e.nominalCenterPositionPulse[axis]) ||
+                std::fabs(center[axis]-e.nominalCenterPositionPulse[axis]) > EDM204::Roundoff(center[axis]) ||
+                e.tangentPulsePerMm[axis] != axisPulse[axis] ||
+                (axis >= 3U && (!EDM109::SameDouble(center[axis],anchor.positionPulse[axis]) ||
+                    !EDM109::SameDouble(e.nominalCenterPositionPulse[axis],anchor.positionPulse[axis])))) return false;
+        }
+        EDM204::Geometry geometry{};
+        if (!EDM204::Build(anchor.positionPulse,center,axisPulse,scale,0.2,
+            pending.kind == 6U ? 3U : 4U,geometry)) return false;
+        for (unsigned axis=0U;axis<6U;++axis)
+            if (!std::isfinite(e.centerPositionPulse[axis]) || !std::isfinite(e.topPositionPulse[axis]) ||
+                std::fabs(e.centerPositionPulse[axis]-geometry.centerPulse[axis]) > EDM204::Roundoff(geometry.centerPulse[axis]) ||
+                std::fabs(e.topPositionPulse[axis]-geometry.topPulse[axis]) > EDM204::Roundoff(geometry.topPulse[axis]) ||
+                (axis >= 3U && (!EDM109::SameDouble(e.centerPositionPulse[axis],anchor.positionPulse[axis]) ||
+                    !EDM109::SameDouble(e.topPositionPulse[axis],anchor.positionPulse[axis])))) return false;
+        return true;
+    }();
+    const bool eventComplete=(homogeneousEventComplete || mixedEventComplete) && b2ClockProof && centerProof;
+    const bool lineComplete=pending.kind == 1U && !IsEDM173Profile() &&
+        m_edm114Current.kind == EDM114::Kind::Line && m_edm114Current.lineRows == 1U &&
+        m_edm114Current.arcRows == 0U && m_edm114Current.endpointRows == 1U &&
+        m_edm114Current.completedRows == 1U && m_edm114Current.rowComplete && m_edm114Current.completed &&
+        !m_edm114Current.failed && source.ordinal == 0ULL &&
+        m_edm114Current.startPulse[2U] != m_edm114Current.endPulse[2U];
+    // EDM235's ordinary parent is one authored quarter circle. Rebuild the
+    // unchanged canonical arc and retain its pulse-space precision budget;
+    // rounding at a nonzero origin must not become an endpoint tolerance.
+    const bool arcComplete=[&]() noexcept -> bool {
+        const auto& p=m_edm114Current;
+        if ((pending.kind != 3U && pending.kind != 4U) || IsEDM173Profile() ||
+            p.kind != EDM114::Kind::Arc || !p.enabled || !p.geometryValid || !p.mappedOutput ||
+            !std::isfinite(p.startAngle) || !EDM114::Positive(p.pulseLength) ||
+            p.begunRows != 1U || p.lineRows != 0U || p.arcRows != 1U || p.endpointRows != 1U ||
+            p.completedRows != 1U || !p.rowComplete || !p.completed || p.failed || p.stopActive || p.stopped ||
+            p.reason != EDM114::Reason::None || source.ordinal != 0ULL ||
+            p.cwRows != (pending.kind == 3U ? 1U : 0U) || p.ccwRows != (pending.kind == 4U ? 1U : 0U) ||
+            (pending.kind == 3U ? p.sweepRadians >= 0.0 : p.sweepRadians <= 0.0) ||
+            !EDM114::BoundedArcSweepFits(p.startPulse,p.endPulse,p.pulsePerNative,
+                p.centerPulse,p.radiusPulse,p.sweepRadians)) return false;
+        const double sign=pending.kind == 3U ? 1.0 : -1.0;
+        const std::array<double,2U> center{{sign*0.001,0.0}};
+        EDM112::Curve rebuilt{};
+        if (!EDM112::BuildArc(p.startPulse,p.endPulse,p.pulsePerNative,17U,center,
+            pending.kind == 3U ? -1 : 1,false,rebuilt) || !rebuilt.valid || rebuilt.fullCircle) return false;
+        double scale=p.radiusPulse;
+        for (unsigned axis=0U;axis<2U;++axis)
+            scale=(std::max)(scale,(std::max)(std::fabs(p.centerPulse[axis]),
+                (std::max)(std::fabs(p.startPulse[axis]),std::fabs(p.endPulse[axis]))));
+        const double budget=4.0*EDM114::Roundoff(scale);
+        if (!std::isfinite(budget) || budget/p.pulsePerNative[0U] > EDM114::MaximumBoundedArcNativeError ||
+            std::fabs((p.endPulse[0U]-p.startPulse[0U])-sign*0.001*p.pulsePerNative[0U]) > budget ||
+            std::fabs((p.endPulse[1U]-p.startPulse[1U])-0.001*p.pulsePerNative[1U]) > budget ||
+            std::fabs(p.radiusPulse-0.001*p.pulsePerNative[0U]) > budget ||
+            std::fabs(p.centerPulse[0U]-(p.startPulse[0U]+center[0U]*p.pulsePerNative[0U])) > budget ||
+            std::fabs(p.centerPulse[1U]-p.startPulse[1U]) > budget ||
+            std::fabs(p.startAngle-rebuilt.startAngle)*p.radiusPulse > budget ||
+            std::fabs(p.sweepRadians-rebuilt.sweepRadians)*p.radiusPulse > budget ||
+            std::fabs(std::fabs(p.sweepRadians)-EDM114::Pi/2.0)*p.radiusPulse > budget ||
+            std::fabs(p.pulseLength-std::fabs(p.sweepRadians)*p.radiusPulse) > budget) return false;
+        for (unsigned axis=2U;axis<6U;++axis)
+            if (p.startPulse[axis] != p.endPulse[axis]) return false;
+        return true;
+    }();
+    const bool mixedComplete=[&]() noexcept -> bool {
+        const auto& p=m_edm114Current;
+        if (pending.kind != 5U || IsEDM173Profile() || p.kind != EDM114::Kind::Line ||
+            !p.enabled || !p.geometryValid || !p.mappedOutput || p.begunRows != 4U ||
+            p.lineRows != 2U || p.arcRows != 2U || p.cwRows != 1U || p.ccwRows != 1U ||
+            p.endpointRows != 4U || p.completedRows != 4U || !p.rowComplete || !p.completed ||
+            p.failed || p.stopActive || p.stopped || p.reason != EDM114::Reason::None ||
+            source.ordinal != 3ULL || !EDM114::Positive(p.pulsePerNative[2U])) return false;
+        const double scale=(std::max)(std::fabs(p.startPulse[2U]),std::fabs(p.endPulse[2U]));
+        const double budget=4.0*EDM114::Roundoff(scale);
+        // This only validates the authored increment at a nonzero origin.
+        // The live endpoint, committed image and physical target remain exact.
+        if (!std::isfinite(budget) || budget/p.pulsePerNative[2U] > EDM114::MaximumBoundedArcNativeError ||
+            !std::isfinite(p.startPulse[2U]) || !std::isfinite(p.endPulse[2U]) ||
+            std::fabs((p.endPulse[2U]-p.startPulse[2U])+0.0015*p.pulsePerNative[2U]) > budget) return false;
+        for (unsigned axis=0U;axis<6U;++axis)
+            if (axis != 2U && p.startPulse[axis] != p.endPulse[axis]) return false;
+        return true;
+    }();
+    const bool orbitComplete=orbitStage && IsEDM173Profile() && m_edm173 &&
+        m_edm173->sealed && !m_edm173->handshaking &&
+        m_edm173->current.plan.scope.session == receipt.session &&
+        m_edm173->current.plan.scope.armEpoch == pending.armIdentity.epoch &&
+        m_edm173->current.plan.scope.owner.Matches(pending.lease) &&
+        m_edm173->current.plan.scope.run == pending.run && m_edm173->current.plan.scope.cache == pending.cache &&
+        m_edm173->current.plan.scope.sourcePC == pending.parentPC &&
+        m_edm173->current.plan.scope.dispatch == pending.parentDispatch &&
+        EDM130::SameRecipe(m_edm173->current.plan.recipe,recipe) &&
+        m_edm173->nextChild == 25U && m_edm173->terminalMask == 0x01ffffffU && source.ordinal == 24ULL &&
+        m_edm173->currentFeedback.eventRetained && m_edm173->currentFeedback.retainedEvents == 1U &&
+        m_edm173->currentFeedback.completedEvent.exactReturn &&
+        m_edm173->currentFeedback.completedEvent.rowEventComplete &&
+        m_edm173->currentFeedback.completedEvent.policy.mode == policyMode &&
+        m_edm173->currentFeedback.completedEvent.work.triggeredEvents == 1ULL &&
+        m_edm173->currentFeedback.completedEvent.work.completedEvents == 1ULL;
+    bool endpointCurrent=m_edm114Current.session == receipt.session &&
+        m_edm114Current.armEpoch == pending.armIdentity.epoch &&
+        m_edm114Current.ownerGeneration == pending.lease.generation &&
+        m_edm114Current.source.scope.session == receipt.session &&
+        m_edm114Current.source.scope.run == pending.run && m_edm114Current.source.scope.cache == pending.cache &&
+        EDM109::SameScope(m_edm114Current.source.scope,source.scope) &&
+        m_edm114Current.source.dispatch == pending.parentDispatch && m_edm114Current.source.sourcePC == pending.parentPC &&
+        m_edm114Current.source.epoch == pending.liveEpoch && m_edm114Current.source.step == rows-1U &&
+        m_edm114Current.source.segment == source.segment &&
+        EDM126::SameSource(image.authorizedSource,source) && image.velocityPps == EDM126::Point{};
+    for (unsigned axis=0U;endpointCurrent && axis<6U;++axis) {
+        endpointCurrent=image.positionPulse[axis] == m_edm114Current.endPulse[axis] &&
+            image.positionPulse[axis] == feedback.finishTargetPulse[axis] &&
+            (pending.kind != 1U || axis == 2U ||
+                m_edm114Current.startPulse[axis] == m_edm114Current.endPulse[axis]);
+    }
+    const bool parentComplete=stage && recipeKind && (lineComplete || arcComplete || mixedComplete || orbitComplete) && eventComplete && endpointCurrent &&
+        m_edm126Current.fixture == fixture && mode.fixture == fixture &&
+        m_edm126Current.authorizedRows == rows && m_edm126Current.completedRows == rows &&
+        mode.authorizedRows == rows && mode.completedRows == rows && !m_edm126Current.rowActive &&
+        m_edm126Current.rowCompleted && !m_edm126Current.faulted && !mode.faulted &&
+        m_edm126Current.lastMappingTick && m_edm126Current.lastMappingTick == mode.lastMappingTick &&
+        m_edm126Current.lastMappingUs == mode.lastMappingUs &&
+        IsGroupDone() && IsGroupNCDrained() && GetCommandIngressSize() == 0U &&
+        GetCommandReplaySize() == 0U && GetAxisCommandMailboxDepth() == 0U;
+    if (!parentComplete || !exactSent || !handedOff || !receipt.allZero || !ValidateEDM94SendClock()) return;
+    const EDM94::Frame completed=CaptureEDM94Frame(m_ncSettleMotionPassCompleted);
+    bool frameCurrent=m_ncSettleMotionPassCompleted && receipt.sourceTick == m_ncSettleRuntimeCycleTick &&
+        completed.tick == receipt.sourceTick && completed.tick == m_edm94.LastFrame().tick &&
+        completed.tick == feedback.lastSentTick && completed.groupIdle && completed.allCommandZero &&
+        completed.healthy && completed.clockValid && completed.pdoValid && completed.sourceFresh &&
+        completed.authorityCurrent && EDM94::SameIdentity(completed.identity,feedback.currentIdentity) &&
+        completed.visibleZFlushActive158 == m_edm94.LastFrame().visibleZFlushActive158 &&
+        completed.mappedFlushProfile == m_edm94.LastFrame().mappedFlushProfile;
+    for (unsigned axis=0U;frameCurrent && axis<6U;++axis) {
+        const auto& frozen=m_edm94.FrozenConfig().axis[axis];
+        frameCurrent=completed.axis[axis].actualPulse == m_edm94.LastFrame().axis[axis].actualPulse &&
+            completed.axis[axis].commandPulse == m_edm94.LastFrame().axis[axis].commandPulse &&
+            completed.axis[axis].configFingerprint == frozen.configFingerprint &&
+            completed.axis[axis].mappingFingerprint == frozen.mappingFingerprint &&
+            completed.axis[axis].healthy &&
+            std::isfinite(completed.axis[axis].followingErrorPulse) &&
+            std::fabs(completed.axis[axis].followingErrorPulse) <= frozen.followingWindowPulse;
+    }
+    if (!frameCurrent || !m_edm94.CanReleaseFinishedStage234(completed.identity,completed,true,pending.kind,pending.program)) return;
+    if (!safetyCurrent() || m_motionOwnerState.load(std::memory_order_acquire) != ownerState ||
+        m_executionEpochPublication.load(std::memory_order_acquire) != execution ||
+        m_frameSafetyIntentState.load(std::memory_order_acquire) != pending.safetyIntent ||
+        alarms.GetMotionSafetyIntentState() != pending.alarmIntent ||
+        alarms.GetUpdateCount() != pending.alarmRevision || alarms.HasAlarm()) {revoke();return;}
+    unsigned open=0U;
+    if (!m_edm94CompletionDecision.compare_exchange_strong(open,3U,
+        std::memory_order_acq_rel,std::memory_order_acquire)) {revoke();return;}
+    // This CAS is the cancellation ordering point. The same RT owner now
+    // retires only this proven finished parent; AUTO, epoch, pose and PID stay.
+    if (!m_edm94.ReleaseFinishedStage234(completed.identity,completed,true,pending.kind,pending.program)) {revoke();return;}
+    m_edm94Claim.store(0ULL,std::memory_order_release);
+    m_edm94FormalStopRequested=false;m_edm234ParentReleasePending=false;
+    // Retain published completion evidence, but retire the old plan's runtime
+    // routing before ordinary NC can continue under the retained AUTO lease.
+    m_edm126Profile=m_edm126Participating=m_edm128Profile=m_edm130Profile=false;
+    m_edm114Profile=m_edm97Profile=m_edm96Profile=false;
+    if (m_edm173) m_edm173->sealed=m_edm173->handshaking=false;
 }
 
 void MotionCore::FinishEDM94CompletionRelease(ServoOutputFrameReservation& reservation,
@@ -25090,8 +25899,8 @@ bool MotionCore::IsEDM165FlushGainActive(const AxisContext& axis, EDM174Leaf::Sa
     // EDM173 FIX9: these RT-owned candidate checks are read-only. When no
     // flush/hold path exists, gain selection is false without authority work.
     const auto& flush=m_edm128.Evidence();
-    // A center excursion deliberately cannot resume from HOLD. That pause
-    // restriction must not suppress its configured FLUSH gain bank.
+    // Center HOLD permission is separate from selecting its FLUSH gain bank.
+    // Admitted captured center-leg pauses keep this full prior-envelope proof.
     // Servo calculation precedes this pass's complete physical guard frame;
     // use only the immediately preceding COMPLETE, accepted center receipt.
     // First detached ToCenter has no such receipt and retains G00 for one pass.
@@ -25104,7 +25913,9 @@ bool MotionCore::IsEDM165FlushGainActive(const AxisContext& axis, EDM174Leaf::Sa
         (flush.phase==EDM128::Phase::Resume&&flush.exactReturn&&flush.centerLegsCompleted==15U);
     if(centerPhase&&flush.detached&&!flush.faulted&&!flush.stopped&&flush.liveAnchor&&
         flush.anchorCaptured&&flush.centerCaptured&&flush.targetCaptured&&
-        flush.work.triggeredEvents==1ULL&&flush.work.completedEvents==0ULL&&
+        flush.eventIndex&&flush.eventIndex==flush.work.triggeredEvents&&
+        flush.eventIndex<=EDM130::G76EventLimit(m_edm130ArmRecipe)&&
+        flush.work.completedEvents+1ULL==flush.work.triggeredEvents&&
         EDM130::IsTimed(flush.work)&&EDM130::ValidWorkEvidence(flush.work)&&
         m_edm173&&m_edm173->sealed&&IsEDM173Profile()&&m_edm94.HasCenterEnvelope()&&
         center.tick&&center.nowUs&&center.tick!=(std::numeric_limits<std::uint64_t>::max)()&&
@@ -25116,7 +25927,8 @@ bool MotionCore::IsEDM165FlushGainActive(const AxisContext& axis, EDM174Leaf::Sa
         (previous.mappedFlushProfile==6U||previous.mappedFlushProfile==7U)&&
         EDM94::SameIdentity(center.identity,guard.identity)&&
         previous.identity.session==center.identity.session&&previous.identity.ownerGeneration==center.identity.ownerGeneration&&
-        previous.identity.epoch==center.liveEpoch&&center.child<25U)
+        previous.identity.epoch==center.liveEpoch&&
+        center.childCount==EDM173::CountForRecipe(m_edm173->current.plan.recipe)&&center.child<center.childCount)
     {
         const auto& seal=m_edm173->current;const auto& plan=seal.plan;const auto& scope=plan.scope;
         const auto& source=flush.anchor.cursorSource;const auto& identity=seal.identities[center.child];
@@ -25143,7 +25955,7 @@ bool MotionCore::IsEDM165FlushGainActive(const AxisContext& axis, EDM174Leaf::Sa
             EDM109::SamePulse(geometry.pulsePerNative,flush.heightPulsePerNative)&&
             (!flush.topCaptured||EDM109::SamePulse(geometry.topPulse,flush.topPositionPulse));
     }
-    const bool event=EDM128::CanPauseTimedFlush(flush)||centerEvent;
+    const bool event=(!EDM116::IsCenterMode(flush.policy.mode)&&EDM128::CanPauseTimedFlush(flush))||centerEvent;
     const auto& paused=m_edm157Pause.Current();
     const bool holdPath=m_edm157Pause.DemandZero()&&m_edm157Pause.PathReturn()&&
         paused.anchorCaptured&&paused.retreatPlanned&&
@@ -25942,8 +26754,9 @@ void MotionCore::Run_Servo_Loop(DriveType& servo, AxisContext& axis, const AxisC
         // syntax, while its bound endpoint and outputs cover all six axes.
         // Intermediate children never enter IDLE retirement.
         const bool edm173FinalEndpoint = IsEDM173CommandCurrent(true) &&
-            completed.edm173ChildOrdinal==24U && m_edm173->nextChild==25U &&
-            m_edm173->terminalMask==0x01ffffffU && !m_edm173->handshaking &&
+            completed.edm173ChildOrdinal+1U==EDM173::CountForRecipe(m_edm173->current.plan.recipe) &&
+            m_edm173->nextChild==EDM173::CountForRecipe(m_edm173->current.plan.recipe) &&
+            m_edm173->terminalMask==((1U<<EDM173::CountForRecipe(m_edm173->current.plan.recipe))-1U) && !m_edm173->handshaking &&
             m_edm114Current.rowComplete && !m_edm114Current.failed && !m_edm114Current.stopActive &&
             m_edm126Current.rowCompleted && !m_edm126Current.faulted &&
             EDM126CommittedImage().completeReady && EDM126CommittedImage().historyDepth==0U &&
@@ -34488,7 +35301,8 @@ void MotionCore::UpdateInterpolation()
         // Intermediate G76 children hand off while the physical axes retain
         // their interpolation gains. The final child uses normal retirement.
         (m_safetyControlledStopInProgress || !m_Group.currentCmd.edm173G76Gap ||
-            m_Group.currentCmd.edm173ChildOrdinal==24U))
+            (m_Group.currentCmd.edm173ChildCount==EDM173::CountForRecipe(m_edm130ArmRecipe)&&
+             m_Group.currentCmd.edm173ChildOrdinal+1U==m_Group.currentCmd.edm173ChildCount)))
     {
         const bool allPhysicalInPos = ArePhysicalGroupAxesReadyForTerminal();
 

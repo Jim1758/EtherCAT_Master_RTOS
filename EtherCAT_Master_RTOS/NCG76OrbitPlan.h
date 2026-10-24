@@ -7,8 +7,9 @@
 #include <limits>
 #include <cstring>
 #include "NCTranslationSnapshot.h"
+#include "NCG76OscillationMode.h"
 
-// G76 P11 prototype geometry only. These points are inputs to the existing
+// G76 bounded oscillation geometry. These points are inputs to the existing
 // CNC line producer; this header owns no motion, GAP, power or I/O authority.
 // G90 inputs are absolute program XYZ. G91 uses a zero program origin and
 // literal canonical XYZ displacements, preserving small moves at large origins.
@@ -27,6 +28,13 @@ using Point3 = std::array<double, 3U>;
 using Point8 = std::array<double, 8U>;
 constexpr std::uint32_t Version = 1U;
 constexpr std::uint32_t ModeP11 = 11U;
+constexpr std::uint32_t ModeP12 = 12U;
+constexpr std::uint32_t ModeP13 = 13U;
+constexpr std::uint32_t ModeP16 = 16U;
+constexpr std::uint32_t ModeP21 = 21U;
+constexpr std::uint32_t ModeP22 = 22U;
+constexpr std::uint32_t ModeP23 = 23U;
+constexpr std::uint32_t ModeP26 = 26U;
 constexpr unsigned MaximumPoints = 32U;
 constexpr unsigned GrowSegments = 24U;
 constexpr unsigned FlushSample = 12U;
@@ -52,6 +60,7 @@ struct PlanInput
     double heightMm = 0.0;  // Total height above sample-12 center, not an addition.
     double centerReturnFeedMmMin = 0.0; // Physical mm/min; zero inherits F.
     double shapeAngleDeg = 0.0; // K: local orbit orientation; center path is unchanged.
+    unsigned polygonSides = 0U; // Literal Q for P16/P26 only; other modes require zero.
     bool targetAxis = false; // Internal sealed-lane opt-in; no additional NC word.
 };
 
@@ -62,7 +71,8 @@ enum class Phase : std::uint8_t
     Lift = 2U,
     ReturnCenter = 3U,
     Resume = 4U,
-    FinishCenter = 5U
+    FinishCenter = 5U,
+    ApproachCenter = 6U // Expansion first reaches the target center before growing.
 };
 
 struct Endpoint
@@ -135,7 +145,7 @@ inline bool SameInput(const PlanInput& a, const PlanInput& b) noexcept
         a.flushMode == b.flushMode && a.heightMm == b.heightMm &&
         a.centerReturnFeedMmMin == b.centerReturnFeedMmMin &&
         std::memcmp(&a.shapeAngleDeg,&b.shapeAngleDeg,sizeof(double)) == 0 &&
-        a.targetAxis == b.targetAxis;
+        a.polygonSides == b.polygonSides && a.targetAxis == b.targetAxis;
 }
 inline Point3 RotateOrbit(const Point3& orbit, double angleDeg) noexcept
 {
@@ -267,22 +277,32 @@ inline bool ValidInput(const PlanInput& in, Point3& delta, double& coordinateSca
 
 // Failure replaces out with an empty plan. Do not concurrently change the
 // borrowed input/output while this allocation-free routine is running.
-inline bool Build(const PlanInput& in, ProgramPlan& out) noexcept
+inline bool BuildMode(std::uint32_t modeP,const PlanInput& in, ProgramPlan& out) noexcept
 {
     // Copy first, so a caller may safely rebuild directly from out.input.
     const PlanInput frozen = in;
     out = ProgramPlan{};
+    const bool expansion = NCG76Mode::IsHoleExpansion(modeP);
+    if(!NCG76Mode::IsImplemented(modeP)||(modeP!=ModeP11&&frozen.flushMode!=0U)||
+        (expansion&&!frozen.targetAxis)||
+        (NCG76Mode::IsPolygon(modeP)?!NCG76Mode::ValidPolygonSides(frozen.polygonSides):frozen.polygonSides!=0U))return false;
     Point3 delta{};
     double coordinateScale = 0.0;
     if (!Detail::ValidInput(frozen,delta,coordinateScale)) return false;
     Detail::OrbitBasis basis{};
     if (!Detail::BuildOrbitBasis(frozen,delta,basis)) return false;
     ProgramPlan p{};
-    p.version = Version; p.modeP = ModeP11; p.input = frozen;
+    p.version = Version; p.modeP = modeP; p.input = frozen;
     p.boundsMin = frozen.start; p.boundsMax = frozen.start;
     p.flushBeginIndex = NoIndex; p.flushEndIndex = NoIndex;
     p.flushLegIndices.fill(NoIndex);
-    constexpr double pi = 3.141592653589793238462643383279502884;
+    if (expansion)
+    {
+        Endpoint approach{};
+        approach.position = frozen.end; approach.center = frozen.end;
+        approach.phase = Phase::ApproachCenter; approach.feedMmMin = frozen.feedMmMin;
+        if (!Detail::Append(p,approach,false)) return false;
+    }
     for (unsigned k = 1U; k <= GrowSegments; ++k)
     {
         const double t = static_cast<double>(k)/static_cast<double>(GrowSegments);
@@ -290,19 +310,9 @@ inline bool Build(const PlanInput& in, ProgramPlan& out) noexcept
         e.phase = Phase::Grow; e.growIndex = k; e.radiusMm = frozen.radiusMm*t;
         e.feedMmMin = frozen.feedMmMin;
         for (unsigned j = 0U; j < 3U; ++j)
-            e.center[j] = k == GrowSegments ? frozen.end[j] : frozen.start[j] + delta[j]*t;
+            e.center[j] = expansion || k == GrowSegments ? frozen.end[j] : frozen.start[j] + delta[j]*t;
         double cosine = 0.0, sine = 0.0;
-        // Exact cardinal samples avoid artificial residual motion at the
-        // half-turn, closure and the B4 45-degree construction.
-        if (k == 6U) sine = 1.0;
-        else if (k == 12U) cosine = -1.0;
-        else if (k == 18U) sine = -1.0;
-        else if (k == 24U) cosine = 1.0;
-        else
-        {
-            const double angle = (2.0*pi)*t;
-            cosine = std::cos(angle); sine = std::sin(angle);
-        }
+        if(!NCG76Mode::UnitBoundary(modeP,k,cosine,sine,frozen.polygonSides))return false;
         e.orbit = Detail::OrbitOffset({{e.radiusMm*cosine,e.radiusMm*sine,0.0}},frozen.shapeAngleDeg,basis);
         for (unsigned j = 0U; j < 3U; ++j) e.position[j] = e.center[j]+e.orbit[j];
         if (!Detail::Append(p,e,false)) return false;
@@ -340,8 +350,11 @@ inline bool Build(const PlanInput& in, ProgramPlan& out) noexcept
     finish.phase = Phase::FinishCenter; finish.growIndex = GrowSegments;
     finish.feedMmMin = frozen.centerReturnFeedMmMin > 0.0 ? frozen.centerReturnFeedMmMin : frozen.feedMmMin;
     if (!Detail::Append(p,finish,false)) return false;
-    // For q(t)=C(t)+Rt(cos(2*pi*t),sin(2*pi*t),0), C''=0 and
-    // |q''| <= R*((2*pi)^2+4*pi) < 53R (pi<22/7).
+    // Circle: |q''| <= R*((2*pi)^2+4*pi) < 53R (pi<22/7).
+    // Square/diamond: q(t)=C(t)+Rt*s(t); each side is linear with |s'|=4*sqrt(2),
+    // hence |q''|=8*sqrt(2)*R<53R. Every corner is a sample boundary.
+    // P16/P26 have at least two intervals per edge: |s'|<=24 and |q''|<=48R.
+    // Expansion has a fixed center; its separate approach is an exact line.
     // The fixed orthonormal target-axis basis preserves this norm bound.
     // Linear interpolation on h=1/24 has error <= max|q''|*h*h/8.
     // The additional epsilon budget covers endpoint arithmetic at this frame
@@ -354,12 +367,16 @@ inline bool Build(const PlanInput& in, ProgramPlan& out) noexcept
     return true;
 }
 
+// The legacy entry point retains P11 and its exact arithmetic/metadata.
+inline bool Build(const PlanInput& in,ProgramPlan& out) noexcept
+{ return BuildMode(ModeP11,in,out); }
+
 // Rebuild and compare every public field, including unused slots, so tampered
 // phase, resume, bounds or geometry metadata cannot look like a valid plan.
 inline bool Valid(const ProgramPlan& p) noexcept
 {
     ProgramPlan expected{};
-    if (!Build(p.input,expected) || p.version != expected.version || p.modeP != expected.modeP ||
+    if (!BuildMode(p.modeP,p.input,expected) || p.version != expected.version || p.modeP != expected.modeP ||
         !Detail::SameInput(p.input,expected.input) || p.count != expected.count ||
         p.growCount != expected.growCount || p.flushBeginIndex != expected.flushBeginIndex ||
         p.flushEndIndex != expected.flushEndIndex || p.flushLegIndices != expected.flushLegIndices ||
@@ -435,7 +452,7 @@ inline bool BuildNativeBase(const ProgramPlan& program, const NCTranslationSnaps
             if (frozenProgram.input.start[a] != 0.0) return false;
     }
     NativePlan p{};
-    p.program = frozenProgram; p.translation = frozenTranslation;
+    p.program = frozenProgram; p.translation = frozenTranslation; p.modeP=frozenProgram.modeP;
     p.startMCS = frozenStart; p.count = frozenProgram.count;
     p.translationGeneration = frozenTranslation.generation;
     const bool hasXYZ[8] = {true,true,true,false,false,false,false,false};
@@ -544,22 +561,32 @@ inline void ClearValidationNative(NativePlan& p) noexcept
 }
 inline bool ClearValidationProgramFalse(ProgramPlan& p) noexcept {ClearValidationProgram(p);return false;}
 inline bool ClearValidationNativeFalse(NativePlan& p) noexcept {ClearValidationNative(p);return false;}
-inline bool BuildValidationProgram(const PlanInput& in, ProgramPlan& out) noexcept
+inline bool BuildValidationProgramMode(std::uint32_t modeP,const PlanInput& in, ProgramPlan& out) noexcept
 {
     // Copy first, so a caller may safely rebuild directly from out.input.
     const PlanInput frozen = in;
     ClearValidationProgram(out);
+    const bool expansion = NCG76Mode::IsHoleExpansion(modeP);
+    if(!NCG76Mode::IsImplemented(modeP)||(modeP!=ModeP11&&frozen.flushMode!=0U)||
+        (expansion&&!frozen.targetAxis)||
+        (NCG76Mode::IsPolygon(modeP)?!NCG76Mode::ValidPolygonSides(frozen.polygonSides):frozen.polygonSides!=0U))return ClearValidationProgramFalse(out);
     Point3 delta{};
     double coordinateScale = 0.0;
     if (!Detail::ValidInput(frozen,delta,coordinateScale)) return ClearValidationProgramFalse(out);
     Detail::OrbitBasis basis{};
     if (!Detail::BuildOrbitBasis(frozen,delta,basis)) return ClearValidationProgramFalse(out);
     ProgramPlan& p = out;
-    p.version = Version; p.modeP = ModeP11; p.input = frozen;
+    p.version = Version; p.modeP = modeP; p.input = frozen;
     p.boundsMin = frozen.start; p.boundsMax = frozen.start;
     p.flushBeginIndex = NoIndex; p.flushEndIndex = NoIndex;
     p.flushLegIndices.fill(NoIndex);
-    constexpr double pi = 3.141592653589793238462643383279502884;
+    if (expansion)
+    {
+        Endpoint approach{};
+        approach.position = frozen.end; approach.center = frozen.end;
+        approach.phase = Phase::ApproachCenter; approach.feedMmMin = frozen.feedMmMin;
+        if (!Detail::Append(p,approach,false)) return ClearValidationProgramFalse(out);
+    }
     for (unsigned k = 1U; k <= GrowSegments; ++k)
     {
         const double t = static_cast<double>(k)/static_cast<double>(GrowSegments);
@@ -567,19 +594,9 @@ inline bool BuildValidationProgram(const PlanInput& in, ProgramPlan& out) noexce
         e.phase = Phase::Grow; e.growIndex = k; e.radiusMm = frozen.radiusMm*t;
         e.feedMmMin = frozen.feedMmMin;
         for (unsigned j = 0U; j < 3U; ++j)
-            e.center[j] = k == GrowSegments ? frozen.end[j] : frozen.start[j] + delta[j]*t;
+            e.center[j] = expansion || k == GrowSegments ? frozen.end[j] : frozen.start[j] + delta[j]*t;
         double cosine = 0.0, sine = 0.0;
-        // Exact cardinal samples avoid artificial residual motion at the
-        // half-turn, closure and the B4 45-degree construction.
-        if (k == 6U) sine = 1.0;
-        else if (k == 12U) cosine = -1.0;
-        else if (k == 18U) sine = -1.0;
-        else if (k == 24U) cosine = 1.0;
-        else
-        {
-            const double angle = (2.0*pi)*t;
-            cosine = std::cos(angle); sine = std::sin(angle);
-        }
+        if(!NCG76Mode::UnitBoundary(modeP,k,cosine,sine,frozen.polygonSides))return ClearValidationProgramFalse(out);
         e.orbit = OrbitOffset({{e.radiusMm*cosine,e.radiusMm*sine,0.0}},frozen.shapeAngleDeg,basis);
         for (unsigned j = 0U; j < 3U; ++j) e.position[j] = e.center[j]+e.orbit[j];
         if (!Detail::Append(p,e,false)) return ClearValidationProgramFalse(out);
@@ -617,8 +634,11 @@ inline bool BuildValidationProgram(const PlanInput& in, ProgramPlan& out) noexce
     finish.phase = Phase::FinishCenter; finish.growIndex = GrowSegments;
     finish.feedMmMin = frozen.centerReturnFeedMmMin > 0.0 ? frozen.centerReturnFeedMmMin : frozen.feedMmMin;
     if (!Detail::Append(p,finish,false)) return ClearValidationProgramFalse(out);
-    // For q(t)=C(t)+Rt(cos(2*pi*t),sin(2*pi*t),0), C''=0 and
-    // |q''| <= R*((2*pi)^2+4*pi) < 53R (pi<22/7).
+    // Circle: |q''| <= R*((2*pi)^2+4*pi) < 53R (pi<22/7).
+    // Square/diamond: q(t)=C(t)+Rt*s(t); each side is linear with |s'|=4*sqrt(2),
+    // hence |q''|=8*sqrt(2)*R<53R. Every corner is a sample boundary.
+    // P16/P26 have at least two intervals per edge: |s'|<=24 and |q''|<=48R.
+    // Expansion has a fixed center; its separate approach is an exact line.
     // The fixed orthonormal target-axis basis preserves this norm bound.
     // Linear interpolation on h=1/24 has error <= max|q''|*h*h/8.
     // The additional epsilon budget covers endpoint arithmetic at this frame
@@ -630,9 +650,12 @@ inline bool BuildValidationProgram(const PlanInput& in, ProgramPlan& out) noexce
     return true;
 }
 
+inline bool BuildValidationProgram(const PlanInput& in,ProgramPlan& out) noexcept
+{ return BuildValidationProgramMode(ModeP11,in,out); }
+
 inline bool ValidateProgramWithStorage(const ProgramPlan& p,ProgramPlan& expected) noexcept
 {
-    if (!BuildValidationProgram(p.input,expected) || p.version != expected.version || p.modeP != expected.modeP ||
+    if (!BuildValidationProgramMode(p.modeP,p.input,expected) || p.version != expected.version || p.modeP != expected.modeP ||
         !Detail::SameInput(p.input,expected.input) || p.count != expected.count ||
         p.growCount != expected.growCount || p.flushBeginIndex != expected.flushBeginIndex ||
         p.flushEndIndex != expected.flushEndIndex || p.flushLegIndices != expected.flushLegIndices ||
@@ -684,7 +707,7 @@ inline bool BuildValidationNative(const ProgramPlan& program, const NCTranslatio
             if (frozenProgram.input.start[a] != 0.0) return ClearValidationNativeFalse(out);
     }
     NativePlan& p = out;
-    p.program = frozenProgram; p.translation = frozenTranslation;
+    p.program = frozenProgram; p.translation = frozenTranslation; p.modeP=frozenProgram.modeP;
     p.startMCS = frozenStart; p.count = frozenProgram.count;
     p.translationGeneration = frozenTranslation.generation;
     const bool hasXYZ[8] = {true,true,true,false,false,false,false,false};

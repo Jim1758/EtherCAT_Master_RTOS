@@ -3074,15 +3074,21 @@ void NCManager::LogCncFeedSameThread(const char* phase, const CncFeedFlight* row
 NC_PATH_FEED_NOINLINE
 bool NCManager::IsG76OrbitBlockShapeValid(const NCBlock& block, bool allowMissingFeed, int unitsMode) noexcept
 {
+    const bool polygon=block.has('P')&&(block.val('P')==16.0||block.val('P')==26.0);
+    const bool expansion=block.has('P')&&(block.val('P')==21.0||block.val('P')==22.0||block.val('P')==23.0||block.val('P')==26.0);
+    const bool nonCircular=block.has('P')&&(block.val('P')==12.0||block.val('P')==13.0||polygon||expansion);
     if ((unitsMode != 20 && unitsMode != 21) || block.isEmpty || block.isGoto || block.isBlockSkip ||
         !block.hasG || block.gCode != 76 || block.gCount != 1 || block.gCodes[0] != 76 || block.mCount != 0 ||
-        !block.has('P') || block.val('P') != 11.0 || !block.has('R') ||
+        !block.has('P') || (block.val('P') != 11.0 && !nonCircular) || !block.has('R') ||
+        (nonCircular&&(!block.has('B')||block.val('B')!=0.0)) ||
+        (polygon&&(!block.has('Q')||!std::isfinite(block.val('Q'))||block.val('Q')<3.0||
+            block.val('Q')>12.0||std::floor(block.val('Q'))!=block.val('Q'))) ||
         !(block.has('X') || block.has('Y') || block.has('Z')) || (!allowMissingFeed && !block.has('F'))) return false;
     for (char word = 'A'; word <= 'Z'; ++word)
     {
         if (!block.has(word)) continue;
         if ((word != 'N' && word != 'X' && word != 'Y' && word != 'Z' && word != 'R' &&
-             word != 'P' && word != 'F' && word != 'B') || !std::isfinite(block.val(word))) return false;
+             word != 'P' && word != 'F' && word != 'B' && !(nonCircular&&word=='K')&&!(polygon&&word=='Q')) || !std::isfinite(block.val(word))) return false;
         if ((word == 'X' || word == 'Y' || word == 'Z') &&
             !std::isfinite(NCTranslationLengthToMM(block.val(word),unitsMode))) return false;
     }
@@ -3090,6 +3096,7 @@ bool NCManager::IsG76OrbitBlockShapeValid(const NCBlock& block, bool allowMissin
     const double feed = block.has('F') ? NCTranslationLengthToMM(block.val('F'),unitsMode) : 0.0;
     return std::isfinite(radius) && radius > 0.0 && radius <= NCG76::MaximumRadiusMm &&
         (!block.has('F') || (std::isfinite(feed) && feed > 0.0 && feed <= NCG76::MaximumFeedMmMin)) &&
+        (!nonCircular||!block.has('K')||NCG76::ValidShapeAngle(block.val('K'))) &&
         (!block.has('B') || block.val('B') == 0.0 || block.val('B') == 2.0 || block.val('B') == 3.0 || block.val('B') == 4.0);
 }
 
@@ -3220,6 +3227,15 @@ WaitConditionFunc NCManager::StartG76OrbitSameThread(const NCBlock& block)
     }
     NCG76::PlanInput input{};
     input.flushMode=mode; input.feedMmMin=s.feed.feedMMMin;
+    // Target-plane shapes explicitly author B0 AIR. Expansion first reaches
+    // the XYZ target center; P11 retains its legacy program-XY plane.
+    if(block.val('P')==12.0||block.val('P')==13.0||block.val('P')==16.0||
+        block.val('P')==21.0||block.val('P')==22.0||block.val('P')==23.0||block.val('P')==26.0)
+    {
+        input.targetAxis=true;
+        input.shapeAngleDeg=block.has('K')?block.val('K'):0.0;
+    }
+    if(block.val('P')==16.0||block.val('P')==26.0)input.polygonSides=static_cast<unsigned>(block.val('Q'));
     const NCTranslationSnapshot frozen=CoordSys.GetTranslationSnapshot();
     input.radiusMm=NCTranslationLengthToMM(block.val('R'),frozen.unitsMode);
     s.mode=mode; s.sourceG=76;
@@ -3244,7 +3260,7 @@ WaitConditionFunc NCManager::StartG76OrbitSameThread(const NCBlock& block)
         input.end[a]=block.has(word) ? NCTranslationLengthToMM(block.val(word),frozen.unitsMode) : input.start[a];
     }
     PrintNCG76StartCheckpoint("G76_INPUT_READY", pc);
-    if (!NCG76::Build(input,s.program))
+    if (!NCG76::BuildMode(static_cast<std::uint32_t>(block.val('P')),input,s.program))
     { RejectG76OrbitSameThread("PROGRAM_OR_TRANSFORMED_ENVELOPE",AlarmManager::G_Code_Invalid_parameter); return nullptr; }
     PrintNCG76StartCheckpoint("G76_PROGRAM_BUILT", pc);
     if (!(mode==2U ? NCG76::BuildNativeBase(s.program,frozen,start,s.native) : NCG76::BuildNative(s.program,frozen,start,s.native)))
@@ -3305,10 +3321,25 @@ WaitConditionFunc NCManager::StartG76OrbitSameThread(const NCBlock& block)
         RejectG76OrbitSameThread("NATIVE_BATCH_RECEIPT",r.commandAccepted ? AlarmManager::MOTION_GROUP_MAPPING_INTEGRITY : AlarmManager::PATH_MOTION_NOT_ADMITTED); return nullptr;
     }
     s.active=true;
+    PrintNCG76DiagnosticLine("[EDM258_FIX1] event=AIR_ROUTE dispatch=%llu retainedArm=%u activeGap=0 source=CURRENT_UNLATCHED_G76 discharge=0\n",
+        static_cast<unsigned long long>(s.dispatch),m_edm94.gapHistoryArm);
     PrintNCG76DiagnosticLine("[EDM170] event=AIR_RUN_BEGIN run=%llu cache=%llu dispatch=%llu pc=%d B=%u inheritedB=%u count=%u grow=%u R=%.6f F=%.6f H=%.6f centerReturnF=%.6f trigger=%s chordError=%.9f discharge=0\n",
         static_cast<unsigned long long>(s.run),static_cast<unsigned long long>(s.cache),static_cast<unsigned long long>(s.dispatch),s.pc,
         mode,s.inheritedB?1U:0U,s.native.count,NCG76::GrowSegments,input.radiusMm,input.feedMmMin,input.heightMm,
         input.centerReturnFeedMmMin>0.0 ? input.centerReturnFeedMmMin : input.feedMmMin,mode ? "DEMO_HALF_TURN" : "NONE",s.program.chordErrorBoundMm);
+    if(s.program.modeP==NCG76::ModeP12)
+        PrintNCG76DiagnosticLine("[EDM249] event=AIR_MODE_BEGIN dispatch=%llu P=12 shape=TAPER_SQUARE B=0 R=%.9f radius=CIRCUMRADIUS rotationDeg=%.9f children=%u plane=PERPENDICULAR_XYZ_TARGET discharge=0\n",
+            static_cast<unsigned long long>(s.dispatch),input.radiusMm,input.shapeAngleDeg,s.native.count);
+    if(s.program.modeP==NCG76::ModeP13)
+        PrintNCG76DiagnosticLine("[EDM254] event=AIR_MODE_BEGIN dispatch=%llu P=13 shape=TAPER_DIAMOND B=0 R=%.9f radius=CIRCUMRADIUS rotationDeg=%.9f children=%u plane=PERPENDICULAR_XYZ_TARGET discharge=0\n",
+            static_cast<unsigned long long>(s.dispatch),input.radiusMm,input.shapeAngleDeg,s.native.count);
+    if(s.program.modeP==NCG76::ModeP16)
+        PrintNCG76DiagnosticLine("[EDM261] event=AIR_MODE_BEGIN dispatch=%llu P=16 Q=%u shape=TAPER_POLYGON B=0 R=%.9f radius=CIRCUMRADIUS rotationDeg=%.9f children=%u plane=PERPENDICULAR_XYZ_TARGET discharge=0\n",
+            static_cast<unsigned long long>(s.dispatch),input.polygonSides,input.radiusMm,input.shapeAngleDeg,s.native.count);
+    if(NCG76Mode::IsHoleExpansion(s.program.modeP))
+        PrintNCG76DiagnosticLine("[EDM262] event=AIR_MODE_BEGIN dispatch=%llu P=%u Q=%u shape=%s B=0 R=%.9f radius=CIRCUMRADIUS rotationDeg=%.9f children=%u approachChildren=1 growChildren=24 finishChildren=1 targetX=%.9f targetY=%.9f targetZ=%.9f plane=PERPENDICULAR_XYZ_TARGET expansion=TARGET_PLANE_GROW discharge=0\n",
+            static_cast<unsigned long long>(s.dispatch),s.program.modeP,input.polygonSides,NCG76Mode::ShapeName(s.program.modeP),
+            input.radiusMm,input.shapeAngleDeg,s.native.count,input.end[0],input.end[1],input.end[2]);
     return [](NCManager* n) { return n->CompleteG76OrbitSameThread(); };
 }
 
@@ -3453,7 +3484,9 @@ void NCManager::ObserveG76OrbitFeedbackSameThread(const MotionFeedbackEvent& eve
             return;
         }
         s.lastFeedback[k]=event.sequence;
-        if (event.type==MotionFeedbackType::COMPLETED && !EDM173::IsArm(m_edm94.gapHistoryArm))
+        // A released GAP receipt keeps its selector for diagnostics. Only a
+        // latched GAP parent may replace the current ordinary AIR route.
+        if (event.type==MotionFeedbackType::COMPLETED && !(m_edm94.latched && EDM173::IsArm(m_edm94.gapHistoryArm)))
         {
             auto& a=*m_edm171Air;
             if (s.mixed)
@@ -3462,13 +3495,16 @@ void NCManager::ObserveG76OrbitFeedbackSameThread(const MotionFeedbackEvent& eve
                 if (leg.phase==NCG76Mixed::Phase::Nominal)
                     AppendEDM171HistorySameThread(leg.geometry,id,s.dispatch,s.commit,s.pc,s.line,leg.nominalOrdinal);
             }
-            else if (k<s.program.count && (s.program.points[k].phase==NCG76::Phase::Grow || s.program.points[k].phase==NCG76::Phase::FinishCenter))
+            else if (k<s.program.count && (s.program.points[k].phase==NCG76::Phase::Grow ||
+                s.program.points[k].phase==NCG76::Phase::FinishCenter || s.program.points[k].phase==NCG76::Phase::ApproachCenter))
             {
                 const auto& from=k ? s.native.pointsMCS[k-1U] : s.native.startMCS;
                 const auto& fromPulse=k ? s.receipt.legEndPulse[k-1U] : s.receipt.startPulse;
                 if (!BuildEDM171LineSameThread(from,s.native.pointsMCS[k],fromPulse,s.receipt.legEndPulse[k],s.native.feedMmMin[k],a.geometry))
                 { RejectG76OrbitSameThread("G76_NOMINAL_CANONICAL_GEOMETRY",AlarmManager::MOTION_GROUP_MAPPING_INTEGRITY); return; }
-                AppendEDM171HistorySameThread(a.geometry,id,s.dispatch,s.commit,s.pc,s.line,s.program.points[k].phase==NCG76::Phase::FinishCenter ? 25U : s.program.points[k].growIndex);
+                const bool expansion=NCG76Mode::IsHoleExpansion(s.program.modeP);
+                AppendEDM171HistorySameThread(a.geometry,id,s.dispatch,s.commit,s.pc,s.line,expansion ? k+1U :
+                    s.program.points[k].phase==NCG76::Phase::FinishCenter ? 25U : s.program.points[k].growIndex);
             }
         }
         return;
@@ -3512,18 +3548,36 @@ bool NCManager::CompleteG76OrbitSameThread()
     for (unsigned a=0U;a<8U;++a)
         if (FeedDoubleBits(CoordSys.commandedMCS[a])!=FeedDoubleBits(s.receipt.endMCS[a]))
         { RejectG76OrbitSameThread("FINAL_ACCEPTED_TAIL",AlarmManager::MOTION_GROUP_MAPPING_INTEGRITY); return false; }
-    if (EDM173::IsArm(m_edm94.gapHistoryArm) && !IsEDM173RuntimeCompleteSameThread()) return false;
+    if (m_edm94.latched && EDM173::IsArm(m_edm94.gapHistoryArm) && !IsEDM173RuntimeCompleteSameThread()) return false;
     ServiceG76OrbitSameThread();
     s.active=false; s.completed=true;
-    if (EDM173::IsArm(m_edm94.gapHistoryArm))
+    if (m_edm94.latched && EDM173::IsArm(m_edm94.gapHistoryArm))
     {
-        RtPrintf("[EDM173] event=PARENT_COMPLETE dispatch=%llu commit=%llu completed=25 children=25 E5completed=1 evidence=ALL_CHILDREN_GROUP_DRAIN_AND_SHARED_E5 discharge=0\n",
-            static_cast<unsigned long long>(s.dispatch),static_cast<unsigned long long>(s.commit));
+        RtPrintf("[EDM173] event=PARENT_COMPLETE dispatch=%llu commit=%llu completed=25 children=25 E5completed=%u evidence=ALL_CHILDREN_GROUP_DRAIN_AND_SHARED_E5 discharge=0\n",
+            static_cast<unsigned long long>(s.dispatch),static_cast<unsigned long long>(s.commit),
+            EDM130::G76EventLimit(m_edm130.recipe));
         return true;
     }
     PrintNCG76DiagnosticLine("[EDM170] event=COMPLETE dispatch=%llu commit=%llu completed=%u count=%u finalX=%.9f finalY=%.9f finalZ=%.9f evidence=ALL_CHILDREN_AND_GROUP_DRAIN discharge=0\n",
         static_cast<unsigned long long>(s.dispatch),static_cast<unsigned long long>(s.commit),ledger.motionCompletedCount,s.receipt.count,
         s.receipt.endMCS[0],s.receipt.endMCS[1],s.receipt.endMCS[2]);
+    if(!s.mixed&&s.program.modeP==NCG76::ModeP12)
+        PrintNCG76DiagnosticLine("[EDM249] event=AIR_MODE_COMPLETE dispatch=%llu P=12 shape=TAPER_SQUARE B=0 R=%.9f radius=CIRCUMRADIUS rotationDeg=%.9f completed=%u children=%u discharge=0\n",
+            static_cast<unsigned long long>(s.dispatch),s.program.input.radiusMm,s.program.input.shapeAngleDeg,
+            ledger.motionCompletedCount,s.receipt.count);
+    if(!s.mixed&&s.program.modeP==NCG76::ModeP13)
+        PrintNCG76DiagnosticLine("[EDM254] event=AIR_MODE_COMPLETE dispatch=%llu P=13 shape=TAPER_DIAMOND B=0 R=%.9f radius=CIRCUMRADIUS rotationDeg=%.9f completed=%u children=%u discharge=0\n",
+            static_cast<unsigned long long>(s.dispatch),s.program.input.radiusMm,s.program.input.shapeAngleDeg,
+            ledger.motionCompletedCount,s.receipt.count);
+    if(!s.mixed&&s.program.modeP==NCG76::ModeP16)
+        PrintNCG76DiagnosticLine("[EDM261] event=AIR_MODE_COMPLETE dispatch=%llu P=16 Q=%u shape=TAPER_POLYGON B=0 R=%.9f radius=CIRCUMRADIUS rotationDeg=%.9f completed=%u children=%u discharge=0\n",
+            static_cast<unsigned long long>(s.dispatch),s.program.input.polygonSides,s.program.input.radiusMm,s.program.input.shapeAngleDeg,
+            ledger.motionCompletedCount,s.receipt.count);
+    if(!s.mixed&&NCG76Mode::IsHoleExpansion(s.program.modeP))
+        PrintNCG76DiagnosticLine("[EDM262] event=AIR_MODE_COMPLETE dispatch=%llu P=%u Q=%u shape=%s B=0 R=%.9f radius=CIRCUMRADIUS rotationDeg=%.9f completed=%u children=%u targetX=%.9f targetY=%.9f targetZ=%.9f expansion=TARGET_PLANE_GROW discharge=0\n",
+            static_cast<unsigned long long>(s.dispatch),s.program.modeP,s.program.input.polygonSides,NCG76Mode::ShapeName(s.program.modeP),
+            s.program.input.radiusMm,s.program.input.shapeAngleDeg,ledger.motionCompletedCount,s.receipt.count,
+            s.program.input.end[0],s.program.input.end[1],s.program.input.end[2]);
     return true;
 }
 
@@ -3555,14 +3609,15 @@ void NCManager::ServiceG76OrbitSameThread()
                 leg.originalSourceIndex,leg.nominalOrdinal,leg.startU,leg.endU);
             ++s.loggedChildren; continue;
         }
-        if (EDM173::IsArm(m_edm94.gapHistoryArm))
+        if (m_edm94.latched && EDM173::IsArm(m_edm94.gapHistoryArm))
         {
             RtPrintf("[EDM173] event=CHILD_COMPLETED dispatch=%llu child=%u children=25 evidence=IDENTITY_MATCHED_LEDGER discharge=0\n",
                 static_cast<unsigned long long>(s.dispatch),k+1U);
             ++s.loggedChildren; continue;
         }
         const auto& point=s.program.points[k];
-        const char* phase=point.phase==NCG76::Phase::Grow ? "GROW" : point.phase==NCG76::Phase::ToCenter ? "TO_CENTER" :
+        const char* phase=point.phase==NCG76::Phase::ApproachCenter ? "APPROACH_CENTER" :
+            point.phase==NCG76::Phase::Grow ? "GROW" : point.phase==NCG76::Phase::ToCenter ? "TO_CENTER" :
             point.phase==NCG76::Phase::Lift ? "LIFT" : point.phase==NCG76::Phase::ReturnCenter ? "RETURN_CENTER" :
             point.phase==NCG76::Phase::Resume ? "RESUME" : "FINISH_CENTER";
         PrintNCG76DiagnosticLine("[EDM170] event=CHILD_COMPLETED phase=%s dispatch=%llu segment=%u count=%u grow=%u centerX=%.6f centerY=%.6f centerZ=%.6f targetX=%.6f targetY=%.6f targetZ=%.6f evidence=IDENTITY_MATCHED_FEEDBACK discharge=0\n",
@@ -3747,7 +3802,8 @@ bool NCManager::NormalizeEDM171AirBlockSameThread(const NCBlock& input,NCBlock& 
         input.gCount==1 && input.hasG && input.gCodes[0]==input.gCode && input.mCount==0 &&
         a.literal.gCount==input.gCount && a.literal.gCode==input.gCode && a.literal.gCodes[0]==input.gCodes[0] &&
         a.literal.hasG==input.hasG && a.literal.mCount==input.mCount && !input.isBlockSkip && !input.isGoto &&
-        !input.has('Q') && (input.gCode==76 || !input.has('P'));
+        (!input.has('Q')||(input.gCode==76&&input.has('P')&&(input.val('P')==16.0||input.val('P')==26.0))) &&
+        (input.gCode==76 || !input.has('P'));
     for (char word='A';word<='Z' && valid;++word)
         valid=input.has(word)==a.literal.has(word) && (!input.has(word) ||
             (std::isfinite(input.val(word)) && FeedDoubleBits(input.val(word))==FeedDoubleBits(a.literal.val(word))));
@@ -4062,7 +4118,8 @@ bool NCManager::IsEDM171AirProgramSameThread(int firstPC) const noexcept
             for (char word='A';word<='Z';++word) if (b.has(word) && word!='N') return false;
             return offset!=0U && intent;
         }
-        if (b.gCount!=1 || !b.hasG || b.mCount!=0 || b.isGoto || b.has('Q')) return false;
+        if (b.gCount!=1 || !b.hasG || b.mCount!=0 || b.isGoto ||
+            (b.has('Q')&&!(b.gCode==76&&b.has('P')&&(b.val('P')==16.0||b.val('P')==26.0)))) return false;
         const bool orbit=b.gCode==76;
         intent=intent || orbit || (b.has('B') && b.val('B')==2.0);
         if (b.has('B'))

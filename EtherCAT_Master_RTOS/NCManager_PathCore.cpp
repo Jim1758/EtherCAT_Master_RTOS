@@ -3609,8 +3609,85 @@ bool NCManager::IsFixedTranslationBlockAllowedSameThread(const NCBlock& block)
     if (m_g76PowerInhibited && NCGCodeSemantics::Contains(block,180)
         && !IsEDM173BracketBlockSameThread(block))
     {
-        RejectG76OrbitSameThread("EDM_BRACKET_DURING_AIR_RUN",AlarmManager::G_Code_Invalid_parameter);
-        return false;
+        // EDM234_RETIRED_G76_LINE_BRACKET_BEGIN
+        // The power inhibit also belongs to true GAP G76. Keep it asserted
+        // while admitting only the released sequence's exact line controls.
+        const auto retiredG76LineControl = [&]() noexcept {
+            const auto& history=m_edm237;const auto& q=m_edm234;const auto& s=m_edm94;const int pc=GetActiveDispatchPC();
+            if(history.authorized)
+            {
+                // A retired G76 keeps power inhibited through each following four-row parent.
+                // ExecuteBlock advances the finish ordinal before this gate.
+                if(!IsEDM237SequenceScopeCurrentSameThread()||!history.parentIndex||history.parentIndex>=history.parentCount||history.parentIndex>=4U||
+                    (history.kinds[history.parentIndex-1U]!=2U&&!(((history.program==240U||history.program==241U||history.program==243U)&&
+                        (history.kinds[history.parentIndex-1U]==6U||history.kinds[history.parentIndex-1U]==7U))||
+                        (history.program==244U&&history.kinds[history.parentIndex-1U]==7U)||
+                        (history.program==245U&&history.kinds[history.parentIndex-1U]==6U)||
+                        (history.program==246U&&history.kinds[history.parentIndex-1U]==7U)))||history.kinds[history.parentIndex]!=5U||!history.firstRecipeBound||
+                    !history.firstReleased||!history.firstSession||history.previousSession<history.firstSession||
+                    history.releasePending||!history.previousFinishDispatch||history.releaseTick<=history.previousReleaseFloorTick||
+                    m_g76Orbit->active||!IsEDM234BracketShapeValid(block))return false;
+                const int armPC=history.armPC[history.parentIndex];
+                if(block.val('P')==274.0)
+                    return pc==armPC&&IsEDM237NextArmCurrentSameThread(pc,274U)&&
+                        IsEDM94TranslationBracketAllowedSameThread(block);
+                return block.val('P')==275.0&&pc==armPC+5&&history.stageRecipeBound&&history.stageStarted&&!history.awaitNext&&
+                    s.latched&&s.gapHistoryArm==274U&&s.armPC==armPC&&s.session==history.currentSession&&s.session>history.previousSession&&
+                    s.ready&&s.everArmed&&!s.armPending&&s.moves==4U&&s.next==5U&&history.currentRowBound==4U&&
+                    history.motionDispatch&&m_currentExecutingBlockDispatchId>history.motionDispatch&&
+                    s.pc[0U]==armPC+1&&s.pc[1U]==armPC+2&&s.pc[2U]==armPC+3&&s.pc[3U]==armPC+4&&s.pc[4U]==pc&&
+                    s.run==history.run&&s.cache==history.cache&&s.lease.Matches(history.lease)&&
+                    !s.cancelled&&!s.resetSeen&&!s.resetCommitted&&!s.releaseRequested&&!s.rtFaultReported&&
+                    !s.finishPending&&!s.complete&&!s.normalEndCommitted&&!s.completionReleaseRequested&&
+                    IsEDM94TranslationBracketAllowedSameThread(block);
+            }
+            if(q.authorized&&q.program==236U)
+            {
+                // The first G76 of the reverse four-stage sequence leaves
+                // discharge inhibited across all three ordinary parents.
+                // Each arm/finish uses only its own current stage receipt.
+                if(!IsEDM236SequenceScopeCurrentSameThread()||!q.parentIndex||q.parentIndex>=4U||
+                    q.kinds[q.parentIndex]==2U||!q.firstRecipeBound||!q.firstSession||!q.previousSession||
+                    q.releasePending||!q.firstFinishDispatch||q.releaseTick<=q.previousReleaseFloorTick||
+                    m_g76Orbit->active||!IsEDM234BracketShapeValid(block))return false;
+                const int armPC=q.firstArmPC+static_cast<int>(q.parentIndex*3U);
+                if(block.val('P')==274.0)
+                    return pc==armPC&&IsEDM236NextArmCurrentSameThread(pc,274U)&&
+                        IsEDM94TranslationBracketAllowedSameThread(block);
+                return block.val('P')==275.0&&pc==armPC+2&&q.stageRecipeBound&&q.stageStarted&&!q.awaitNext&&
+                    s.latched&&s.gapHistoryArm==274U&&s.armPC==armPC&&s.session==q.currentSession&&s.session>q.previousSession&&
+                    s.ready&&s.everArmed&&!s.armPending&&s.moves==1U&&s.next==s.moves+1U&&q.motionDispatch&&
+                    m_currentExecutingBlockDispatchId>q.motionDispatch&&s.pc[0U]==armPC+1&&s.pc[1U]==pc&&
+                    s.run==q.run&&s.cache==q.cache&&s.lease.Matches(q.lease)&&
+                    !s.cancelled&&!s.resetSeen&&!s.resetCommitted&&!s.releaseRequested&&!s.rtFaultReported&&
+                    !s.finishPending&&!s.complete&&!s.normalEndCommitted&&!s.completionReleaseRequested&&
+                    IsEDM94TranslationBracketAllowedSameThread(block);
+            }
+            if(!q.authorized||q.arms[0U]!=EDM173::B2ArmP||q.arms[1U]!=274U||
+                !q.firstRecipeBound||!q.firstSession||!q.firstReleased||q.releasePending||
+                !q.firstFinishDispatch||q.releaseTick<=q.releaseFloorTick||
+                !IsEDM234SequenceScopeCurrentSameThread()||m_g76Orbit->active||
+                !IsEDM234BracketShapeValid(block))return false;
+            if(block.val('P')==274.0)
+                return pc==q.firstArmPC+3&&IsEDM234NextArmCurrentSameThread(pc,274U)&&
+                    IsEDM94TranslationBracketAllowedSameThread(block);
+            // ExecuteBlock's authored guard has advanced the one motion row
+            // to its finish ordinal before this frozen-frame gate runs.
+            return block.val('P')==275.0&&pc==q.firstArmPC+5&&q.secondStarted&&
+                s.latched&&s.gapHistoryArm==274U&&s.armPC==q.firstArmPC+3&&s.session>q.firstSession&&
+                s.ready&&s.everArmed&&!s.armPending&&s.moves==1U&&s.next==s.moves+1U&&q.motionDispatch&&
+                m_currentExecutingBlockDispatchId>q.motionDispatch&&s.pc[0U]==q.firstArmPC+4&&s.pc[1U]==pc&&
+                s.run==q.run&&s.cache==q.cache&&s.lease.Matches(q.lease)&&
+                !s.cancelled&&!s.resetSeen&&!s.resetCommitted&&!s.releaseRequested&&!s.rtFaultReported&&
+                !s.finishPending&&!s.complete&&!s.normalEndCommitted&&!s.completionReleaseRequested&&
+                IsEDM94TranslationBracketAllowedSameThread(block);
+        };
+        if(!retiredG76LineControl())
+        {
+            RejectG76OrbitSameThread("EDM_BRACKET_DURING_AIR_RUN",AlarmManager::G_Code_Invalid_parameter);
+            return false;
+        }
+        // EDM234_RETIRED_G76_LINE_BRACKET_END
     }
     // EDM94 is a separately preflighted, stopped-only G91 physical bracket.
     // Only its exact P85/P86 scope may bypass the generic retained/GAP ban.
@@ -3619,6 +3696,13 @@ bool NCManager::IsFixedTranslationBlockAllowedSameThread(const NCBlock& block)
     // authored-source preflight still precedes every ExecuteBlock side effect.
     if (IsEDMRecipeEditRequest(block))
     {
+        if(m_edm237.authorized&&(m_edm237.program==240U||m_edm237.program==241U||m_edm237.program==242U||m_edm237.program==243U||m_edm237.program==244U||m_edm237.program==245U||m_edm237.program==246U||m_edm237.program==247U||m_edm237.program==248U))
+        {
+            const int pc=GetActiveDispatchPC();const auto* source=GetBaseProgramCache().TryGetLine(pc);
+            EDMRecipeControl::Request decoded{};
+            if(source&&DecodeEDMRecipeEditBlock(block,source->parsedBlock,decoded)&&IsEDM240RecipeBridgeCurrentSameThread(pc))return true;
+            RejectEDM94SameThread("EDM240_FIXED_BRIDGE_SCOPE",m_gapDryRun.sourceLine);return false;
+        }
         if (IsEDMRecipeEditBlockShapeValid(block) && IsEDMRecipeStoppedAuthorityCurrentSameThread()) return true;
         RejectEDMRecipeEditSameThread(0, "FIXED_EDIT_SCOPE", EDMRecipe::Error::None);
         return false;

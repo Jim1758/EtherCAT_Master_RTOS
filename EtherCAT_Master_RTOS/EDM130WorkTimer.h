@@ -24,6 +24,9 @@ constexpr std::uint64_t G76B4HeightScaled177=2000000ULL;
 // E214: center commissioning admits either the one-mm test stroke or the
 // retained two-mm stroke. The selected E6 stays part of the frozen recipe.
 constexpr std::uint64_t G76CenterShortHeightScaled214=1000000ULL;
+// Center architecture-only stroke. Recipe permission remains explicitly
+// selected by L233, L239 or L240 with diagnostic source3.
+constexpr std::uint64_t G76ArchitectureHeightScaled233=200000ULL;
 // EDM192 B0 is a bounded native tangent excursion, not a visible-Z grant.
 constexpr std::uint16_t G76B0Profile192=8U;
 constexpr std::uint64_t G76B0HeightScaled192=2000000ULL;
@@ -157,7 +160,17 @@ struct Recipe
     // first B1 E5; L3 selects an eligible B2 E5 after crossing retained history.
     // EDM200 also admits P294 L3 without H for the sealed G76 B2 test.
     // EDM217 uses P296/P298 L1 without H for a nominal GAP work checkpoint.
-    // NC submits one existing HOLD transaction at >=25%; START remains operator-only.
+    // EDM218 uses P296/P298 L2 without H for an in-flight center outbound checkpoint.
+    // EDM219/220 use L3/L4 for axial return/final anchor-return checkpoints.
+    // EDM221 uses L5 for the first detached machining-anchor-to-center leg.
+    // EDM222/224/225/226 use L6-L9 for apex, both center and final anchor dwells.
+    // EDM227 uses L10 for initial settlement before capturing the local E5 path.
+    // EDM228 uses L11 for the first observed moving E5 braking phase.
+    // EDM230 uses L230 as an independent two-E5 commissioning selector,
+    // without an automatic HOLD. Earlier L1-L11 keep their one-event meaning.
+    // EDM231 uses L231 for one ordinary HOLD on the second E5 outbound leg.
+    // EDM232 selects one HOLD on the second E5 axial return with L232.
+    // NC submits one existing HOLD transaction; START remains operator-only.
     std::uint16_t flushHoldTest=0U;
     std::uint64_t jumpHeightScaled=0ULL; // Millimetres in recipe fixed-point units (1e6).
     // EDM133: explicit E21/E22 binding, including a disabled zero interval.
@@ -182,6 +195,131 @@ inline bool IsVisibleFlush167(const Recipe& r) noexcept
 {return r.commissioningProfile==VisibleFlushProfile167;}
 inline bool IsVisibleFlush173(const Recipe& r) noexcept
 {return r.commissioningProfile==VisibleFlushProfile173;}
+// EDM250 selects only the P12 square B1 fixture. The selector is immutable
+// recipe identity, not an automatic HOLD request or a new process field.
+inline bool IsG76SquareB1_250(const Recipe& r) noexcept
+{return IsVisibleFlush173(r)&&r.flushHoldTest==250U&&
+    r.workTimeUs==500000ULL&&r.jumpHeightScaled==VisibleFlushHeightScaled173&&
+    r.jumpSpeedPercentScaled==100000000ULL&&r.diagnosticControlSource==3U&&
+    r.planRows==25U&&r.planMovementMask==7U&&!r.holdRetreatMode&&
+    !r.deepFlushCycleInterval&&r.deepFlushHeightMultiplierScaled==1000000ULL;}
+// EDM251 uses the existing B2 retained-path distance, with a separate
+// immutable selector. It grants no B1 lift or automatic HOLD checkpoint.
+inline bool IsG76SquareB2_251(const Recipe& r) noexcept
+{return r.commissioningProfile==G76B2Profile175&&r.flushHoldTest==251U&&
+    r.workTimeUs==500000ULL&&r.jumpHeightScaled==G76B2HeightScaled175&&
+    r.jumpSpeedPercentScaled==100000000ULL&&r.diagnosticControlSource==3U&&
+    r.planRows==25U&&r.planMovementMask==7U&&!r.holdRetreatMode&&
+    !r.deepFlushCycleInterval&&r.deepFlushHeightMultiplierScaled==1000000ULL;}
+// EDM252 binds the existing B3 center route to one square parent. E6 is
+// native distance opposite the signed machining axis from its nominal center.
+inline bool IsG76SquareB3_252(const Recipe& r) noexcept
+{return r.commissioningProfile==G76B3Profile176&&r.flushHoldTest==252U&&
+    r.workTimeUs==500000ULL&&r.jumpHeightScaled==G76B3HeightScaled176&&
+    r.jumpSpeedPercentScaled==100000000ULL&&r.diagnosticControlSource==3U&&
+    r.planRows==25U&&r.planMovementMask==7U&&!r.holdRetreatMode&&
+    !r.deepFlushCycleInterval&&r.deepFlushHeightMultiplierScaled==1000000ULL;}
+// EDM253 retains B4's diagonal center join. E6 includes the first axial
+// contribution and remains total native withdrawal from the nominal center.
+inline bool IsG76SquareB4_253(const Recipe& r) noexcept
+{return r.commissioningProfile==G76B4Profile177&&r.flushHoldTest==253U&&
+    r.workTimeUs==500000ULL&&r.jumpHeightScaled==G76B4HeightScaled177&&
+    r.jumpSpeedPercentScaled==100000000ULL&&r.diagnosticControlSource==3U&&
+    r.planRows==25U&&r.planMovementMask==7U&&!r.holdRetreatMode&&
+    !r.deepFlushCycleInterval&&r.deepFlushHeightMultiplierScaled==1000000ULL;}
+inline bool IsG76SquareMode12(const Recipe& r) noexcept
+{return IsG76SquareB1_250(r)||IsG76SquareB2_251(r)||IsG76SquareB3_252(r)||IsG76SquareB4_253(r);}
+// EDM255 keeps P13's confirmed diamond separate from P12 recipe identity.
+inline bool IsG76DiamondB1_255(const Recipe& r) noexcept
+{return IsVisibleFlush173(r)&&r.flushHoldTest==255U&&
+    r.workTimeUs==500000ULL&&r.jumpHeightScaled==VisibleFlushHeightScaled173&&
+    r.jumpSpeedPercentScaled==100000000ULL&&r.diagnosticControlSource==3U&&
+    r.planRows==25U&&r.planMovementMask==7U&&!r.holdRetreatMode&&
+    !r.deepFlushCycleInterval&&r.deepFlushHeightMultiplierScaled==1000000ULL;}
+// EDM256 uses the same retained-path B2 distance as EDM251, with P13 identity.
+inline bool IsG76DiamondB2_256(const Recipe& r) noexcept
+{return r.commissioningProfile==G76B2Profile175&&r.flushHoldTest==256U&&
+    r.workTimeUs==500000ULL&&r.jumpHeightScaled==G76B2HeightScaled175&&
+    r.jumpSpeedPercentScaled==100000000ULL&&r.diagnosticControlSource==3U&&
+    r.planRows==25U&&r.planMovementMask==7U&&!r.holdRetreatMode&&
+    !r.deepFlushCycleInterval&&r.deepFlushHeightMultiplierScaled==1000000ULL;}
+// EDM257 binds the existing B3 center route to the confirmed P13 diamond.
+inline bool IsG76DiamondB3_257(const Recipe& r) noexcept
+{return r.commissioningProfile==G76B3Profile176&&r.flushHoldTest==257U&&
+    r.workTimeUs==500000ULL&&r.jumpHeightScaled==G76B3HeightScaled176&&
+    r.jumpSpeedPercentScaled==100000000ULL&&r.diagnosticControlSource==3U&&
+    r.planRows==25U&&r.planMovementMask==7U&&!r.holdRetreatMode&&
+    !r.deepFlushCycleInterval&&r.deepFlushHeightMultiplierScaled==1000000ULL;}
+// EDM258 preserves B4's diagonal center join and total axial withdrawal.
+inline bool IsG76DiamondB4_258(const Recipe& r) noexcept
+{return r.commissioningProfile==G76B4Profile177&&r.flushHoldTest==258U&&
+    r.workTimeUs==500000ULL&&r.jumpHeightScaled==G76B4HeightScaled177&&
+    r.jumpSpeedPercentScaled==100000000ULL&&r.diagnosticControlSource==3U&&
+    r.planRows==25U&&r.planMovementMask==7U&&!r.holdRetreatMode&&
+    !r.deepFlushCycleInterval&&r.deepFlushHeightMultiplierScaled==1000000ULL;}
+// EDM260 uses separate immutable identities for the one-mm test family.
+// The selector identifies shape; the existing profile identifies B1/B3/B4.
+inline bool IsG76OneMmSelector260(unsigned selector) noexcept
+{return selector==260U||selector==261U||selector==262U||selector==263U;}
+inline unsigned G76OneMmMode260(unsigned selector) noexcept
+{return selector==260U?11U:selector==261U?12U:selector==262U?13U:selector==263U?16U:0U;}
+inline bool IsG76OneMm260(const Recipe& r) noexcept
+{return IsG76OneMmSelector260(r.flushHoldTest)&&
+    (r.commissioningProfile==VisibleFlushProfile173||r.commissioningProfile==G76B3Profile176||r.commissioningProfile==G76B4Profile177)&&
+    r.workTimeUs==500000ULL&&r.jumpHeightScaled==1000000ULL&&
+    r.jumpSpeedPercentScaled==100000000ULL&&r.diagnosticControlSource==3U&&
+    r.planRows==25U&&r.planMovementMask==7U&&!r.holdRetreatMode&&
+    !r.deepFlushCycleInterval&&r.deepFlushHeightMultiplierScaled==1000000ULL;}
+inline bool IsG76OneMmB1_260(const Recipe& r) noexcept
+{return r.commissioningProfile==VisibleFlushProfile173&&IsG76OneMm260(r);}
+inline bool IsG76OneMmB3_260(const Recipe& r) noexcept
+{return r.commissioningProfile==G76B3Profile176&&IsG76OneMm260(r);}
+inline bool IsG76OneMmB4_260(const Recipe& r) noexcept
+{return r.commissioningProfile==G76B4Profile177&&IsG76OneMm260(r);}
+// P16 B2 retains its existing bounded native-path distance, independently of
+// the one-mm B1/B3/B4 family. L264 identifies only this polygon recipe.
+inline bool IsG76PolygonB2_261(const Recipe& r) noexcept
+{return r.commissioningProfile==G76B2Profile175&&r.flushHoldTest==264U&&
+    r.workTimeUs==500000ULL&&r.jumpHeightScaled==G76B2HeightScaled175&&
+    r.jumpSpeedPercentScaled==100000000ULL&&r.diagnosticControlSource==3U&&
+    r.planRows==25U&&r.planMovementMask==7U&&!r.holdRetreatMode&&
+    !r.deepFlushCycleInterval&&r.deepFlushHeightMultiplierScaled==1000000ULL;}
+// EDM263 keeps the target-plane expansion's 26-child identity separate from
+// every established 25-child taper recipe. Selectors alone grant no authority.
+inline bool IsG76ExpansionSelector263(unsigned selector) noexcept
+{return selector>=265U&&selector<=272U;}
+inline unsigned G76ExpansionMode263(unsigned selector) noexcept
+{return selector==265U||selector==269U?21U:selector==266U||selector==270U?22U:
+    selector==267U||selector==271U?23U:selector==268U||selector==272U?26U:0U;}
+inline bool IsG76Expansion263(const Recipe& r) noexcept
+{
+    const bool b2=r.flushHoldTest>=269U&&r.flushHoldTest<=272U;
+    return IsG76ExpansionSelector263(r.flushHoldTest)&&
+        (b2?r.commissioningProfile==G76B2Profile175:
+            r.commissioningProfile==VisibleFlushProfile173||r.commissioningProfile==G76B3Profile176||r.commissioningProfile==G76B4Profile177)&&
+        r.workTimeUs==500000ULL&&r.jumpHeightScaled==(b2?G76B2HeightScaled175:1000000ULL)&&
+        r.jumpSpeedPercentScaled==100000000ULL&&r.diagnosticControlSource==3U&&
+        r.planRows==26U&&r.planMovementMask==7U&&!r.holdRetreatMode&&
+        !r.deepFlushCycleInterval&&r.deepFlushHeightMultiplierScaled==1000000ULL;
+}
+inline bool IsG76ExpansionB1_263(const Recipe& r) noexcept
+{return r.commissioningProfile==VisibleFlushProfile173&&IsG76Expansion263(r);}
+inline bool IsG76ExpansionB2_263(const Recipe& r) noexcept
+{return r.commissioningProfile==G76B2Profile175&&IsG76Expansion263(r);}
+inline bool IsG76ExpansionB3_263(const Recipe& r) noexcept
+{return r.commissioningProfile==G76B3Profile176&&IsG76Expansion263(r);}
+inline bool IsG76ExpansionB4_263(const Recipe& r) noexcept
+{return r.commissioningProfile==G76B4Profile177&&IsG76Expansion263(r);}
+inline unsigned G76PlanRows(const Recipe& r) noexcept
+{return IsG76Expansion263(r)?26U:25U;}
+inline bool IsG76NonCircular(const Recipe& r) noexcept
+{return IsG76SquareMode12(r)||IsG76DiamondB1_255(r)||IsG76DiamondB2_256(r)||IsG76DiamondB3_257(r)||IsG76DiamondB4_258(r)||IsG76PolygonB2_261(r);}
+inline bool IsG76CommissioningRecipe(const Recipe& r) noexcept
+{return IsG76NonCircular(r)||IsG76OneMm260(r)||IsG76Expansion263(r);}
+inline unsigned G76PlanMode(const Recipe& r) noexcept
+{return IsG76Expansion263(r)?G76ExpansionMode263(r.flushHoldTest):IsG76OneMm260(r)?G76OneMmMode260(r.flushHoldTest):
+    IsG76PolygonB2_261(r)?16U:
+    (IsG76DiamondB1_255(r)||IsG76DiamondB2_256(r)||IsG76DiamondB3_257(r)||IsG76DiamondB4_258(r))?13U:IsG76SquareMode12(r)?12U:11U;}
 inline bool IsG76B2Flush175(const Recipe& r) noexcept
 {return r.commissioningProfile==G76B2Profile175;}
 // The automatic crossed-history checkpoint is only the existing L3 meaning
@@ -197,6 +335,162 @@ inline bool IsG76B4Flush177(const Recipe& r) noexcept
 inline bool IsG76CenterHold217(const Recipe& r) noexcept
 {return (IsG76B3Flush176(r)||IsG76B4Flush177(r))&&r.flushHoldTest==1U&&
     !r.holdRetreatMode&&r.diagnosticControlSource==3U;}
+// EDM218: one pause on the captured center-to-top axial leg of the first E5.
+// L2 selects the test checkpoint; it does not grant JOG or automatic START.
+inline bool IsG76CenterFlushHold218(const Recipe& r) noexcept
+{return (IsG76B3Flush176(r)||IsG76B4Flush177(r))&&r.flushHoldTest==2U&&
+    !r.holdRetreatMode&&r.diagnosticControlSource==3U;}
+// EDM219: L3 selects the captured top-to-center axial return of the first E5.
+// The outward L2 checkpoint remains unchanged; neither permits JOG or auto-START.
+inline bool IsG76CenterReturnHold219(const Recipe& r) noexcept
+{return (IsG76B3Flush176(r)||IsG76B4Flush177(r))&&r.flushHoldTest==3U&&
+    !r.holdRetreatMode&&r.diagnosticControlSource==3U;}
+inline bool IsG76CenterAnyFlushHold219(const Recipe& r) noexcept
+{return IsG76CenterFlushHold218(r)||IsG76CenterReturnHold219(r);}
+// EDM220: L4 selects the captured center-to-machining-anchor final E5 leg.
+// This checkpoint retains the same backend and grants no JOG or automatic START.
+inline bool IsG76CenterAnchorHold220(const Recipe& r) noexcept
+{return (IsG76B3Flush176(r)||IsG76B4Flush177(r))&&r.flushHoldTest==4U&&
+    !r.holdRetreatMode&&r.diagnosticControlSource==3U;}
+inline bool IsG76CenterAnyFlushHold220(const Recipe& r) noexcept
+{return IsG76CenterAnyFlushHold219(r)||IsG76CenterAnchorHold220(r);}
+// EDM221: L5 selects the already detached machining-anchor-to-center E5 leg.
+// It never admits the initial main/local backend transition or grants JOG.
+inline bool IsG76CenterStartHold221(const Recipe& r) noexcept
+{return (IsG76B3Flush176(r)||IsG76B4Flush177(r))&&r.flushHoldTest==5U&&
+    !r.holdRetreatMode&&r.diagnosticControlSource==3U;}
+inline bool IsG76CenterAnyFlushHold221(const Recipe& r) noexcept
+{return IsG76CenterAnyFlushHold220(r)||IsG76CenterStartHold221(r);}
+// EDM222: L6 selects the captured apex dwell of the first center-mode E5.
+// HOLD discards partial dwell qualification; fresh START must qualify it again.
+inline bool IsG76CenterTopDwellHold222(const Recipe& r) noexcept
+{return (IsG76B3Flush176(r)||IsG76B4Flush177(r))&&r.flushHoldTest==6U&&
+    !r.holdRetreatMode&&r.diagnosticControlSource==3U;}
+inline bool IsG76CenterAnyFlushHold222(const Recipe& r) noexcept
+{return IsG76CenterAnyFlushHold221(r)||IsG76CenterTopDwellHold222(r);}
+// EDM224: L7 selects the first center waypoint dwell, before axial Outbound.
+// This does not admit CenterReturnDwell or credit time spent under HOLD.
+inline bool IsG76CenterDwellHold224(const Recipe& r) noexcept
+{return (IsG76B3Flush176(r)||IsG76B4Flush177(r))&&r.flushHoldTest==7U&&
+    !r.holdRetreatMode&&r.diagnosticControlSource==3U;}
+inline bool IsG76CenterAnyFlushHold224(const Recipe& r) noexcept
+{return IsG76CenterAnyFlushHold222(r)||IsG76CenterDwellHold224(r);}
+// EDM225: L8 selects the captured center-return dwell, before final ToAnchor.
+// The captured top and event remain frozen; START qualifies the full dwell again.
+inline bool IsG76CenterReturnDwellHold225(const Recipe& r) noexcept
+{return (IsG76B3Flush176(r)||IsG76B4Flush177(r))&&r.flushHoldTest==8U&&
+    !r.holdRetreatMode&&r.diagnosticControlSource==3U;}
+inline bool IsG76CenterAnyFlushHold225(const Recipe& r) noexcept
+{return IsG76CenterAnyFlushHold224(r)||IsG76CenterReturnDwellHold225(r);}
+// EDM226: L9 selects the final dwell at the original machining anchor.
+// The event stays pending until fresh START and a complete new dwell.
+inline bool IsG76CenterFinalDwellHold226(const Recipe& r) noexcept
+{return (IsG76B3Flush176(r)||IsG76B4Flush177(r))&&r.flushHoldTest==9U&&
+    !r.holdRetreatMode&&r.diagnosticControlSource==3U;}
+inline bool IsG76CenterAnyFlushHold226(const Recipe& r) noexcept
+{return IsG76CenterAnyFlushHold225(r)||IsG76CenterFinalDwellHold226(r);}
+// EDM227: L10 selects initial settlement before E5 captures any local path.
+// The main path stays attached; fresh START must qualify the full dwell.
+inline bool IsG76CenterInitialDwellHold227(const Recipe& r) noexcept
+{return (IsG76B3Flush176(r)||IsG76B4Flush177(r))&&r.flushHoldTest==10U&&
+    !r.holdRetreatMode&&r.diagnosticControlSource==3U;}
+inline bool IsG76CenterAnyFlushHold227(const Recipe& r) noexcept
+{return IsG76CenterAnyFlushHold226(r)||IsG76CenterInitialDwellHold227(r);}
+// EDM228: L11 pauses E5 braking on the still-attached main path.
+// HOLD reaches rest before START can continue to the full initial dwell.
+inline bool IsG76CenterBrakeHold228(const Recipe& r) noexcept
+{return (IsG76B3Flush176(r)||IsG76B4Flush177(r))&&r.flushHoldTest==11U&&
+    !r.holdRetreatMode&&r.diagnosticControlSource==3U;}
+inline bool IsG76CenterAnyFlushHold228(const Recipe& r) noexcept
+{return IsG76CenterAnyFlushHold227(r)||IsG76CenterBrakeHold228(r);}
+// Keep the commissioning envelope/profile unchanged. L230 permits two E5
+// events without an automatic HOLD inside the same sealed G76 parent.
+inline bool IsG76CenterRepeat230(const Recipe& r) noexcept
+{return (IsG76B3Flush176(r)||IsG76B4Flush177(r))&&r.flushHoldTest==230U&&
+    !r.holdRetreatMode&&r.diagnosticControlSource==3U;}
+// EDM231 shares the two-event cap but requires the second outbound HOLD
+// receipt before completion. It is never the no-checkpoint L230 selector.
+inline bool IsG76CenterSecondFlushHold231(const Recipe& r) noexcept
+{return (IsG76B3Flush176(r)||IsG76B4Flush177(r))&&r.flushHoldTest==231U&&
+    !r.holdRetreatMode&&r.diagnosticControlSource==3U;}
+inline bool IsG76CenterAnyFlushHold231(const Recipe& r) noexcept
+{return IsG76CenterAnyFlushHold228(r)||IsG76CenterSecondFlushHold231(r);}
+// EDM232 retains the two-event cap and selects only the second axial return.
+// It does not change L231's outbound checkpoint or grant retreat/JOG.
+inline bool IsG76CenterSecondReturnHold232(const Recipe& r) noexcept
+{return (IsG76B3Flush176(r)||IsG76B4Flush177(r))&&r.flushHoldTest==232U&&
+    !r.holdRetreatMode&&r.diagnosticControlSource==3U;}
+inline bool IsG76CenterAnyFlushHold232(const Recipe& r) noexcept
+{return IsG76CenterAnyFlushHold231(r)||IsG76CenterSecondReturnHold232(r);}
+// EDM233 opts into two independently retired G76 parents in one fixed NC.
+// Each parent retains the one-event limit; this selector never requests HOLD.
+inline bool IsG76ParentSequence233(const Recipe& r) noexcept
+{return (IsG76B3Flush176(r)||IsG76B4Flush177(r))&&r.flushHoldTest==233U&&
+    !r.holdRetreatMode&&r.diagnosticControlSource==3U;}
+// EDM239 retires four alternating center parents. Its independent selector
+// keeps L233's two-parent semantics and freezes the actual E6=0.2 mm source.
+inline bool IsG76CenterSequence239(const Recipe& r) noexcept
+{return (IsG76B3Flush176(r)||IsG76B4Flush177(r))&&r.flushHoldTest==239U&&
+    r.jumpHeightScaled==G76ArchitectureHeightScaled233&&
+    !r.holdRetreatMode&&r.diagnosticControlSource==3U;}
+// EDM240 binds the center parents of an explicitly authored E6-switching
+// sequence. The selected actual height remains 0.2 mm; L239 stays separate.
+inline bool IsG76CenterSequence240(const Recipe& r) noexcept
+{return (IsG76B3Flush176(r)||IsG76B4Flush177(r))&&r.flushHoldTest==240U&&
+    r.jumpHeightScaled==G76ArchitectureHeightScaled233&&
+    !r.holdRetreatMode&&r.diagnosticControlSource==3U;}
+// EDM241 adds native B2 to the mixed sequence while retaining an independent
+// center selector. Only B3/B4 use the actual E6=0.2 mm center architecture.
+inline bool IsG76CenterSequence241(const Recipe& r) noexcept
+{return (IsG76B3Flush176(r)||IsG76B4Flush177(r))&&r.flushHoldTest==241U&&
+    r.jumpHeightScaled==G76ArchitectureHeightScaled233&&
+    !r.holdRetreatMode&&r.diagnosticControlSource==3U;}
+// EDM242 combines equal-height handoffs with one authored E6 bridge.
+// Its center selector retains actual E6=0.2 mm and the one-event limit.
+inline bool IsG76CenterSequence242(const Recipe& r) noexcept
+{return (IsG76B3Flush176(r)||IsG76B4Flush177(r))&&r.flushHoldTest==242U&&
+    r.jumpHeightScaled==G76ArchitectureHeightScaled233&&
+    !r.holdRetreatMode&&r.diagnosticControlSource==3U;}
+// EDM243 retains both E6 bridge receipts across the intervening equal-height
+// center handoff. Its independent center selector captures actual E6=0.2 mm.
+inline bool IsG76CenterSequence243(const Recipe& r) noexcept
+{return (IsG76B3Flush176(r)||IsG76B4Flush177(r))&&r.flushHoldTest==243U&&
+    r.jumpHeightScaled==G76ArchitectureHeightScaled233&&
+    !r.holdRetreatMode&&r.diagnosticControlSource==3U;}
+// EDM244 repeats an identical center profile under a fresh parent identity.
+// The independent selector preserves actual E6=0.2 mm and one E5 per parent.
+inline bool IsG76CenterSequence244(const Recipe& r) noexcept
+{return (IsG76B3Flush176(r)||IsG76B4Flush177(r))&&r.flushHoldTest==244U&&
+    r.jumpHeightScaled==G76ArchitectureHeightScaled233&&
+    !r.holdRetreatMode&&r.diagnosticControlSource==3U;}
+// EDM245 repeats the ordinary history parent around a native B2 parent.
+// Its single center parent still freezes the actual E6=0.2 mm recipe.
+inline bool IsG76CenterSequence245(const Recipe& r) noexcept
+{return IsG76B3Flush176(r)&&r.flushHoldTest==245U&&
+    r.jumpHeightScaled==G76ArchitectureHeightScaled233&&
+    !r.holdRetreatMode&&r.diagnosticControlSource==3U;}
+// EDM246 exercises the same ordinary/native handoffs with a B4 center parent.
+// Its selector accepts only the actual E6=0.2 mm B4 recipe.
+inline bool IsG76CenterSequence246(const Recipe& r) noexcept
+{return IsG76B4Flush177(r)&&r.flushHoldTest==246U&&
+    r.jumpHeightScaled==G76ArchitectureHeightScaled233&&
+    !r.holdRetreatMode&&r.diagnosticControlSource==3U;}
+// EDM247 isolates consecutive native B2 parents around a B3 center parent.
+// Its selector accepts only the actual E6=0.2 mm B3 recipe.
+inline bool IsG76CenterSequence247(const Recipe& r) noexcept
+{return IsG76B3Flush176(r)&&r.flushHoldTest==247U&&
+    r.jumpHeightScaled==G76ArchitectureHeightScaled233&&
+    !r.holdRetreatMode&&r.diagnosticControlSource==3U;}
+// EDM248 pairs consecutive native B2 parents with a B4 center parent.
+// Its selector accepts only the actual E6=0.2 mm B4 recipe.
+inline bool IsG76CenterSequence248(const Recipe& r) noexcept
+{return IsG76B4Flush177(r)&&r.flushHoldTest==248U&&
+    r.jumpHeightScaled==G76ArchitectureHeightScaled233&&
+    !r.holdRetreatMode&&r.diagnosticControlSource==3U;}
+inline unsigned G76CenterHoldEventIndex(const Recipe& r) noexcept
+{return (IsG76CenterSecondFlushHold231(r)||IsG76CenterSecondReturnHold232(r))?2U:1U;}
+inline unsigned G76EventLimit(const Recipe& r) noexcept
+{return (IsG76CenterRepeat230(r)||IsG76CenterSecondFlushHold231(r)||IsG76CenterSecondReturnHold232(r))?2U:1U;}
 inline bool IsG76B0Flush192(const Recipe& r) noexcept
 {return r.commissioningProfile==G76B0Profile192;}
 inline bool IsG76Gap173(const Recipe& r) noexcept
@@ -206,7 +500,12 @@ inline bool IsOneShotCommissioning(const Recipe& r) noexcept
 // Explicit L words remain opt-in: omitted L is stored as zero, never L0.
 inline bool ValidFlushHoldSelection(unsigned arm,unsigned value) noexcept
 {return value==1U?((EDM149::IsFlushHoldTestArm(arm)&&!EDM149::IsManualVoltageTestArm(arm))||arm==296U||arm==298U):
-    (arm==274U&&(value==2U||value==3U))||(arm==294U&&value==3U);}
+    (arm==274U&&(value==2U||value==3U))||(arm==294U&&value==3U)||
+    (arm==292U&&value==250U)||
+    ((arm==292U||arm==296U||arm==298U)&&IsG76OneMmSelector260(value))||(arm==294U&&value==264U)||
+    ((arm==292U||arm==296U||arm==298U)&&value>=265U&&value<=268U)||(arm==294U&&value>=269U&&value<=272U)||
+    (arm==296U&&value==245U)||(arm==298U&&value==246U)||(arm==296U&&value==247U)||(arm==298U&&value==248U)||
+    ((arm==296U||arm==298U)&&(value==2U||value==3U||value==4U||value==5U||value==6U||value==7U||value==8U||value==9U||value==10U||value==11U||value==230U||value==231U||value==232U||value==233U||value==239U||value==240U||value==241U||value==242U||value==243U||value==244U));}
 inline unsigned FlushHoldTargetMode(unsigned selector) noexcept
 {return selector==2U?1U:selector==3U?2U:3U;}
 inline bool SameRecipe(const Recipe& a,const Recipe& b) noexcept
@@ -240,7 +539,7 @@ inline bool ValidProgramPlan(const Recipe& r) noexcept
 {
     // EDM197: B0/B2 may freeze a pure-XY nominal path. The plan owner
     // independently derives this mask from the compensated native geometry.
-    if(IsG76Gap173(r))return IsMotionTest(r)&&r.planRows==25U&&
+    if(IsG76Gap173(r))return IsMotionTest(r)&&r.planRows==G76PlanRows(r)&&
         (r.planMovementMask==7U||((IsG76B0Flush192(r)||IsG76B2Flush175(r))&&r.planMovementMask==3U));
     return (!r.planRows&&!r.planMovementMask)||(IsMotionTest(r)&&r.planRows>=1U&&r.planRows<=16U&&
         r.planMovementMask<=63U&&(r.planMovementMask&7U)!=0U&&
@@ -265,7 +564,7 @@ inline bool ValidG76FlushSpeedPercent(unsigned commissioningProfile,std::uint64_
 inline bool HasBoundSpeed(const Recipe& r) noexcept
 {return r.speedFieldId!=0U&&r.jumpSpeedPercentScaled!=0ULL;}
 inline bool ValidG76CenterHeightScaled(std::uint64_t heightScaled) noexcept
-{return heightScaled==G76CenterShortHeightScaled214||heightScaled==G76B3HeightScaled176;}
+{return heightScaled==G76ArchitectureHeightScaled233||heightScaled==G76CenterShortHeightScaled214||heightScaled==G76B3HeightScaled176;}
 inline bool ValidJumpHeight(std::uint64_t heightScaled,unsigned commissioningProfile=0U) noexcept
 {return commissioningProfile<=G76B0Profile192&&(commissioningProfile==G76B0Profile192?heightScaled==G76B0HeightScaled192:
     (commissioningProfile==G76B4Profile177||commissioningProfile==G76B3Profile176)?ValidG76CenterHeightScaled(heightScaled):
@@ -339,7 +638,7 @@ inline bool DeepFlushScaledValues(double baseHeightMm,double multiplier,
 {
     if(commissioningProfile>G76B0Profile192||!std::isfinite(baseHeightMm)||
         (commissioningProfile==G76B2Profile175?baseHeightMm!=0.001:
-        (commissioningProfile==G76B3Profile176||commissioningProfile==G76B4Profile177)?(baseHeightMm!=1.0&&baseHeightMm!=2.0):
+        (commissioningProfile==G76B3Profile176||commissioningProfile==G76B4Profile177)?(baseHeightMm!=0.2&&baseHeightMm!=1.0&&baseHeightMm!=2.0):
         (commissioningProfile==VisibleFlushProfile159||commissioningProfile==VisibleFlushProfile167||commissioningProfile==VisibleFlushProfile173||commissioningProfile==G76B0Profile192)?baseHeightMm!=2.0:commissioningProfile==VisibleFlushProfile158?baseHeightMm!=5.0:(baseHeightMm<0.0001||baseHeightMm>0.005))||
         !std::isfinite(multiplier)||multiplier<0.0||multiplier>20.0)return false;
     const auto height=static_cast<std::uint64_t>(std::llround(baseHeightMm*1000000.0));
@@ -368,10 +667,13 @@ inline double SelectedJumpHeightMm(double baseHeightMm,std::uint32_t interval,do
 }
 inline bool ValidRecipe(const Recipe& r) noexcept
 {
-    return r.holdRetreatMode<=1U&&r.flushHoldTest<=3U&&
-        (r.flushHoldTest<=1U||((!r.commissioningProfile||IsG76B2FlushHold200(r))&&r.diagnosticControlSource==3U))&&
+    // Short geometry is not a generic commissioning permission. Only the
+    // frozen center architecture selectors can authorize their exact E6.
+    return (r.jumpHeightScaled!=G76ArchitectureHeightScaled233||IsG76ParentSequence233(r)||IsG76CenterSequence239(r)||IsG76CenterSequence240(r)||IsG76CenterSequence241(r)||IsG76CenterSequence242(r)||IsG76CenterSequence243(r)||IsG76CenterSequence244(r)||IsG76CenterSequence245(r)||IsG76CenterSequence246(r)||IsG76CenterSequence248(r)||IsG76CenterSequence247(r))&&
+        r.holdRetreatMode<=1U&&(r.flushHoldTest<=3U||IsG76CommissioningRecipe(r)||IsG76CenterAnchorHold220(r)||IsG76CenterStartHold221(r)||IsG76CenterTopDwellHold222(r)||IsG76CenterDwellHold224(r)||IsG76CenterReturnDwellHold225(r)||IsG76CenterFinalDwellHold226(r)||IsG76CenterInitialDwellHold227(r)||IsG76CenterBrakeHold228(r)||IsG76CenterRepeat230(r)||IsG76ParentSequence233(r)||IsG76CenterSequence239(r)||IsG76CenterSequence240(r)||IsG76CenterSequence241(r)||IsG76CenterSequence242(r)||IsG76CenterSequence243(r)||IsG76CenterSequence244(r)||IsG76CenterSequence245(r)||IsG76CenterSequence246(r)||IsG76CenterSequence248(r)||IsG76CenterSequence247(r)||IsG76CenterSecondFlushHold231(r)||IsG76CenterSecondReturnHold232(r))&&
+        (r.flushHoldTest<=1U||((!r.commissioningProfile||IsG76CommissioningRecipe(r)||IsG76B2FlushHold200(r)||IsG76CenterAnyFlushHold232(r)||IsG76CenterRepeat230(r)||IsG76ParentSequence233(r)||IsG76CenterSequence239(r)||IsG76CenterSequence240(r)||IsG76CenterSequence241(r)||IsG76CenterSequence242(r)||IsG76CenterSequence243(r)||IsG76CenterSequence244(r)||IsG76CenterSequence245(r)||IsG76CenterSequence246(r)||IsG76CenterSequence248(r)||IsG76CenterSequence247(r))&&r.diagnosticControlSource==3U))&&
         (!r.flushHoldTest||(IsMotionTest(r)&&HasBoundProgramPlan(r)&&
-            (IsG76B2FlushHold200(r)||IsG76CenterHold217(r)||(r.holdRetreatMode==1U&&
+            (IsG76CommissioningRecipe(r)||IsG76B2FlushHold200(r)||IsG76CenterHold217(r)||IsG76CenterAnyFlushHold232(r)||IsG76CenterRepeat230(r)||IsG76ParentSequence233(r)||IsG76CenterSequence239(r)||IsG76CenterSequence240(r)||IsG76CenterSequence241(r)||IsG76CenterSequence242(r)||IsG76CenterSequence243(r)||IsG76CenterSequence244(r)||IsG76CenterSequence245(r)||IsG76CenterSequence246(r)||IsG76CenterSequence248(r)||IsG76CenterSequence247(r)||(r.holdRetreatMode==1U&&
              (!r.commissioningProfile||IsVisibleFlush159(r)||IsVisibleFlush167(r))))))&&
         (!r.holdRetreatMode||(IsMotionTest(r)&&HasBoundProgramPlan(r)&&
             (!r.commissioningProfile||IsVisibleFlush159(r)||IsVisibleFlush167(r))))&&
@@ -380,22 +682,22 @@ inline bool ValidRecipe(const Recipe& r) noexcept
             r.workTimeUs>=VisibleFlushMinimumWorkUs173&&r.workTimeUs<=VisibleFlushMaximumWorkUs173&&
             r.jumpSpeedPercentScaled==100000000ULL&&r.diagnosticControlSource==3U&&
             !r.holdRetreatMode&&!r.flushHoldTest))&&
-        (!IsVisibleFlush173(r)||(HasBoundHeight(r)&&r.jumpHeightScaled==VisibleFlushHeightScaled173&&
+        (!IsVisibleFlush173(r)||(HasBoundHeight(r)&&(r.jumpHeightScaled==VisibleFlushHeightScaled173||IsG76OneMmB1_260(r)||IsG76ExpansionB1_263(r))&&
             r.workTimeUs>=VisibleFlushMinimumWorkUs173&&r.workTimeUs<=VisibleFlushMaximumWorkUs173&&
             r.jumpSpeedPercentScaled==100000000ULL&&r.diagnosticControlSource==3U&&
-            !r.holdRetreatMode&&!r.flushHoldTest))&&
+            !r.holdRetreatMode&&(!r.flushHoldTest||IsG76SquareB1_250(r)||IsG76DiamondB1_255(r)||IsG76OneMmB1_260(r)||IsG76ExpansionB1_263(r))))&&
         (!IsG76B3Flush176(r)||(HasBoundHeight(r)&&ValidG76CenterHeightScaled(r.jumpHeightScaled)&&
             r.workTimeUs>=VisibleFlushMinimumWorkUs173&&r.workTimeUs<=VisibleFlushMaximumWorkUs173&&
             ValidG76FlushSpeedPercent(r.commissioningProfile,r.jumpSpeedPercentScaled)&&r.diagnosticControlSource==3U&&
-            !r.holdRetreatMode&&(!r.flushHoldTest||IsG76CenterHold217(r))))&&
+            !r.holdRetreatMode&&(!r.flushHoldTest||IsG76SquareB3_252(r)||IsG76DiamondB3_257(r)||IsG76OneMmB3_260(r)||IsG76ExpansionB3_263(r)||IsG76CenterHold217(r)||IsG76CenterAnyFlushHold232(r)||IsG76CenterRepeat230(r)||IsG76ParentSequence233(r)||IsG76CenterSequence239(r)||IsG76CenterSequence240(r)||IsG76CenterSequence241(r)||IsG76CenterSequence242(r)||IsG76CenterSequence243(r)||IsG76CenterSequence244(r)||IsG76CenterSequence245(r)||IsG76CenterSequence247(r))))&&
         (!IsG76B4Flush177(r)||(HasBoundHeight(r)&&ValidG76CenterHeightScaled(r.jumpHeightScaled)&&
             r.workTimeUs>=VisibleFlushMinimumWorkUs173&&r.workTimeUs<=VisibleFlushMaximumWorkUs173&&
             ValidG76FlushSpeedPercent(r.commissioningProfile,r.jumpSpeedPercentScaled)&&r.diagnosticControlSource==3U&&
-            !r.holdRetreatMode&&(!r.flushHoldTest||IsG76CenterHold217(r))))&&
+            !r.holdRetreatMode&&(!r.flushHoldTest||IsG76SquareB4_253(r)||IsG76DiamondB4_258(r)||IsG76OneMmB4_260(r)||IsG76ExpansionB4_263(r)||IsG76CenterHold217(r)||IsG76CenterAnyFlushHold232(r)||IsG76CenterRepeat230(r)||IsG76ParentSequence233(r)||IsG76CenterSequence239(r)||IsG76CenterSequence240(r)||IsG76CenterSequence241(r)||IsG76CenterSequence242(r)||IsG76CenterSequence243(r)||IsG76CenterSequence244(r)||IsG76CenterSequence246(r)||IsG76CenterSequence248(r))))&&
         (!IsG76B2Flush175(r)||(HasBoundHeight(r)&&r.jumpHeightScaled==G76B2HeightScaled175&&
             r.workTimeUs>=VisibleFlushMinimumWorkUs173&&r.workTimeUs<=VisibleFlushMaximumWorkUs173&&
             r.jumpSpeedPercentScaled==100000000ULL&&r.diagnosticControlSource==3U&&
-            !r.holdRetreatMode&&(!r.flushHoldTest||IsG76B2FlushHold200(r))))&&
+            !r.holdRetreatMode&&(!r.flushHoldTest||IsG76B2FlushHold200(r)||IsG76SquareB2_251(r)||IsG76DiamondB2_256(r)||IsG76PolygonB2_261(r)||IsG76ExpansionB2_263(r))))&&
         (!IsVisibleFlush(r)||(HasBoundHeight(r)&&r.jumpHeightScaled==VisibleFlushHeightScaled158&&
             r.workTimeUs==VisibleFlushWorkUs158&&r.jumpSpeedPercentScaled==100000000ULL&&
             (!r.diagnosticControlSource||r.diagnosticControlSource==3U)))&&
@@ -412,12 +714,12 @@ inline bool ValidRecipe(const Recipe& r) noexcept
             (r.speedFieldId&&r.speedFieldId!=r.fieldId&&ValidSpeedPercent(r.jumpSpeedPercentScaled)))&&
         ((!r.heightFieldId&&!r.jumpHeightScaled)||
             (r.heightFieldId&&r.heightFieldId!=r.fieldId&&r.heightFieldId!=r.speedFieldId&&
-                HasBoundSpeed(r)&&ValidJumpHeight(r.jumpHeightScaled,r.commissioningProfile)))&&
+                HasBoundSpeed(r)&&(ValidJumpHeight(r.jumpHeightScaled,r.commissioningProfile)||IsG76OneMmB1_260(r)||IsG76ExpansionB1_263(r))))&&
         ((!r.intervalFieldId&&!r.multiplierFieldId&&!r.deepFlushCycleInterval&&!r.deepFlushHeightMultiplierScaled)||
             (HasBoundDeep(r)&&HasBoundHeight(r)&&r.intervalFieldId!=r.multiplierFieldId&&
                 r.intervalFieldId!=r.fieldId&&r.intervalFieldId!=r.heightFieldId&&r.intervalFieldId!=r.speedFieldId&&
                 r.multiplierFieldId!=r.fieldId&&r.multiplierFieldId!=r.heightFieldId&&r.multiplierFieldId!=r.speedFieldId&&
-                ValidDeepFlushValues(r.jumpHeightScaled,r.deepFlushCycleInterval,r.deepFlushHeightMultiplierScaled,r.commissioningProfile)))&&
+                (ValidDeepFlushValues(r.jumpHeightScaled,r.deepFlushCycleInterval,r.deepFlushHeightMultiplierScaled,r.commissioningProfile)||IsG76OneMmB1_260(r)||IsG76ExpansionB1_263(r))))&&
         ((!r.machiningFieldId&&!r.machiningSpeedPercentScaled)||
             (HasBoundMachiningSpeed(r)&&HasBoundDeep(r)&&ValidMachiningSpeedPercent(r.machiningSpeedPercentScaled)&&
                 r.machiningFieldId!=r.fieldId&&r.machiningFieldId!=r.speedFieldId&&
@@ -447,7 +749,7 @@ inline bool ValidHistoryRecipeBinding(unsigned fixture,const Recipe& r) noexcept
 {
     return ValidRecipe(r)&&EDM149::ValidHistoryBinding(fixture,r.diagnosticControlSource)&&
         (!r.holdRetreatMode||fixture==(IsVisibleFlush167(r)?EDM149::SixVisibleFlushHistoryFixture:IsVisibleFlush159(r)?EDM149::XYZVisibleFlushHistoryFixture:EDM149::ProgramHistoryFixture))&&
-        (!r.flushHoldTest||fixture==((IsG76B2FlushHold200(r)||IsG76CenterHold217(r))?EDM149::G76GapHistoryFixture:
+        (!r.flushHoldTest||fixture==((IsG76CommissioningRecipe(r)||IsG76B2FlushHold200(r)||IsG76CenterHold217(r)||IsG76CenterAnyFlushHold232(r)||IsG76CenterRepeat230(r)||IsG76ParentSequence233(r)||IsG76CenterSequence239(r)||IsG76CenterSequence240(r)||IsG76CenterSequence241(r)||IsG76CenterSequence242(r)||IsG76CenterSequence243(r)||IsG76CenterSequence244(r)||IsG76CenterSequence245(r)||IsG76CenterSequence246(r)||IsG76CenterSequence248(r)||IsG76CenterSequence247(r))?EDM149::G76GapHistoryFixture:
             IsVisibleFlush167(r)?EDM149::SixVisibleFlushHistoryFixture:IsVisibleFlush159(r)?EDM149::XYZVisibleFlushHistoryFixture:EDM149::ProgramHistoryFixture))&&
         ((fixture==EDM149::VisibleFlushHistoryFixture)==IsVisibleFlush(r))&&
         ((fixture==EDM149::XYZVisibleFlushHistoryFixture)==IsVisibleFlush159(r))&&

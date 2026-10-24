@@ -14,7 +14,9 @@ constexpr double MaximumRadiusMm=0.01;
 constexpr double CommissioningHeightMm=2.0;
 constexpr double MaximumRoundoffMm=1.0e-8;
 inline bool ValidCommissioningHeightMm(double height) noexcept
-{return height==1.0||height==CommissioningHeightMm;}
+// Pure geometry only. The recipe binder separately restricts 0.2 mm to
+// the explicit L233 architecture fixture; this grants no Motion authority.
+{return height==0.2||height==1.0||height==CommissioningHeightMm;}
 inline double Roundoff(double magnitude) noexcept
 {return 64.0*(std::numeric_limits<double>::epsilon)()*(std::max)(1.0,std::fabs(magnitude));}
 inline bool AxisNative(const Point& axisPulse,const Point& scale,Point& native) noexcept

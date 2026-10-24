@@ -211,7 +211,7 @@ public:
         std::uint64_t fingerprint, std::uint64_t parentDispatch, std::uint64_t epoch,
         int sourcePC, unsigned count) noexcept
     {
-        if (!fingerprint || !parentDispatch || !epoch || sourcePC < 0 || count != 25U)
+        if (!fingerprint || !parentDispatch || !epoch || sourcePC < 0 || (count != 25U && count != 26U))
             return Fail(Reason::Source);
         if (!Begin(scope,settings)) return false;
         compound_ = true; compoundFingerprint_ = fingerprint; compoundDispatch_ = parentDispatch;
@@ -225,7 +225,7 @@ public:
         if (!compound_ || !begun_ || currentValid_ || pending_ || stop_ || feedback_.faulted || !tick || !nowUs)
             return Fail(Reason::State);
         if (!fingerprint || fingerprint != compoundFingerprint_ || count != compoundCount_ ||
-            count != 25U || childOrdinal >= count || childOrdinal != compoundBound_ ||
+            (count != 25U && count != 26U) || childOrdinal >= count || childOrdinal != compoundBound_ ||
             compoundAppended_ != childOrdinal || !ValidSource(source) ||
             !EDM109::SameScope(scope_,source.scope) || source.dispatch != compoundDispatch_ ||
             source.epoch != compoundEpoch_ || source.sourcePC != compoundPC_ || source.ordinal != childOrdinal ||

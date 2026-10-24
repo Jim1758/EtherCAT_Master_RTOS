@@ -127,11 +127,43 @@ inline bool IsFlushPhase(Phase phase) noexcept
         phase==Phase::TopDwell||phase==Phase::Returning||phase==Phase::ReturnDwell||phase==Phase::Resume||
         phase==Phase::ToCenter||phase==Phase::CenterDwell||phase==Phase::CenterReturnDwell||phase==Phase::ToAnchor;
 }
-inline bool CanPauseTimedFlush(const Feedback& e) noexcept
+inline bool CanPauseTimedFlush(const Feedback& e,unsigned eventLimit=1U) noexcept
 {
+    const bool center=IsCenterMode(e.policy.mode);
+    // The caller binds this limit to its frozen recipe/coordinator. No old
+    // call site admits event two merely because its receipt names that event.
+    if(center&&(eventLimit<1U||eventLimit>2U||!e.eventIndex||e.eventIndex>eventLimit||
+        e.work.triggeredEvents!=e.eventIndex||e.work.completedEvents!=e.eventIndex-1ULL||
+        e.eventCount!=e.work.completedEvents))return false;
+    const unsigned priorDwells=center?5U*static_cast<unsigned>(e.eventIndex-1ULL):0U;
     const bool mainOnly=e.policy.mode==Mode::B2||e.phase==Phase::Brake||e.phase==Phase::AnchorDwell;
     const bool backend=mainOnly?!e.detached:(e.phase==Phase::Outbound||e.detached);
-    return !IsCenterMode(e.policy.mode)&&IsFlushPhase(e.phase)&&EDM116::ValidMode(e.policy.mode)&&backend&&
+    // EDM218-228 admit the center legs, dwells and pre-capture braking.
+    // EDM229 also freezes the committed rest boundaries before detaching
+    // the main path and before reattaching it after the exact return.
+    const bool centerLeg=((e.phase==Phase::ToCenter||e.phase==Phase::CenterDwell)&&!e.topCaptured&&
+        e.centerLegsCompleted==0U&&e.qualifiedDwells==priorDwells+1U)||
+        ((e.phase==Phase::Outbound||e.phase==Phase::TopDwell)&&!e.topCaptured&&
+        e.centerLegsCompleted==1U&&e.qualifiedDwells==priorDwells+2U)||
+        ((e.phase==Phase::Returning||e.phase==Phase::CenterReturnDwell)&&e.topCaptured&&
+        e.centerLegsCompleted==3U&&e.qualifiedDwells==priorDwells+3U)||
+        ((e.phase==Phase::ToAnchor||e.phase==Phase::ReturnDwell)&&e.topCaptured&&
+        e.centerLegsCompleted==7U&&e.qualifiedDwells==priorDwells+4U);
+    const bool centerMoving=centerLeg&&e.detached&&e.anchorCaptured&&e.targetCaptured&&e.centerCaptured;
+    const bool centerMainPause=(e.phase==Phase::Brake||e.phase==Phase::AnchorDwell)&&!e.detached&&
+        !e.anchorCaptured&&!e.targetCaptured&&!e.centerCaptured&&!e.topCaptured&&
+        e.centerLegsCompleted==0U&&e.qualifiedDwells==priorDwells;
+    const bool centerBeforeDetach=e.phase==Phase::ToCenter&&!e.detached&&
+        e.anchorCaptured&&e.targetCaptured&&e.centerCaptured&&!e.topCaptured&&
+        e.centerLegsCompleted==0U&&e.qualifiedDwells==priorDwells+1U&&!e.rowEventComplete&&
+        e.stableCycles>=EDM126::RequiredSeamStableCycles&&e.stableStartUs;
+    const bool centerBeforeResume=e.phase==Phase::Resume&&e.detached&&
+        e.anchorCaptured&&e.targetCaptured&&e.centerCaptured&&e.topCaptured&&e.exactReturn&&
+        e.centerLegsCompleted==15U&&e.qualifiedDwells==priorDwells+5U&&!e.rowEventComplete&&
+        e.stableCycles>=EDM126::RequiredSeamStableCycles&&e.stableStartUs;
+    const bool centerPaused=e.policy.fixture==EDM116::Fixture::ModalG76Gap173&&
+        (((centerMoving||centerMainPause||centerBeforeDetach)&&!e.exactReturn)||centerBeforeResume);
+    return (center?centerPaused:IsFlushPhase(e.phase)&&backend)&&EDM116::ValidMode(e.policy.mode)&&
         !e.faulted&&!e.stopped&&e.liveAnchor&&EDM130::IsTimed(e.work)&&
         EDM130::ValidWorkEvidence(e.work)&&e.work.completedEvents<e.work.triggeredEvents&&
         e.work.triggeredEvents-e.work.completedEvents==1ULL;
@@ -191,7 +223,18 @@ inline double ReservedB3VisibleAcceleration(double effectiveMaxSpeedMmSec,double
 }
 inline bool ValidAbsoluteJumpHeightMm(double h,unsigned profile=0U) noexcept
 {return std::isfinite(h)&&profile<=8U&&((profile==6U||profile==7U)?EDM204::ValidCommissioningHeightMm(h):
-    profile?h==CommissioningHeightMm(profile):(h>=0.0001&&h<=0.005));}
+    profile?((profile==4U&&h==1.0)||h==CommissioningHeightMm(profile)):(h>=0.0001&&h<=0.005));}
+// This is a geometric configuration check, not recipe or motion authority.
+// The full frozen recipe admits the new one-mm B1 only with L260/L261/L262.
+// Keep EDM130's generic profile4 helpers and all other fixture shapes intact.
+inline bool ValidHeightConfig260(const Policy& policy,double height,std::uint32_t interval,
+    double multiplier,bool bound) noexcept
+{
+    const unsigned profile=VisibleFlushProfile(policy);
+    return EDM130::ValidDeepFlushConfig(height,interval,multiplier,bound,profile)||
+        (policy.fixture==EDM116::Fixture::ModalG76Gap173&&policy.mode==Mode::B1&&profile==4U&&
+            height==1.0&&interval==0U&&multiplier==1.0&&bound);
+}
 inline bool HeightClose(double a,double b) noexcept
 {return std::isfinite(a)&&std::isfinite(b)&&std::fabs(a-b)<=EDM126::Roundoff((std::max)(std::fabs(a),std::fabs(b)));}
 // Local distance is measured by subtracting absolute pulse coordinates.
@@ -322,7 +365,7 @@ inline bool ValidHeightProof(const Feedback& e,double expectedBaseH,std::uint32_
     if((visible&&(e.policy.mode!=(profile==8U?Mode::B0:profile==7U?Mode::B4:profile==6U?Mode::B3:profile==5U?Mode::B2:Mode::B1)||!ValidAbsoluteJumpHeightMm(expectedBaseH,profile)||expectedN||expectedM!=1.0||!expectedDeepBound))||
         ((profile==4U||profile==5U||profile==6U||profile==7U||profile==8U)&&!ValidVisibleWorkTime(profile,e.work.workTimeUs))||
         !std::isfinite(expectedBaseH)||e.absoluteJumpHeightMm!=expectedBaseH||
-        !EDM130::ValidDeepFlushConfig(expectedBaseH,expectedN,expectedM,expectedDeepBound,profile)||
+        !ValidHeightConfig260(e.policy,expectedBaseH,expectedN,expectedM,expectedDeepBound)||
         e.deepBound!=expectedDeepBound||e.deepFlushCycleInterval!=expectedN||
         e.deepFlushHeightMultiplier!=expectedM)return false;
     double expectedH=expectedBaseH;
@@ -408,29 +451,31 @@ inline bool ValidHeightProof(const Feedback& e,double expectedBaseH,std::uint32_
 // Index 0 is the initial center; index k+1 is child k's final center.
 struct B3Orbit
 {
-    Point centers[EDM116::G76GapRows173+1U]{};
+    Point centers[EDM116::G76GapMaximumRows263+1U]{};
     Point machiningAxisNative{}; // Signed unit XYZ vector; C/U/V remain exactly zero.
     EDM109::Scope scope{};
     double centerReturnMmMin=0.0;
+    unsigned rows=EDM116::G76GapRows173;
 };
 inline bool EmptyB3Orbit(const B3Orbit& b) noexcept
 {
-    if(!EDM109::SameScope(b.scope,EDM109::Scope{})||b.centerReturnMmMin!=0.0||
+    if(b.rows!=EDM116::G76GapRows173||!EDM109::SameScope(b.scope,EDM109::Scope{})||b.centerReturnMmMin!=0.0||
         !EDM109::SamePulse(b.machiningAxisNative,Point{}))return false;
     for(const auto& p:b.centers)if(!EDM109::SamePulse(p,Point{}))return false;
     return true;
 }
 inline bool SameB3Orbit(const B3Orbit& a,const B3Orbit& b) noexcept
 {
-    if(!EDM109::SameScope(a.scope,b.scope)||a.centerReturnMmMin!=b.centerReturnMmMin||
+    if(a.rows!=b.rows||!EDM109::SameScope(a.scope,b.scope)||a.centerReturnMmMin!=b.centerReturnMmMin||
         !EDM109::SamePulse(a.machiningAxisNative,b.machiningAxisNative))return false;
-    for(unsigned k=0U;k<=EDM116::G76GapRows173;++k)
+    for(unsigned k=0U;k<=EDM116::G76GapMaximumRows263;++k)
         if(!EDM109::SamePulse(a.centers[k],b.centers[k]))return false;
     return true;
 }
 inline bool ValidB3Orbit(const B3Orbit& b,const EDM109::Scope& scope) noexcept
 {
-    if(!EDM109::ValidScope(scope)||!EDM109::SameScope(b.scope,scope)||
+    if((b.rows!=EDM116::G76GapRows173&&b.rows!=EDM116::G76GapMaximumRows263)||
+        !EDM109::ValidScope(scope)||!EDM109::SameScope(b.scope,scope)||
         !EDM126::Positive(b.centerReturnMmMin)||b.centerReturnMmMin>30.0)return false;
     double norm=0.0;
     for(unsigned a=0U;a<6U;++a) {
@@ -438,9 +483,11 @@ inline bool ValidB3Orbit(const B3Orbit& b,const EDM109::Scope& scope) noexcept
         if(a<3U)norm=std::hypot(norm,b.machiningAxisNative[a]);
     }
     if(!HeightClose(norm,1.0))return false;
-    for(const auto& p:b.centers)for(unsigned a=0U;a<6U;++a)
-        if(!std::isfinite(p[a])||(a>=3U&&p[a]!=b.centers[0U][a]))return false;
-    return EDM109::SamePulse(b.centers[24U],b.centers[25U]);
+    for(unsigned k=0U;k<=b.rows;++k)for(unsigned a=0U;a<6U;++a)
+        if(!std::isfinite(b.centers[k][a])||(a>=3U&&b.centers[k][a]!=b.centers[0U][a]))return false;
+    for(unsigned k=b.rows+1U;k<=EDM116::G76GapMaximumRows263;++k)
+        if(!EDM109::SamePulse(b.centers[k],Point{}))return false;
+    return EDM109::SamePulse(b.centers[b.rows-1U],b.centers[b.rows]);
 }
 // The signed vector must agree with the sealed center-line progression in
 // physical units. Reject unresolved or reversed directions before movement.
@@ -449,7 +496,7 @@ inline bool ValidB3OrbitMapping(const B3Orbit& b,const EDM109::Scope& scope,cons
     if(!ValidB3Orbit(b,scope))return false;
     for(unsigned a=0U;a<6U;++a)if(!EDM126::Positive(scale[a]))return false;
     double previous=0.0,lastBudget=0.0;
-    for(unsigned k=1U;k<=EDM116::G76GapRows173;++k) {
+    for(unsigned k=1U;k<=b.rows;++k) {
         Point delta{};double projection=0.0,budget=EDM126::Roundoff(0.0);
         for(unsigned a=0U;a<3U;++a) {
             delta[a]=(b.centers[k][a]-b.centers[0U][a])/scale[a];
@@ -474,18 +521,22 @@ public:
     bool BeginRow(EDM126::Traversal& main,const Policy& policy,const Point& lowPulse,const Point& highPulse,bool liveAnchor=false,std::uint64_t workTimeUs=0ULL,double absoluteJumpHeightMm=0.0,
         std::uint32_t deepFlushCycleInterval=0U,double deepFlushHeightMultiplier=0.0,bool deepBound=false,
         const EDM130::FlushStages& flushStages=EDM130::FlushStages{},
-        const B3Orbit* b3Orbit=nullptr) noexcept
+        const B3Orbit* b3Orbit=nullptr,unsigned visibleEventLimit=1U) noexcept
     {
         const EDM126::Feedback& f=main.Committed();
         const unsigned profile=VisibleFlushProfile(policy);const bool visible=profile!=0U;
-        if((IsCenterMode(policy.mode)?(!b3Orbit||!ValidB3OrbitMapping(*b3Orbit,f.authorizedSource.scope,main.CursorMapping().Geometry().line.pulsePerNative)):b3Orbit!=nullptr)||
+        if((visibleEventLimit!=1U&&(visibleEventLimit!=2U||
+                policy.fixture!=EDM116::Fixture::ModalG76Gap173||!IsCenterMode(policy.mode)))||
+            (rowValid_&&visibleEventLimit_!=visibleEventLimit)||
+            (IsCenterMode(policy.mode)?(!b3Orbit||b3Orbit->rows!=EDM116::PolicyRows(policy)||
+                !ValidB3OrbitMapping(*b3Orbit,f.authorizedSource.scope,main.CursorMapping().Geometry().line.pulsePerNative)):b3Orbit!=nullptr)||
             (rowValid_&&b3Orbit&&!SameB3Orbit(b3Orbit_,*b3Orbit))||
             (visible&&(policy.mode!=(profile==8U?Mode::B0:profile==7U?Mode::B4:profile==6U?Mode::B3:profile==5U?Mode::B2:Mode::B1)||!ValidAbsoluteJumpHeightMm(absoluteJumpHeightMm,profile)||!liveAnchor||!ValidVisibleWorkTime(profile,workTimeUs)||
                 !deepBound||deepFlushCycleInterval||deepFlushHeightMultiplier!=1.0))||
             (!EDM130::EmptyFlushStages(flushStages)&&(!EDM130::ValidFlushStages(flushStages)||
                 !absoluteJumpHeightMm||!liveAnchor||!workTimeUs))||
             (rowValid_&&!EDM130::SameFlushStages(flushStages_,flushStages))||
-            !EDM130::ValidDeepFlushConfig(absoluteJumpHeightMm,deepFlushCycleInterval,deepFlushHeightMultiplier,deepBound,profile)||
+            !ValidHeightConfig260(policy,absoluteJumpHeightMm,deepFlushCycleInterval,deepFlushHeightMultiplier,deepBound)||
             (deepBound&&(!absoluteJumpHeightMm||!liveAnchor||!workTimeUs))||
             (rowValid_&&(deepBound_!=deepBound||deepFlushCycleInterval_!=deepFlushCycleInterval||
                 deepFlushHeightMultiplier_!=deepFlushHeightMultiplier))||
@@ -498,7 +549,7 @@ public:
             !EDM116::IsModalFixture(policy.fixture)||!EDM116::PolicyMatchesBinding(policy,
                 static_cast<unsigned>(f.authorizedSource.ordinal),f.authorizedSource.sourcePC,f.authorizedSource.dispatch)||
             (rowValid_&&(policy.fixture==EDM116::Fixture::ModalG76Gap173||evidence_.policy.fixture==EDM116::Fixture::ModalG76Gap173)&&
-                (policy.fixture!=evidence_.policy.fixture||policy.mode!=evidence_.policy.mode||policy.selectorPC!=evidence_.policy.selectorPC||
+                (policy.fixture!=evidence_.policy.fixture||policy.g76Rows!=evidence_.policy.g76Rows||policy.mode!=evidence_.policy.mode||policy.selectorPC!=evidence_.policy.selectorPC||
                     policy.selectorDispatch!=evidence_.policy.selectorDispatch||policy.modeOriginPC!=evidence_.policy.modeOriginPC||
                     policy.modeOriginDispatch!=evidence_.policy.modeOriginDispatch||policy.modeOriginRevision!=evidence_.policy.modeOriginRevision||
                     !EDM107::SameFlushProfile(policy.profile,evidence_.policy.profile)))||
@@ -515,7 +566,7 @@ public:
         evidence_.deepBound=deepBound;evidence_.deepFlushCycleInterval=deepFlushCycleInterval;
         evidence_.deepFlushHeightMultiplier=deepFlushHeightMultiplier;
         evidence_.completedDeepEvents=deepBound&&deepFlushCycleInterval?work.completedEvents/deepFlushCycleInterval:0ULL;
-        absoluteJumpHeightMm_=absoluteJumpHeightMm;deepBound_=deepBound;
+        absoluteJumpHeightMm_=absoluteJumpHeightMm;deepBound_=deepBound;visibleEventLimit_=visibleEventLimit;
         deepFlushCycleInterval_=deepFlushCycleInterval;deepFlushHeightMultiplier_=deepFlushHeightMultiplier;
         flushStages_=flushStages;if(b3Orbit)b3Orbit_=*b3Orbit;
         ClearHeightCapture();
@@ -687,7 +738,7 @@ public:
         bool physicalSettled) noexcept
     {
         if(!rowValid_||stopping_||pending_||evidence_.faulted||
-            !CanPauseTimedFlush(committedEvidence_)||backend_!=committedBackend_||
+            !CanPauseTimedFlush(committedEvidence_,visibleEventLimit_)||backend_!=committedBackend_||
             (committedBackend_==Backend::Local?(!localValid_||!main.Suspended()):main.Suspended())||
             !Clock(tick,nowUs))return Fail();
         evidence_=committedEvidence_;backend_=committedBackend_;ClearSpeedSample();
@@ -698,9 +749,12 @@ public:
             if(!local_.Step(tick,nowUs,0.0,physicalSettled))return Fail();
             LocalImage();
         }
-        // Held wall time never satisfies an E5 dwell. Resume already has a
-        // qualified exact return needed to reattach the suspended main path.
-        if(evidence_.phase!=Phase::Resume)ResetDwell();
+        // Held wall time never satisfies an E5 dwell. The two transfer
+        // boundaries already hold a completed dwell proof. Keep it for
+        // reattachment, including cancellation of a pending first local step.
+        const bool transferBoundary=evidence_.phase==Phase::Resume||
+            (evidence_.phase==Phase::ToCenter&&!evidence_.detached);
+        if(!transferBoundary)ResetDwell();
         evidence_.work.previousEligible=false;image_.completeReady=false;
         CaptureSpeedProof();return Propose();
     }
@@ -759,6 +813,14 @@ public:
             SpeedProofCurrent(committedEvidence_,committedSpeedProof_)&&
             (!pending_||SpeedProofCurrent(evidence_,speedProof_));
     }
+    bool IsEventLimitCurrent(unsigned eventLimit) const noexcept
+    {
+        return rowValid_&&visibleEventLimit_==eventLimit&&
+            (!VisibleFlushProfile(evidence_.policy)||
+                (committedEvidence_.work.triggeredEvents<=eventLimit&&
+                 committedEvidence_.work.completedEvents<=eventLimit&&
+                 (!pending_||(evidence_.work.triggeredEvents<=eventLimit&&evidence_.work.completedEvents<=eventLimit))));
+    }
     bool Active() const noexcept{return rowValid_;}
     bool ExcursionActive() const noexcept{return rowValid_&&committedEvidence_.phase!=Phase::Gap;}
     void Clear() noexcept
@@ -767,7 +829,7 @@ public:
         anchor_=topTarget_=EDM126::Cursor{};localCurve_=EDM112::Curve{};localLimits_=EDM126::Limits{};
         low_=high_=Point{};localSpeed_=0.0;rowValid_=pending_=stopping_=first_=localValid_=false;
         backend_=committedBackend_=Backend::Main;absoluteJumpHeightMm_=0.0;
-        deepBound_=false;deepFlushCycleInterval_=0U;deepFlushHeightMultiplier_=0.0;
+        deepBound_=false;deepFlushCycleInterval_=0U;deepFlushHeightMultiplier_=0.0;visibleEventLimit_=1U;
         flushStages_=EDM130::FlushStages{};b3Orbit_=B3Orbit{};
         speedProof_=committedSpeedProof_=SpeedCapture{};
         ClearHeightCapture();committedHeight_=height_;
@@ -790,6 +852,7 @@ private:
         bool deepCycle=false;
         double effectiveJumpHeightMm=0.0;
     };
+    unsigned visibleEventLimit_=1U;
     double absoluteJumpHeightMm_=0.0;
     std::uint32_t deepFlushCycleInterval_=0U;
     double deepFlushHeightMultiplier_=0.0;
@@ -822,7 +885,7 @@ private:
     }
     bool TimedTrigger(const EDM126::Traversal& main,bool eligible) const noexcept
     {
-        if((VisibleFlushProfile(evidence_.policy)!=0U&&evidence_.work.completedEvents!=0ULL)||!eligible||!evidence_.work.due||committed_.velocityMmSec<=0.0||committed_.atCurrentEnd||
+        if((VisibleFlushProfile(evidence_.policy)!=0U&&evidence_.work.completedEvents>=visibleEventLimit_)||!eligible||!evidence_.work.due||committed_.velocityMmSec<=0.0||committed_.atCurrentEnd||
             committed_.awaitingSeam||committed_.localMm<=0.0||committed_.localMm>=committed_.lengthMm)return false;
         if(evidence_.policy.mode!=Mode::B2)return true;
         EDM126::Cursor target{};
@@ -912,7 +975,7 @@ private:
         const auto& scale=main.CursorMapping().Geometry().line.pulsePerNative;
         if(!IsCenterMode(evidence_.policy.mode)||(VisibleFlushProfile(evidence_.policy)!=6U&&VisibleFlushProfile(evidence_.policy)!=7U)||
             !ValidB3OrbitMapping(b3Orbit_,a.cursorSource.scope,scale)||
-            a.cursorSource.ordinal>=EDM116::G76GapRows173||!EDM126::Positive(a.lengthMm)||
+            a.cursorSource.ordinal>=b3Orbit_.rows||!EDM126::Positive(a.lengthMm)||
             a.localMm<0.0||a.localMm>a.lengthMm||!Zero(a))return false;
         const unsigned k=static_cast<unsigned>(a.cursorSource.ordinal);
         const double u=a.localMm==a.lengthMm?1.0:a.localMm/a.lengthMm;
@@ -1224,7 +1287,9 @@ private:
         EDM109::SamePulse(f.positionPulse,evidence_.anchor.positionPulse);}
     bool Propose() noexcept
     {
-        if(!EDM130::ValidWorkEvidence(evidence_.work)||!HeightEvidenceCurrent(evidence_)||
+        if((VisibleFlushProfile(evidence_.policy)!=0U&&
+                (evidence_.work.triggeredEvents>visibleEventLimit_||evidence_.work.completedEvents>visibleEventLimit_))||
+            !EDM130::ValidWorkEvidence(evidence_.work)||!HeightEvidenceCurrent(evidence_)||
             !SpeedProofCurrent(evidence_,speedProof_)||image_.faulted||!EDM126::SameSource(image_.authorizedSource,committed_.authorizedSource))return Fail();
         for(unsigned i=0U;i<6U;++i)if(!std::isfinite(image_.positionPulse[i])||image_.positionPulse[i]<low_[i]||image_.positionPulse[i]>high_[i])return Fail();
         pending_=true;return true;

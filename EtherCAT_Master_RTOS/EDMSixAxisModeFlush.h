@@ -25,6 +25,7 @@ enum class Fixture : std::uint8_t
 { Canonical116 = 0U, Complement117 = 1U, ArcPair124 = 2U, ArcPairComplement124 = 3U,
   Modal127 = 4U, ModalComplement127 = 5U, ModalZ149 = 6U, ModalXYZ150 = 7U, ModalSix151 = 8U, ModalArc152 = 9U, ModalOrder153 = 10U, ModalSparse154 = 11U, ModalSparseArc155 = 12U, ModalProgram156 = 13U, ModalPause157 = 14U, ModalVisibleFlush158 = 15U, ModalXYZVisibleFlush159 = 16U, ModalSixVisibleFlush167 = 17U, ModalG76Gap173 = 18U };
 constexpr unsigned G76GapRows173 = 25U;
+constexpr unsigned G76GapMaximumRows263 = 26U;
 inline unsigned PolicyRows(Fixture fixture) noexcept
 { return fixture == Fixture::ModalG76Gap173 ? G76GapRows173 : EDM114::RequiredRows; }
 inline bool IsModalFixture(Fixture fixture) noexcept
@@ -111,7 +112,21 @@ struct Policy
     // fabricated B dispatch. Legacy explicit-P131 policies keep origin empty.
     int modeOriginPC = -1;
     std::uint64_t modeOriginDispatch = 0ULL, modeOriginRevision = 0ULL;
+    // EDM263 explicitly seals the 26-child target-plane expansion. Existing
+    // compound and unrelated fixtures retain their original 25-row default.
+    unsigned g76Rows = G76GapRows173;
 };
+inline unsigned PolicyRows(const Policy& policy) noexcept
+{
+    if (policy.fixture != Fixture::ModalG76Gap173)
+        return policy.g76Rows == G76GapRows173 ? PolicyRows(policy.fixture) : 0U;
+    return policy.g76Rows == G76GapRows173 || policy.g76Rows == G76GapMaximumRows263 ? policy.g76Rows : 0U;
+}
+inline int ExpectedGCode(unsigned step, const Policy& policy, int authoredCode = 0) noexcept
+{
+    return policy.fixture == Fixture::ModalG76Gap173 ? (step < PolicyRows(policy) ? 1 : 0) :
+        policy.g76Rows == G76GapRows173 ? ExpectedGCode(step,policy.fixture,authoredCode) : 0;
+}
 inline bool ValidPolicy(const Policy& policy) noexcept
 {
     if ((policy.fixture == Fixture::ModalVisibleFlush158 && (policy.mode != Mode::B1 || policy.revision != 1ULL)) ||
@@ -120,7 +135,7 @@ inline bool ValidPolicy(const Policy& policy) noexcept
         (policy.fixture == Fixture::ModalG76Gap173 && policy.mode != Mode::B0 && policy.mode != Mode::B1 && policy.mode != Mode::B2 && !IsCenterMode(policy.mode)) ||
         (IsCenterMode(policy.mode) && policy.fixture != Fixture::ModalG76Gap173) ||
         !ValidMode(policy.mode) || !ValidFixture(policy.fixture) || !EDM107::ValidFlushProfile(policy.profile) || policy.selectorPC < 0 ||
-        !policy.selectorDispatch || policy.revision < 1ULL || policy.revision > PolicyRows(policy.fixture)) return false;
+        !policy.selectorDispatch || policy.revision < 1ULL || policy.revision > PolicyRows(policy)) return false;
     if (!IsModalFixture(policy.fixture)) return policy.modeOriginPC == -1 && !policy.modeOriginDispatch && !policy.modeOriginRevision;
     return policy.modeOriginPC >= 0 && policy.modeOriginDispatch && policy.modeOriginRevision &&
         policy.modeOriginPC <= policy.selectorPC && policy.modeOriginDispatch <= policy.selectorDispatch &&
@@ -130,11 +145,12 @@ inline bool SamePolicy(const Policy& a, const Policy& b) noexcept
 {
     return a.mode == b.mode && a.fixture == b.fixture && EDM107::SameFlushProfile(a.profile,b.profile) && a.selectorPC == b.selectorPC &&
         a.selectorDispatch == b.selectorDispatch && a.revision == b.revision &&
-        a.modeOriginPC == b.modeOriginPC && a.modeOriginDispatch == b.modeOriginDispatch && a.modeOriginRevision == b.modeOriginRevision;
+        a.modeOriginPC == b.modeOriginPC && a.modeOriginDispatch == b.modeOriginDispatch && a.modeOriginRevision == b.modeOriginRevision &&
+        a.g76Rows == b.g76Rows;
 }
 inline bool PolicyMatchesBinding(const Policy& policy, unsigned step, int sourcePC, std::uint64_t dispatch) noexcept
 {
-    return ValidPolicy(policy) && step < PolicyRows(policy.fixture) && sourcePC >= 0 && dispatch &&
+    return ValidPolicy(policy) && step < PolicyRows(policy) && sourcePC >= 0 && dispatch &&
         policy.revision == static_cast<std::uint64_t>(step)+1ULL &&
         (IsModalFixture(policy.fixture) ? (policy.selectorPC == sourcePC && policy.selectorDispatch == dispatch) :
             (policy.selectorPC < sourcePC && policy.selectorDispatch < dispatch));
@@ -144,7 +160,7 @@ inline bool PolicyMatchesSource(const Policy& policy, const Source& source) noex
     const bool validSource = policy.fixture == Fixture::ModalG76Gap173 ?
         (EDM109::ValidScope(source.scope) && source.dispatch && source.epoch &&
             source.epoch <= (std::numeric_limits<std::uint32_t>::max)() && source.segment &&
-            source.sourcePC >= 0 && source.step < G76GapRows173) : EDM114::ValidSource(source);
+            source.sourcePC >= 0 && source.step < PolicyRows(policy)) : EDM114::ValidSource(source);
     return validSource && PolicyMatchesBinding(policy,source.step,source.sourcePC,source.dispatch);
 }
 inline bool PolicyFollowsCompleted(const Policy& policy, const Policy& previous, const Source& source) noexcept
@@ -153,7 +169,7 @@ inline bool PolicyFollowsCompleted(const Policy& policy, const Policy& previous,
     // ordinal advances; neither the selector nor its modal origin is invented.
     if (policy.fixture == Fixture::ModalG76Gap173)
         return ValidPolicy(policy) && PolicyMatchesSource(previous,source) && policy.fixture == previous.fixture &&
-            policy.mode == previous.mode &&
+            policy.mode == previous.mode && policy.g76Rows == previous.g76Rows &&
             policy.revision == previous.revision+1ULL && policy.selectorPC == source.sourcePC &&
             policy.selectorDispatch == source.dispatch && policy.modeOriginPC == previous.modeOriginPC &&
             policy.modeOriginDispatch == previous.modeOriginDispatch && policy.modeOriginRevision == previous.modeOriginRevision &&

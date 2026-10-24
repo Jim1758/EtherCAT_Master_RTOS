@@ -1280,7 +1280,8 @@ inline bool IsMotionEDMCommissioningMarkerEncodingValid(const MotionCommand& com
         selected += value;
     }
     return selected <= 1U && (bytes[offsetof(MotionCommand, edm173G76Gap)] ?
-        command.edm173ChildCount==25U && command.edm173ChildOrdinal<25U :
+        (command.edm173ChildCount==25U || command.edm173ChildCount==26U) &&
+        command.edm173ChildOrdinal<command.edm173ChildCount :
         command.edm173ChildCount==0U && command.edm173ChildOrdinal==0U);
 }
 
@@ -2484,8 +2485,8 @@ struct MotionG76OrbitProducerWorkspace
 struct MotionEDM173Seal
 {
     EDM173::Plan plan{};
-    std::array<MotionExecutionIdentity,25U> identities{};
-    std::array<std::array<double,8U>,25U> endPulse{};
+    std::array<MotionExecutionIdentity,EDM173::MaximumNominalCount> identities{};
+    std::array<std::array<double,8U>,EDM173::MaximumNominalCount> endPulse{};
     std::array<double,8U> startPulse{},pulsePerUnit{};
     MotionExecutionEpoch epoch=MOTION_EXECUTION_EPOCH_INVALID;
 };
@@ -2508,7 +2509,7 @@ struct MotionEDM173Storage
     EDM173::ValidationScratch validation{}; // Startup-owned; only the RT seal consumer writes it.
     EDM128::B3Orbit b3Orbit{}; // B3/B4 center table: RT-owned, frozen at first child bind.
     std::atomic<std::uint64_t> publishedSession{0ULL};
-    EDM53::Channel<EDM173::Feedback,2048U> feedback{};
+    EDM53::Channel<EDM173::Feedback,4096U> feedback{};
     EDM173::Feedback currentFeedback{};
     // FIX7: RT-owned, observation-only source evidence. No control authority.
     EDM173InputDiag::Recorder inputDiagnostic{};
@@ -2766,7 +2767,7 @@ public:
         const MotionOwnerLease& lease, const EDM97::Tuning& tuning,
         const EDM107::FlushProfile& flushProfile, unsigned fixture, const EDM130::Recipe& recipe,
         std::uint64_t manualRun = 0ULL, std::uint64_t manualCache = 0ULL,
-        bool rejectBeforeArm = false) noexcept;
+        bool rejectBeforeArm = false, unsigned ordinarySequenceProgram = 0U) noexcept;
     bool AuthorizeEDM130Feed(std::uint64_t session, std::uint64_t run, std::uint64_t cache,
         std::uint64_t dispatch, int sourcePC, unsigned step, int gCode,
         const std::array<double,6U>& increment, const std::array<double,2U>& center,
@@ -2786,6 +2787,11 @@ public:
         MotionExecutionEpoch armEpoch, const MotionOwnerLease& armLease,
         MotionExecutionEpoch completionEpoch, const MotionOwnerLease& idleLease,
         MotionOwnerGeneration& expectedNoneGeneration) noexcept;
+    bool RequestEDM233ParentRelease(std::uint64_t session,
+        MotionExecutionEpoch armEpoch, const MotionOwnerLease& armLease) noexcept;
+    bool RequestEDM234ParentRelease(std::uint64_t session, MotionExecutionEpoch armEpoch,
+        const MotionOwnerLease& armLease, unsigned kind, std::uint64_t run, std::uint64_t cache,
+        int parentPC, std::uint64_t parentDispatch, const EDM130::Recipe& recipe, unsigned program = 234U) noexcept;
     bool ReadEDM94Feedback(EDM94::Feedback& feedback) const noexcept;
     bool AuthorizeEDM94Feed(std::uint64_t session, std::uint64_t run, std::uint64_t cache,
         std::uint64_t dispatch, int sourcePC, unsigned step,
@@ -3885,6 +3891,7 @@ private:
         bool physicalAd = false; // EDM129 independent real-source selection
         bool workTimeFlush = false; // EDM130 E-recipe committed machining-time opt-in
         bool rejectionProbe = false; // EDM216 explicit L216: reject before Engine::Arm, never an output permit.
+        unsigned ordinarySequenceProgram = 0U; // EDM247 FIX1: explicit NC sequence scope, never inferred from recipe equality.
         EDM130::Recipe timerRecipe{}; // immutable NC -> RT admission and each handoff
         unsigned historyFixture = 0U;
         EDM116::Fixture modeFixture = EDM116::Fixture::Canonical116; // fixed at arm; never row-selected
@@ -4096,15 +4103,18 @@ private:
     FixedCapacitySpscRing<EDM157Request,4U> m_edm157Requests{};
     EDM157Request m_edm157Incoming{},m_edm157HoldRequest{},m_edm157ResumeRequest{};
     EDM157::Transaction m_edm157Pause{};
-    EDM53::Channel<EDM157::Feedback,1024U> m_edm157Feedback{};
+    EDM53::Channel<EDM157::Feedback,1152U> m_edm157Feedback{};
     std::uint64_t m_edm157ZeroOutputTick=0ULL,m_edm157QualifySeedTick=0ULL;
+    std::uint64_t m_edm157PhysicalDiagnosticTick=0ULL;
+    std::uint32_t m_edm157PhysicalEvaluated=0U,m_edm157PhysicalFailures=0U,m_edm157PhysicalAxisMask=0U;
     EDM157::Scope CurrentEDM157Scope() const noexcept;
     bool IsEDM157ScopeCurrent(const EDM157::Scope& scope) const noexcept;
     bool IsEDM157PublishedScopeCurrent(const EDM157::Scope& scope, std::uint64_t& tick,
         std::uint64_t& nowUs) const noexcept;
     bool ServiceEDM157Requests() noexcept;
     void ObserveEDM157PauseProof(bool complete,const EDM94::RuntimeDiagnostic& priorSendProof) noexcept;
-    void RejectEDM157Pause() noexcept;
+    void RejectEDM157Pause(EDM157::RejectSite site,EDM157::Phase priorPhase,
+        std::uint32_t proofEvaluated=0U,std::uint32_t proofFailures=0U,std::uint64_t proofTick=0ULL) noexcept;
     void PublishEDM157Feedback() noexcept;
     // EDM126 bounded traversal state (no NC rewind or historical side-effect replay).
     bool m_edm126Profile=false, m_edm126Participating=false, m_edm126PhysicalSettled=false;
@@ -4269,10 +4279,42 @@ private:
     bool m_edm94CompletionRevoked = false;
     bool m_edm94CompletionOwnerReleased = false;
     // Claim pins the session; this CAS orders NC cancel against normal release.
-    // 0=open, 1=cancel won, 2=normal release committed.
+    // 0=open, 1=cancel won, 2=M30 release, 3=EDM233 parent retirement.
     std::atomic<unsigned> m_edm94CompletionDecision{0U};
     std::uint64_t m_edm94CompletionOwnerReleaseTick = 0ULL;
     void FinishEDM94CompletionRelease(ServoOutputFrameReservation& reservation,
+        bool exactSent, bool handedOff) noexcept;
+    struct EDM233ParentReleaseRequest
+    {
+        EDM94::Identity armIdentity{};
+        MotionOwnerLease lease{};
+        MotionExecutionEpoch liveEpoch = MOTION_EXECUTION_EPOCH_INVALID;
+        std::uint64_t safetyIntent = 0ULL, alarmIntent = 0ULL;
+        std::uint32_t alarmRevision = 0U;
+    };
+    FixedCapacitySpscRing<EDM233ParentReleaseRequest, 2U> m_edm233ParentReleaseRequests{};
+    EDM233ParentReleaseRequest m_edm233ParentReleaseRequest{}; // RT owner only
+    EDM94::Identity m_edm233ParentReleaseSubmitted{}; // NC producer only
+    bool m_edm233ParentReleasePending = false;
+    void FinishEDM233ParentRelease(ServoOutputFrameReservation& reservation,
+        bool exactSent, bool handedOff) noexcept;
+    struct EDM234ParentReleaseRequest
+    {
+        EDM94::Identity armIdentity{};
+        MotionOwnerLease lease{};
+        MotionExecutionEpoch liveEpoch = MOTION_EXECUTION_EPOCH_INVALID;
+        std::uint64_t run = 0ULL, cache = 0ULL, parentDispatch = 0ULL;
+        int parentPC = -1;
+        unsigned kind = 0U, program = 0U;
+        EDM130::Recipe recipe{};
+        std::uint64_t safetyIntent = 0ULL, alarmIntent = 0ULL;
+        std::uint32_t alarmRevision = 0U;
+    };
+    FixedCapacitySpscRing<EDM234ParentReleaseRequest, 2U> m_edm234ParentReleaseRequests{};
+    EDM234ParentReleaseRequest m_edm234ParentReleaseRequest{}; // RT owner only
+    EDM234ParentReleaseRequest m_edm234ParentReleaseSubmitted{}; // NC producer only
+    bool m_edm234ParentReleasePending = false;
+    void FinishEDM234ParentRelease(ServoOutputFrameReservation& reservation,
         bool exactSent, bool handedOff) noexcept;
     std::uint64_t m_edm94LastSession = 0ULL;
     std::uint64_t m_edm94ArmUs = 0ULL;

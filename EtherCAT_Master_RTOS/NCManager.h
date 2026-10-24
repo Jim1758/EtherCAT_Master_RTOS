@@ -2660,9 +2660,114 @@ private:
         bool prepared=false,published=false,parentCommitted=false,completed=false;
     };
     std::unique_ptr<EDM173NCState> m_edm173{};
+    // EDM233 retains the one initial M00 grant across exactly two parents.
+    // Each parent keeps its independent EDM173 session and E5 ledger.
+    struct EDM233NCState
+    {
+        NCTranslationSnapshot translation{};
+        MotionOwnerLease lease{};
+        MotionExecutionEpoch epoch=MOTION_EXECUTION_EPOCH_INVALID;
+        std::array<unsigned,2U> arms{};
+        std::uint64_t run=0ULL,cache=0ULL,confirmationDispatch=0ULL,startRequests=0ULL;
+        std::uint64_t recipeGeneration=0ULL,processGeneration=0ULL;
+        std::uint64_t firstSession=0ULL,firstFinishDispatch=0ULL,releaseFloorTick=0ULL,releaseTick=0ULL;
+        int firstArmPC=-1;
+        bool authorized=false,releasePending=false,firstReleased=false,secondStarted=false;
+    } m_edm233{};
+    bool IsEDM233SequenceScopeCurrentSameThread() noexcept;
+    bool IsEDM233SecondArmCurrentSameThread(int,unsigned) noexcept;
+    bool BeginEDM233SequenceSameThread(int) noexcept;
+    bool ConsumeEDM233ParentReleaseSameThread();
+    // EDM237 seals two alternating history/G76 parents; EDM238 seals four.
+    // Every handoff consumes its own stopped fresh-session receipt.
+    struct EDM237NCState
+    {
+        NCTranslationSnapshot translation{};
+        EDM130::Recipe firstRecipe{},currentRecipe{};
+        MotionOwnerLease lease{};
+        MotionExecutionEpoch epoch=MOTION_EXECUTION_EPOCH_INVALID,currentArmEpoch=MOTION_EXECUTION_EPOCH_INVALID;
+        std::array<unsigned,4U> kinds{};
+        std::array<int,4U> armPC{{-1,-1,-1,-1}};
+        std::uint64_t run=0ULL,cache=0ULL,confirmationDispatch=0ULL,startRequests=0ULL;
+        std::uint64_t recipeGeneration=0ULL,processGeneration=0ULL,firstSession=0ULL,currentSession=0ULL,previousSession=0ULL;
+        std::uint64_t motionDispatch=0ULL,currentFinishDispatch=0ULL,firstFinishDispatch=0ULL,releaseFloorTick=0ULL,releaseTick=0ULL;
+        // EDM237 FIX1: NC-only observation cadence; never motion authority.
+        std::uint64_t b2TraceTick=0ULL;
+        std::uint64_t previousFinishDispatch=0ULL,previousReleaseFloorTick=0ULL;
+        int firstArmPC=-1;
+        unsigned program=0U,parentCount=0U,parentIndex=0U,currentRowBound=0U,retiredMask=0U;
+        bool authorized=false,firstRecipeBound=false,stageRecipeBound=false,stageStarted=false;
+        bool awaitNext=false,releasePending=false,firstReleased=false;
+        struct EDM240Bridge
+        {
+            EDM130::Recipe previewRecipe{};
+            EDMRecipeControl::Key beforeKey{},afterKey{};
+            MotionOwnerLease lease{};
+            MotionExecutionEpoch epoch=MOTION_EXECUTION_EPOCH_INVALID;
+            std::uint64_t run=0ULL,cache=0ULL,dispatch=0ULL,controlGeneration=0ULL,releaseTick=0ULL;
+            std::uint64_t previousSession=0ULL,finishDispatch=0ULL,beforeGeneration=0ULL,afterGeneration=0ULL;
+            int pc=-1,line=0;
+            bool prepared=false,committed=false;
+        };
+        std::array<EDM240Bridge,3U> bridges{};
+        unsigned bridgeMask=0U;
+    } m_edm237{};
+    bool IsEDM237SequenceScopeCurrentSameThread(bool nativeParentReceipt=false,bool recipeBridgeReceipt=false) noexcept;
+    bool IsEDM240RecipeBridgeCurrentSameThread(int pc,bool afterApply=false) noexcept;
+    bool PrepareEDM240RecipeBridgeSameThread(const NCBlock&,int,int,NCBlockDispatchId);
+    bool CommitEDM240RecipeBridgeSameThread(const NCBlock&);
+    bool AcceptEDM240RecipeBridgeSameThread(const EDMRecipeControl::Result&,const EDM130::Recipe&) noexcept;
+    bool IsEDM237NextArmCurrentSameThread(int,unsigned) noexcept;
+    bool BeginEDM237SequenceSameThread(int) noexcept;
+    bool PreflightEDM237OrdinarySameThread(int) noexcept;
+    bool BindEDM237RecipeSameThread() noexcept;
+    bool ConsumeEDM237ConfirmationSameThread(int) noexcept;
+    bool BindEDM237ParentEpochSameThread(MotionExecutionEpoch,std::uint64_t,int) noexcept;
+    bool FinishEDM237ParentSameThread();
+    bool ConsumeEDM237ParentReleaseSameThread();
+    bool IsEDM237FinalStateSameThread() const noexcept;
+    struct EDM234NCState
+    {
+        NCTranslationSnapshot translation{};
+        EDM130::Recipe firstRecipe{};
+        MotionOwnerLease lease{};
+        MotionExecutionEpoch epoch=MOTION_EXECUTION_EPOCH_INVALID;
+        std::array<unsigned,2U> arms{};
+        std::uint64_t run=0ULL,cache=0ULL,confirmationDispatch=0ULL,startRequests=0ULL;
+        std::uint64_t recipeGeneration=0ULL,processGeneration=0ULL,firstSession=0ULL;
+        std::uint64_t motionDispatch=0ULL,firstFinishDispatch=0ULL,currentFinishDispatch=0ULL,releaseFloorTick=0ULL,releaseTick=0ULL;
+        int firstArmPC=-1;
+        unsigned program=0U,ordinaryGCode=0U;
+        // EDM236 adds a bounded four-parent cursor; legacy two-parent fields
+        // above retain their original 234/235 meaning.
+        std::array<unsigned,4U> kinds{};
+        EDM130::Recipe currentRecipe{};
+        std::uint64_t currentSession=0ULL,previousSession=0ULL,previousReleaseFloorTick=0ULL;
+        unsigned parentIndex=0U,retiredMask=0U;
+        bool stageRecipeBound=false,stageStarted=false,awaitNext=false;
+        bool authorized=false,firstRecipeBound=false,releasePending=false,firstReleased=false,secondStarted=false;
+    } m_edm234{};
+    static bool IsEDM234BracketShapeValid(const NCBlock&) noexcept;
+    bool IsEDM234SequenceScopeCurrentSameThread() noexcept;
+    bool IsEDM234NextArmCurrentSameThread(int,unsigned) noexcept;
+    bool BeginEDM234SequenceSameThread(int) noexcept;
+    bool PreflightEDM234LineSameThread(int) noexcept;
+    bool BindEDM234RecipeSameThread() noexcept;
+    bool BindEDM234ParentEpochSameThread(MotionExecutionEpoch,std::uint64_t,int) noexcept;
+    bool FinishEDM234ParentSameThread();
+    bool ConsumeEDM234ParentReleaseSameThread();
+    bool IsEDM236SequenceScopeCurrentSameThread() noexcept;
+    bool IsEDM236NextArmCurrentSameThread(int,unsigned) noexcept;
+    bool BeginEDM236SequenceSameThread(int) noexcept;
+    bool PreflightEDM236OrdinarySameThread(int) noexcept;
+    bool BindEDM236RecipeSameThread() noexcept;
+    bool ConsumeEDM236ConfirmationSameThread(int) noexcept;
+    bool BindEDM236ParentEpochSameThread(MotionExecutionEpoch,std::uint64_t,int) noexcept;
+    bool FinishEDM236ParentSameThread();
+    bool ConsumeEDM236ParentReleaseSameThread();
     static bool IsEDM173BracketShapeValid(const NCBlock&) noexcept;
     static bool IsEDM173OrbitBlockShapeValid(const NCBlock&) noexcept;
-    bool IsEDM173BracketBlockSameThread(const NCBlock&) const noexcept;
+    bool IsEDM173BracketBlockSameThread(const NCBlock&) noexcept;
     bool IsEDM173OrbitAllowedSameThread(const NCBlock&) noexcept;
     bool IsEDM173TerminalBlockAllowedSameThread(const NCBlock&) noexcept;
     bool FreezeEDM173TranslationSameThread();
@@ -3083,6 +3188,9 @@ private:
         EDM157::Feedback feedback{};
         std::uint64_t holdSequence=0ULL, startFloor=0ULL, resumeStartSequence=0ULL;
         std::uint64_t requestTick=0ULL, lastTick=0ULL;
+        // EDM223: one operator START may wait for current zero proof; not an RT request.
+        std::uint64_t startIntentSequence=0ULL, startIntentTick=0ULL, startIntentUs=0ULL;
+        bool startIntentPending=false;
         std::uint64_t compoundCommit=0ULL; // EDM199 immutable NC parent commit.
         std::uint64_t safetyProvenance=0ULL, alarmIntent=0ULL;
         std::uint32_t alarmUpdate=0U;
@@ -3113,10 +3221,13 @@ private:
     bool CaptureEDM157ScopeSameThread(EDM157::Scope& scope) noexcept;
     bool TryHoldEDM157SameThread() noexcept;
     bool TryResumeEDM157SameThread() noexcept;
+    bool TryRetainEDM223StartSameThread() noexcept;
+    void ServiceEDM223StartIntentSameThread(bool feedbackCurrent) noexcept;
     bool ServiceEDM157SameThread(bool feedbackCurrent);
     void ServiceEDM165AutoFlushHoldSameThread(bool feedbackCurrent);
     void ServiceEDM200AutoFlushHoldSameThread(bool feedbackCurrent);
     void ServiceEDM217AutoNominalHoldSameThread(bool feedbackCurrent);
+    void ServiceEDM218AutoCenterFlushHoldSameThread(bool feedbackCurrent);
     bool IsEDM200AutoHoldCheckpointCompleteSameThread() const noexcept;
     bool IsEDM168AutoHoldCheckpointCompleteSameThread() const noexcept;
     void LogEDM157SameThread(const char* event, const char* reason) const noexcept;

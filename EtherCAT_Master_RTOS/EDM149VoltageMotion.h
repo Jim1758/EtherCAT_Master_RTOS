@@ -127,7 +127,7 @@ public:
     bool Enabled() const noexcept { return enabled_; }
     bool BeginCompound(std::uint64_t session, unsigned source, double referenceV, unsigned count) noexcept
     {
-        if (source != 3U || count != 25U) return Fail();
+        if (source != 3U || (count != 25U && count != 26U)) return Fail();
         if (!Begin(session,source,referenceV)) return false;
         compoundCount_ = count; return true;
     }

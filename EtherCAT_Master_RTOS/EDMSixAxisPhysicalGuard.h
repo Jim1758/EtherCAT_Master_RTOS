@@ -48,6 +48,9 @@ namespace EDM94
     // Admission at a completed endpoint, not the zero-output physical stop proof.
     static constexpr std::uint32_t BoundaryReadyCycles = 200U;
     static constexpr std::uint64_t MaximumDurationUs = 120000000ULL;
+    // EDM247 FIX1/EDM248: the four-row ordinary parent includes every E5 flush and
+    // physical dwell. Only its explicit frozen sequence selector gets 180 s.
+    static constexpr std::uint64_t OrdinarySequenceMaximumDurationUs247 = 180000000ULL;
     // The five-mm fixture and E210 slowed two-mm B3/B4 fixtures use the
     // longer window. Ordinary GAP/motion retains the original deadline.
     static constexpr double VisibleFlushReferenceMmSec = 0.065;
@@ -622,6 +625,7 @@ namespace EDM94
         std::uint64_t maxSourceGapUs = 2000ULL;
         bool visibleZFlush158 = false; // Frozen visible-Z commissioning-family permission; ABI retained.
         std::uint8_t commissioningProfile = 0U; // Existing padding: 0 ordinary, 1 five-mm Z, 2 two-mm XYZ, 3 two-mm XYZCUV, 4 G76 two-mm B1, 5 G76 bounded-path B2, 6 G76 axial-center B3, 7 G76 axial-upper-center B4.
+        std::uint16_t ordinarySequenceProgram = 0U; // Prior padding; 247/248 explicitly select their ordinary-parent time budget.
     };
     inline bool EmptyLoadCenterFollowingProfile(const Config& config) noexcept
     {
@@ -739,31 +743,54 @@ namespace EDM94
         CenterMotion motion=CenterMotion::None;
         double motionSpeedMmSec=0.0;
         std::array<double,6U> motionCommandPulse{},motionVelocityPps{};
+        unsigned childCount=25U; // Sealed RT-local compound identity; legacy defaults to 25.
     };
     inline bool SameCenterGeometry(const CenterEnvelope& a,const CenterEnvelope& b) noexcept
     {
         return SameIdentity(a.identity,b.identity)&&a.liveEpoch==b.liveEpoch&&a.run==b.run&&a.cache==b.cache&&
             a.dispatch==b.dispatch&&a.fingerprint==b.fingerprint&&a.sourceEpoch==b.sourceEpoch&&
-            a.segment==b.segment&&a.child==b.child&&a.sourcePC==b.sourcePC&&
+            a.segment==b.segment&&a.child==b.child&&a.childCount==b.childCount&&a.sourcePC==b.sourcePC&&
             EDM204::SameGeometry(a.geometry,b.geometry);
+    }
+    namespace detail
+    {
+        inline bool ValidCenterEnvelopeHeader(const CenterEnvelope& e,const Config& c) noexcept
+        {
+            const bool profile=c.commissioningProfile==6U||c.commissioningProfile==7U;
+            const auto& g=e.geometry;
+            return profile&&c.visibleZFlush158&&ValidIdentity(e.identity)&&e.tick&&e.nowUs&&
+                e.liveEpoch&&e.run&&e.cache&&e.dispatch&&e.fingerprint&&e.sourceEpoch&&e.segment&&
+                (e.childCount==25U||e.childCount==26U)&&e.child<e.childCount&&
+                e.sourcePC>=0&&e.leg<=1U&&g.mode==c.commissioningProfile-3U&&
+                EDM204::ValidCommissioningHeightMm(g.heightMm);
+        }
+        inline bool CenterEnvelopeFitsConfigAxes(const CenterEnvelope& e,const Config& c) noexcept
+        {
+            const auto& g=e.geometry;
+            for(unsigned i=0U;i<6U;++i) {
+                const double p=g.pulsePerNative[i],limit=NativeExcursionLimit(i)*p;
+                if(p!=c.axis[i].pulsePerUnit||
+                    std::fabs(g.anchorPulse[i]-c.axis[i].commandAnchor)>limit||
+                    std::fabs(g.nominalCenterPulse[i]-c.axis[i].commandAnchor)>limit||
+                    std::fabs(g.centerPulse[i]-c.axis[i].commandAnchor)>limit||
+                    (i>=3U&&g.anchorPulse[i]!=c.axis[i].commandAnchor))return false;
+            }
+            return true;
+        }
     }
     inline bool ValidCenterEnvelope(const CenterEnvelope& e,const Config& c) noexcept
     {
-        const bool profile=c.commissioningProfile==6U||c.commissioningProfile==7U;
-        const auto& g=e.geometry;
-        if(!profile||!c.visibleZFlush158||!ValidIdentity(e.identity)||!e.tick||!e.nowUs||
-            !e.liveEpoch||!e.run||!e.cache||!e.dispatch||!e.fingerprint||!e.sourceEpoch||!e.segment||
-            e.child>=25U||e.sourcePC<0||e.leg>1U||g.mode!=c.commissioningProfile-3U||
-            !EDM204::ValidCommissioningHeightMm(g.heightMm)||!EDM204::ValidGeometry(g))return false;
-        for(unsigned i=0U;i<6U;++i) {
-            const double p=g.pulsePerNative[i],limit=NativeExcursionLimit(i)*p;
-            if(p!=c.axis[i].pulsePerUnit||
-                std::fabs(g.anchorPulse[i]-c.axis[i].commandAnchor)>limit||
-                std::fabs(g.nominalCenterPulse[i]-c.axis[i].commandAnchor)>limit||
-                std::fabs(g.centerPulse[i]-c.axis[i].commandAnchor)>limit||
-                (i>=3U&&g.anchorPulse[i]!=c.axis[i].commandAnchor))return false;
-        }
-        return true;
+        return detail::ValidCenterEnvelopeHeader(e,c)&&EDM204::ValidGeometry(e.geometry)&&
+            detail::CenterEnvelopeFitsConfigAxes(e,c);
+    }
+    inline bool BuildCenterEnvelopeGeometry(CenterEnvelope& e,const Config& c,
+        const EDM204::Point& anchor,const EDM204::Point& nominalCenter,const EDM204::Point& axisPulse,
+        const EDM204::Point& scale,double height,unsigned mode) noexcept
+    {
+        // A successful build proves this exact geometry within this call.
+        // Received envelopes still use ValidCenterEnvelope and rebuild it.
+        return EDM204::Build(anchor,nominalCenter,axisPulse,scale,height,mode,e.geometry)&&
+            detail::ValidCenterEnvelopeHeader(e,c)&&detail::CenterEnvelopeFitsConfigAxes(e,c);
     }
     inline double CenterDynamicFollowingWindowPulse(const AxisConfig& c) noexcept
     {
@@ -875,6 +902,8 @@ namespace EDM94
     };
     enum class CompletionReleasePhase : std::uint32_t
     { None, Requested, AwaitingZero, Released, Revoked };
+    enum class ParentReleasePhase : std::uint32_t
+    { None, Requested, Revoked, Released };
     struct Feedback
     {
         RuntimeDiagnostic firstFault{};
@@ -890,6 +919,14 @@ namespace EDM94
         std::uint32_t completionIdleOwnerGeneration = 0U;
         std::uint32_t completionNoneOwnerGeneration = 0U;
         bool completionReleased = false;
+        // EDM233 retires one completed parent while retaining the same AUTO
+        // owner and execution epoch. It grants no subsequent motion authority.
+        ParentReleasePhase parentReleasePhase = ParentReleasePhase::None;
+        std::uint64_t parentReleaseTick = 0ULL;
+        bool parentReleased = false;
+        // EDM234/235/236 identify a stopped-stage retirement receipt. The
+        // original EDM233 lane leaves these discriminators at zero.
+        std::uint16_t parentReleaseProgram = 0U, parentReleaseKind = 0U;
         Config config{};
         AxisEvidence axis[AxisCount]{};
         std::int32_t expectedCsv[AxisCount]{};
@@ -1096,6 +1133,8 @@ namespace EDM94
                 m_followingTripWindowPulse[axis]=config.axis[axis].followingWindowPulse; }
             m_acceptedIdentity = Identity{}; m_acceptedTick = m_acceptedSourceNowUs = 0ULL;
             const bool validMovementMask = (config.visibleZFlush158 == visibleZFlush158) &&
+                (!config.ordinarySequenceProgram || (boundedProgram && requiredMovementMask == 7U &&
+                    !visibleZFlush158 && config.commissioningProfile == 0U)) &&
                 (!visibleZFlush158 || (boundedProgram && requiredMovementMask == VisibleFlushRequiredMask(config.commissioningProfile))) &&
                 (!IsNominalMovementProfile(config.commissioningProfile) ||
                     (boundedProgram && (requiredMovementMask == 3U || requiredMovementMask == 7U))) &&
@@ -1724,6 +1763,100 @@ namespace EDM94
             return true;
         }
 
+        void ObserveParentRelease(ParentReleasePhase phase) noexcept
+        {
+            if (!Active() || m_feedback.parentReleased ||
+                (phase != ParentReleasePhase::Requested && phase != ParentReleasePhase::Revoked)) return;
+            if (m_feedback.parentReleasePhase == ParentReleasePhase::Revoked) return;
+            m_feedback.parentReleasePhase = phase;
+        }
+        bool CanReleaseFinishedParent(const Identity& identity, const Frame& frame,
+            bool exactParentReady) const noexcept
+        {
+            return exactParentReady && m_feedback.armAccepted && m_feedback.boundedProgram &&
+                m_feedback.finishTargetBound && m_feedback.finishRequested && m_feedback.pass &&
+                !m_feedback.cancelled && !m_feedback.faulted && !m_feedback.handoffZero &&
+                (m_feedback.config.commissioningProfile == 6U || m_feedback.config.commissioningProfile == 7U) &&
+                m_feedback.parentReleasePhase == ParentReleasePhase::Requested &&
+                m_feedback.completionPhase == CompletionReleasePhase::None &&
+                SameIdentity(identity,m_feedback.currentIdentity) &&
+                identity.ownerGeneration == m_feedback.identity.ownerGeneration &&
+                MovementProven() && CanReleaseStopProof(identity,frame,true);
+        }
+        bool ReleaseFinishedParent(const Identity& identity, const Frame& frame,
+            bool exactParentReady) noexcept
+        {
+            if (!CanReleaseFinishedParent(identity,frame,exactParentReady) ||
+                !ReleaseStopProof(identity,frame,true)) return false;
+            m_feedback.parentReleasePhase = ParentReleasePhase::Released;
+            m_feedback.parentReleaseTick = frame.tick;
+            m_feedback.parentReleased = true;
+            return true;
+        }
+
+        void ObserveParentRelease234(unsigned kind, unsigned program = 234U) noexcept
+        {
+            const bool stage = program == 234U ? (kind == 1U || kind == 2U) :
+                program == 235U ? (kind == 2U || kind == 3U || kind == 4U) :
+                program == 236U ? kind >= 1U && kind <= 4U :
+                (program == 237U || program == 238U) ? (kind == 2U || kind == 5U) :
+                program == 239U ? (kind == 6U || kind == 7U) :
+                program == 240U ? (kind == 5U || kind == 6U || kind == 7U) :
+                (program == 241U || program == 242U || program == 243U || program == 244U) ? (kind == 2U || kind == 5U || kind == 6U || kind == 7U) :
+                (program == 245U || program == 247U) ? (kind == 2U || kind == 5U || kind == 6U) :
+                (program == 246U || program == 248U) && (kind == 2U || kind == 5U || kind == 7U);
+            if (!Active() || m_feedback.parentReleased || !stage ||
+                (m_feedback.config.ordinarySequenceProgram &&
+                    (program != m_feedback.config.ordinarySequenceProgram || kind != 5U)) ||
+                m_feedback.parentReleasePhase != ParentReleasePhase::None) return;
+            m_feedback.parentReleaseProgram = static_cast<std::uint16_t>(program);
+            m_feedback.parentReleaseKind = static_cast<std::uint16_t>(kind);
+            ObserveParentRelease(ParentReleasePhase::Requested);
+        }
+        bool CanReleaseFinishedStage234(const Identity& identity, const Frame& frame,
+            bool exactStageReady, unsigned kind, unsigned program = 234U) const noexcept
+        {
+            const bool stage = program == 234U ? (kind == 1U || kind == 2U) :
+                program == 235U ? (kind == 2U || kind == 3U || kind == 4U) :
+                program == 236U ? kind >= 1U && kind <= 4U :
+                (program == 237U || program == 238U) ? (kind == 2U || kind == 5U) :
+                program == 239U ? (kind == 6U || kind == 7U) :
+                program == 240U ? (kind == 5U || kind == 6U || kind == 7U) :
+                (program == 241U || program == 242U || program == 243U || program == 244U) ? (kind == 2U || kind == 5U || kind == 6U || kind == 7U) :
+                (program == 245U || program == 247U) ? (kind == 2U || kind == 5U || kind == 6U) :
+                (program == 246U || program == 248U) && (kind == 2U || kind == 5U || kind == 7U);
+            const bool profile = kind == 1U ?
+                m_feedback.config.commissioningProfile == 0U && m_feedback.requiredMovementMask == 4U :
+                kind == 2U ? m_feedback.config.commissioningProfile == 5U && m_feedback.requiredMovementMask == 7U :
+                kind == 5U ? m_feedback.config.commissioningProfile == 0U && m_feedback.requiredMovementMask == 7U :
+                (kind == 6U || kind == 7U) ? m_feedback.config.commissioningProfile == kind && m_feedback.requiredMovementMask == 7U :
+                (kind == 3U || kind == 4U) && m_feedback.config.commissioningProfile == 0U && m_feedback.requiredMovementMask == 3U;
+            const bool centerStage = ((program == 239U || program == 240U || program == 241U || program == 242U || program == 243U || program == 244U) && (kind == 6U || kind == 7U)) ||
+                ((program == 245U || program == 247U) && kind == 6U) || ((program == 246U || program == 248U) && kind == 7U);
+            return exactStageReady && stage && profile && m_feedback.config.visibleZFlush158 == centerStage &&
+                (!m_feedback.config.ordinarySequenceProgram ||
+                    (program == m_feedback.config.ordinarySequenceProgram && kind == 5U)) &&
+                m_feedback.parentReleaseProgram == program && m_feedback.parentReleaseKind == kind &&
+                m_feedback.armAccepted && m_feedback.boundedProgram && m_feedback.finishTargetBound &&
+                m_feedback.finishRequested && m_feedback.pass && !m_feedback.cancelled &&
+                !m_feedback.faulted && !m_feedback.handoffZero &&
+                m_feedback.parentReleasePhase == ParentReleasePhase::Requested &&
+                m_feedback.completionPhase == CompletionReleasePhase::None &&
+                SameIdentity(identity,m_feedback.currentIdentity) &&
+                identity.ownerGeneration == m_feedback.identity.ownerGeneration &&
+                MovementProven() && CanReleaseStopProof(identity,frame,true);
+        }
+        bool ReleaseFinishedStage234(const Identity& identity, const Frame& frame,
+            bool exactStageReady, unsigned kind, unsigned program = 234U) noexcept
+        {
+            if (!CanReleaseFinishedStage234(identity,frame,exactStageReady,kind,program) ||
+                !ReleaseStopProof(identity,frame,true)) return false;
+            m_feedback.parentReleasePhase = ParentReleasePhase::Released;
+            m_feedback.parentReleaseTick = frame.tick;
+            m_feedback.parentReleased = true;
+            return true;
+        }
+
         // explicitResetReady is supplied only after the EXISTING RESET settle
         // and rebase proof. This operation never performs the rebase itself.
         bool Release(const Identity& identity, const Frame& frame, bool explicitResetReady) noexcept
@@ -1779,11 +1912,16 @@ namespace EDM94
         }
         static bool ValidConfig(const Config& config) noexcept
         {
+            if (config.ordinarySequenceProgram != 0U && config.ordinarySequenceProgram != 247U &&
+                config.ordinarySequenceProgram != 248U) return false;
+            const bool ordinarySequence = config.ordinarySequenceProgram == 247U || config.ordinarySequenceProgram == 248U;
             if (config.commissioningProfile > 8U ||
                 config.visibleZFlush158 != ((config.commissioningProfile >= 1U && config.commissioningProfile <= 4U) || config.commissioningProfile == 6U || config.commissioningProfile == 7U) ||
                 config.maxDurationUs == 0ULL ||
-                (config.visibleZFlush158 ? config.maxDurationUs != VisibleFlushDurationUs(config.commissioningProfile) :
-                    config.maxDurationUs > MaximumDurationUs) ||
+                (ordinarySequence ? (config.commissioningProfile != 0U || config.visibleZFlush158 ||
+                    config.maxDurationUs != OrdinarySequenceMaximumDurationUs247) :
+                    (config.visibleZFlush158 ? config.maxDurationUs != VisibleFlushDurationUs(config.commissioningProfile) :
+                        config.maxDurationUs > MaximumDurationUs)) ||
                 config.maxSourceGapUs == 0ULL || config.maxSourceGapUs > 2000ULL) return false;
             for (unsigned axis = 0U; axis < AxisCount; ++axis)
             {

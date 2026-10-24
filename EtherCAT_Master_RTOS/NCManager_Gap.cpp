@@ -1307,6 +1307,7 @@ void NCManager::RejectEDMRecipeEditSameThread(int line, const char* reason, EDMR
 
 bool NCManager::PrepareEDMRecipeEditSameThread(const NCBlock& block, int sourcePC, int line, NCBlockDispatchId dispatch)
 {
+    if(m_edm237.authorized&&(m_edm237.program==240U||m_edm237.program==241U||m_edm237.program==242U||m_edm237.program==243U||m_edm237.program==244U||m_edm237.program==245U||m_edm237.program==246U||m_edm237.program==247U||m_edm237.program==248U))return PrepareEDM240RecipeBridgeSameThread(block,sourcePC,line,dispatch);
     m_recipeEditPrepared.ready = false;
     const NCProgramCacheLine* source = GetBaseProgramCache().TryGetLine(sourcePC);
     if (m_mode != NCOperationMode::MEMORY || !m_macroStack.empty() || !source ||
@@ -1338,6 +1339,7 @@ bool NCManager::PrepareEDMRecipeEditSameThread(const NCBlock& block, int sourceP
 
 bool NCManager::CommitEDMRecipeEditSameThread(const NCBlock& block)
 {
+    if(m_edm237.authorized&&(m_edm237.program==240U||m_edm237.program==241U||m_edm237.program==242U||m_edm237.program==243U||m_edm237.program==244U||m_edm237.program==245U||m_edm237.program==246U||m_edm237.program==247U||m_edm237.program==248U))return CommitEDM240RecipeBridgeSameThread(block);
     const int line = m_recipeEditPrepared.line;
     const NCProgramCacheLine* source = GetBaseProgramCache().TryGetLine(m_recipeEditPrepared.sourcePC);
     EDMRecipeControl::Request decoded{};
@@ -1387,7 +1389,10 @@ bool NCManager::IsEDM173DiagnosticQuietSameThread() const noexcept
     // Use only NC-owned cached state. No RT channel read, publication, or
     // control mutation is introduced by asking whether passive IO may wait.
     const auto& s = m_edm94;
-    return m_state.load(std::memory_order_relaxed) == NCState::RUN &&
+    // EDM231 FIX2: passive diagnostics stay quiet during HOLD braking and
+    // HELD. Fault/cancel/reset/release still reopen the existing diagnostics.
+    const NCState state = m_state.load(std::memory_order_relaxed);
+    return (state == NCState::RUN || state == NCState::HOLD) &&
         s.program && s.latched && EDM173::IsArm(s.gapHistoryArm) &&
         !s.complete && !s.cancelled && !s.resetSeen && !s.resetCommitted &&
         !s.releaseRequested && !s.rtFaultReported &&
@@ -1579,6 +1584,7 @@ EDMVoltage::Snapshot NCManager::ReadEDMVoltageSnapshotSameThread() noexcept
 
 bool NCManager::IsGapDryRunBlockShapeValid(const NCBlock& block) noexcept
 {
+    if(block.has('P')&&block.val('P')==274.0&&block.has('L')&&(block.val('L')==234.0||block.val('L')==235.0||block.val('L')==236.0||block.val('L')==237.0||block.val('L')==238.0||block.val('L')==240.0||block.val('L')==241.0||block.val('L')==242.0||block.val('L')==243.0||block.val('L')==244.0||block.val('L')==245.0||block.val('L')==246.0||block.val('L')==247.0||block.val('L')==248.0))return IsEDM234BracketShapeValid(block);
     if (block.has('P') && (block.val('P')==292.0 || block.val('P')==293.0 || block.val('P')==294.0 || block.val('P')==295.0 || block.val('P')==296.0 || block.val('P')==297.0 || block.val('P')==298.0 || block.val('P')==299.0 || block.val('P')==300.0 || block.val('P')==301.0)) return IsEDM173BracketShapeValid(block);
     if (block.has('P') && (block.val('P') == 158.0 || block.val('P') == 159.0 ||
         block.val('P') == 160.0 || block.val('P') == 161.0))
@@ -15884,6 +15890,278 @@ namespace
             EDM77::Detail::Clean(b)&&b.has('L')&&!b.has('H')&&
             EDM77::Detail::EqualLiteral(b.expression('L'),1U);
     }
+    bool E218CenterFlushHold(const NCParsedBlock& b, unsigned selector) noexcept
+    {
+        return (selector==EDM173::B3ArmP||selector==EDM173::B4ArmP)&&
+            EDM77::Detail::Clean(b)&&b.has('L')&&!b.has('H')&&
+            EDM77::Detail::EqualLiteral(b.expression('L'),2U);
+    }
+    bool E219CenterReturnHold(const NCParsedBlock& b, unsigned selector) noexcept
+    {
+        return (selector==EDM173::B3ArmP||selector==EDM173::B4ArmP)&&
+            EDM77::Detail::Clean(b)&&b.has('L')&&!b.has('H')&&
+            EDM77::Detail::EqualLiteral(b.expression('L'),3U);
+    }
+    bool E220CenterAnchorHold(const NCParsedBlock& b, unsigned selector) noexcept
+    {
+        return (selector==EDM173::B3ArmP||selector==EDM173::B4ArmP)&&
+            EDM77::Detail::Clean(b)&&b.has('L')&&!b.has('H')&&
+            EDM77::Detail::EqualLiteral(b.expression('L'),4U);
+    }
+    bool E221CenterStartHold(const NCParsedBlock& b, unsigned selector) noexcept
+    {
+        return (selector==EDM173::B3ArmP||selector==EDM173::B4ArmP)&&
+            EDM77::Detail::Clean(b)&&b.has('L')&&!b.has('H')&&
+            EDM77::Detail::EqualLiteral(b.expression('L'),5U);
+    }
+    bool E222CenterTopDwellHold(const NCParsedBlock& b, unsigned selector) noexcept
+    {
+        return (selector==EDM173::B3ArmP||selector==EDM173::B4ArmP)&&
+            EDM77::Detail::Clean(b)&&b.has('L')&&!b.has('H')&&
+            EDM77::Detail::EqualLiteral(b.expression('L'),6U);
+    }
+    bool E224CenterDwellHold(const NCParsedBlock& b, unsigned selector) noexcept
+    {
+        return (selector==EDM173::B3ArmP||selector==EDM173::B4ArmP)&&
+            EDM77::Detail::Clean(b)&&b.has('L')&&!b.has('H')&&
+            EDM77::Detail::EqualLiteral(b.expression('L'),7U);
+    }
+    bool E225CenterReturnDwellHold(const NCParsedBlock& b, unsigned selector) noexcept
+    {
+        return (selector==EDM173::B3ArmP||selector==EDM173::B4ArmP)&&
+            EDM77::Detail::Clean(b)&&b.has('L')&&!b.has('H')&&
+            EDM77::Detail::EqualLiteral(b.expression('L'),8U);
+    }
+    bool E226CenterFinalDwellHold(const NCParsedBlock& b, unsigned selector) noexcept
+    {
+        return (selector==EDM173::B3ArmP||selector==EDM173::B4ArmP)&&
+            EDM77::Detail::Clean(b)&&b.has('L')&&!b.has('H')&&
+            EDM77::Detail::EqualLiteral(b.expression('L'),9U);
+    }
+    bool E227CenterInitialDwellHold(const NCParsedBlock& b, unsigned selector) noexcept
+    {
+        return (selector==EDM173::B3ArmP||selector==EDM173::B4ArmP)&&
+            EDM77::Detail::Clean(b)&&b.has('L')&&!b.has('H')&&
+            EDM77::Detail::EqualLiteral(b.expression('L'),10U);
+    }
+    bool E228CenterBrakeHold(const NCParsedBlock& b, unsigned selector) noexcept
+    {
+        return (selector==EDM173::B3ArmP||selector==EDM173::B4ArmP)&&
+            EDM77::Detail::Clean(b)&&b.has('L')&&!b.has('H')&&
+            EDM77::Detail::EqualLiteral(b.expression('L'),11U);
+    }
+    // EDM230 is a bounded two-event commissioning selector, not a HOLD checkpoint.
+    bool E230CenterRepeat(const NCParsedBlock& b, unsigned selector) noexcept
+    {
+        return (selector==EDM173::B3ArmP||selector==EDM173::B4ArmP)&&
+            EDM77::Detail::Clean(b)&&b.has('L')&&!b.has('H')&&
+            EDM77::Detail::EqualLiteral(b.expression('L'),230U);
+    }
+    // EDM231 keeps the two-event cap and selects only event 2 Outbound.
+    bool E231CenterSecondFlushHold(const NCParsedBlock& b, unsigned selector) noexcept
+    {
+        return (selector==EDM173::B3ArmP||selector==EDM173::B4ArmP)&&
+            EDM77::Detail::Clean(b)&&b.has('L')&&!b.has('H')&&
+            EDM77::Detail::EqualLiteral(b.expression('L'),231U);
+    }
+    // EDM232 keeps event 1 uninterrupted and pauses only event 2 Returning.
+    bool E232CenterSecondReturnHold(const NCParsedBlock& b, unsigned selector) noexcept
+    {
+        return (selector==EDM173::B3ArmP||selector==EDM173::B4ArmP)&&
+            EDM77::Detail::Clean(b)&&b.has('L')&&!b.has('H')&&
+            EDM77::Detail::EqualLiteral(b.expression('L'),232U);
+    }
+    // Two fresh parent sessions; this selector never requests an automatic HOLD.
+    bool E233CenterParentSequence(const NCParsedBlock& b, unsigned selector) noexcept
+    {
+        return (selector==EDM173::B3ArmP||selector==EDM173::B4ArmP)&&
+            EDM77::Detail::Clean(b)&&b.has('L')&&!b.has('H')&&
+            EDM77::Detail::EqualLiteral(b.expression('L'),233U);
+    }
+    bool E234ArmSequence(const NCParsedBlock& b,unsigned selector) noexcept
+    {
+        return (selector==274U||selector==EDM173::B2ArmP)&&EDM77::Detail::Clean(b)&&
+            b.has('P')&&EDM77::Detail::EqualLiteral(b.expression('P'),selector)&&
+            b.has('L')&&!b.has('H')&&(EDM77::Detail::EqualLiteral(b.expression('L'),234U)||
+                EDM77::Detail::EqualLiteral(b.expression('L'),235U)||EDM77::Detail::EqualLiteral(b.expression('L'),236U));
+    }
+    bool E237ArmSequence(const NCParsedBlock& b,unsigned selector) noexcept
+    {
+        const bool history=(selector==274U||selector==EDM173::B2ArmP)&&
+            (EDM77::Detail::EqualLiteral(b.expression('L'),237U)||EDM77::Detail::EqualLiteral(b.expression('L'),238U));
+        const bool center=(selector==EDM173::B3ArmP||selector==EDM173::B4ArmP)&&
+            EDM77::Detail::EqualLiteral(b.expression('L'),239U);
+        const bool mixed=(selector==274U||selector==EDM173::B3ArmP||selector==EDM173::B4ArmP)&&
+            EDM77::Detail::EqualLiteral(b.expression('L'),240U);
+        const bool allKinds=(selector==274U||selector==EDM173::B2ArmP||selector==EDM173::B3ArmP||selector==EDM173::B4ArmP)&&
+            (EDM77::Detail::EqualLiteral(b.expression('L'),241U)||EDM77::Detail::EqualLiteral(b.expression('L'),242U)||EDM77::Detail::EqualLiteral(b.expression('L'),243U)||EDM77::Detail::EqualLiteral(b.expression('L'),244U));
+        const bool repeatedOrdinary=(selector==274U||selector==EDM173::B2ArmP||selector==EDM173::B3ArmP)&&
+            EDM77::Detail::EqualLiteral(b.expression('L'),245U);
+        const bool repeatedOrdinaryB4=(selector==274U||selector==EDM173::B2ArmP||selector==EDM173::B4ArmP)&&
+            EDM77::Detail::EqualLiteral(b.expression('L'),246U);
+        const bool repeatedB2=(selector==274U||selector==EDM173::B2ArmP||selector==EDM173::B3ArmP)&&
+            EDM77::Detail::EqualLiteral(b.expression('L'),247U);
+        const bool repeatedB2B4=(selector==274U||selector==EDM173::B2ArmP||selector==EDM173::B4ArmP)&&
+            EDM77::Detail::EqualLiteral(b.expression('L'),248U);
+        return (history||center||mixed||allKinds||repeatedOrdinary||repeatedOrdinaryB4||repeatedB2||repeatedB2B4)&&EDM77::Detail::Clean(b)&&b.has('P')&&
+            EDM77::Detail::EqualLiteral(b.expression('P'),selector)&&b.has('L')&&!b.has('H');
+    }
+    // The ordinary arc kinds share the stopped-parent protocol, while their
+    // program selector and geometry remain independently frozen in NC.
+    unsigned E234ParentKind(unsigned arm,unsigned program,unsigned ordinaryCode) noexcept
+    {
+        if(program!=234U&&program!=235U)return 0U;
+        if(arm==EDM173::B2ArmP)return 2U;
+        if(arm!=274U)return 0U;
+        return program==234U?(ordinaryCode==1U?1U:0U):
+            ordinaryCode==2U?3U:ordinaryCode==3U?4U:0U;
+    }
+    bool E220CenterAnchorSpan(const EDM128::Feedback& e,double& span) noexcept
+    {
+        span=0.0;EDM204::Geometry geometry{};
+        if(!EDM128::CenterAxisGeometry(e,geometry))return false;
+        // B4's last leg is diagonal: its true native length is not radius
+        // and is independent of E6's much longer axial withdrawal.
+        for(unsigned i=0U;i<6U;++i) {
+            if(i>=3U) {
+                if(!EDM109::SameDouble(geometry.anchorPulse[i],geometry.centerPulse[i]))return false;
+            } else span=std::hypot(span,(geometry.anchorPulse[i]-geometry.centerPulse[i])/geometry.pulsePerNative[i]);
+        }
+        return EDM126::Positive(span);
+    }
+    bool E221CenterStartProgress(const EDM128::Feedback& e,const EDM126::Point& position,
+        double& span,double& traveled) noexcept
+    {
+        span=traveled=0.0;EDM204::Geometry geometry{};double tolerance=0.0;
+        if(e.phase!=EDM128::Phase::ToCenter||!e.detached||
+            !EDM128::CenterAxisGeometry(e,geometry)||
+            !EDM204::CoordinateTolerance(geometry.anchorPulse,geometry.centerPulse,
+                geometry.pulsePerNative,tolerance))return false;
+        unsigned projection=0U;double largest=0.0;
+        for(unsigned i=0U;i<6U;++i) {
+            if(!std::isfinite(position[i]))return false;
+            if(i>=3U) {
+                if(!EDM109::SameDouble(position[i],geometry.anchorPulse[i])||
+                    !EDM109::SameDouble(geometry.centerPulse[i],geometry.anchorPulse[i]))return false;
+            } else {
+                const double native=(geometry.centerPulse[i]-geometry.anchorPulse[i])/geometry.pulsePerNative[i];
+                span=std::hypot(span,native);
+                if(std::fabs(native)>largest){largest=std::fabs(native);projection=i;}
+            }
+        }
+        // A sub-roundoff chord cannot provide a resolved 25% checkpoint.
+        if(!EDM126::Positive(span)||span<=4.0*tolerance||!EDM126::Positive(largest))return false;
+        const double from=geometry.anchorPulse[projection],to=geometry.centerPulse[projection];
+        const double magnitude=(std::max)((std::max)(std::fabs(from),std::fabs(to)),std::fabs(position[projection]));
+        const double qTolerance=2.0*EDM204::Roundoff(magnitude)/std::fabs(to-from);
+        double q=(position[projection]-from)/(to-from);
+        if(!std::isfinite(q)||!std::isfinite(qTolerance)||q < -qTolerance||q>1.0+qTolerance)return false;
+        q=(std::max)(0.0,(std::min)(1.0,q));
+        for(unsigned i=0U;i<3U;++i) {
+            const double a=geometry.anchorPulse[i],b=geometry.centerPulse[i];
+            const double want=q==0.0?a:q==1.0?b:a+(b-a)*q;
+            const double scale=(std::max)((std::max)(std::fabs(a),std::fabs(b)),std::fabs(position[i]));
+            const double budget=2.0*EDM204::Roundoff(scale);
+            if(!std::isfinite(want)||!std::isfinite(budget)||budget/geometry.pulsePerNative[i]>EDM204::MaximumRoundoffMm||
+                std::fabs(position[i]-want)>budget)return false;
+        }
+        // ToCenter has no StageSpeed sample: only the current mapped pulse
+        // point proves progress. Retained main-path localMm is the E5 anchor.
+        traveled=span*q;return std::isfinite(traveled)&&traveled>=0.0&&traveled<=span;
+    }
+    bool E218FlushCheckpointReceipt(const EDM157::Feedback& f) noexcept
+    {
+        return EDM130::IsG76CenterFlushHold218(f.scope.recipe)&&
+            EDM157::ValidG76CenterFlushReceipt(f)&&f.flushPause&&
+            f.flushPhase==EDM128::Phase::Outbound&&f.flushEventIndex==1ULL;
+    }
+    bool E219CenterFlushCheckpointReceipt(const EDM157::Feedback& f) noexcept
+    {
+        return E218FlushCheckpointReceipt(f)||
+            (EDM130::IsG76CenterReturnHold219(f.scope.recipe)&&
+                EDM157::ValidG76CenterFlushReceipt(f)&&f.flushPause&&
+                f.flushPhase==EDM128::Phase::Returning&&f.flushEventIndex==1ULL);
+    }
+    bool E220CenterFlushCheckpointReceipt(const EDM157::Feedback& f) noexcept
+    {
+        return E219CenterFlushCheckpointReceipt(f)||
+            (EDM130::IsG76CenterAnchorHold220(f.scope.recipe)&&
+                EDM157::ValidG76CenterFlushReceipt(f)&&f.flushPause&&
+                f.flushPhase==EDM128::Phase::ToAnchor&&f.flushEventIndex==1ULL);
+    }
+    bool E221CenterFlushCheckpointReceipt(const EDM157::Feedback& f) noexcept
+    {
+        return E220CenterFlushCheckpointReceipt(f)||
+            (EDM130::IsG76CenterStartHold221(f.scope.recipe)&&
+                EDM157::ValidG76CenterFlushReceipt(f)&&f.flushPause&&
+                f.flushPhase==EDM128::Phase::ToCenter&&f.flushEventIndex==1ULL);
+    }
+    bool E222CenterFlushCheckpointReceipt(const EDM157::Feedback& f) noexcept
+    {
+        return E221CenterFlushCheckpointReceipt(f)||
+            (EDM130::IsG76CenterTopDwellHold222(f.scope.recipe)&&
+                EDM157::ValidG76CenterFlushReceipt(f)&&f.flushPause&&
+                f.flushPhase==EDM128::Phase::TopDwell&&f.flushEventIndex==1ULL);
+    }
+    bool E224CenterFlushCheckpointReceipt(const EDM157::Feedback& f) noexcept
+    {
+        return E222CenterFlushCheckpointReceipt(f)||
+            (EDM130::IsG76CenterDwellHold224(f.scope.recipe)&&
+                EDM157::ValidG76CenterFlushReceipt(f)&&f.flushPause&&
+                f.flushPhase==EDM128::Phase::CenterDwell&&f.flushEventIndex==1ULL);
+    }
+    const char* E224CenterDwellIntentTag(const EDM130::Recipe& recipe) noexcept
+    {return EDM130::IsG76CenterDwellHold224(recipe)?"EDM224":"EDM223";}
+    bool E225CenterFlushCheckpointReceipt(const EDM157::Feedback& f) noexcept
+    {
+        return E224CenterFlushCheckpointReceipt(f)||
+            (EDM130::IsG76CenterReturnDwellHold225(f.scope.recipe)&&
+                EDM157::ValidG76CenterFlushReceipt(f)&&f.flushPause&&
+                f.flushPhase==EDM128::Phase::CenterReturnDwell&&f.flushEventIndex==1ULL);
+    }
+    const char* E225CenterDwellIntentTag(const EDM130::Recipe& recipe) noexcept
+    {return EDM130::IsG76CenterReturnDwellHold225(recipe)?"EDM225":E224CenterDwellIntentTag(recipe);}
+    bool E226CenterFlushCheckpointReceipt(const EDM157::Feedback& f) noexcept
+    {
+        return E225CenterFlushCheckpointReceipt(f)||
+            (EDM130::IsG76CenterFinalDwellHold226(f.scope.recipe)&&
+                EDM157::ValidG76CenterFlushReceipt(f)&&f.flushPause&&
+                f.flushPhase==EDM128::Phase::ReturnDwell&&f.flushEventIndex==1ULL);
+    }
+    const char* E226CenterDwellIntentTag(const EDM130::Recipe& recipe) noexcept
+    {return EDM130::IsG76CenterFinalDwellHold226(recipe)?"EDM226":E225CenterDwellIntentTag(recipe);}
+    bool E227CenterFlushCheckpointReceipt(const EDM157::Feedback& f) noexcept
+    {
+        return E226CenterFlushCheckpointReceipt(f)||
+            (EDM130::IsG76CenterInitialDwellHold227(f.scope.recipe)&&
+                EDM157::ValidG76CenterFlushReceipt(f)&&f.flushPause&&
+                f.flushPhase==EDM128::Phase::AnchorDwell&&f.flushEventIndex==1ULL);
+    }
+    const char* E227CenterDwellIntentTag(const EDM130::Recipe& recipe) noexcept
+    {return EDM130::IsG76CenterInitialDwellHold227(recipe)?"EDM227":E226CenterDwellIntentTag(recipe);}
+    bool E228CenterFlushCheckpointReceipt(const EDM157::Feedback& f) noexcept
+    {
+        return E227CenterFlushCheckpointReceipt(f)||
+            (EDM130::IsG76CenterBrakeHold228(f.scope.recipe)&&
+                EDM157::ValidG76CenterFlushReceipt(f)&&f.flushPause&&
+                f.flushPhase==EDM128::Phase::Brake&&f.flushEventIndex==1ULL);
+    }
+    bool E231CenterFlushCheckpointReceipt(const EDM157::Feedback& f) noexcept
+    {
+        return E228CenterFlushCheckpointReceipt(f)||
+            (EDM130::IsG76CenterSecondFlushHold231(f.scope.recipe)&&
+                EDM157::ValidG76CenterFlushReceipt(f)&&f.flushPause&&
+                f.flushPhase==EDM128::Phase::Outbound&&f.flushEventIndex==2ULL);
+    }
+    bool E232CenterFlushCheckpointReceipt(const EDM157::Feedback& f) noexcept
+    {
+        return E231CenterFlushCheckpointReceipt(f)||
+            (EDM130::IsG76CenterSecondReturnHold232(f.scope.recipe)&&
+                EDM157::ValidG76CenterFlushReceipt(f)&&f.flushPause&&
+                f.flushPhase==EDM128::Phase::Returning&&f.flushEventIndex==2ULL);
+    }
+    const char* E228CenterDwellIntentTag(const EDM130::Recipe& recipe) noexcept
+    {return EDM130::IsG76CenterBrakeHold228(recipe)?"EDM228":E227CenterDwellIntentTag(recipe);}
     bool E217NominalCheckpointReceipt(const EDM157::Feedback& f) noexcept
     {
         return EDM130::IsG76CenterHold217(f.scope.recipe)&&EDM157::ValidNominalWorkReceipt(f)&&
@@ -15898,12 +16176,229 @@ namespace
             EDM109::SameDouble(a.localMm,b.localMm)&&EDM109::SameDouble(a.stationMm,b.stationMm)&&
             EDM109::SamePulse(a.positionPulse,b.positionPulse);
     }
+    bool E223StartGuardCurrent(const EDM94::Feedback& guard,const EDM157::Feedback& paused,
+        bool allowPublishingLag=false) noexcept
+    {
+        const bool current=guard.lastTick>=paused.tick&&guard.lastTick-paused.tick<=8ULL&&
+            guard.lastNowUs>=paused.nowUs&&guard.lastNowUs-paused.nowUs<=2000ULL;
+        // Pause proof is published just before the guard. A nearby older
+        // guard may retain the operator intent, but can never submit it.
+        const bool publishingLag=allowPublishingLag&&guard.lastTick<paused.tick&&
+            paused.tick-guard.lastTick<=8ULL&&guard.lastNowUs<paused.nowUs&&
+            paused.nowUs-guard.lastNowUs<=2000ULL;
+        return guard.active&&guard.armAccepted&&guard.armedReady&&!guard.forceZero&&!guard.handoffZero&&
+            !guard.finishRequested&&!guard.cancelled&&!guard.faulted&&
+            guard.identity.session==paused.scope.authorizedSource.scope.session&&
+            guard.identity.epoch==paused.scope.compoundArmEpoch&&
+            guard.identity.ownerGeneration==paused.scope.ownerGeneration&&
+            paused.tick&&paused.nowUs&&guard.lastTick&&guard.lastNowUs&&(current||publishingLag);
+    }
+    bool E250SquareB1Arm(const NCParsedBlock& b,unsigned selector) noexcept
+    {
+        return selector==EDM173::ArmP&&EDM77::Detail::Clean(b)&&!b.isEmpty&&
+            b.gCount==1&&b.mCount==0&&EDM77::Detail::EqualLiteral(b.gExpressions[0],180U)&&
+            EDM77::Detail::OnlyAddresses(b,"NPQRSIJKL")&&b.has('P')&&b.has('L')&&
+            EDM77::Detail::EqualLiteral(b.expression('P'),EDM173::ArmP)&&
+            EDM77::Detail::EqualLiteral(b.expression('L'),250U);
+    }
+    bool E251SquareB2Arm(const NCParsedBlock& b,unsigned selector) noexcept
+    {
+        return selector==EDM173::B2ArmP&&EDM77::Detail::Clean(b)&&!b.isEmpty&&
+            b.gCount==1&&b.mCount==0&&EDM77::Detail::EqualLiteral(b.gExpressions[0],180U)&&
+            EDM77::Detail::OnlyAddresses(b,"NPQRSIJKL")&&b.has('P')&&b.has('L')&&
+            EDM77::Detail::EqualLiteral(b.expression('P'),EDM173::B2ArmP)&&
+            EDM77::Detail::EqualLiteral(b.expression('L'),251U);
+    }
+    bool E252SquareB3Arm(const NCParsedBlock& b,unsigned selector) noexcept
+    {
+        return selector==EDM173::B3ArmP&&EDM77::Detail::Clean(b)&&!b.isEmpty&&
+            b.gCount==1&&b.mCount==0&&EDM77::Detail::EqualLiteral(b.gExpressions[0],180U)&&
+            EDM77::Detail::OnlyAddresses(b,"NPQRSIJKL")&&b.has('P')&&b.has('L')&&
+            EDM77::Detail::EqualLiteral(b.expression('P'),EDM173::B3ArmP)&&
+            EDM77::Detail::EqualLiteral(b.expression('L'),252U);
+    }
+    bool E253SquareB4Arm(const NCParsedBlock& b,unsigned selector) noexcept
+    {
+        return selector==EDM173::B4ArmP&&EDM77::Detail::Clean(b)&&!b.isEmpty&&
+            b.gCount==1&&b.mCount==0&&EDM77::Detail::EqualLiteral(b.gExpressions[0],180U)&&
+            EDM77::Detail::OnlyAddresses(b,"NPQRSIJKL")&&b.has('P')&&b.has('L')&&
+            EDM77::Detail::EqualLiteral(b.expression('P'),EDM173::B4ArmP)&&
+            EDM77::Detail::EqualLiteral(b.expression('L'),253U);
+    }
+    bool E255DiamondB1Arm(const NCParsedBlock& b,unsigned selector) noexcept
+    {
+        return selector==EDM173::ArmP&&EDM77::Detail::Clean(b)&&!b.isEmpty&&
+            b.gCount==1&&b.mCount==0&&EDM77::Detail::EqualLiteral(b.gExpressions[0],180U)&&
+            EDM77::Detail::OnlyAddresses(b,"NPQRSIJKL")&&b.has('P')&&b.has('L')&&
+            EDM77::Detail::EqualLiteral(b.expression('P'),EDM173::ArmP)&&
+            EDM77::Detail::EqualLiteral(b.expression('L'),255U);
+    }
+    bool E256DiamondB2Arm(const NCParsedBlock& b,unsigned selector) noexcept
+    {
+        return selector==EDM173::B2ArmP&&EDM77::Detail::Clean(b)&&!b.isEmpty&&
+            b.gCount==1&&b.mCount==0&&EDM77::Detail::EqualLiteral(b.gExpressions[0],180U)&&
+            EDM77::Detail::OnlyAddresses(b,"NPQRSIJKL")&&b.has('P')&&b.has('L')&&
+            EDM77::Detail::EqualLiteral(b.expression('P'),EDM173::B2ArmP)&&
+            EDM77::Detail::EqualLiteral(b.expression('L'),256U);
+    }
+    bool E257DiamondB3Arm(const NCParsedBlock& b,unsigned selector) noexcept
+    {
+        return selector==EDM173::B3ArmP&&EDM77::Detail::Clean(b)&&!b.isEmpty&&
+            b.gCount==1&&b.mCount==0&&EDM77::Detail::EqualLiteral(b.gExpressions[0],180U)&&
+            EDM77::Detail::OnlyAddresses(b,"NPQRSIJKL")&&b.has('P')&&b.has('L')&&
+            EDM77::Detail::EqualLiteral(b.expression('P'),EDM173::B3ArmP)&&
+            EDM77::Detail::EqualLiteral(b.expression('L'),257U);
+    }
+    bool E258DiamondB4Arm(const NCParsedBlock& b,unsigned selector) noexcept
+    {
+        return selector==EDM173::B4ArmP&&EDM77::Detail::Clean(b)&&!b.isEmpty&&
+            b.gCount==1&&b.mCount==0&&EDM77::Detail::EqualLiteral(b.gExpressions[0],180U)&&
+            EDM77::Detail::OnlyAddresses(b,"NPQRSIJKL")&&b.has('P')&&b.has('L')&&
+            EDM77::Detail::EqualLiteral(b.expression('P'),EDM173::B4ArmP)&&
+            EDM77::Detail::EqualLiteral(b.expression('L'),258U);
+    }
+    // EDM260 keeps the 1 mm family literal and separate from all legacy tags.
+    unsigned E260OneMmMode(const NCParsedBlock& b) noexcept
+    {
+        if(!b.has('L'))return 0U;
+        for(unsigned marker=260U;marker<=263U;++marker)
+            if(EDM77::Detail::EqualLiteral(b.expression('L'),marker))
+                return EDM130::G76OneMmMode260(marker);
+        return 0U;
+    }
+    bool E260OneMmArm(const NCParsedBlock& b,unsigned selector) noexcept
+    {
+        return (selector==EDM173::ArmP||selector==EDM173::B3ArmP||selector==EDM173::B4ArmP)&&
+            EDM77::Detail::Clean(b)&&!b.isEmpty&&b.gCount==1&&b.mCount==0&&
+            EDM77::Detail::EqualLiteral(b.gExpressions[0],180U)&&
+            EDM77::Detail::OnlyAddresses(b,"NPQRSIJKL")&&b.has('P')&&
+            EDM77::Detail::EqualLiteral(b.expression('P'),selector)&&E260OneMmMode(b)!=0U;
+    }
+    bool E261PolygonB2Arm(const NCParsedBlock& b,unsigned selector) noexcept
+    {
+        return selector==EDM173::B2ArmP&&EDM77::Detail::Clean(b)&&!b.isEmpty&&
+            b.gCount==1&&b.mCount==0&&EDM77::Detail::EqualLiteral(b.gExpressions[0],180U)&&
+            EDM77::Detail::OnlyAddresses(b,"NPQRSIJKL")&&b.has('P')&&b.has('L')&&
+            EDM77::Detail::EqualLiteral(b.expression('P'),selector)&&
+            EDM77::Detail::EqualLiteral(b.expression('L'),264U);
+    }
+    bool E261PolygonOrbitShape(const NCBlock& b) noexcept
+    {
+        return b.has('Q')&&std::isfinite(b.val('Q'))&&b.val('Q')>=3.0&&b.val('Q')<=12.0&&
+            std::floor(b.val('Q'))==b.val('Q');
+    }
+    // EDM263 binds each 26-child expansion to an exact authored family tag.
+    unsigned E263ExpansionMode(const NCParsedBlock& b) noexcept
+    {
+        if(!b.has('L'))return 0U;
+        for(unsigned marker=265U;marker<=272U;++marker)
+            if(EDM77::Detail::EqualLiteral(b.expression('L'),marker))
+                return EDM130::G76ExpansionMode263(marker);
+        return 0U;
+    }
+    bool E263ExpansionArm(const NCParsedBlock& b,unsigned selector) noexcept
+    {
+        const bool b2=selector==EDM173::B2ArmP;
+        if((!b2&&selector!=EDM173::ArmP&&selector!=EDM173::B3ArmP&&selector!=EDM173::B4ArmP)||
+            !EDM77::Detail::Clean(b)||b.isEmpty||b.gCount!=1||b.mCount!=0||
+            !EDM77::Detail::EqualLiteral(b.gExpressions[0],180U)||
+            !EDM77::Detail::OnlyAddresses(b,"NPQRSIJKL")||!b.has('P')||
+            !EDM77::Detail::EqualLiteral(b.expression('P'),selector)||!E263ExpansionMode(b))return false;
+        for(unsigned marker=b2?269U:265U;marker<=(b2?272U:268U);++marker)
+            if(EDM77::Detail::EqualLiteral(b.expression('L'),marker))return true;
+        return false;
+    }
+    bool E263ExpansionOrbitShape(const NCBlock& b) noexcept
+    {
+        return b.has('P')&&(b.val('P')==21.0||b.val('P')==22.0||b.val('P')==23.0||b.val('P')==26.0)&&
+            b.has('B')&&(b.val('B')==1.0||b.val('B')==2.0||b.val('B')==3.0||b.val('B')==4.0)&&
+            (b.val('P')==26.0?E261PolygonOrbitShape(b):!b.has('Q'));
+    }
+    bool E251SquareSourcePair(const NCParsedBlock& arm,const NCBlock& orbit) noexcept
+    {
+        const unsigned expansionMode=E263ExpansionMode(arm);
+        if(expansionMode)
+        {
+            unsigned selector=0U;
+            for(unsigned candidate:{EDM173::ArmP,EDM173::B2ArmP,EDM173::B3ArmP,EDM173::B4ArmP})
+                if(E263ExpansionArm(arm,candidate))selector=candidate;
+            return selector&&!orbit.isEmpty&&!orbit.isGoto&&!orbit.isBlockSkip&&orbit.hasG&&
+                orbit.gCode==76&&orbit.gCount==1&&orbit.gCodes[0]==76&&orbit.mCount==0&&
+                E263ExpansionOrbitShape(orbit)&&orbit.val('P')==static_cast<double>(expansionMode)&&
+                orbit.val('B')==static_cast<double>(EDM173::ModeForArm(selector));
+        }
+        if(arm.has('L')&&EDM77::Detail::EqualLiteral(arm.expression('L'),264U))
+            return E261PolygonB2Arm(arm,EDM173::B2ArmP)&&!orbit.isEmpty&&!orbit.isGoto&&!orbit.isBlockSkip&&
+                orbit.hasG&&orbit.gCode==76&&orbit.gCount==1&&orbit.gCodes[0]==76&&orbit.mCount==0&&
+                orbit.has('P')&&orbit.val('P')==16.0&&orbit.has('B')&&orbit.val('B')==2.0&&E261PolygonOrbitShape(orbit);
+        const unsigned oneMmMode=E260OneMmMode(arm);
+        if(oneMmMode)
+        {
+            unsigned selector=0U;
+            for(unsigned candidate:{EDM173::ArmP,EDM173::B3ArmP,EDM173::B4ArmP})
+                if(E260OneMmArm(arm,candidate))selector=candidate;
+            return selector&&!orbit.isEmpty&&!orbit.isGoto&&!orbit.isBlockSkip&&orbit.hasG&&
+                orbit.gCode==76&&orbit.gCount==1&&orbit.gCodes[0]==76&&orbit.mCount==0&&
+                orbit.has('P')&&orbit.val('P')==static_cast<double>(oneMmMode)&&orbit.has('B')&&
+                orbit.val('B')==static_cast<double>(EDM173::ModeForArm(selector))&&
+                (oneMmMode!=16U||E261PolygonOrbitShape(orbit));
+        }
+        const bool squareB1=E250SquareB1Arm(arm,EDM173::ArmP);
+        const bool squareB2=E251SquareB2Arm(arm,EDM173::B2ArmP);
+        const bool squareB3=E252SquareB3Arm(arm,EDM173::B3ArmP);
+        const bool squareB4=E253SquareB4Arm(arm,EDM173::B4ArmP);
+        const bool diamondB2=E256DiamondB2Arm(arm,EDM173::B2ArmP);
+        const bool diamondB3=E257DiamondB3Arm(arm,EDM173::B3ArmP);
+        const bool diamondB4=E258DiamondB4Arm(arm,EDM173::B4ArmP);
+        const bool diamond=E255DiamondB1Arm(arm,EDM173::ArmP)||diamondB2||diamondB3||diamondB4;
+        const bool square=squareB1||squareB2||squareB3||squareB4;
+        if(arm.has('L')&&(EDM77::Detail::EqualLiteral(arm.expression('L'),250U)||
+            EDM77::Detail::EqualLiteral(arm.expression('L'),251U)||
+            EDM77::Detail::EqualLiteral(arm.expression('L'),252U)||
+            EDM77::Detail::EqualLiteral(arm.expression('L'),253U)||
+            EDM77::Detail::EqualLiteral(arm.expression('L'),255U)||
+            EDM77::Detail::EqualLiteral(arm.expression('L'),256U)||
+            EDM77::Detail::EqualLiteral(arm.expression('L'),257U)||
+            EDM77::Detail::EqualLiteral(arm.expression('L'),258U))&&!square&&!diamond)return false;
+        return (square||diamond)?(!orbit.isEmpty&&!orbit.isGoto&&!orbit.isBlockSkip&&orbit.hasG&&
+            orbit.gCode==76&&orbit.gCount==1&&orbit.gCodes[0]==76&&orbit.mCount==0&&
+            orbit.has('P')&&orbit.val('P')==(diamond?13.0:12.0)&&orbit.has('B')&&orbit.val('B')==((squareB4||diamondB4)?4.0:(squareB3||diamondB3)?3.0:(squareB2||diamondB2)?2.0:1.0)):
+            (orbit.has('P')&&orbit.val('P')==11.0);
+    }
+    bool E251SquareConfirmationSource(const NCProgramCache& cache,int armPC) noexcept
+    {
+        const auto* arm=cache.TryGetLine(armPC);
+        const auto* source=armPC<(std::numeric_limits<int>::max)()?cache.TryGetLine(armPC+1):nullptr;
+        if(!arm)return false;
+        const bool tagged=arm->parsedBlock.has('L')&&(EDM77::Detail::EqualLiteral(arm->parsedBlock.expression('L'),250U)||
+            EDM77::Detail::EqualLiteral(arm->parsedBlock.expression('L'),251U)||
+            EDM77::Detail::EqualLiteral(arm->parsedBlock.expression('L'),252U)||
+            EDM77::Detail::EqualLiteral(arm->parsedBlock.expression('L'),253U)||
+            EDM77::Detail::EqualLiteral(arm->parsedBlock.expression('L'),255U)||
+            EDM77::Detail::EqualLiteral(arm->parsedBlock.expression('L'),256U)||
+            EDM77::Detail::EqualLiteral(arm->parsedBlock.expression('L'),257U)||
+            EDM77::Detail::EqualLiteral(arm->parsedBlock.expression('L'),258U)||E260OneMmMode(arm->parsedBlock)!=0U||
+            EDM77::Detail::EqualLiteral(arm->parsedBlock.expression('L'),264U)||E263ExpansionMode(arm->parsedBlock)!=0U);
+        const bool square=source&&source->parsedBlock.has('P')&&(EDM77::Detail::EqualLiteral(source->parsedBlock.expression('P'),12U)||
+            EDM77::Detail::EqualLiteral(source->parsedBlock.expression('P'),13U));
+        if(!tagged&&!square)return true;
+        NCBlock orbit{};
+        return source&&EDM77::Detail::Clean(source->parsedBlock)&&
+            NCPreparedBlockQueueShadow::TryBuildLiteralBlock(source->parsedBlock,orbit)&&
+            E251SquareSourcePair(arm->parsedBlock,orbit);
+    }
     bool E108ProfileOnlyNPQRSIJK(const NCParsedBlock& b, unsigned selector, EDM97::Tuning& tuning,
         EDM107::FlushProfile& profile) noexcept
     {
         const bool rejectBeforeArm=E216RejectBeforeArm(b,selector);
         const bool centerNominalHold=E217CenterNominalHold(b,selector);
-        if (b.has('L')&&!rejectBeforeArm&&!centerNominalHold)
+        const bool centerFlushHold=E218CenterFlushHold(b,selector)||E219CenterReturnHold(b,selector)||E220CenterAnchorHold(b,selector)||E221CenterStartHold(b,selector)||E222CenterTopDwellHold(b,selector)||E224CenterDwellHold(b,selector)||E225CenterReturnDwellHold(b,selector)||E226CenterFinalDwellHold(b,selector)||E227CenterInitialDwellHold(b,selector)||E228CenterBrakeHold(b,selector);
+        const bool centerRepeat=E230CenterRepeat(b,selector);
+        const bool centerSecondFlushHold=E231CenterSecondFlushHold(b,selector);
+        const bool centerSecondReturnHold=E232CenterSecondReturnHold(b,selector);
+        const bool parentSequence=E233CenterParentSequence(b,selector)||E234ArmSequence(b,selector)||E237ArmSequence(b,selector);
+        const bool squareB1=E250SquareB1Arm(b,selector)||E251SquareB2Arm(b,selector)||E252SquareB3Arm(b,selector)||E253SquareB4Arm(b,selector)||E255DiamondB1Arm(b,selector)||E256DiamondB2Arm(b,selector)||E257DiamondB3Arm(b,selector)||E258DiamondB4Arm(b,selector)||E260OneMmArm(b,selector)||E261PolygonB2Arm(b,selector)||E263ExpansionArm(b,selector);
+        if (b.has('L')&&!rejectBeforeArm&&!centerNominalHold&&!centerFlushHold&&!centerRepeat&&!centerSecondFlushHold&&!centerSecondReturnHold&&!parentSequence&&!squareB1)
         {
             unsigned selection = 0U;
             for (unsigned value = 1U; value <= 3U; ++value)
@@ -15915,7 +16410,7 @@ namespace
         }
         if ((selector != 109U && selector != 111U && selector != 113U && selector != 115U && selector != 117U && selector != 119U && selector != 121U && selector != 123U && selector != 125U && selector != 127U && selector != 129U && selector != 132U && selector != 134U && selector != 136U && selector != 138U && selector != 140U && selector != 142U && selector != 144U && selector != 146U && selector != 148U && selector != 150U && selector != 152U && selector != 154U && selector != 156U && selector != 162U && selector != 164U && selector != 166U && selector != 168U && selector != 170U && selector != 172U && selector != 174U && selector != 176U && selector != 178U && selector != 180U && selector != 182U && selector != 184U && selector != 186U && selector != 188U && selector != 190U && selector != 192U && selector != 194U && selector != 196U && selector != 198U && selector != 200U && selector != 202U && selector != 204U && selector != 206U && selector != 208U && selector != 210U && selector != 212U && selector != 214U && selector != 216U && selector != 218U && selector != 220U && selector != 222U && selector != 224U && selector != 226U && selector != 228U && selector != 230U && selector != 232U && selector != 234U && selector != 236U && selector != 238U && selector != 240U && selector != 242U && selector != 244U && selector != 246U && selector != 248U && selector != 250U && selector != 252U && selector != 254U && selector != 256U && selector != 258U && selector != 260U && selector != 262U && selector != 264U && selector != 266U && selector != 268U && selector != 270U && selector != 272U && selector != 274U && selector != 276U && selector != 278U && selector != 280U && selector != 282U && selector != 284U && selector != 286U && selector != 288U && selector != 290U && selector != 292U && selector != 294U && selector != 296U && selector != 298U && selector != 300U) || !EDM77::Detail::Clean(b) || b.isEmpty || b.gCount != 1 || b.mCount != 0 ||
             !EDM77::Detail::EqualLiteral(b.gExpressions[0], 180U) ||
-            !EDM77::Detail::OnlyAddresses(b, rejectBeforeArm||centerNominalHold||selector == EDM173::B2ArmP ? "NPQRSIJKL" :
+            !EDM77::Detail::OnlyAddresses(b, rejectBeforeArm||centerNominalHold||centerFlushHold||centerRepeat||centerSecondFlushHold||centerSecondReturnHold||parentSequence||squareB1||selector == EDM173::B2ArmP ? "NPQRSIJKL" :
                 EDM149::IsFlushHoldTestArm(selector) ? "NPQRSIJKHL" :
                 EDM149::IsManualVoltageTestArm(selector) ? "NPQRSIJKH" : "NPQRSIJK") || !b.has('P') ||
             !EDM77::Detail::EqualLiteral(b.expression('P'), selector) ||
@@ -16505,7 +17000,7 @@ namespace
     template<class State>
     bool E156BoundPlanCurrent(const State& s, const EDM130::Recipe& recipe) noexcept
     {
-        if (EDM173::IsArm(s.gapHistoryArm)) return s.moves==1U && recipe.planRows==25U && EDM130::ValidProgramPlan(recipe) &&
+        if (EDM173::IsArm(s.gapHistoryArm)) return s.moves==1U && recipe.planRows==EDM173::CountForRecipe(recipe) && EDM130::ValidProgramPlan(recipe) &&
             EDM173::RecipeMatchesArm(s.gapHistoryArm,recipe) && EDM130::ValidRecipe(recipe);
         if (!EDM149::IsBoundedProgramTestArm(s.gapHistoryArm))
             return s.moves == EDM114::RequiredRows && !recipe.planRows && !recipe.planMovementMask &&
@@ -16540,7 +17035,7 @@ namespace
         if (EDM173::IsArm(s.gapHistoryArm)) return E156BoundPlanCurrent(s,recipe) && guard.boundedProgram && guard.finishTargetBound &&
             guard.requiredMovementMask==EDM130::ProgramMovementMask(recipe) && last.session==s.session && last.armEpoch==s.armEpoch &&
             last.ownerGeneration==s.lease.generation && last.completed && !last.failed && last.rowComplete &&
-            last.completedRows==25U && last.source.step==24U && last.source.scope.session==s.session &&
+            last.completedRows==EDM173::CountForRecipe(recipe) && last.source.step+1U==EDM173::CountForRecipe(recipe) && last.source.scope.session==s.session &&
             last.source.scope.run==s.run && last.source.scope.cache==s.cache && last.source.sourcePC==s.pc[0U] &&
             guard.finishTargetPulse==last.endPulse;
         if (!EDM149::IsBoundedProgramTestArm(s.gapHistoryArm)) return true;
@@ -16589,7 +17084,7 @@ namespace
         if (!E94Matches(parsed,b)) return false;
         const bool explicitB0=b.has('B')&&b.val('B')==0.0;
         if (explicitB0&&!EDM109::SameDouble(b.val('B'),0.0)) return false;
-        if (!explicitB0&&!b.has('K') && (b.gCode!=76 || b.has('B'))) return true;
+        if (!explicitB0&&!b.has('K')&&!(b.has('P')&&(b.val('P')==16.0||b.val('P')==21.0||b.val('P')==22.0||b.val('P')==23.0||b.val('P')==26.0)) && (b.gCode!=76 || b.has('B'))) return true;
         if (parsed.gCount!=1 || parsed.mCount!=0 || !b.hasG || b.gCode!=76 ||
             b.gCount!=1 || b.gCodes[0]!=76 || b.mCount!=0 || b.gotoTarget!=-1 ||
             parsed.assignment.prefix || !parsed.assignment.indexExpression.empty() ||
@@ -16696,6 +17191,518 @@ namespace
                 !EDM109::SameDouble(b.val(word),0.0))) return false;
         return true;
     }
+    // Read-only whole-program shape, including both literal parents and the
+    // sole initial M00. Callers keep the cache generation as the source fence.
+    template<class Cache,class BracketShape,class OrbitShape>
+    bool E233ProgramShape(const Cache& cache,int& firstArmPC,std::array<unsigned,2U>& arms,
+        BracketShape bracketShape,OrbitShape orbitShape) noexcept
+    {
+        firstArmPC=-1;arms.fill(0U);
+        if(!cache.Size()||cache.Size()>128U)return false;
+        int confirmation=-1;
+        for(std::size_t pc=0U;pc<cache.Size();++pc)
+        {
+            const auto* line=cache.TryGetLine(static_cast<int>(pc));if(!line)return false;
+            const auto& b=line->parsedBlock;
+            if(!EDM77::Detail::Clean(b))return false;
+            if(b.isEmpty)continue;
+            if(E149M00Shape(b)){confirmation=static_cast<int>(pc);break;}
+            bool mutation=false;
+            bool recipe=EDM77::Detail::Operation(b,mutation);
+            if(!recipe&&b.gCount==1&&EDM77::Detail::EqualLiteral(b.gExpressions[0U],39U)&&
+                (EDM77::Detail::EqualLiteral(b.expression('P'),11U)||
+                 EDM77::Detail::EqualLiteral(b.expression('P'),12U)||
+                 EDM77::Detail::EqualLiteral(b.expression('P'),13U)||
+                 EDM77::Detail::EqualLiteral(b.expression('P'),19U)||
+                 EDM77::Detail::EqualLiteral(b.expression('P'),20U)))
+            {
+                NCParsedBlock syntax=b;syntax.paramExpressions['P'-'A']="5";
+                recipe=EDM77::Detail::Operation(syntax,mutation);
+            }
+            if(!E94Preamble(b)&&!E178CoordinatePreamble(b)&&!recipe)return false;
+        }
+        if(confirmation<0||static_cast<std::size_t>(confirmation)+7U>=cache.Size())return false;
+        const int first=confirmation+1;
+        std::array<unsigned,2U> selected{};
+        for(unsigned parent=0U;parent<2U;++parent)
+        {
+            const int pc=first+static_cast<int>(parent*3U);
+            const auto* a=cache.TryGetLine(pc);const auto* o=cache.TryGetLine(pc+1);const auto* f=cache.TryGetLine(pc+2);
+            NCBlock arm{},orbit{},finish{};EDM97::Tuning tuning{};EDM107::FlushProfile profile{};
+            if(!a||!o||!f||!NCPreparedBlockQueueShadow::TryBuildLiteralBlock(a->parsedBlock,arm)||
+                !NCPreparedBlockQueueShadow::TryBuildLiteralBlock(o->parsedBlock,orbit)||
+                !NCPreparedBlockQueueShadow::TryBuildLiteralBlock(f->parsedBlock,finish)||
+                !bracketShape(arm)||!orbitShape(orbit)||!bracketShape(finish)||!arm.has('P'))return false;
+            const unsigned selector=static_cast<unsigned>(arm.val('P'));
+            if(!E233CenterParentSequence(a->parsedBlock,selector)||
+                !E108ProfileOnlyNPQRSIJK(a->parsedBlock,selector,tuning,profile)||
+                !E94Matches(a->parsedBlock,arm)||!E180LiteralAngleSourceMatches(o->parsedBlock,orbit)||
+                !E94Matches(f->parsedBlock,finish)||
+                E181EffectiveOrbitMode(orbit)!=EDM173::ModeForArm(selector)||
+                finish.val('P')!=static_cast<double>(EDM173::FinishForArm(selector)))return false;
+            selected[parent]=selector;
+        }
+        if(selected[0U]==selected[1U])return false;
+        const auto* last=cache.TryGetLine(first+6);NCBlock end{};
+        if(!last||!NCPreparedBlockQueueShadow::TryBuildLiteralBlock(last->parsedBlock,end)||
+            !E94Matches(last->parsedBlock,end)||end.isEmpty||end.isGoto||end.isBlockSkip||end.hasG||
+            end.gCount||end.mCount!=1||end.mCode[0U]!=30||
+            !EDM77::Detail::OnlyAddresses(last->parsedBlock,"N"))return false;
+        for(std::size_t pc=static_cast<std::size_t>(first)+7U;pc<cache.Size();++pc)
+        {const auto* line=cache.TryGetLine(static_cast<int>(pc));if(!line||!line->parsedBlock.isEmpty)return false;}
+        firstArmPC=first;arms=selected;return true;
+    }
+    bool E234BracketLiteralShape(const NCBlock& b) noexcept
+    {
+        if(b.isEmpty||b.isGoto||b.isBlockSkip||!b.hasG||b.gCode!=180||b.gCount!=1||b.gCodes[0U]!=180||
+            b.mCount||!b.has('P'))return false;
+        const bool historyArm=b.val('P')==274.0||b.val('P')==294.0;
+        const bool centerArm=b.val('P')==296.0||b.val('P')==298.0;
+        const bool arm=historyArm||centerArm;
+        if(!arm&&b.val('P')!=275.0&&b.val('P')!=295.0&&b.val('P')!=297.0&&b.val('P')!=299.0)return false;
+        for(char word='A';word<='Z';++word)if(b.has(word)&&
+            (!std::isfinite(b.val(word))||!std::strchr(arm?"NPQRSIJKL":"NP",word)))return false;
+        return !arm||(b.has('L')&&(b.val('L')==241.0||b.val('L')==242.0||b.val('L')==243.0||b.val('L')==244.0||(b.val('L')==245.0&&b.val('P')!=298.0)||(b.val('L')==246.0&&b.val('P')!=296.0)||(b.val('L')==247.0&&b.val('P')!=298.0)||(b.val('L')==248.0&&b.val('P')!=296.0)||(b.val('L')==240.0&&(centerArm||b.val('P')==274.0))||(centerArm?b.val('L')==239.0:
+            (b.val('L')==234.0||b.val('L')==235.0||b.val('L')==236.0||b.val('L')==237.0||b.val('L')==238.0)))&&b.has('Q')&&b.val('Q')==8.0&&
+            b.has('R')&&b.val('R')==1.0&&b.has('S')&&b.val('S')==1.0&&b.has('I')&&b.val('I')==10.0&&
+            b.has('J')&&b.val('J')==50.0&&b.has('K')&&b.val('K')==100.0);
+    }
+    // One genuine ordinary GAP row and one genuine 25-child G76 B2 parent.
+    // L234 retains its exact G01 row; L235 separately seals one CW/CCW arc.
+    template<class Cache>
+    bool E234ProgramShape(const Cache& cache,int& firstArmPC,std::array<unsigned,2U>& arms,
+        unsigned* program=nullptr,unsigned* ordinaryCode=nullptr) noexcept
+    {
+        firstArmPC=-1;arms.fill(0U);if(program)*program=0U;if(ordinaryCode)*ordinaryCode=0U;
+        if(!cache.Size()||cache.Size()>128U)return false;
+        int confirmation=-1;
+        for(std::size_t pc=0U;pc<cache.Size();++pc)
+        {
+            const auto* line=cache.TryGetLine(static_cast<int>(pc));if(!line)return false;
+            const auto& b=line->parsedBlock;if(!EDM77::Detail::Clean(b))return false;
+            if(b.isEmpty)continue;
+            if(E149M00Shape(b)){confirmation=static_cast<int>(pc);break;}
+            const bool clearMirror=b.gCount==1&&b.mCount==0&&EDM77::Detail::OnlyAddresses(b,"N")&&
+                EDM77::Detail::EqualLiteral(b.gExpressions[0U],150U);
+            bool mutation=false;bool recipe=EDM77::Detail::Operation(b,mutation);
+            if(!recipe&&b.gCount==1&&EDM77::Detail::EqualLiteral(b.gExpressions[0U],39U)&&
+                (EDM77::Detail::EqualLiteral(b.expression('P'),11U)||EDM77::Detail::EqualLiteral(b.expression('P'),12U)||
+                 EDM77::Detail::EqualLiteral(b.expression('P'),13U)||EDM77::Detail::EqualLiteral(b.expression('P'),19U)||
+                 EDM77::Detail::EqualLiteral(b.expression('P'),20U)))
+            {NCParsedBlock syntax=b;syntax.paramExpressions['P'-'A']="5";recipe=EDM77::Detail::Operation(syntax,mutation);}
+            if(!E94Preamble(b)&&!clearMirror&&!recipe)return false;
+        }
+        if(confirmation<0||static_cast<std::size_t>(confirmation)+7U>=cache.Size())return false;
+        const int first=confirmation+1;std::array<unsigned,2U> selected{};
+        unsigned selectedProgram=0U,selectedOrdinaryCode=0U;
+        for(unsigned parent=0U;parent<2U;++parent)
+        {
+            const int pc=first+static_cast<int>(parent*3U);
+            const auto* a=cache.TryGetLine(pc);const auto* m=cache.TryGetLine(pc+1);const auto* f=cache.TryGetLine(pc+2);
+            NCBlock arm{},motion{},finish{};EDM97::Tuning tuning{};EDM107::FlushProfile profile{};
+            if(!a||!m||!f||!NCPreparedBlockQueueShadow::TryBuildLiteralBlock(a->parsedBlock,arm)||
+                !NCPreparedBlockQueueShadow::TryBuildLiteralBlock(m->parsedBlock,motion)||
+                !NCPreparedBlockQueueShadow::TryBuildLiteralBlock(f->parsedBlock,finish)||
+                !E234BracketLiteralShape(arm)||!E234BracketLiteralShape(finish)||
+                !E94Matches(a->parsedBlock,arm)||!E94Matches(m->parsedBlock,motion)||!E94Matches(f->parsedBlock,finish))return false;
+            const unsigned selector=static_cast<unsigned>(arm.val('P'));
+            if(!E234ArmSequence(a->parsedBlock,selector)||!E108ProfileOnlyNPQRSIJK(a->parsedBlock,selector,tuning,profile)||
+                finish.val('P')!=static_cast<double>(selector+1U)||motion.isEmpty||motion.isGoto||motion.isBlockSkip||
+                !motion.hasG||motion.gCount!=1||motion.mCount||!motion.has('F')||motion.val('F')!=0.12||
+                !motion.has('B'))return false;
+            const unsigned parentProgram=static_cast<unsigned>(arm.val('L'));
+            if(parent?parentProgram!=selectedProgram:parentProgram!=234U&&parentProgram!=235U)return false;
+            selectedProgram=parentProgram;
+            if(selector==274U)
+            {
+                if(motion.val('B')!=1.0)return false;
+                if(parentProgram==234U)
+                {
+                    if(motion.gCode!=1||motion.gCodes[0U]!=1||!motion.has('Z')||motion.val('Z')!=-0.0015)return false;
+                    for(char word='A';word<='Z';++word)if(motion.has(word)&&!std::strchr("NZFB",word))return false;
+                }
+                else
+                {
+                    const bool cw=motion.gCode==2&&motion.gCodes[0U]==2;
+                    const bool ccw=motion.gCode==3&&motion.gCodes[0U]==3;
+                    const double x=cw?0.001:-0.001;
+                    if((!cw&&!ccw)||!motion.has('X')||motion.val('X')!=x||!motion.has('Y')||motion.val('Y')!=0.001||
+                        !motion.has('I')||motion.val('I')!=x||!motion.has('J')||motion.val('J')!=0.0)return false;
+                    for(char word='A';word<='Z';++word)if(motion.has(word)&&!std::strchr("NXYIJFB",word))return false;
+                    EDM114::Point increment{};increment[0U]=x;increment[1U]=0.001;EDM112::Curve curve{};
+                    if(!EDM114::BuildBoundedXYArc(motion.gCode,increment,{{x,0.0}},motion.val('F'),curve))return false;
+                }
+                selectedOrdinaryCode=static_cast<unsigned>(motion.gCode);
+            }
+            else
+            {
+                if(motion.gCode!=76||motion.gCodes[0U]!=76||!motion.has('P')||motion.val('P')!=11.0||
+                    !motion.has('X')||!motion.has('Y')||!motion.has('Z')||!motion.has('R')||motion.val('R')!=0.004||
+                    !motion.has('K')||motion.val('K')!=45.0||motion.val('B')!=2.0||
+                    (motion.val('X')!=0.001&&motion.val('X')!=-0.001)||motion.val('Y')!=motion.val('X')||motion.val('Z')!=motion.val('X'))return false;
+                for(char word='A';word<='Z';++word)if(motion.has(word)&&!std::strchr("NPXYZRFBK",word))return false;
+            }
+            selected[parent]=selector;
+        }
+        if(selected[0U]==selected[1U])return false;
+        const auto* last=cache.TryGetLine(first+6);NCBlock end{};
+        if(!last||!NCPreparedBlockQueueShadow::TryBuildLiteralBlock(last->parsedBlock,end)||!E94Matches(last->parsedBlock,end)||
+            end.isEmpty||end.isGoto||end.isBlockSkip||end.hasG||end.gCount||end.mCount!=1||end.mCode[0U]!=30||
+            !EDM77::Detail::OnlyAddresses(last->parsedBlock,"N"))return false;
+        for(std::size_t pc=static_cast<std::size_t>(first)+7U;pc<cache.Size();++pc)
+        {const auto* line=cache.TryGetLine(static_cast<int>(pc));if(!line||!line->parsedBlock.isEmpty)return false;}
+        firstArmPC=first;arms=selected;if(program)*program=selectedProgram;if(ordinaryCode)*ordinaryCode=selectedOrdinaryCode;return true;
+    }
+    unsigned E236ArmForKind(unsigned kind) noexcept
+    {return kind==2U?294U:(kind==1U||kind==3U||kind==4U)?274U:0U;}
+    unsigned E236GCodeForKind(unsigned kind) noexcept
+    {return kind==1U?1U:kind==2U?76U:kind==3U?2U:kind==4U?3U:0U;}
+    bool E236RecipeForKind(const EDM130::Recipe& recipe,unsigned kind) noexcept
+    {
+        return E236ArmForKind(kind)&&recipe.commissioningProfile==(kind==2U?EDM130::G76B2Profile175:0U)&&
+            recipe.planRows==(kind==2U?25U:1U)&&recipe.planMovementMask==(kind==2U?7U:kind==1U?4U:3U)&&
+            EDM130::ValidHistoryRecipeBinding(kind==2U?EDM173::HistoryFixture:EDM149::ProgramHistoryFixture,recipe)&&
+            recipe.diagnosticControlSource==3U&&recipe.workTimeUs==500000ULL&&recipe.jumpHeightScaled==1000ULL&&
+            recipe.jumpSpeedPercentScaled==100000000U&&!recipe.flushHoldTest&&!recipe.holdRetreatMode&&
+            !recipe.deepFlushCycleInterval&&recipe.deepFlushHeightMultiplierScaled==1000000ULL;
+    }
+    bool E237NativeKind(unsigned kind) noexcept
+    {return kind==2U||kind==6U||kind==7U;}
+    unsigned E237ArmForKind(unsigned kind) noexcept
+    {return kind==2U?294U:kind==5U?274U:kind==6U?296U:kind==7U?298U:0U;}
+    unsigned E237RowsForKind(unsigned kind) noexcept
+    {return E237NativeKind(kind)?1U:kind==5U?4U:0U;}
+    bool E237RecipeForKind(const EDM130::Recipe& recipe,unsigned kind) noexcept
+    {
+        if(kind==6U||kind==7U)
+            return EDM130::IsG76CenterSequence239(recipe)&&
+                recipe.commissioningProfile==(kind==6U?EDM130::G76B3Profile176:EDM130::G76B4Profile177)&&
+                recipe.planRows==25U&&recipe.planMovementMask==7U&&
+                EDM130::ValidHistoryRecipeBinding(EDM173::HistoryFixture,recipe)&&
+                recipe.diagnosticControlSource==3U&&recipe.workTimeUs==500000ULL&&recipe.jumpHeightScaled==200000ULL&&
+                recipe.jumpSpeedPercentScaled==100000000U&&!recipe.holdRetreatMode&&
+                !recipe.deepFlushCycleInterval&&recipe.deepFlushHeightMultiplierScaled==1000000ULL;
+        return E237ArmForKind(kind)&&recipe.commissioningProfile==(kind==2U?EDM130::G76B2Profile175:0U)&&
+            recipe.planRows==(kind==2U?25U:4U)&&recipe.planMovementMask==7U&&
+            EDM130::ValidHistoryRecipeBinding(kind==2U?EDM173::HistoryFixture:EDM149::ProgramHistoryFixture,recipe)&&
+            recipe.diagnosticControlSource==3U&&recipe.workTimeUs==500000ULL&&recipe.jumpHeightScaled==1000ULL&&
+            recipe.jumpSpeedPercentScaled==100000000U&&!recipe.flushHoldTest&&!recipe.holdRetreatMode&&
+            !recipe.deepFlushCycleInterval&&recipe.deepFlushHeightMultiplierScaled==1000000ULL;
+    }
+    unsigned E237RequiredBridgeMask(unsigned program,unsigned firstKind=0U) noexcept
+    {return program==248U?(firstKind==5U?4U:firstKind==7U?1U:8U):program==247U?(firstKind==5U?4U:firstKind==6U?1U:8U):program==246U?(firstKind==5U?4U:firstKind==7U?1U:8U):program==245U?(firstKind==5U?4U:firstKind==6U?1U:8U):program==240U||program==241U?7U:program==242U?2U:(program==243U||program==244U)?5U:0U;}
+    bool E237BridgeRequired(unsigned program,unsigned nextParent,unsigned firstKind=0U) noexcept
+    {const unsigned mask=E237RequiredBridgeMask(program,firstKind);return mask<=7U&&nextParent>0U&&nextParent<4U&&(mask&(1U<<(nextParent-1U)))!=0U;}
+    unsigned E237ArmStride(unsigned program,unsigned kind,unsigned nextParent=1U,unsigned firstKind=0U) noexcept
+    {return E237RequiredBridgeMask(program,firstKind)>7U?0U:E237RowsForKind(kind)+2U+(E237BridgeRequired(program,nextParent,firstKind)?1U:0U);}
+    bool E240RecipeBridgeShape(const NCParsedBlock& b,unsigned kind,unsigned program=240U) noexcept
+    {
+        return (program==240U||program==241U||program==242U||program==243U||program==244U||program==245U||program==246U||program==247U||program==248U)&&(program!=245U||kind!=7U)&&(program!=246U||kind!=6U)&&(program!=247U||kind!=7U)&&(program!=248U||kind!=6U)&&(kind==5U||kind==6U||kind==7U||((program==241U||program==242U||program==243U||program==244U||program==245U||program==246U||program==247U||program==248U)&&kind==2U))&&EDM77::Detail::Clean(b)&&!b.isEmpty&&
+            b.gCount==1&&b.mCount==0&&EDM77::Detail::EqualLiteral(b.gExpressions[0U],39U)&&
+            EDM77::Detail::OnlyAddresses(b,"NPQR")&&b.has('P')&&b.has('Q')&&b.has('R')&&
+            EDM77::Detail::EqualLiteral(b.expression('P'),6U)&&EDM77::Detail::EqualLiteral(b.expression('Q'),3U)&&
+            ((kind==2U||kind==5U)?b.expression('R')=="0.001":b.expression('R')=="0.2");
+    }
+    bool E237RecipeForProgramKind(const EDM130::Recipe& recipe,unsigned kind,unsigned program) noexcept
+    {
+        if(program!=240U&&program!=241U&&program!=242U&&program!=243U&&program!=244U&&program!=245U&&program!=246U&&program!=247U&&program!=248U)return E237RecipeForKind(recipe,kind);
+        if(kind==5U||((program==241U||program==242U||program==243U||program==244U||program==245U||program==246U||program==247U||program==248U)&&kind==2U))return recipe.heightFieldId==6U&&E237RecipeForKind(recipe,kind);
+        return (kind==6U||kind==7U)&&(program!=245U||kind==6U)&&(program!=246U||kind==7U)&&(program!=247U||kind==6U)&&(program!=248U||kind==7U)&&(program==240U?EDM130::IsG76CenterSequence240(recipe):program==241U?EDM130::IsG76CenterSequence241(recipe):program==242U?EDM130::IsG76CenterSequence242(recipe):program==243U?EDM130::IsG76CenterSequence243(recipe):program==244U?EDM130::IsG76CenterSequence244(recipe):program==245U?EDM130::IsG76CenterSequence245(recipe):program==246U?EDM130::IsG76CenterSequence246(recipe):program==247U?EDM130::IsG76CenterSequence247(recipe):EDM130::IsG76CenterSequence248(recipe))&&recipe.heightFieldId==6U&&
+            recipe.commissioningProfile==(kind==6U?EDM130::G76B3Profile176:EDM130::G76B4Profile177)&&
+            recipe.planRows==25U&&recipe.planMovementMask==7U&&
+            EDM130::ValidHistoryRecipeBinding(EDM173::HistoryFixture,recipe)&&recipe.diagnosticControlSource==3U&&
+            recipe.workTimeUs==500000ULL&&recipe.jumpHeightScaled==200000ULL&&
+            recipe.jumpSpeedPercentScaled==100000000U&&!recipe.holdRetreatMode&&
+            !recipe.deepFlushCycleInterval&&recipe.deepFlushHeightMultiplierScaled==1000000ULL;
+    }
+    bool E237SameParentRecipe(const EDM130::Recipe& first,const EDM130::Recipe& current,unsigned program) noexcept
+    {
+        auto expected=first;expected.commissioningProfile=current.commissioningProfile;
+        expected.planRows=current.planRows;expected.planMovementMask=current.planMovementMask;
+        if(program==240U||program==241U||program==242U||program==243U||program==244U||program==245U||program==246U||program==247U||program==248U)
+        {expected.generation=current.generation;expected.jumpHeightScaled=current.jumpHeightScaled;expected.flushHoldTest=current.flushHoldTest;}
+        return EDM130::SameRecipe(expected,current);
+    }
+    template<class State>
+    bool E240BridgeHistory(const State& q) noexcept
+    {
+        const unsigned required=E237RequiredBridgeMask(q.program,q.kinds[0U]);
+        if(required>7U)return false;
+        if(!required)return q.bridgeMask==0U;
+        if(q.parentCount!=4U||q.parentIndex>=4U||q.bridgeMask>7U)return false;
+        const unsigned prefix=required&((1U<<q.parentIndex)-1U);
+        const unsigned previous=q.parentIndex?required&((1U<<(q.parentIndex-1U))-1U):0U;
+        if((q.bridgeMask!=prefix&&q.bridgeMask!=previous)||
+            ((q.stageRecipeBound||q.stageStarted)&&q.bridgeMask!=prefix))return false;
+        unsigned count=0U,total=0U;
+        for(unsigned i=0U;i<3U;++i){count+=(q.bridgeMask>>i)&1U;total+=(required>>i)&1U;}
+        if(!q.firstRecipeBound)return !q.parentIndex&&!q.bridgeMask;
+        if(!E237RecipeForProgramKind(q.firstRecipe,q.kinds[0U],q.program)||!q.firstRecipe.generation||
+            q.firstRecipe.generation>(std::numeric_limits<std::uint64_t>::max)()-total||
+            q.recipeGeneration!=q.firstRecipe.generation+count)return false;
+        unsigned ordinal=0U;int previousBridge=-1;
+        for(unsigned i=0U;i<3U;++i)
+        {
+            const auto& r=q.bridges[i];
+            if(!(q.bridgeMask&(1U<<i)))
+            {if(r.committed||(r.prepared&&(!(required&(1U<<i))||!q.awaitNext||q.stageRecipeBound||i+1U!=q.parentIndex)))return false;continue;}
+            auto key=r.beforeKey;key.generation=r.afterGeneration;
+            if(!r.committed||r.prepared||r.pc!=q.armPC[i+1U]-1||r.line<=0||!r.dispatch||
+                r.dispatch<=r.finishDispatch||!r.controlGeneration||!r.releaseTick||!r.previousSession||
+                !r.finishDispatch||r.run!=q.run||r.cache!=q.cache||r.epoch==MOTION_EXECUTION_EPOCH_INVALID||
+                !r.lease.Matches(q.lease)||r.beforeGeneration!=q.firstRecipe.generation+ordinal||
+                r.afterGeneration!=r.beforeGeneration+1ULL||r.beforeKey.generation!=r.beforeGeneration||
+                !EDMRecipeControl::IsKeyValid(r.beforeKey)||!EDMRecipeControl::SameKey(key,r.afterKey)||
+                r.previewRecipe.generation!=r.afterGeneration||
+                !E237RecipeForProgramKind(r.previewRecipe,q.kinds[i+1U],q.program)||
+                !E237SameParentRecipe(q.firstRecipe,r.previewRecipe,q.program))return false;
+            if(previousBridge>=0&&(r.dispatch<=q.bridges[previousBridge].dispatch||r.releaseTick<=q.bridges[previousBridge].releaseTick||
+                r.previousSession<=q.bridges[previousBridge].previousSession||r.finishDispatch<=q.bridges[previousBridge].finishDispatch))return false;
+            if(i+1U<q.parentIndex&&
+                (r.releaseTick>q.previousReleaseFloorTick||r.releaseTick>=q.releaseTick||r.previousSession>=q.previousSession||
+                    r.finishDispatch>=q.previousFinishDispatch||r.dispatch>=q.previousFinishDispatch))return false;
+            previousBridge=static_cast<int>(i);++ordinal;
+        }
+        if(q.parentIndex&&E237BridgeRequired(q.program,q.parentIndex,q.kinds[0U])&&q.bridgeMask==prefix)
+        {const auto& r=q.bridges[q.parentIndex-1U];if(r.releaseTick!=q.releaseTick||r.previousSession!=q.previousSession||
+            r.finishDispatch!=q.previousFinishDispatch)return false;}
+        return !q.stageRecipeBound||q.currentRecipe.generation==q.recipeGeneration;
+    }
+    // EDM237 seals two history parents, EDM238 four history parents, and
+    // EDM239 four native B3/B4 parents. Each family has its own exact shape.
+    // Ordinary rows share history/E5 only within their fresh parent session.
+    template<class Cache>
+    bool E237HistoryProgramShape(const Cache& cache,int& firstArmPC,std::array<unsigned,4U>& kinds,
+        unsigned& program,unsigned& parentCount) noexcept
+    {
+        firstArmPC=-1;kinds.fill(0U);program=parentCount=0U;
+        if(!cache.Size()||cache.Size()>128U)return false;
+        int confirmation=-1;
+        for(std::size_t pc=0U;pc<cache.Size();++pc)
+        {
+            const auto* line=cache.TryGetLine(static_cast<int>(pc));if(!line)return false;
+            const auto& b=line->parsedBlock;if(!EDM77::Detail::Clean(b))return false;
+            if(b.isEmpty)continue;
+            if(E149M00Shape(b)){confirmation=static_cast<int>(pc);break;}
+            const bool clearMirror=b.gCount==1&&b.mCount==0&&EDM77::Detail::OnlyAddresses(b,"N")&&
+                EDM77::Detail::EqualLiteral(b.gExpressions[0U],150U);
+            bool mutation=false;bool recipe=EDM77::Detail::Operation(b,mutation);
+            if(!recipe&&b.gCount==1&&EDM77::Detail::EqualLiteral(b.gExpressions[0U],39U)&&
+                (EDM77::Detail::EqualLiteral(b.expression('P'),11U)||EDM77::Detail::EqualLiteral(b.expression('P'),12U)||
+                 EDM77::Detail::EqualLiteral(b.expression('P'),13U)||EDM77::Detail::EqualLiteral(b.expression('P'),19U)||
+                 EDM77::Detail::EqualLiteral(b.expression('P'),20U)))
+            {NCParsedBlock syntax=b;syntax.paramExpressions['P'-'A']="5";recipe=EDM77::Detail::Operation(syntax,mutation);}
+            if(!E94Preamble(b)&&!clearMirror&&!recipe)return false;
+        }
+        if(confirmation<0||static_cast<std::size_t>(confirmation)+10U>=cache.Size())return false;
+        const int first=confirmation+1;const auto* firstLine=cache.TryGetLine(first);
+        if(!firstLine)return false;
+        const auto& firstBlock=firstLine->parsedBlock;
+        const unsigned selectedProgram=EDM77::Detail::EqualLiteral(firstBlock.expression('L'),237U)?237U:
+            EDM77::Detail::EqualLiteral(firstBlock.expression('L'),238U)?238U:
+            EDM77::Detail::EqualLiteral(firstBlock.expression('L'),239U)?239U:
+            EDM77::Detail::EqualLiteral(firstBlock.expression('L'),240U)?240U:
+            EDM77::Detail::EqualLiteral(firstBlock.expression('L'),241U)?241U:
+            EDM77::Detail::EqualLiteral(firstBlock.expression('L'),242U)?242U:
+            EDM77::Detail::EqualLiteral(firstBlock.expression('L'),243U)?243U:
+            EDM77::Detail::EqualLiteral(firstBlock.expression('L'),244U)?244U:
+            EDM77::Detail::EqualLiteral(firstBlock.expression('L'),245U)?245U:
+            EDM77::Detail::EqualLiteral(firstBlock.expression('L'),246U)?246U:
+            EDM77::Detail::EqualLiteral(firstBlock.expression('L'),247U)?247U:
+            EDM77::Detail::EqualLiteral(firstBlock.expression('L'),248U)?248U:0U;
+        if(!selectedProgram)return false;
+        const bool centerSequence=selectedProgram==239U;const bool mixedCenter=selectedProgram==240U||selectedProgram==241U||selectedProgram==242U||selectedProgram==243U||selectedProgram==244U||selectedProgram==245U||selectedProgram==246U||selectedProgram==247U||selectedProgram==248U;
+        const unsigned count=selectedProgram==237U?2U:4U;
+        const unsigned firstKind=selectedProgram==248U?(EDM77::Detail::EqualLiteral(firstBlock.expression('P'),274U)?5U:
+            EDM77::Detail::EqualLiteral(firstBlock.expression('P'),298U)?7U:0U):selectedProgram==247U?(EDM77::Detail::EqualLiteral(firstBlock.expression('P'),274U)?5U:
+            EDM77::Detail::EqualLiteral(firstBlock.expression('P'),296U)?6U:0U):selectedProgram==246U?(EDM77::Detail::EqualLiteral(firstBlock.expression('P'),274U)?5U:
+            EDM77::Detail::EqualLiteral(firstBlock.expression('P'),298U)?7U:0U):selectedProgram==245U?(EDM77::Detail::EqualLiteral(firstBlock.expression('P'),274U)?5U:
+            EDM77::Detail::EqualLiteral(firstBlock.expression('P'),296U)?6U:0U):(selectedProgram==243U||selectedProgram==244U)?(EDM77::Detail::EqualLiteral(firstBlock.expression('P'),274U)?5U:
+            EDM77::Detail::EqualLiteral(firstBlock.expression('P'),294U)?2U:0U):mixedCenter?(EDM77::Detail::EqualLiteral(firstBlock.expression('P'),274U)?5U:7U):centerSequence?(EDM77::Detail::EqualLiteral(firstBlock.expression('P'),296U)?6U:7U):
+            (EDM77::Detail::EqualLiteral(firstBlock.expression('P'),274U)?5U:2U);
+        const unsigned otherKind=centerSequence?(firstKind==6U?7U:6U):(firstKind==5U?2U:5U);
+        const double expectedOrbitSign=(selectedProgram==245U||selectedProgram==246U||selectedProgram==247U||selectedProgram==248U)?(firstKind==5U?0.001:-0.001):(firstKind==5U||firstKind==6U?0.001:-0.001);
+        const std::array<unsigned,4U> forward{{5U,6U,5U,7U}},reverse{{7U,5U,6U,5U}};
+        const std::array<unsigned,4U> allForward{{5U,6U,2U,7U}},allReverse{{7U,2U,6U,5U}};
+        const std::array<unsigned,4U> adjacentForward{{5U,2U,6U,7U}},adjacentReverse{{7U,6U,2U,5U}};
+        const std::array<unsigned,4U> twoBridgeForward{{5U,6U,7U,2U}},twoBridgeReverse{{2U,7U,6U,5U}};
+        const std::array<unsigned,4U> repeatedForward{{5U,6U,6U,2U}},repeatedReverse{{2U,7U,7U,5U}};
+        const std::array<unsigned,4U> ordinaryForward{{5U,2U,5U,6U}},ordinaryReverse{{6U,5U,2U,5U}};
+        const std::array<unsigned,4U> ordinaryB4Forward{{5U,2U,5U,7U}},ordinaryB4Reverse{{7U,5U,2U,5U}};
+        const std::array<unsigned,4U> repeatedB2Forward{{5U,2U,2U,6U}},repeatedB2Reverse{{6U,2U,2U,5U}};
+        const std::array<unsigned,4U> repeatedB2B4Forward{{5U,2U,2U,7U}},repeatedB2B4Reverse{{7U,2U,2U,5U}};
+        const auto& mixedKinds=selectedProgram==248U?(firstKind==5U?repeatedB2B4Forward:repeatedB2B4Reverse):selectedProgram==247U?(firstKind==5U?repeatedB2Forward:repeatedB2Reverse):selectedProgram==246U?(firstKind==5U?ordinaryB4Forward:ordinaryB4Reverse):selectedProgram==245U?(firstKind==5U?ordinaryForward:ordinaryReverse):selectedProgram==244U?(firstKind==5U?repeatedForward:repeatedReverse):selectedProgram==243U?(firstKind==5U?twoBridgeForward:twoBridgeReverse):selectedProgram==242U?(firstKind==5U?adjacentForward:adjacentReverse):selectedProgram==241U?(firstKind==5U?allForward:allReverse):(firstKind==5U?forward:reverse);
+        if(mixedCenter)
+        {
+            unsigned heights=0U;
+            for(int before=0;before<confirmation;++before)
+            {
+                const auto* line=cache.TryGetLine(before);const auto& b=line->parsedBlock;
+                if(b.gCount==1&&EDM77::Detail::EqualLiteral(b.gExpressions[0U],39U)&&
+                    EDM77::Detail::EqualLiteral(b.expression('P'),6U))
+                {if(++heights!=1U||!E240RecipeBridgeShape(b,firstKind,selectedProgram))return false;}
+            }
+            if(heights!=1U)return false;
+        }
+        int pc=first;std::array<unsigned,4U> selected{};
+        for(unsigned parent=0U;parent<count;++parent)
+        {
+            if(E237BridgeRequired(selectedProgram,parent,firstKind))
+            {const auto* bridge=cache.TryGetLine(pc);if(!bridge||!E240RecipeBridgeShape(bridge->parsedBlock,mixedKinds[parent],selectedProgram))return false;++pc;}
+            const auto* a=cache.TryGetLine(pc);NCBlock arm{};EDM97::Tuning tuning{};EDM107::FlushProfile profile{};
+            if(!a||!NCPreparedBlockQueueShadow::TryBuildLiteralBlock(a->parsedBlock,arm)||
+                !E234BracketLiteralShape(arm)||!E94Matches(a->parsedBlock,arm))return false;
+            const unsigned selector=static_cast<unsigned>(arm.val('P'));
+            if(!E237ArmSequence(a->parsedBlock,selector)||
+                !EDM77::Detail::EqualLiteral(a->parsedBlock.expression('L'),selectedProgram)||
+                !E108ProfileOnlyNPQRSIJK(a->parsedBlock,selector,tuning,profile))return false;
+            const unsigned kind=selector==274U?5U:selector==294U?2U:selector==296U?6U:selector==298U?7U:0U;
+            if(kind!=(mixedCenter?mixedKinds[parent]:(parent%2U?otherKind:firstKind)))return false;
+            const unsigned rows=E237RowsForKind(kind);if(!rows)return false;
+            for(unsigned row=0U;row<rows;++row)
+            {
+                const auto* line=cache.TryGetLine(pc+1+static_cast<int>(row));NCBlock motion{};
+                if(!line||!NCPreparedBlockQueueShadow::TryBuildLiteralBlock(line->parsedBlock,motion)||
+                    !E94Matches(line->parsedBlock,motion)||motion.isEmpty||motion.isGoto||motion.isBlockSkip||
+                    !motion.hasG||motion.gCount!=1||motion.gCodes[0U]!=motion.gCode||motion.mCount||
+                    !motion.has('F')||motion.val('F')!=0.12)return false;
+                if(kind==5U)
+                {
+                    const int codes[4]={1,2,3,1};
+                    if(motion.gCode!=codes[row]||motion.has('B')!=(row!=3U)||
+                        (row!=3U&&motion.val('B')!=static_cast<double>(row)))return false;
+                    if(row==0U||row==3U)
+                    {
+                        if(!motion.has('Z')||motion.val('Z')!=-0.0015)return false;
+                        for(char word='A';word<='Z';++word)if(motion.has(word)&&!std::strchr(row==3U?"NZF":"NZFB",word))return false;
+                    }
+                    else
+                    {
+                        const double x=row==1U?0.001:-0.001;
+                        if(!motion.has('X')||motion.val('X')!=x||!motion.has('Y')||motion.val('Y')!=0.001||
+                            !motion.has('I')||motion.val('I')!=x||!motion.has('J')||motion.val('J')!=0.0)return false;
+                        for(char word='A';word<='Z';++word)if(motion.has(word)&&!std::strchr("NXYIJFB",word))return false;
+                        EDM114::Point increment{};increment[0U]=x;increment[1U]=0.001;EDM112::Curve curve{};
+                        if(!EDM114::BuildBoundedXYArc(motion.gCode,increment,{{x,0.0}},motion.val('F'),curve))return false;
+                    }
+                }
+                else
+                {
+                    if(motion.gCode!=76||!motion.has('P')||motion.val('P')!=11.0||
+                        !motion.has('X')||!motion.has('Y')||!motion.has('Z')||!motion.has('R')||motion.val('R')!=0.004||
+                        !motion.has('K')||motion.val('K')!=45.0||!motion.has('B')||
+                        motion.val('B')!=static_cast<double>(kind==6U?3U:kind==7U?4U:2U)||
+                        motion.val('X')!=expectedOrbitSign||motion.val('Y')!=motion.val('X')||motion.val('Z')!=motion.val('X'))return false;
+                    for(char word='A';word<='Z';++word)if(motion.has(word)&&!std::strchr("NPXYZRFBK",word))return false;
+                }
+            }
+            const auto* f=cache.TryGetLine(pc+1+static_cast<int>(rows));NCBlock finish{};
+            if(!f||!NCPreparedBlockQueueShadow::TryBuildLiteralBlock(f->parsedBlock,finish)||
+                !E234BracketLiteralShape(finish)||!E94Matches(f->parsedBlock,finish)||finish.val('P')!=selector+1.0)return false;
+            selected[parent]=kind;pc+=static_cast<int>(rows)+2;
+        }
+        if(pc!=first+static_cast<int>(mixedCenter?((selectedProgram==247U||selectedProgram==248U)?16U:(selectedProgram==245U||selectedProgram==246U)?19U:(selectedProgram==243U||selectedProgram==244U)?17U:selectedProgram==242U?16U:selectedProgram==241U?18U:21U):centerSequence?count*3U:count/2U*9U))return false;
+        const auto* last=cache.TryGetLine(pc);NCBlock end{};
+        if(!last||!NCPreparedBlockQueueShadow::TryBuildLiteralBlock(last->parsedBlock,end)||!E94Matches(last->parsedBlock,end)||
+            end.isEmpty||end.isGoto||end.isBlockSkip||end.hasG||end.gCount||end.mCount!=1||end.mCode[0U]!=30||
+            !EDM77::Detail::OnlyAddresses(last->parsedBlock,"N"))return false;
+        for(std::size_t after=static_cast<std::size_t>(pc)+1U;after<cache.Size();++after)
+        {const auto* line=cache.TryGetLine(static_cast<int>(after));if(!line||!line->parsedBlock.isEmpty)return false;}
+        firstArmPC=first;kinds=selected;program=selectedProgram;parentCount=count;return true;
+    }
+    // Existing preamble queries need only the first pair, but validate the
+    // whole source through the same bounded parser before using either kind.
+    template<class Cache>
+    bool E237ProgramShape(const Cache& cache,int& firstArmPC,std::array<unsigned,2U>& kinds) noexcept
+    {
+        std::array<unsigned,4U> selected{};unsigned program=0U,count=0U;kinds.fill(0U);
+        if(!E237HistoryProgramShape(cache,firstArmPC,selected,program,count))return false;
+        kinds[0U]=selected[0U];kinds[1U]=selected[1U];return true;
+    }
+    // Four immutable stopped sessions. This seals only the authored forward
+    // order and its exact reverse; it creates no shared-history motion lane.
+    template<class Cache>
+    bool E236ProgramShape(const Cache& cache,int& firstArmPC,std::array<unsigned,4U>& kinds) noexcept
+    {
+        firstArmPC=-1;kinds.fill(0U);
+        if(!cache.Size()||cache.Size()>128U)return false;
+        int confirmation=-1;
+        for(std::size_t pc=0U;pc<cache.Size();++pc)
+        {
+            const auto* line=cache.TryGetLine(static_cast<int>(pc));if(!line)return false;
+            const auto& b=line->parsedBlock;if(!EDM77::Detail::Clean(b))return false;
+            if(b.isEmpty)continue;
+            if(E149M00Shape(b)){confirmation=static_cast<int>(pc);break;}
+            const bool clearMirror=b.gCount==1&&b.mCount==0&&EDM77::Detail::OnlyAddresses(b,"N")&&
+                EDM77::Detail::EqualLiteral(b.gExpressions[0U],150U);
+            bool mutation=false;bool recipe=EDM77::Detail::Operation(b,mutation);
+            if(!recipe&&b.gCount==1&&EDM77::Detail::EqualLiteral(b.gExpressions[0U],39U)&&
+                (EDM77::Detail::EqualLiteral(b.expression('P'),11U)||EDM77::Detail::EqualLiteral(b.expression('P'),12U)||
+                 EDM77::Detail::EqualLiteral(b.expression('P'),13U)||EDM77::Detail::EqualLiteral(b.expression('P'),19U)||
+                 EDM77::Detail::EqualLiteral(b.expression('P'),20U)))
+            {NCParsedBlock syntax=b;syntax.paramExpressions['P'-'A']="5";recipe=EDM77::Detail::Operation(syntax,mutation);}
+            if(!E94Preamble(b)&&!clearMirror&&!recipe)return false;
+        }
+        if(confirmation<0||static_cast<std::size_t>(confirmation)+13U>=cache.Size())return false;
+        const int first=confirmation+1;std::array<unsigned,4U> selected{};double orbitSign=0.0;
+        for(unsigned parent=0U;parent<4U;++parent)
+        {
+            const int pc=first+static_cast<int>(parent*3U);
+            const auto* a=cache.TryGetLine(pc);const auto* m=cache.TryGetLine(pc+1);const auto* f=cache.TryGetLine(pc+2);
+            NCBlock arm{},motion{},finish{};EDM97::Tuning tuning{};EDM107::FlushProfile profile{};
+            if(!a||!m||!f||!NCPreparedBlockQueueShadow::TryBuildLiteralBlock(a->parsedBlock,arm)||
+                !NCPreparedBlockQueueShadow::TryBuildLiteralBlock(m->parsedBlock,motion)||
+                !NCPreparedBlockQueueShadow::TryBuildLiteralBlock(f->parsedBlock,finish)||
+                !E234BracketLiteralShape(arm)||!E234BracketLiteralShape(finish)||!arm.has('L')||arm.val('L')!=236.0||
+                !E94Matches(a->parsedBlock,arm)||!E94Matches(m->parsedBlock,motion)||!E94Matches(f->parsedBlock,finish))return false;
+            const unsigned selector=static_cast<unsigned>(arm.val('P'));
+            if(!E234ArmSequence(a->parsedBlock,selector)||!E108ProfileOnlyNPQRSIJK(a->parsedBlock,selector,tuning,profile)||
+                finish.val('P')!=static_cast<double>(selector+1U)||motion.isEmpty||motion.isGoto||motion.isBlockSkip||
+                !motion.hasG||motion.gCount!=1||motion.gCodes[0U]!=motion.gCode||motion.mCount||
+                !motion.has('F')||motion.val('F')!=0.12||!motion.has('B'))return false;
+            unsigned kind=0U;
+            if(selector==274U)
+            {
+                if(motion.val('B')!=1.0)return false;
+                if(motion.gCode==1)
+                {
+                    if(!motion.has('Z')||motion.val('Z')!=-0.0015)return false;
+                    for(char word='A';word<='Z';++word)if(motion.has(word)&&!std::strchr("NZFB",word))return false;
+                    kind=1U;
+                }
+                else
+                {
+                    const bool cw=motion.gCode==2;const double x=cw?0.001:-0.001;
+                    if((!cw&&motion.gCode!=3)||!motion.has('X')||motion.val('X')!=x||!motion.has('Y')||motion.val('Y')!=0.001||
+                        !motion.has('I')||motion.val('I')!=x||!motion.has('J')||motion.val('J')!=0.0)return false;
+                    for(char word='A';word<='Z';++word)if(motion.has(word)&&!std::strchr("NXYIJFB",word))return false;
+                    EDM114::Point increment{};increment[0U]=x;increment[1U]=0.001;EDM112::Curve curve{};
+                    if(!EDM114::BuildBoundedXYArc(motion.gCode,increment,{{x,0.0}},motion.val('F'),curve))return false;
+                    kind=cw?3U:4U;
+                }
+            }
+            else
+            {
+                if(selector!=294U||motion.gCode!=76||!motion.has('P')||motion.val('P')!=11.0||
+                    !motion.has('X')||!motion.has('Y')||!motion.has('Z')||!motion.has('R')||motion.val('R')!=0.004||
+                    !motion.has('K')||motion.val('K')!=45.0||motion.val('B')!=2.0||
+                    (motion.val('X')!=0.001&&motion.val('X')!=-0.001)||motion.val('Y')!=motion.val('X')||motion.val('Z')!=motion.val('X'))return false;
+                for(char word='A';word<='Z';++word)if(motion.has(word)&&!std::strchr("NPXYZRFBK",word))return false;
+                kind=2U;orbitSign=motion.val('X');
+            }
+            selected[parent]=kind;
+        }
+        const std::array<unsigned,4U> forward{{1U,3U,4U,2U}},reverse{{2U,4U,3U,1U}};
+        if((selected!=forward&&selected!=reverse)||orbitSign!=(selected==forward?0.001:-0.001))return false;
+        const auto* last=cache.TryGetLine(first+12);NCBlock end{};
+        if(!last||!NCPreparedBlockQueueShadow::TryBuildLiteralBlock(last->parsedBlock,end)||!E94Matches(last->parsedBlock,end)||
+            end.isEmpty||end.isGoto||end.isBlockSkip||end.hasG||end.gCount||end.mCount!=1||end.mCode[0U]!=30||
+            !EDM77::Detail::OnlyAddresses(last->parsedBlock,"N"))return false;
+        for(std::size_t pc=static_cast<std::size_t>(first)+13U;pc<cache.Size();++pc)
+        {const auto* line=cache.TryGetLine(static_cast<int>(pc));if(!line||!line->parsedBlock.isEmpty)return false;}
+        firstArmPC=first;kinds=selected;return true;
+    }
+
     bool E132Near(double a, double b, double scale = 1.0) noexcept
     {
         return std::isfinite(a) && std::isfinite(b) && std::isfinite(scale) &&
@@ -16816,6 +17823,21 @@ namespace
 
 bool NCManager::IsEDM94TranslationBracketAllowedSameThread(const NCBlock& block) noexcept
 {
+    if(block.has('P')&&block.val('P')==274.0&&block.has('L')&&(block.val('L')==234.0||block.val('L')==235.0||block.val('L')==236.0||block.val('L')==237.0||block.val('L')==238.0||block.val('L')==240.0||block.val('L')==241.0||block.val('L')==242.0||block.val('L')==243.0||block.val('L')==244.0||block.val('L')==245.0||block.val('L')==246.0||block.val('L')==247.0||block.val('L')==248.0))
+    {
+        if(!IsEDM234BracketShapeValid(block)||m_state!=NCState::RUN||m_mode!=NCOperationMode::MEMORY||
+            !IsNCXYZCUVFeedNeutralFrame(CoordSys.GetTranslationSnapshot())||CoordSys.GetTranslationSnapshot().distanceMode!=91||
+            AlarmManager::GetInstance().HasAlarm()||m_motion.HasPendingSafetyOrRecoveryRequests()||
+            !m_motion.IsMotionOwnerLeaseCurrent(m_programMotionLease))return false;
+        const int pc=GetActiveDispatchPC();
+        if(m_edm237.authorized)return IsEDM237NextArmCurrentSameThread(pc,274U);
+        if(m_edm234.authorized&&m_edm234.program==236U)return IsEDM236NextArmCurrentSameThread(pc,274U);
+        if(m_edm234.authorized&&pc==m_edm234.firstArmPC+3)return IsEDM234NextArmCurrentSameThread(pc,274U);
+        const auto& c=m_edm149Confirmation;
+        return !m_edm94.latched&&c.confirmed&&!c.waiting&&c.arm==274U&&c.armPC==pc&&
+            c.run==m_pathCoreLiveBookkeeping.currentRunToken&&c.cache==GetBaseProgramCache().GetGeneration()&&
+            c.startRequests==m_startDiagnosticRequests&&c.dispatch&&m_currentExecutingBlockDispatchId>c.dispatch;
+    }
     if (block.has('P') && (block.val('P')==292.0 || block.val('P')==293.0 || block.val('P')==294.0 || block.val('P')==295.0 || block.val('P')==296.0 || block.val('P')==297.0 || block.val('P')==298.0 || block.val('P')==299.0 || block.val('P')==300.0 || block.val('P')==301.0)) return IsEDM173BracketBlockSameThread(block);
     if (block.has('P') && block.val('P') == 131.0)
         return IsEDM116SelectorCurrentSameThread(block);
@@ -16938,6 +17960,14 @@ bool NCManager::PreflightEDM94ProgramSameThread(int armPC) noexcept
 {
     const auto& cache = GetBaseProgramCache();
     if (armPC < 0 || cache.Size() == 0U || cache.Size() > 128U) return false;
+    // EDM237_PREFLIGHT_DISPATCH_BEGIN
+    const auto* historyArm=cache.TryGetLine(armPC);
+    if(historyArm&&E237ArmSequence(historyArm->parsedBlock,274U))return PreflightEDM237OrdinarySameThread(armPC);
+    // EDM237_PREFLIGHT_DISPATCH_END
+    // EDM234_PREFLIGHT_DISPATCH_BEGIN
+    const auto* mixedArm=cache.TryGetLine(armPC);
+    if(mixedArm&&E234ArmSequence(mixedArm->parsedBlock,274U))return PreflightEDM234LineSameThread(armPC);
+    // EDM234_PREFLIGHT_DISPATCH_END
     m_edm94.moves = m_edm94.next = 0U;
     m_edm94.authoredGCode.fill(0U);
     m_edm127 = EDM127NCState{};
@@ -17839,7 +18869,7 @@ bool NCManager::IsEDM199G76PauseScopeCurrentSameThread(const EDM157::Scope& scop
     if(!w.prepared||!w.published||!w.parentCommitted||w.completed||!g.active||!g.bound||g.completed||g.mixed||
         !g.commit||g.mode!=EDM173::ModeForArm(s.gapHistoryArm)||g.sourceG!=76||g.run!=s.run||g.cache!=s.cache||g.pc!=s.pc[0U]||
         g.pc!=GetActiveDispatchPC()||g.dispatch!=m_waitingBlockDispatchId||
-        !r.valid||!r.commandAccepted||!r.captureBound||!r.tailCommitted||r.count!=25U||
+        !r.valid||!r.commandAccepted||!r.captureBound||!r.tailCommitted||r.count!=EDM173::CountForRecipe(scope.recipe)||
         !r.ownerLease.Matches(s.lease)||!r.tail.IsCommitted()||!r.tail.captureBound||
         !r.tail.endpointExact||!r.tail.accountingValid||!r.tail.ownerLease.Matches(r.ownerLease)||
         parent.session!=s.session||parent.run!=s.run||parent.cache!=s.cache||parent.dispatch!=g.dispatch||
@@ -17852,7 +18882,7 @@ bool NCManager::IsEDM199G76PauseScopeCurrentSameThread(const EDM157::Scope& scop
         source.scope.translationGeneration!=w.plan.nominal.translationGeneration||
         !SameNCTranslationSnapshot(w.plan.nominal.translation,CoordSys.GetTranslationSnapshot())||
         !m_motion.MatchesNCTranslation(w.plan.nominal.translation)||
-        source.dispatch!=g.dispatch||source.sourcePC!=g.pc||source.ordinal>=25ULL||
+        source.dispatch!=g.dispatch||source.sourcePC!=g.pc||source.ordinal>=EDM173::CountForRecipe(scope.recipe)||
         source.epoch!=m_motion.GetCurrentExecutionEpoch()||
         (m_edm157.active&&m_edm157.compoundCommit!=g.commit)) return false;
     const unsigned child=static_cast<unsigned>(source.ordinal);
@@ -17922,7 +18952,7 @@ bool NCManager::CaptureEDM157ScopeSameThread(EDM157::Scope& scope) noexcept
     if (!m_motion.ReadEDM126Feedback(history) || !m_motion.ReadEDM130Feedback(mode) ||
         !history.enabled || !history.active || history.faulted || !history.sourceReady ||
         !history.rowActive || history.rowCompleted || history.completedRows + 1U != history.authorizedRows ||
-        (compound ? (history.authorizedRows>25U||history.authorizedRows!=history.authorizedSource.ordinal+1ULL) :
+        (compound ? (history.authorizedRows>EDM173::CountForRecipe(m_edm130.recipe)||history.authorizedRows!=history.authorizedSource.ordinal+1ULL) :
             history.authorizedRows!=s.next) || !history.tick || !history.nowUs ||
         history.session != s.session || history.armEpoch != s.armEpoch || history.ownerGeneration != s.lease.generation ||
         !mode.enabled || !mode.active || mode.faulted || !mode.workTimeFlush ||
@@ -17937,7 +18967,7 @@ bool NCManager::CaptureEDM157ScopeSameThread(EDM157::Scope& scope) noexcept
     if(compound)
     {
         EDM173::Feedback parent{};
-        if(!m_edm173||!m_g76Orbit||history.authorizedSource.ordinal>=25ULL||
+        if(!m_edm173||!m_g76Orbit||history.authorizedSource.ordinal>=EDM173::CountForRecipe(m_edm130.recipe)||
             m_g76Orbit->done[static_cast<unsigned>(history.authorizedSource.ordinal)]||
             !m_motion.ReadEDM173Feedback(parent)||!parent.enabled||!parent.active||parent.faulted||
             !parent.tick||parent.liveEpoch!=history.liveEpoch||
@@ -17955,7 +18985,28 @@ void NCManager::LogEDM157SameThread(const char* event, const char* reason) const
     const auto& p = m_edm157;
     if(EDM157::IsG76NominalPause(p.scope))
     {
-        const char* tag=EDM157::IsG76CenterNominalPause(p.scope)?"EDM217":
+        const char* tag=EDM157::IsG76CenterNominalPause(p.scope)?
+            (EDM130::IsG76CenterSecondReturnHold232(p.scope.recipe)?"EDM232":EDM130::IsG76CenterSecondFlushHold231(p.scope.recipe)?"EDM231":
+                (p.feedback.flushPause&&p.feedback.flushPhase==EDM128::Phase::Resume)?"EDM229":
+                EDM130::IsG76CenterBrakeHold228(p.scope.recipe)||
+                (p.feedback.flushPause&&p.feedback.flushPhase==EDM128::Phase::Brake)?"EDM228":
+                EDM130::IsG76CenterInitialDwellHold227(p.scope.recipe)||
+                (p.feedback.flushPause&&p.feedback.flushPhase==EDM128::Phase::AnchorDwell)?"EDM227":
+                EDM130::IsG76CenterFinalDwellHold226(p.scope.recipe)||
+                (p.feedback.flushPause&&p.feedback.flushPhase==EDM128::Phase::ReturnDwell)?"EDM226":
+                EDM130::IsG76CenterReturnDwellHold225(p.scope.recipe)||
+                (p.feedback.flushPause&&p.feedback.flushPhase==EDM128::Phase::CenterReturnDwell)?"EDM225":
+                EDM130::IsG76CenterDwellHold224(p.scope.recipe)||
+                (p.feedback.flushPause&&p.feedback.flushPhase==EDM128::Phase::CenterDwell)?"EDM224":
+                EDM130::IsG76CenterTopDwellHold222(p.scope.recipe)||
+                (p.feedback.flushPause&&p.feedback.flushPhase==EDM128::Phase::TopDwell)?"EDM223":
+                EDM130::IsG76CenterStartHold221(p.scope.recipe)||
+                (p.feedback.flushPause&&p.feedback.flushPhase==EDM128::Phase::ToCenter)?"EDM221":
+                EDM130::IsG76CenterAnchorHold220(p.scope.recipe)||
+                (p.feedback.flushPause&&p.feedback.flushPhase==EDM128::Phase::ToAnchor)?"EDM220":
+                EDM130::IsG76CenterReturnHold219(p.scope.recipe)||
+                (p.feedback.flushPause&&p.feedback.flushPhase==EDM128::Phase::Returning)?"EDM219":
+                p.feedback.flushPause||EDM130::IsG76CenterFlushHold218(p.scope.recipe)?"EDM218":"EDM217"):
             p.feedback.flushPause||EDM130::IsG76B2FlushHold200(p.scope.recipe)?"EDM200":"EDM199";
         char record[481]{};
         const int length=std::snprintf(record,sizeof(record),
@@ -17985,7 +19036,7 @@ void NCManager::LogEDM157SameThread(const char* event, const char* reason) const
                 static_cast<unsigned long long>(EDM130::CurveDoubleBits(f.positionPulse[5U])));
             if(poseLength>0&&poseLength<=480&&static_cast<std::size_t>(poseLength)<sizeof(record))RtPrintf("%s",record);
             else RtPrintf("[%s] event=LOG_FORMAT_ERROR part=PAUSE_POSE\n",tag);
-            if(EDM157::IsG76CenterNominalPause(p.scope))
+            if(EDM157::IsG76CenterNominalPause(p.scope)&&!f.flushPause)
             {
                 const auto& work=f.nominalWork;
                 const int workLength=std::snprintf(record,sizeof(record),
@@ -18003,18 +19054,18 @@ void NCManager::LogEDM157SameThread(const char* event, const char* reason) const
                 // sample. A delayed RUNNING ACK can follow a live phase change.
                 const auto& flush=f.flush;
                 const int timerLength=std::snprintf(record,sizeof(record),
-                    "[EDM200] event=FLUSH_RECEIPT result=%.24s hold=%llu tick=%llu flushPhase=%s eventIndex=%llu stopAnchor=%u e5Anchor=%u target=%u top=%u exactReturn=%u dwells=%u workUs=%llu elapsedUs=%llu triggerTick=%llu triggerUs=%llu evidence=RT_FROZEN_FLUSH authority=NONE\n",
-                    event,static_cast<unsigned long long>(p.holdSequence),static_cast<unsigned long long>(f.tick),
+                    "[%s] event=FLUSH_RECEIPT result=%.24s hold=%llu tick=%llu flushPhase=%s eventIndex=%llu stopAnchor=%u e5Anchor=%u target=%u top=%u exactReturn=%u dwells=%u workUs=%llu elapsedUs=%llu triggerTick=%llu triggerUs=%llu evidence=RT_FROZEN_FLUSH authority=NONE\n",
+                    tag,event,static_cast<unsigned long long>(p.holdSequence),static_cast<unsigned long long>(f.tick),
                     EDM128::PhaseName(f.flushPhase),static_cast<unsigned long long>(f.flushEventIndex),
                     f.anchorCaptured?1U:0U,flush.anchorCaptured?1U:0U,flush.targetCaptured?1U:0U,
                     flush.topCaptured?1U:0U,flush.exactReturn?1U:0U,flush.qualifiedDwells,
                     static_cast<unsigned long long>(flush.totalWorkUs),static_cast<unsigned long long>(flush.elapsedUs),
                     static_cast<unsigned long long>(flush.lastTriggerTick),static_cast<unsigned long long>(flush.lastTriggerUs));
                 if(timerLength>0&&timerLength<=480&&static_cast<std::size_t>(timerLength)<sizeof(record))RtPrintf("%s",record);
-                else RtPrintf("[EDM200] event=LOG_FORMAT_ERROR part=FLUSH_RECEIPT\n");
+                else RtPrintf("[%s] event=LOG_FORMAT_ERROR part=FLUSH_RECEIPT\n",tag);
                 const int pathLength=std::snprintf(record,sizeof(record),
-                    "[EDM200] event=FLUSH_PATH result=%.24s hold=%llu anchorRow=%llu anchorSegment=%llu anchorLocalBits=%llu anchorStationBits=%llu targetRow=%llu targetSegment=%llu targetLocalBits=%llu targetStationBits=%llu evidence=RT_FROZEN_FLUSH authority=NONE\n",
-                    event,static_cast<unsigned long long>(p.holdSequence),
+                    "[%s] event=FLUSH_PATH result=%.24s hold=%llu anchorRow=%llu anchorSegment=%llu anchorLocalBits=%llu anchorStationBits=%llu targetRow=%llu targetSegment=%llu targetLocalBits=%llu targetStationBits=%llu evidence=RT_FROZEN_FLUSH authority=NONE\n",
+                    tag,event,static_cast<unsigned long long>(p.holdSequence),
                     static_cast<unsigned long long>(flush.anchorOrdinal),static_cast<unsigned long long>(flush.anchorSegment),
                     static_cast<unsigned long long>(EDM130::CurveDoubleBits(flush.anchorLocalMm)),
                     static_cast<unsigned long long>(EDM130::CurveDoubleBits(flush.anchorStationMm)),
@@ -18022,7 +19073,7 @@ void NCManager::LogEDM157SameThread(const char* event, const char* reason) const
                     static_cast<unsigned long long>(EDM130::CurveDoubleBits(flush.targetLocalMm)),
                     static_cast<unsigned long long>(EDM130::CurveDoubleBits(flush.targetStationMm)));
                 if(pathLength>0&&pathLength<=480&&static_cast<std::size_t>(pathLength)<sizeof(record))RtPrintf("%s",record);
-                else RtPrintf("[EDM200] event=LOG_FORMAT_ERROR part=FLUSH_PATH\n");
+                else RtPrintf("[%s] event=LOG_FORMAT_ERROR part=FLUSH_PATH\n",tag);
             }
         }
         return;
@@ -18169,6 +19220,9 @@ bool NCManager::TryHoldEDM157SameThread() noexcept
         (!EDM157::ValidPauseContext(m_edm157.feedback)||
             (EDM130::IsG76CenterHold217(scope.recipe)?
                 (!E217NominalCheckpointReceipt(m_edm157.feedback)||m_edm200.eventIndex):
+                EDM130::IsG76CenterAnyFlushHold232(scope.recipe)?
+                (!E232CenterFlushCheckpointReceipt(m_edm157.feedback)||
+                    m_edm200.eventIndex!=EDM130::G76CenterHoldEventIndex(scope.recipe)):
                 (!m_edm157.feedback.flushPause||m_edm157.feedback.flushPhase!=EDM128::Phase::Outbound||
                     m_edm157.feedback.flushEventIndex!=m_edm200.eventIndex))))return false;
     if (m_edm157HoldSerial == (std::numeric_limits<std::uint64_t>::max)()) return false;
@@ -18311,22 +19365,157 @@ void NCManager::ServiceEDM217AutoNominalHoldSameThread(bool feedbackCurrent)
         static_cast<unsigned long long>(work.elapsedUs),static_cast<unsigned long long>(work.workTimeUs));
 }
 
+void NCManager::ServiceEDM218AutoCenterFlushHoldSameThread(bool feedbackCurrent)
+{
+    // L2-L5 retain moving-leg checkpoints; L6/L7 pause apex/outgoing center
+    // dwells, L8 the returning center dwell and EDM226 L9 the final anchor dwell.
+    // EDM227 L10 pauses initial settlement on the still attached main path.
+    // EDM228 L11 retains the initial moving Brake until a fresh START.
+    // EDM231 L231 pauses the second Outbound; EDM232 L232 pauses its Returning.
+    // Both keep event 1 uninterrupted and retain the two-event cap.
+    // START restarts the full dwell;
+    // held wall time is never completion credit and no checkpoint grants JOG.
+    const auto& s=m_edm94;const auto& recipe=m_edm130.recipe;
+    const bool topDwell=EDM130::IsG76CenterTopDwellHold222(recipe);
+    const bool centerDwell=EDM130::IsG76CenterDwellHold224(recipe);
+    const bool centerReturnDwell=EDM130::IsG76CenterReturnDwellHold225(recipe);
+    const bool finalDwell=EDM130::IsG76CenterFinalDwellHold226(recipe);
+    const bool initialDwell=EDM130::IsG76CenterInitialDwellHold227(recipe);
+    const bool braking=EDM130::IsG76CenterBrakeHold228(recipe);
+    const bool preCapture=initialDwell||braking;
+    const bool dwelling=topDwell||centerDwell||centerReturnDwell||finalDwell||initialDwell;
+    const bool toCenter=EDM130::IsG76CenterStartHold221(recipe);
+    const bool toAnchor=EDM130::IsG76CenterAnchorHold220(recipe);
+    const bool secondReturning=EDM130::IsG76CenterSecondReturnHold232(recipe);
+    const bool returning=EDM130::IsG76CenterReturnHold219(recipe)||secondReturning;
+    const bool second=EDM130::IsG76CenterSecondFlushHold231(recipe);
+    const std::uint64_t holdEvent=EDM130::G76CenterHoldEventIndex(recipe);
+    if(!feedbackCurrent||!m_edm130.bound||!EDM173::RecipeMatchesArm(s.gapHistoryArm,recipe)||
+        !EDM130::IsG76CenterAnyFlushHold232(recipe)||!EDM130::ValidRecipe(recipe)||
+        !s.session||m_edm200.queued||m_edm157.active||m_state!=NCState::RUN||
+        !s.latched||!s.ready||!s.everArmed||s.armPending||s.cancelled||
+        s.resetSeen||s.resetCommitted||s.releaseRequested||s.rtFaultReported||
+        s.finishPending||s.complete||m_resetContinuationPhase!=ResetContinuationPhase::IDLE||
+        !s.feedback.active||s.feedback.faulted||s.feedback.forceZero||
+        AlarmManager::GetInstance().HasAlarm())return;
+    EDM128::MotionFeedback mode{};EDM126::MotionFeedback history{};
+    const double height=EDM130::FrozenJumpHeightMm(recipe);
+    if(!m_motion.ReadEDM130Feedback(mode)||!mode.enabled||!mode.active||mode.faulted||
+        !mode.workTimeFlush||mode.fixture!=EDM173::HistoryFixture||
+        mode.session!=s.session||mode.armEpoch!=s.armEpoch||mode.ownerGeneration!=s.lease.generation||
+        mode.liveEpoch!=m_motion.GetCurrentExecutionEpoch()||!mode.authorizedRows||mode.authorizedRows>25U||
+        mode.completedRows+1U!=mode.authorizedRows||!mode.tick||!mode.nowUs||!s.feedback.lastTick||
+        (mode.tick>s.feedback.lastTick?mode.tick-s.feedback.lastTick:s.feedback.lastTick-mode.tick)>8ULL||
+        !EDM130::SameRecipe(mode.timerRecipe,recipe)||!EDM116::SamePolicy(mode.rowPolicy,mode.coordinator.policy))return;
+    const auto& event=mode.coordinator;double span=0.0,traveled=0.0;
+    std::uint64_t dwellElapsedUs=0ULL;
+    if((!braking&&!toCenter&&!dwelling&&(!(toAnchor?E220CenterAnchorSpan(event,span):EDM128::TrySpeedStageSpanMm(event,span))||!EDM126::Positive(span)))||
+        event.policy.fixture!=EDM116::Fixture::ModalG76Gap173||
+        static_cast<unsigned>(event.policy.mode)!=EDM173::ModeForArm(s.gapHistoryArm)||
+        event.phase!=(braking?EDM128::Phase::Brake:initialDwell?EDM128::Phase::AnchorDwell:finalDwell?EDM128::Phase::ReturnDwell:centerReturnDwell?EDM128::Phase::CenterReturnDwell:centerDwell?EDM128::Phase::CenterDwell:topDwell?EDM128::Phase::TopDwell:toCenter?EDM128::Phase::ToCenter:toAnchor?EDM128::Phase::ToAnchor:returning?EDM128::Phase::Returning:EDM128::Phase::Outbound)||
+        (preCapture?(event.detached||event.centerCaptured||event.anchorCaptured):
+            (!event.detached||!event.centerCaptured||!event.anchorCaptured))||event.faulted||event.stopped||
+        event.eventIndex!=holdEvent||event.work.triggeredEvents!=holdEvent||event.work.completedEvents!=holdEvent-1ULL||
+        !EDM130::ValidWorkEvidence(event.work)||!std::isfinite(event.stageDistanceMm)||
+        // Return samples publish remaining distance to that leg's endpoint.
+        // A phase transition without a speed sample is never 25% travel.
+        (!braking&&!toCenter&&!dwelling&&(((returning||toAnchor)?(event.speedStage==EDM128::SpeedStage::None||event.stageDistanceMm>span*0.75):
+            event.stageDistanceMm<span*0.25)||event.stageDistanceMm>span+EDM126::Roundoff(span)))||
+        !EDM128::ValidHeightProof(event,height,recipe.deepFlushCycleInterval,
+            EDM130::FrozenDeepMultiplier(recipe),EDM130::HasBoundDeep(recipe))||
+        !EDM128::ValidSpeedProof(event,recipe.flushStages))return;
+    if(dwelling) {
+        const auto duration=event.policy.profile.dwellUs;
+        if(!duration||!event.stableCycles||!event.stableStartUs||event.stableStartUs>mode.nowUs)return;
+        dwellElapsedUs=mode.nowUs-event.stableStartUs;
+        if(dwellElapsedUs<duration/4ULL||dwellElapsedUs>=duration)return;
+    }
+    EDM157::Scope scope{};
+    if(!CaptureEDM157ScopeSameThread(scope)||!EDM157::PauseModeAllowed(scope,event)||
+        !EDM130::SameRecipe(scope.recipe,recipe)||!EDM116::SamePolicy(scope.policy,mode.rowPolicy)||
+        (!preCapture&&!EDM126::SameSource(scope.authorizedSource,event.anchor.authorizedSource))||
+        !m_motion.ReadEDM126Feedback(history)||!history.enabled||!history.active||history.faulted||
+        !history.sourceReady||!history.rowActive||history.rowCompleted||
+        history.fixture!=mode.fixture||history.session!=mode.session||history.armEpoch!=mode.armEpoch||
+        history.ownerGeneration!=mode.ownerGeneration||history.liveEpoch!=mode.liveEpoch||
+        history.authorizedRows!=mode.authorizedRows||history.completedRows!=mode.completedRows||
+        history.tick!=mode.tick||history.nowUs!=mode.nowUs||history.lastMappingTick!=history.tick||
+        history.lastMappingUs!=history.nowUs||mode.lastMappingTick!=history.lastMappingTick||
+        mode.lastMappingUs!=history.lastMappingUs||history.traversal.tick!=history.tick||
+        history.traversal.nowUs!=history.nowUs||!EDM126::SameSource(history.authorizedSource,scope.authorizedSource)||
+        !EDM157::ValidMapped(scope,history.traversal)||
+        (!preCapture&&(!EDM157::ValidMapped(scope,event.anchor)||
+            !EDM126::SameSource(history.traversal.cursorSource,event.anchor.cursorSource)||
+            history.traversal.localMm!=event.anchor.localMm||history.traversal.stationMm!=event.anchor.stationMm||
+            history.traversal.historyDepth!=event.anchor.historyDepth)))return;
+    // Main-path braking uses its constant deceleration. Leave at least two
+    // 2ms freshness windows plus one RT sample before the predicted stop.
+    // This margin is only a test trigger; the RT receipt must still be Brake.
+    if(braking&&(!EDM126::Positive(history.traversal.velocityMmSec)||
+        history.traversal.accelerationMmSec2>=0.0||
+        history.traversal.velocityMmSec<=-history.traversal.accelerationMmSec2*0.00425))return;
+    if(toCenter&&(!E221CenterStartProgress(event,history.traversal.positionPulse,span,traveled)||
+        traveled<span*0.25))return;
+    if(dwelling) {
+        EDM204::Geometry geometry{};const auto& pose=history.traversal;
+        // Initial dwell has no canonical E5 anchor yet. The current scoped,
+        // mapped main-path pose is frozen by the RT transaction on acceptance.
+        if(!EDM128::Zero(pose)||pose.accelerationMmSec2!=0.0||pose.accelerationPps2!=EDM126::Point{}||
+            (!initialDwell&&(!EDM128::CenterAxisGeometry(event,geometry)||
+                !EDM109::SamePulse(pose.positionPulse,finalDwell?geometry.anchorPulse:
+                    (centerDwell||centerReturnDwell)?geometry.centerPulse:geometry.topPulse))))return;
+    }
+    const bool accepted=TryHoldEDM157SameThread();
+    // A second capture in TryHold must still name the same live compound child.
+    // The RT receipt below must additionally confirm the requested flush phase.
+    if(!accepted||!EDM157::SameScope(m_edm157.scope,scope)||!m_edm157.compoundCommit)
+    {
+        RejectEDM94SameThread(secondReturning?"EDM232_AUTO_HOLD_REQUEST_REJECTED":second?"EDM231_AUTO_HOLD_REQUEST_REJECTED":braking?"EDM228_AUTO_HOLD_REQUEST_REJECTED":initialDwell?"EDM227_AUTO_HOLD_REQUEST_REJECTED":finalDwell?"EDM226_AUTO_HOLD_REQUEST_REJECTED":centerReturnDwell?"EDM225_AUTO_HOLD_REQUEST_REJECTED":centerDwell?"EDM224_AUTO_HOLD_REQUEST_REJECTED":topDwell?"EDM223_AUTO_HOLD_REQUEST_REJECTED":toCenter?"EDM221_AUTO_HOLD_REQUEST_REJECTED":toAnchor?"EDM220_AUTO_HOLD_REQUEST_REJECTED":returning?"EDM219_AUTO_HOLD_REQUEST_REJECTED":"EDM218_AUTO_HOLD_REQUEST_REJECTED",
+            m_gapDryRun.sourceLine);return;
+    }
+    m_edm200.scope=scope;m_edm200.compoundCommit=m_edm157.compoundCommit;
+    m_edm200.holdSequence=m_edm157.holdSequence;m_edm200.eventIndex=event.eventIndex;m_edm200.queued=true;
+    if(braking)
+        PrintNCG76DiagnosticLine("[EDM228] event=AUTO_HOLD_REQUEST result=QUEUED session=%llu L=11 B=%u eventIndex=1 phase=BRAKE tick=%llu hold=%llu startFloor=%llu child=%llu velocityMmSec=%.9g accelerationMmSec2=%.9g initialDwell=FULL_AFTER_START resume=MANUAL_FRESH_START discharge=0\n",
+            static_cast<unsigned long long>(s.session),EDM173::ModeForArm(s.gapHistoryArm),
+            static_cast<unsigned long long>(mode.tick),static_cast<unsigned long long>(m_edm157.holdSequence),
+            static_cast<unsigned long long>(m_edm157.startFloor),
+            static_cast<unsigned long long>(scope.authorizedSource.ordinal+1ULL),
+            history.traversal.velocityMmSec,history.traversal.accelerationMmSec2);
+    else if(dwelling)
+        PrintNCG76DiagnosticLine("[%s] event=AUTO_HOLD_REQUEST result=QUEUED session=%llu L=%u B=%u eventIndex=1 phase=%s tick=%llu hold=%llu startFloor=%llu child=%llu dwellElapsedUs=%llu dwellUs=%llu dwellRestart=FULL resume=MANUAL_FRESH_START discharge=0\n",
+            E228CenterDwellIntentTag(recipe),static_cast<unsigned long long>(s.session),static_cast<unsigned>(recipe.flushHoldTest),
+            EDM173::ModeForArm(s.gapHistoryArm),EDM128::PhaseName(event.phase),static_cast<unsigned long long>(mode.tick),static_cast<unsigned long long>(m_edm157.holdSequence),
+            static_cast<unsigned long long>(m_edm157.startFloor),
+            static_cast<unsigned long long>(scope.authorizedSource.ordinal+1ULL),
+            static_cast<unsigned long long>(dwellElapsedUs),static_cast<unsigned long long>(event.policy.profile.dwellUs));
+    else PrintNCG76DiagnosticLine("[%s] event=AUTO_HOLD_REQUEST result=QUEUED session=%llu L=%u B=%u eventIndex=%llu phase=%s tick=%llu hold=%llu startFloor=%llu child=%llu distanceMm=%.9g %s=%.9g resume=MANUAL_FRESH_START discharge=0\n",
+        secondReturning?"EDM232":second?"EDM231":toCenter?"EDM221":toAnchor?"EDM220":returning?"EDM219":"EDM218",static_cast<unsigned long long>(s.session),static_cast<unsigned>(recipe.flushHoldTest),
+        EDM173::ModeForArm(s.gapHistoryArm),static_cast<unsigned long long>(event.eventIndex),EDM128::PhaseName(event.phase),
+        static_cast<unsigned long long>(mode.tick),static_cast<unsigned long long>(m_edm157.holdSequence),
+        static_cast<unsigned long long>(m_edm157.startFloor),
+        static_cast<unsigned long long>(scope.authorizedSource.ordinal+1ULL),toCenter?traveled:event.stageDistanceMm,
+        toCenter?"centerSpanMm":toAnchor?"anchorSpanMm":"axialSpanMm",span);
+}
+
 bool NCManager::IsEDM200AutoHoldCheckpointCompleteSameThread() const noexcept
 {
     const auto& recipe=m_edm130.recipe;const auto& s=m_edm94;const auto& c=m_edm200;
-    if(!recipe.flushHoldTest)return true;
+    if(EDM130::IsG76CommissioningRecipe(recipe)&&EDM130::ValidRecipe(recipe))return true;
+    if(!recipe.flushHoldTest||((EDM130::IsG76CenterRepeat230(recipe)||EDM130::IsG76ParentSequence233(recipe)||EDM130::IsG76CenterSequence239(recipe)||EDM130::IsG76CenterSequence240(recipe)||EDM130::IsG76CenterSequence241(recipe)||EDM130::IsG76CenterSequence242(recipe)||EDM130::IsG76CenterSequence243(recipe)||EDM130::IsG76CenterSequence244(recipe)||EDM130::IsG76CenterSequence245(recipe)||EDM130::IsG76CenterSequence246(recipe)||EDM130::IsG76CenterSequence247(recipe)||EDM130::IsG76CenterSequence248(recipe))&&EDM130::ValidRecipe(recipe)))return true;
     const bool center=EDM130::IsG76CenterHold217(recipe);
+    const bool centerFlush=EDM130::IsG76CenterAnyFlushHold232(recipe);
     if(!EDM173::RecipeMatchesArm(s.gapHistoryArm,recipe)||!m_edm173||!m_g76Orbit||!m_edm130.bound||
-        (!center&&!EDM130::IsG76B2FlushHold200(recipe))||!EDM130::ValidRecipe(recipe)||
+        (!center&&!centerFlush&&!EDM130::IsG76B2FlushHold200(recipe))||!EDM130::ValidRecipe(recipe)||
         !EDM157::ValidScope(c.scope)||!c.queued||!c.resumed||!c.holdSequence||!c.resumeStartSequence||
-        c.eventIndex!=(center?0ULL:1ULL)||c.scope.authorizedSource.scope.session!=s.session||
+        c.eventIndex!=(center?0ULL:EDM130::G76CenterHoldEventIndex(recipe))||c.scope.authorizedSource.scope.session!=s.session||
         !EDM130::SameRecipe(c.scope.recipe,recipe)||!EDM130::SameRecipe(m_edm173->plan.recipe,recipe)||
         c.scope.compoundFingerprint!=m_edm173->plan.fingerprint||c.scope.compoundArmEpoch!=s.armEpoch||
         c.compoundCommit!=m_g76Orbit->commit||c.scope.authorizedSource.dispatch!=m_g76Orbit->dispatch||
         c.scope.authorizedSource.sourcePC!=m_g76Orbit->pc||c.scope.compoundLine!=m_g76Orbit->line||
         c.scope.authorizedSource.scope.run!=s.run||c.scope.authorizedSource.scope.cache!=s.cache||
         c.scope.authorizedSource.scope.translationGeneration!=m_edm173->plan.nominal.translationGeneration||
-        c.scope.ownerGeneration!=s.lease.generation||c.scope.authorizedSource.ordinal>=25ULL)return false;
+        c.scope.ownerGeneration!=s.lease.generation||c.scope.authorizedSource.ordinal>=EDM173::CountForRecipe(recipe))return false;
     const unsigned child=static_cast<unsigned>(c.scope.authorizedSource.ordinal);
     const auto& id=m_g76Orbit->receipt.identities[child];
     return m_g76Orbit->accepted[child]&&m_g76Orbit->started[child]&&id.IsAssigned()&&
@@ -18341,6 +19530,7 @@ void NCManager::ServiceEDM165AutoFlushHoldSameThread(bool feedbackCurrent)
     // trajectory, mapping, physical-zero and fresh-START authority.
     const auto& s = m_edm94;
     const auto& recipe = m_edm130.recipe;
+    if(EDM130::IsG76CommissioningRecipe(recipe)&&EDM130::ValidRecipe(recipe))return;
     const unsigned selection = recipe.flushHoldTest;
     const unsigned target = EDM130::FlushHoldTargetMode(selection);
     const bool targeted = selection >= 2U;
@@ -18449,7 +19639,7 @@ bool NCManager::ServiceEDM157SameThread(bool feedbackCurrent)
     auto& p = m_edm157;
     if (!p.active) return false;
     if (!IsEDM157ScopeCurrentSameThread(p.scope) || GetActiveDispatchPC() != p.pc ||
-        (p.resumePending && (AlarmManager::GetInstance().GetUpdateCount() != p.alarmUpdate ||
+        ((p.resumePending || p.startIntentPending) && (AlarmManager::GetInstance().GetUpdateCount() != p.alarmUpdate ||
             AlarmManager::MotionAdmissionBaseState(AlarmManager::GetInstance().GetMotionSafetyIntentState()) != p.alarmIntent ||
             m_motion.GetSafetyProvenanceGeneration() != p.safetyProvenance)))
     { LogEDM157SameThread("CANCEL", "PAUSE_SCOPE_CHANGED"); CancelEDM94SameThread("EDM157_PAUSE_SCOPE_CHANGED"); return false; }
@@ -18468,6 +19658,7 @@ bool NCManager::ServiceEDM157SameThread(bool feedbackCurrent)
         !EDM157::ValidPauseContext(observed) || (p.feedback.phase != EDM157::Phase::Idle &&
             !EDM157::SamePauseContext(observed, p.feedback)) ||
         observed.startFloor != p.startFloor || !observed.tick || !observed.nowUs || observed.tick < p.lastTick ||
+        (p.startIntentPending&&observed.nowUs<p.feedback.nowUs)||
         (feedbackCurrent && m_edm94.feedback.lastTick > observed.tick &&
             m_edm94.feedback.lastTick - observed.tick >
                 (observed.phase == EDM157::Phase::Running ? 4000ULL : 8ULL)) ||
@@ -18484,6 +19675,18 @@ bool NCManager::ServiceEDM157SameThread(bool feedbackCurrent)
             m_edm200.holdSequence!=p.holdSequence||m_edm200.compoundCommit!=p.compoundCommit||
             !EDM157::SameScope(m_edm200.scope,p.scope)))
     {LogEDM157SameThread("CANCEL","AUTO_CHECKPOINT_CHANGED");CancelEDM94SameThread("EDM217_AUTO_CHECKPOINT_CHANGED");return false;}
+    if(EDM130::IsG76CenterAnyFlushHold232(p.scope.recipe)&&m_edm200.queued&&!m_edm200.resumed&&
+        (!E232CenterFlushCheckpointReceipt(observed)||
+            m_edm200.eventIndex!=EDM130::G76CenterHoldEventIndex(p.scope.recipe)||
+            m_edm200.holdSequence!=p.holdSequence||m_edm200.compoundCommit!=p.compoundCommit||
+            !EDM157::SameScope(m_edm200.scope,p.scope)))
+    {LogEDM157SameThread("CANCEL","AUTO_CHECKPOINT_CHANGED");
+        CancelEDM94SameThread(EDM130::IsG76CenterSecondReturnHold232(p.scope.recipe)?"EDM232_AUTO_CHECKPOINT_CHANGED":EDM130::IsG76CenterSecondFlushHold231(p.scope.recipe)?"EDM231_AUTO_CHECKPOINT_CHANGED":EDM130::IsG76CenterBrakeHold228(p.scope.recipe)?"EDM228_AUTO_CHECKPOINT_CHANGED":EDM130::IsG76CenterInitialDwellHold227(p.scope.recipe)?"EDM227_AUTO_CHECKPOINT_CHANGED":EDM130::IsG76CenterFinalDwellHold226(p.scope.recipe)?"EDM226_AUTO_CHECKPOINT_CHANGED":EDM130::IsG76CenterReturnDwellHold225(p.scope.recipe)?"EDM225_AUTO_CHECKPOINT_CHANGED":
+            EDM130::IsG76CenterDwellHold224(p.scope.recipe)?"EDM224_AUTO_CHECKPOINT_CHANGED":
+            EDM130::IsG76CenterTopDwellHold222(p.scope.recipe)?"EDM223_AUTO_CHECKPOINT_CHANGED":
+            EDM130::IsG76CenterStartHold221(p.scope.recipe)?"EDM221_AUTO_CHECKPOINT_CHANGED":
+            EDM130::IsG76CenterAnchorHold220(p.scope.recipe)?"EDM220_AUTO_CHECKPOINT_CHANGED":
+            EDM130::IsG76CenterReturnHold219(p.scope.recipe)?"EDM219_AUTO_CHECKPOINT_CHANGED":"EDM218_AUTO_CHECKPOINT_CHANGED");return false;}
     // RUNNING is the one retained completion receipt of the requested START.
     // RT stops publishing it after the final zero proof; the 10 ms NC scan
     // can arrive after the normal eight-tick live-proof freshness window.
@@ -18493,18 +19696,45 @@ bool NCManager::ServiceEDM157SameThread(bool feedbackCurrent)
     if (observed.phase == EDM157::Phase::Running &&
         (!feedbackCurrent || m_edm94.feedback.lastTick < observed.tick)) return true;
     // TryResume retained the actual Held receipt before queuing START. The
-    // Running acknowledgement must retain its nominal pose and frozen work.
+    // Running acknowledgement must retain its stopped pose. SamePauseContext
+    // above also requires the same frozen nominal-work or flush receipt.
     if(EDM157::IsG76CenterNominalPause(p.scope)&&
-        (p.feedback.phase==EDM157::Phase::Held||p.feedback.phase==EDM157::Phase::Resuming)&&
+        (p.startIntentPending||p.feedback.phase==EDM157::Phase::Held||p.feedback.phase==EDM157::Phase::Resuming)&&
         (!E217SameNominalPose(observed,p.feedback)||
             !EDM157::SameNominalWorkReceipt(observed.nominalWork,p.feedback.nominalWork)))
-    {LogEDM157SameThread("CANCEL","NOMINAL_RECEIPT_CHANGED");CancelEDM94SameThread("EDM217_NOMINAL_RECEIPT_CHANGED");return false;}
+    {LogEDM157SameThread("CANCEL",observed.flushPause?"FLUSH_RECEIPT_CHANGED":"NOMINAL_RECEIPT_CHANGED");
+        CancelEDM94SameThread(observed.flushPause?
+            (EDM130::IsG76CenterSecondReturnHold232(p.scope.recipe)?"EDM232_FLUSH_RECEIPT_CHANGED":EDM130::IsG76CenterSecondFlushHold231(p.scope.recipe)?"EDM231_FLUSH_RECEIPT_CHANGED":
+                observed.flushPhase==EDM128::Phase::Resume?"EDM229_FLUSH_RECEIPT_CHANGED":
+                observed.flushPhase==EDM128::Phase::Brake?"EDM228_FLUSH_RECEIPT_CHANGED":
+                observed.flushPhase==EDM128::Phase::AnchorDwell?"EDM227_FLUSH_RECEIPT_CHANGED":
+                observed.flushPhase==EDM128::Phase::ReturnDwell?"EDM226_FLUSH_RECEIPT_CHANGED":
+                observed.flushPhase==EDM128::Phase::CenterReturnDwell?"EDM225_FLUSH_RECEIPT_CHANGED":
+                observed.flushPhase==EDM128::Phase::CenterDwell?"EDM224_FLUSH_RECEIPT_CHANGED":
+                observed.flushPhase==EDM128::Phase::TopDwell?"EDM223_FLUSH_RECEIPT_CHANGED":
+                observed.flushPhase==EDM128::Phase::ToCenter?"EDM221_FLUSH_RECEIPT_CHANGED":
+                observed.flushPhase==EDM128::Phase::ToAnchor?"EDM220_FLUSH_RECEIPT_CHANGED":
+                observed.flushPhase==EDM128::Phase::Returning?"EDM219_FLUSH_RECEIPT_CHANGED":"EDM218_FLUSH_RECEIPT_CHANGED"):
+            "EDM217_NOMINAL_RECEIPT_CHANGED");return false;}
     if(observed.phase==EDM157::Phase::Running&&EDM157::IsG76CenterNominalPause(p.scope)&&
         ((p.feedback.phase!=EDM157::Phase::Held&&p.feedback.phase!=EDM157::Phase::Resuming)||
             p.feedback.stableCycles<EDM157::RequiredStableCycles||observed.stableCycles<EDM157::RequiredStableCycles||
             !E217SameNominalPose(observed,p.feedback)||
             !EDM157::SameNominalWorkReceipt(observed.nominalWork,p.feedback.nominalWork)))
-    {LogEDM157SameThread("CANCEL","NOMINAL_RECEIPT_CHANGED");CancelEDM94SameThread("EDM217_NOMINAL_RECEIPT_CHANGED");return false;}
+    {LogEDM157SameThread("CANCEL",observed.flushPause?"FLUSH_RECEIPT_CHANGED":"NOMINAL_RECEIPT_CHANGED");
+        CancelEDM94SameThread(observed.flushPause?
+            (EDM130::IsG76CenterSecondReturnHold232(p.scope.recipe)?"EDM232_FLUSH_RECEIPT_CHANGED":EDM130::IsG76CenterSecondFlushHold231(p.scope.recipe)?"EDM231_FLUSH_RECEIPT_CHANGED":
+                observed.flushPhase==EDM128::Phase::Resume?"EDM229_FLUSH_RECEIPT_CHANGED":
+                observed.flushPhase==EDM128::Phase::Brake?"EDM228_FLUSH_RECEIPT_CHANGED":
+                observed.flushPhase==EDM128::Phase::AnchorDwell?"EDM227_FLUSH_RECEIPT_CHANGED":
+                observed.flushPhase==EDM128::Phase::ReturnDwell?"EDM226_FLUSH_RECEIPT_CHANGED":
+                observed.flushPhase==EDM128::Phase::CenterReturnDwell?"EDM225_FLUSH_RECEIPT_CHANGED":
+                observed.flushPhase==EDM128::Phase::CenterDwell?"EDM224_FLUSH_RECEIPT_CHANGED":
+                observed.flushPhase==EDM128::Phase::TopDwell?"EDM223_FLUSH_RECEIPT_CHANGED":
+                observed.flushPhase==EDM128::Phase::ToCenter?"EDM221_FLUSH_RECEIPT_CHANGED":
+                observed.flushPhase==EDM128::Phase::ToAnchor?"EDM220_FLUSH_RECEIPT_CHANGED":
+                observed.flushPhase==EDM128::Phase::Returning?"EDM219_FLUSH_RECEIPT_CHANGED":"EDM218_FLUSH_RECEIPT_CHANGED"):
+            "EDM217_NOMINAL_RECEIPT_CHANGED");return false;}
     const auto priorPhase = p.feedback.phase;
     p.feedback = observed; p.lastTick = observed.tick;
     if ((p.scope.recipe.holdRetreatMode || observed.flushPause) && priorPhase != observed.phase)
@@ -18556,6 +19786,15 @@ bool NCManager::ServiceEDM157SameThread(bool feedbackCurrent)
                 static_cast<unsigned long long>(m_edm94.session),EDM173::ModeForArm(m_edm94.gapHistoryArm),
                 static_cast<unsigned long long>(p.holdSequence),static_cast<unsigned long long>(p.resumeStartSequence));
         }
+        if(EDM130::IsG76CenterAnyFlushHold232(p.scope.recipe)&&m_edm200.queued&&!m_edm200.resumed)
+        {
+            m_edm200.resumed=true;m_edm200.resumeStartSequence=p.resumeStartSequence;
+            PrintNCG76DiagnosticLine("[%s] event=CHECKPOINT_RESUMED session=%llu L=%u B=%u eventIndex=%llu hold=%llu start=%llu samePose=1 eventFrozen=1 proof=VALIDATED_RT_RUNNING discharge=0\n",
+                EDM130::IsG76CenterSecondReturnHold232(p.scope.recipe)?"EDM232":EDM130::IsG76CenterSecondFlushHold231(p.scope.recipe)?"EDM231":EDM130::IsG76CenterBrakeHold228(p.scope.recipe)?"EDM228":EDM130::IsG76CenterInitialDwellHold227(p.scope.recipe)?"EDM227":EDM130::IsG76CenterFinalDwellHold226(p.scope.recipe)?"EDM226":EDM130::IsG76CenterReturnDwellHold225(p.scope.recipe)?"EDM225":EDM130::IsG76CenterDwellHold224(p.scope.recipe)?"EDM224":EDM130::IsG76CenterTopDwellHold222(p.scope.recipe)?"EDM223":EDM130::IsG76CenterStartHold221(p.scope.recipe)?"EDM221":EDM130::IsG76CenterAnchorHold220(p.scope.recipe)?"EDM220":EDM130::IsG76CenterReturnHold219(p.scope.recipe)?"EDM219":"EDM218",
+                static_cast<unsigned long long>(m_edm94.session),static_cast<unsigned>(p.scope.recipe.flushHoldTest),
+                EDM173::ModeForArm(m_edm94.gapHistoryArm),static_cast<unsigned long long>(observed.flushEventIndex),
+                static_cast<unsigned long long>(p.holdSequence),static_cast<unsigned long long>(p.resumeStartSequence));
+        }
         m_state = NCState::RUN; m_pauseAfterBlock = false;
         ResumePathCoreLiveRetentionSameThread();
         LogEDM157SameThread("RESUMED", observed.flushPause ? "RT_ACK_FLUSH_SAME_POSE_RESUME_E5" : p.scope.recipe.holdRetreatMode ?
@@ -18576,7 +19815,125 @@ bool NCManager::ServiceEDM157SameThread(bool feedbackCurrent)
         p = EDM157NCState{};
         return false;
     }
+    ServiceEDM223StartIntentSameThread(feedbackCurrent);
+    return p.active;
+}
+
+bool NCManager::TryRetainEDM223StartSameThread() noexcept
+{
+    auto& p=m_edm157;
+    // L6-L11 can also receive an ordinary manual HOLD before/after their automatic
+    // checkpoint. Those pauses keep the existing immediate-START path.
+    if((!EDM130::IsG76CenterTopDwellHold222(p.scope.recipe)&&!EDM130::IsG76CenterDwellHold224(p.scope.recipe)&&!EDM130::IsG76CenterReturnDwellHold225(p.scope.recipe)&&!EDM130::IsG76CenterFinalDwellHold226(p.scope.recipe)&&!EDM130::IsG76CenterInitialDwellHold227(p.scope.recipe)&&!EDM130::IsG76CenterBrakeHold228(p.scope.recipe))||
+        (!p.startIntentPending&&(!m_edm200.queued||m_edm200.resumed)))return false;
+    // Only CycleStart calls this capture path. Service may spend this exact
+    // operator sequence, but cannot invent one or extend its one-second life.
+    if(p.startIntentPending) {
+        LogEDM157SameThread("START_PENDING","ORIGINAL_START_RETAINED_DEADLINE_UNCHANGED");return true;
+    }
+    auto& alarms=AlarmManager::GetInstance();
+    const auto update=alarms.GetUpdateCount();
+    const auto intent=AlarmManager::MotionAdmissionBaseState(alarms.GetMotionSafetyIntentState());
+    const auto safety=m_motion.GetSafetyProvenanceGeneration();
+    EDM157::Feedback observed{};EDM94::Feedback guard{};
+    if(!m_motion.ReadEDM157Feedback(observed)||!m_motion.ReadEDM94Feedback(guard)||
+        !EDM157::SameScope(observed.scope,p.scope)||!EDM157::ValidPauseContext(observed)||
+        !E228CenterFlushCheckpointReceipt(observed)||
+        (observed.phase!=EDM157::Phase::Qualifying&&observed.phase!=EDM157::Phase::Held)||
+        observed.holdSequence!=p.holdSequence||observed.startFloor!=p.startFloor||
+        observed.tick<p.lastTick||!E223StartGuardCurrent(guard,observed,true)||
+        (p.feedback.phase!=EDM157::Phase::Idle&&
+            (!EDM157::SamePauseContext(observed,p.feedback)||!E217SameNominalPose(observed,p.feedback)||
+                !EDM157::SameNominalWorkReceipt(observed.nominalWork,p.feedback.nominalWork)))||
+        !m_edm200.queued||m_edm200.resumed||m_edm200.eventIndex!=1ULL||
+        m_edm200.holdSequence!=p.holdSequence||m_edm200.compoundCommit!=p.compoundCommit||
+        !EDM157::SameScope(m_edm200.scope,p.scope)||GetActiveDispatchPC()!=p.pc||
+        m_startDiagnosticRequests<=p.startFloor||m_startDiagnosticRequests<=p.startIntentSequence||
+        m_startDiagnosticRequests<=observed.rejectedStartSequence||
+        !IsEDM157ScopeCurrentSameThread(p.scope)||m_state!=NCState::HOLD||alarms.HasAlarm()||
+        update!=alarms.GetUpdateCount()||
+        intent!=AlarmManager::MotionAdmissionBaseState(alarms.GetMotionSafetyIntentState())||
+        safety!=m_motion.GetSafetyProvenanceGeneration())
+    {LogEDM157SameThread("START_BLOCKED",EDM130::IsG76CenterBrakeHold228(p.scope.recipe)?"CURRENT_BRAKE_STOP_OR_NEW_START_REQUIRED":EDM130::IsG76CenterInitialDwellHold227(p.scope.recipe)?"CURRENT_INITIAL_DWELL_OR_NEW_START_REQUIRED":EDM130::IsG76CenterFinalDwellHold226(p.scope.recipe)?"CURRENT_FINAL_DWELL_OR_NEW_START_REQUIRED":EDM130::IsG76CenterReturnDwellHold225(p.scope.recipe)?"CURRENT_CENTER_RETURN_DWELL_OR_NEW_START_REQUIRED":EDM130::IsG76CenterDwellHold224(p.scope.recipe)?"CURRENT_CENTER_DWELL_OR_NEW_START_REQUIRED":"CURRENT_TOP_DWELL_OR_NEW_START_REQUIRED");return true;}
+    p.alarmUpdate=update;p.alarmIntent=intent;p.safetyProvenance=safety;
+    p.startIntentSequence=m_startDiagnosticRequests;p.startIntentTick=observed.tick;p.startIntentUs=observed.nowUs;
+    p.startIntentPending=true;p.feedback=observed;p.lastTick=observed.tick;
+    PrintNCG76DiagnosticLine("[%s] event=START_INTENT_RETAINED session=%llu hold=%llu start=%llu phase=%s stable=%u waitLimitUs=1000000 resume=ON_CURRENT_ZERO_200 discharge=0\n",
+        E228CenterDwellIntentTag(p.scope.recipe),static_cast<unsigned long long>(m_edm94.session),static_cast<unsigned long long>(p.holdSequence),
+        static_cast<unsigned long long>(p.startIntentSequence),EDM157::PhaseName(observed.phase),observed.stableCycles);
+    ServiceEDM223StartIntentSameThread(true);
     return true;
+}
+
+void NCManager::ServiceEDM223StartIntentSameThread(bool feedbackCurrent) noexcept
+{
+    auto& p=m_edm157;
+    if(!p.active||!p.startIntentPending)return;
+    const auto& observed=p.feedback;auto& alarms=AlarmManager::GetInstance();
+    if(p.resumePending||m_state!=NCState::HOLD||!IsEDM157ScopeCurrentSameThread(p.scope)||
+        GetActiveDispatchPC()!=p.pc||(!EDM130::IsG76CenterTopDwellHold222(p.scope.recipe)&&!EDM130::IsG76CenterDwellHold224(p.scope.recipe)&&!EDM130::IsG76CenterReturnDwellHold225(p.scope.recipe)&&!EDM130::IsG76CenterFinalDwellHold226(p.scope.recipe)&&!EDM130::IsG76CenterInitialDwellHold227(p.scope.recipe)&&!EDM130::IsG76CenterBrakeHold228(p.scope.recipe))||
+        !EDM157::SameScope(observed.scope,p.scope)||!EDM157::ValidPauseContext(observed)||
+        !E228CenterFlushCheckpointReceipt(observed)||
+        (observed.phase!=EDM157::Phase::Qualifying&&observed.phase!=EDM157::Phase::Held)||
+        observed.holdSequence!=p.holdSequence||observed.startFloor!=p.startFloor||
+        !m_edm200.queued||m_edm200.resumed||m_edm200.eventIndex!=1ULL||
+        m_edm200.holdSequence!=p.holdSequence||m_edm200.compoundCommit!=p.compoundCommit||
+        !EDM157::SameScope(m_edm200.scope,p.scope)||
+        !p.startIntentSequence||p.startIntentSequence<=p.startFloor||
+        p.startIntentSequence<=observed.rejectedStartSequence||p.startIntentSequence>m_startDiagnosticRequests||
+        !p.startIntentTick||!p.startIntentUs||observed.tick<p.startIntentTick||observed.nowUs<p.startIntentUs||
+        alarms.GetUpdateCount()!=p.alarmUpdate||alarms.HasAlarm()||
+        AlarmManager::MotionAdmissionBaseState(alarms.GetMotionSafetyIntentState())!=p.alarmIntent||
+        m_motion.GetSafetyProvenanceGeneration()!=p.safetyProvenance)
+    {LogEDM157SameThread("CANCEL","RETAINED_START_CONTEXT_CHANGED");CancelEDM94SameThread(EDM130::IsG76CenterBrakeHold228(p.scope.recipe)?"EDM228_START_CONTEXT_CHANGED":EDM130::IsG76CenterInitialDwellHold227(p.scope.recipe)?"EDM227_START_CONTEXT_CHANGED":EDM130::IsG76CenterFinalDwellHold226(p.scope.recipe)?"EDM226_START_CONTEXT_CHANGED":EDM130::IsG76CenterReturnDwellHold225(p.scope.recipe)?"EDM225_START_CONTEXT_CHANGED":EDM130::IsG76CenterDwellHold224(p.scope.recipe)?"EDM224_START_CONTEXT_CHANGED":"EDM223_START_CONTEXT_CHANGED");return;}
+    // Time and tick bounds both fail closed; repeated START cannot refresh
+    // either. Keep the consumed sequence until a new HOLD resets the state.
+    if(observed.nowUs-p.startIntentUs>=1000000ULL||observed.tick-p.startIntentTick>=4000ULL) {
+        p.startIntentPending=false;
+        PrintNCG76DiagnosticLine("[%s] event=START_INTENT_EXPIRED session=%llu hold=%llu start=%llu waitedUs=%llu action=REMAIN_HOLD_NEW_START_REQUIRED discharge=0\n",
+            E228CenterDwellIntentTag(p.scope.recipe),static_cast<unsigned long long>(m_edm94.session),static_cast<unsigned long long>(p.holdSequence),
+            static_cast<unsigned long long>(p.startIntentSequence),static_cast<unsigned long long>(observed.nowUs-p.startIntentUs));
+        return;
+    }
+    if(!feedbackCurrent)return;
+    EDM94::Feedback guard{};
+    if(!m_motion.ReadEDM94Feedback(guard)||!E223StartGuardCurrent(guard,observed,true)) {
+        p.startIntentPending=false;LogEDM157SameThread("START_BLOCKED","RETAINED_START_GUARD_CHANGED_NEW_START_REQUIRED");return;
+    }
+    // A newer guard can cross the deadline while the pause publication is
+    // still within the eight-tick freshness window. Neither clock may extend it.
+    if(guard.lastNowUs>=p.startIntentUs&&guard.lastTick>=p.startIntentTick&&
+        (guard.lastNowUs-p.startIntentUs>=1000000ULL||guard.lastTick-p.startIntentTick>=4000ULL)) {
+        p.startIntentPending=false;
+        PrintNCG76DiagnosticLine("[%s] event=START_INTENT_EXPIRED session=%llu hold=%llu start=%llu waitedUs=%llu action=REMAIN_HOLD_NEW_START_REQUIRED discharge=0\n",
+            E228CenterDwellIntentTag(p.scope.recipe),static_cast<unsigned long long>(m_edm94.session),static_cast<unsigned long long>(p.holdSequence),
+            static_cast<unsigned long long>(p.startIntentSequence),static_cast<unsigned long long>(guard.lastNowUs-p.startIntentUs));
+        return;
+    }
+    if(!E223StartGuardCurrent(guard,observed))return;
+    if(observed.phase!=EDM157::Phase::Held||observed.stableCycles<EDM157::RequiredStableCycles)return;
+    const std::uint64_t sequence=p.startIntentSequence;
+    AlarmManager::MotionAdmissionReservation admission{};
+    const auto result=alarms.TryBeginMotionAdmission(p.alarmUpdate,p.alarmIntent,admission,true);
+    if(result!=AlarmManager::MotionAdmissionResult::ACQUIRED) {
+        p.startIntentPending=false;LogEDM157SameThread("START_BLOCKED","RETAINED_START_ADMISSION_DENIED_NEW_START_REQUIRED");return;
+    }
+    const bool current=m_state==NCState::HOLD&&IsEDM157ScopeCurrentSameThread(p.scope)&&
+        GetActiveDispatchPC()==p.pc&&!alarms.HasAlarm()&&alarms.GetUpdateCount()==p.alarmUpdate&&
+        AlarmManager::MotionAdmissionBaseState(alarms.GetMotionSafetyIntentState())==p.alarmIntent&&
+        m_motion.GetSafetyProvenanceGeneration()==p.safetyProvenance;
+    const bool submitted=current&&m_motion.RequestEDM157Resume(p.scope,p.holdSequence,sequence);
+    const bool ended=alarms.EndMotionAdmission(admission);
+    // Once attempted, this ticket is spent. In particular, a queued request
+    // or a later RT rejection must never be retried automatically.
+    p.startIntentPending=false;
+    if(!ended) {CancelEDM94SameThread(EDM130::IsG76CenterBrakeHold228(p.scope.recipe)?"EDM228_RESUME_ALARM_ADMISSION_REVOKED":EDM130::IsG76CenterInitialDwellHold227(p.scope.recipe)?"EDM227_RESUME_ALARM_ADMISSION_REVOKED":EDM130::IsG76CenterFinalDwellHold226(p.scope.recipe)?"EDM226_RESUME_ALARM_ADMISSION_REVOKED":EDM130::IsG76CenterReturnDwellHold225(p.scope.recipe)?"EDM225_RESUME_ALARM_ADMISSION_REVOKED":EDM130::IsG76CenterDwellHold224(p.scope.recipe)?"EDM224_RESUME_ALARM_ADMISSION_REVOKED":"EDM223_RESUME_ALARM_ADMISSION_REVOKED");return;}
+    if(!submitted) {LogEDM157SameThread("START_BLOCKED","RESUME_NOT_QUEUED_FRESH_START_REQUIRED");return;}
+    p.resumePending=true;p.resumeStartSequence=sequence;
+    PrintNCG76DiagnosticLine("[%s] event=START_INTENT_SUBMITTED session=%llu hold=%llu start=%llu waitedUs=%llu stable=%u proof=CURRENT_HELD_ZERO_200 discharge=0\n",
+        E228CenterDwellIntentTag(p.scope.recipe),static_cast<unsigned long long>(m_edm94.session),static_cast<unsigned long long>(p.holdSequence),
+        static_cast<unsigned long long>(sequence),static_cast<unsigned long long>(observed.nowUs-p.startIntentUs),observed.stableCycles);
+    LogEDM157SameThread("RESUME_REQUEST","RETAINED_FRESH_START_CONTINUE_SAME_E5_EVENT");
 }
 
 bool NCManager::TryResumeEDM157SameThread() noexcept
@@ -18587,6 +19944,7 @@ bool NCManager::TryResumeEDM157SameThread() noexcept
     { CancelEDM94SameThread("EDM157_START_SCOPE_CHANGED"); return true; }
     if (p.resumePending)
     { LogEDM157SameThread("START_BLOCKED", "RESUME_ACK_PENDING"); return true; }
+    if(TryRetainEDM223StartSameThread())return true;
     EDM157::Feedback observed{};
     if (!m_motion.ReadEDM157Feedback(observed) || !EDM157::SameScope(observed.scope, p.scope) ||
         !EDM157::ValidPauseContext(observed) || (p.feedback.phase != EDM157::Phase::Idle &&
@@ -18623,6 +19981,9 @@ bool NCManager::TryResumeEDM157SameThread() noexcept
 
 void NCManager::CancelEDM94SameThread(const char* reason) noexcept
 {
+    m_edm237 = EDM237NCState{};
+    m_edm234 = EDM234NCState{};
+    m_edm233 = EDM233NCState{};
     m_edm157 = EDM157NCState{};
     m_edm149Confirmation = EDM149Confirmation{};
     if(m_edm173) { m_edm173->coordinateRow.valid=false; m_edm173->coordinateScope=EDM173::Scope{}; }
@@ -18672,7 +20033,75 @@ void NCManager::RejectEDM94SameThread(const char* reason, int line)
 
 bool NCManager::GuardEDM94BlockSameThread(const NCBlock& block, int pc, int line)
 {
+    if(m_edm237.authorized)
+    {
+        const auto& q=m_edm237;const auto& state=m_edm94;
+        if(!IsEDM237SequenceScopeCurrentSameThread())
+        {RejectEDM94SameThread("EDM237_PARENT_SCOPE",line);return false;}
+        if(!state.latched&&q.awaitNext)
+        {
+            const auto* source=GetBaseProgramCache().TryGetLine(pc);
+            const bool bridge=E237BridgeRequired(q.program,q.parentIndex,q.kinds[0U])&&source&&E240RecipeBridgeShape(source->parsedBlock,q.kinds[q.parentIndex],q.program)&&
+                E94Matches(source->parsedBlock,block)&&IsEDM240RecipeBridgeCurrentSameThread(pc);
+            const bool valid=bridge||(source&&IsEDM234BracketShapeValid(block)&&E94Matches(source->parsedBlock,block)&&
+                IsEDM237NextArmCurrentSameThread(pc,static_cast<unsigned>(block.val('P'))));
+            if(!valid)RejectEDM94SameThread("EDM237_NEXT_ARM_SCOPE",line);
+            return valid;
+        }
+        if(state.latched&&(!q.stageRecipeBound||!q.stageStarted||q.awaitNext||state.session!=q.currentSession||
+            state.armPC!=q.armPC[q.parentIndex]||state.gapHistoryArm!=E237ArmForKind(q.kinds[q.parentIndex])||
+            state.moves!=E237RowsForKind(q.kinds[q.parentIndex])||
+            (state.next&&q.currentRowBound+1U<state.next)||
+            (state.complete&&(q.parentIndex+1U!=q.parentCount||!q.firstReleased||q.releasePending))))
+        {RejectEDM94SameThread("EDM237_PARENT_BLOCK_SCOPE",line);return false;}
+    }
+    if(m_edm234.authorized&&m_edm234.program==236U)
+    {
+        const auto& q=m_edm234;const auto& state=m_edm94;
+        if(!IsEDM236SequenceScopeCurrentSameThread())
+        {RejectEDM94SameThread("EDM236_PARENT_SCOPE",line);return false;}
+        if(!state.latched&&q.awaitNext)
+        {
+            const auto* source=GetBaseProgramCache().TryGetLine(pc);
+            const bool valid=source&&IsEDM234BracketShapeValid(block)&&E94Matches(source->parsedBlock,block)&&
+                IsEDM236NextArmCurrentSameThread(pc,static_cast<unsigned>(block.val('P')));
+            if(!valid)RejectEDM94SameThread("EDM236_NEXT_ARM_SCOPE",line);
+            return valid;
+        }
+        if(state.latched&&(!q.stageRecipeBound||!q.stageStarted||q.awaitNext||state.session!=q.currentSession||
+            state.armPC!=q.firstArmPC+static_cast<int>(q.parentIndex*3U)||
+            state.gapHistoryArm!=E236ArmForKind(q.kinds[q.parentIndex])||(state.next==1U&&!q.motionDispatch)||
+            (state.complete&&(q.parentIndex!=3U||q.retiredMask!=7U||q.releasePending))))
+        {RejectEDM94SameThread("EDM236_PARENT_BLOCK_SCOPE",line);return false;}
+    }
+    else if(m_edm234.authorized)
+    {
+        const auto& q=m_edm234;const auto& state=m_edm94;
+        if(!state.latched&&q.firstReleased&&!q.secondStarted)
+        {
+            const auto* source=GetBaseProgramCache().TryGetLine(pc);
+            const bool valid=source&&IsEDM234BracketShapeValid(block)&&E94Matches(source->parsedBlock,block)&&
+                IsEDM234NextArmCurrentSameThread(pc,static_cast<unsigned>(block.val('P')));
+            if(!valid)RejectEDM94SameThread("EDM234_NEXT_ARM_SCOPE",line);
+            return valid;
+        }
+        if(state.latched&&(!IsEDM234SequenceScopeCurrentSameThread()||
+            state.armPC!=q.firstArmPC+(q.secondStarted?3:0)||state.gapHistoryArm!=q.arms[q.secondStarted?1U:0U]||
+            (state.next==1U&&!q.motionDispatch)||
+            (state.complete&&(!q.firstReleased||!q.secondStarted||q.releasePending||state.session<=q.firstSession))))
+        {RejectEDM94SameThread("EDM234_PARENT_BLOCK_SCOPE",line);return false;}
+    }
     if (m_edm94.latched && EDM173::IsArm(m_edm94.gapHistoryArm)) return GuardEDM173BlockSameThread(block,pc,line);
+    if(m_edm233.authorized&&m_edm233.firstReleased&&!m_edm233.secondStarted)
+    {
+        const auto* source=GetBaseProgramCache().TryGetLine(pc);
+        const bool valid=source&&IsEDM173BracketShapeValid(block)&&
+            E233CenterParentSequence(source->parsedBlock,static_cast<unsigned>(block.val('P')))&&
+            E94Matches(source->parsedBlock,block)&&
+            IsEDM233SecondArmCurrentSameThread(pc,static_cast<unsigned>(block.val('P')));
+        if(!valid)RejectEDM94SameThread("EDM233_SECOND_ARM_ORDER_OR_SCOPE",line);
+        return valid;
+    }
     if (!InspectEDM94ProgramSameThread() && !m_edm94.latched) return true;
     const auto* authored = GetBaseProgramCache().TryGetLine(pc);
     if (!authored || !(E94Matches(authored->parsedBlock, block) ||
@@ -18706,6 +20135,19 @@ bool NCManager::GuardEDM94BlockSameThread(const NCBlock& block, int pc, int line
                 !m_macroStack.empty()||m_isG66Active||m_edm149Confirmation.waiting||m_edm149Confirmation.confirmed) return false;
             const auto& cache=GetBaseProgramCache();const auto generation=cache.GetGeneration();
             if(!generation||generation!=m_edm94.inspectedCache||cache.Size()>128U) return false;
+            int sequenceFirst=-1;std::array<unsigned,2U> sequenceArms{};std::array<unsigned,4U> chainKinds{};
+            if(E237ProgramShape(cache,sequenceFirst,sequenceArms))
+            {coordinateArm=E237ArmForKind(sequenceArms[0U]);coordinateArmPC=sequenceFirst;return pc<sequenceFirst-1&&generation==cache.GetGeneration();}
+            if(E236ProgramShape(cache,sequenceFirst,chainKinds))
+            {coordinateArm=E236ArmForKind(chainKinds[0U]);coordinateArmPC=sequenceFirst;return pc<sequenceFirst-1&&generation==cache.GetGeneration();}
+            if(E234ProgramShape(cache,sequenceFirst,sequenceArms))
+            {coordinateArm=sequenceArms[0U];coordinateArmPC=sequenceFirst;return pc<sequenceFirst-1&&generation==cache.GetGeneration();}
+            if(E233ProgramShape(cache,sequenceFirst,sequenceArms,&NCManager::IsEDM173BracketShapeValid,
+                &NCManager::IsEDM173OrbitBlockShapeValid))
+            {
+                coordinateArm=sequenceArms[0U];coordinateArmPC=sequenceFirst;
+                return pc<sequenceFirst-1&&generation==cache.GetGeneration();
+            }
             unsigned brackets=0U,confirmations=0U,coordinateExpressions=0U;
             int confirmationPC=-1,coordinateExpressionPC=-1;
             NCBlock candidate{}; EDM179::Specification coordinateSource{};
@@ -18740,13 +20182,15 @@ bool NCManager::GuardEDM94BlockSameThread(const NCBlock& block, int pc, int line
                 (coordinateExpressions!=0U&&coordinateExpressionPC!=coordinateArmPC+1)||
                 static_cast<std::size_t>(coordinateArmPC)+3U>=cache.Size()) return false;
             NCBlock orbit{},finish{},end{};
+            const auto* armLine=cache.TryGetLine(coordinateArmPC);
             const auto* orbitLine=cache.TryGetLine(coordinateArmPC+1);
             const auto* finishLine=cache.TryGetLine(coordinateArmPC+2);
             const auto* endLine=cache.TryGetLine(coordinateArmPC+3);
-            if(!orbitLine||!finishLine||!endLine||
+            if(!armLine||!orbitLine||!finishLine||!endLine||
                 (!NCPreparedBlockQueueShadow::TryBuildLiteralBlock(orbitLine->parsedBlock,orbit)&&
                     !EDM179::Parse(orbitLine->parsedBlock,coordinateSource,orbit))||
                 !IsEDM173OrbitBlockShapeValid(orbit)||E181EffectiveOrbitMode(orbit)!=EDM173::ModeForArm(coordinateArm)||
+                !E251SquareSourcePair(armLine->parsedBlock,orbit)||
                 ((orbit.has('K')||!orbit.has('B')||orbit.val('B')==0.0)&&!orbitLine->parsedBlock.dependsOnMacroState&&
                     !E180LiteralAngleSourceMatches(orbitLine->parsedBlock,orbit))||
                 !NCPreparedBlockQueueShadow::TryBuildLiteralBlock(finishLine->parsedBlock,finish)||
@@ -19225,6 +20669,21 @@ WaitConditionFunc NCManager::StartEDM94SameThread(const NCBlock& block)
                 static_cast<unsigned long long>(m_edm94.session));
         if (!E156FinishTargetMatches(m_edm94, m_edm130.recipe, m_edm94.feedback, m_edm114.retained))
         { RejectEDM94SameThread("EDM156_FINISH_TARGET_RECEIPT", m_gapDryRun.sourceLine); return nullptr; }
+        if(m_edm237.authorized)
+        {
+            if(!IsEDM237SequenceScopeCurrentSameThread()||!m_edm237.motionDispatch||
+                m_edm237.currentRowBound!=E237RowsForKind(m_edm237.kinds[m_edm237.parentIndex]))
+            {RejectEDM94SameThread("EDM237_FINISH_SCOPE",m_gapDryRun.sourceLine);return nullptr;}
+            m_edm237.currentFinishDispatch=m_currentExecutingBlockDispatchId;
+            if(!m_edm237.parentIndex)m_edm237.firstFinishDispatch=m_currentExecutingBlockDispatchId;
+        }
+        if(m_edm234.authorized)
+        {
+            if(!IsEDM234SequenceScopeCurrentSameThread()||!m_edm234.motionDispatch)
+            {RejectEDM94SameThread("EDM234_LINE_FINISH_SCOPE",m_gapDryRun.sourceLine);return nullptr;}
+            m_edm234.currentFinishDispatch=m_currentExecutingBlockDispatchId;
+            if(m_edm234.program!=236U&&!m_edm234.secondStarted)m_edm234.firstFinishDispatch=m_currentExecutingBlockDispatchId;
+        }
         m_edm94.ready = false; m_edm94.finishPending = true; m_edm94.polls = 0U;
         m_motion.RequestEDM94Finish(m_edm94.session);
         LogEDM94SameThread("FINISH_REQUEST", "AWAIT_PHYSICAL_ZERO_STABILITY");
@@ -19339,11 +20798,28 @@ WaitConditionFunc NCManager::StartEDM94SameThread(const NCBlock& block)
     }
     if (EDM149::IsTestArm(m_edm94.gapHistoryArm) && !ConsumeEDM149ConfirmationSameThread(pc))
     { RejectEDM94SameThread("EDM149_M00_START_CONFIRMATION_REQUIRED", m_gapDryRun.sourceLine); return nullptr; }
+    // EDM247 FIX1 and EDM248: the ordinary recipe intentionally retains marker zero.
+    // Only its current, confirmed sequence parent may request the longer budget.
+    unsigned ordinarySequenceProgram=0U;
+    if(m_edm237.authorized&&(m_edm237.program==247U||m_edm237.program==248U))
+    {
+        const auto& q=m_edm237;const auto& s=m_edm94;
+        if(!IsEDM237SequenceScopeCurrentSameThread()||q.parentIndex>=q.parentCount||q.parentIndex>=4U||
+            q.kinds[q.parentIndex]!=5U||!q.stageRecipeBound||!q.stageStarted||q.awaitNext||q.releasePending||q.currentRowBound||
+            !s.program||!s.gapHistoryServo||!s.gapHistoryMode||!s.gapWorkTime||s.gapHistoryArm!=274U||s.moves!=4U||
+            s.session!=q.currentSession||s.armEpoch!=q.currentArmEpoch||s.armPC!=q.armPC[q.parentIndex]||
+            s.run!=q.run||s.cache!=q.cache||!s.lease.Matches(q.lease)||s.armDispatch!=m_currentExecutingBlockDispatchId||
+            !m_edm130.bound||!EDM130::SameRecipe(m_edm130.recipe,q.currentRecipe)||
+            !E237RecipeForProgramKind(m_edm130.recipe,5U,q.program))
+        {RejectEDM94SameThread(q.program==248U?"EDM248_ORDINARY_DURATION_SCOPE":"EDM247_ORDINARY_DURATION_SCOPE",m_gapDryRun.sourceLine);return nullptr;}
+        ordinarySequenceProgram=q.program;
+    }
     const bool submitted = m_edm94.gapWorkTime ?
         m_motion.SubmitEDM130Arm(m_edm94.session, m_edm94.armEpoch, m_edm94.lease,
             m_edm94.gapTuning, m_edm94.gapFlushParameters, E149HistoryFixture(m_edm94.gapHistoryArm), m_edm130.recipe,
             EDM149::IsManualVoltageTestArm(m_edm94.gapHistoryArm) ? m_edm94.run : 0ULL,
-            EDM149::IsManualVoltageTestArm(m_edm94.gapHistoryArm) ? m_edm94.cache : 0ULL) : m_edm94.gapPhysicalAd ?
+            EDM149::IsManualVoltageTestArm(m_edm94.gapHistoryArm) ? m_edm94.cache : 0ULL,
+            false,ordinarySequenceProgram) : m_edm94.gapPhysicalAd ?
         m_motion.SubmitEDM129Arm(m_edm94.session, m_edm94.armEpoch, m_edm94.lease,
             m_edm94.gapTuning, m_edm94.gapFlushParameters, m_edm94.gapHistoryArm == 170U ? 0U : 1U) : m_edm94.gapHistoryMode ?
         m_motion.SubmitEDM128Arm(m_edm94.session, m_edm94.armEpoch, m_edm94.lease,
@@ -19367,6 +20843,10 @@ WaitConditionFunc NCManager::StartEDM94SameThread(const NCBlock& block)
         m_motion.SubmitEDM94Arm(m_edm94.session, m_edm94.armEpoch, m_edm94.lease);
     if (!submitted)
     { RejectEDM94SameThread("ARM_PUBLICATION", m_gapDryRun.sourceLine); return nullptr; }
+    if(ordinarySequenceProgram==247U||ordinarySequenceProgram==248U)
+        PrintNCG76DiagnosticLine("[EDM%u%s] event=PARENT_DURATION_BUDGET parent=%u kind=5 session=%llu maxDurationUs=%llu E5policy=UNCHANGED discharge=0\n",
+            ordinarySequenceProgram,ordinarySequenceProgram==247U?"_FIX1":"",m_edm237.parentIndex+1U,static_cast<unsigned long long>(m_edm94.session),
+            static_cast<unsigned long long>(EDM94::OrdinarySequenceMaximumDurationUs247));
     m_edm94.latched = m_edm94.armPending = true;
     if(m_edm94.gapHistoryServo)
         RtPrintf("[EDM145] event=BUILD scope=SOURCE_STARTUP_AND_LOCAL_PROOF_REUSE session=%llu thread=NC phase=ARM_REQUEST rtBuildPrint=0 noCrossTickCache=1\n",
@@ -19488,6 +20968,17 @@ bool NCManager::HasEDM94CompletionReleaseAcknowledgementSameThread(const EDM94::
 bool NCManager::ConsumeEDM94CompletionReleaseSameThread(const EDM94::Feedback& f) noexcept
 {
     if (!m_edm94.latched || !HasEDM94CompletionReleaseAcknowledgementSameThread(f)) return false;
+    if(m_edm237.authorized&&!IsEDM237FinalStateSameThread())return false;
+    if(m_edm234.authorized&&m_edm234.program==236U)
+    {
+        const auto& q=m_edm234;const auto& state=m_edm94;int first=-1;std::array<unsigned,4U> kinds{};
+        if(q.parentIndex!=3U||q.retiredMask!=7U||!q.stageRecipeBound||!q.stageStarted||q.awaitNext||q.releasePending||
+            !q.firstRecipeBound||!q.firstSession||q.previousSession<q.firstSession||state.session!=q.currentSession||
+            q.currentSession<=q.previousSession||state.armPC!=q.firstArmPC+9||
+            q.run!=state.run||q.cache!=state.cache||q.cache!=GetBaseProgramCache().GetGeneration()||
+            !EDM130::SameRecipe(q.currentRecipe,m_edm130.recipe)||!E236RecipeForKind(q.currentRecipe,q.kinds[3U])||
+            !E236ProgramShape(GetBaseProgramCache(),first,kinds)||first!=q.firstArmPC||kinds!=q.kinds)return false;
+    }
     m_edm94.feedback = f;
     m_edm94.lastTick = f.lastTick;
     LogEDM94SameThread("NORMAL_RELEASED", "M30_AND_EXACT_NONE_PHYSICAL_ZERO");
@@ -19513,12 +21004,29 @@ bool NCManager::ConsumeEDM94CompletionReleaseSameThread(const EDM94::Feedback& f
     if (m_edm94.gapModeFlush && IsEDM116CurrentSameThread(EDM114::RequiredRows))
         LogEDM116SameThread("NORMAL_RELEASED");
     m_edm94.latched = m_edm94.armPending = m_edm94.ready = m_edm94.finishPending = false;
+    if(m_edm237.authorized)m_edm237=EDM237NCState{};
+    if(m_edm234.authorized&&m_edm234.program==236U)m_edm234=EDM234NCState{};
+    else if(m_edm234.authorized&&m_edm234.secondStarted&&m_edm234.firstReleased&&
+        m_edm94.session>m_edm234.firstSession)m_edm234=EDM234NCState{};
+    if(m_edm233.authorized&&m_edm233.secondStarted&&m_edm233.firstReleased&&
+        m_edm94.session>m_edm233.firstSession)m_edm233=EDM233NCState{};
     return true;
 }
 
 bool NCManager::IsEDM94CompletionSelectionCurrentSameThread() const noexcept
 {
     const auto& s = m_edm94;
+    if(m_edm237.authorized&&!IsEDM237FinalStateSameThread())return false;
+    if(m_edm234.authorized&&m_edm234.program==236U)
+    {
+        const auto& q=m_edm234;int first=-1;std::array<unsigned,4U> kinds{};
+        if(q.parentIndex!=3U||q.retiredMask!=7U||!q.stageRecipeBound||!q.stageStarted||q.awaitNext||q.releasePending||
+            !q.firstRecipeBound||!q.firstSession||q.previousSession<q.firstSession||s.session!=q.currentSession||
+            q.currentSession<=q.previousSession||s.armPC!=q.firstArmPC+9||q.run!=s.run||q.cache!=s.cache||
+            q.cache!=GetBaseProgramCache().GetGeneration()||!EDM130::SameRecipe(q.currentRecipe,m_edm130.recipe)||
+            !E236RecipeForKind(q.currentRecipe,q.kinds[3U])||!E236ProgramShape(GetBaseProgramCache(),first,kinds)||
+            first!=q.firstArmPC||kinds!=q.kinds)return false;
+    }
     if (!s.normalEndCommitted || !s.completionReleaseRequested || !s.complete ||
         !s.everArmed || !s.terminalLogged || s.armPending || s.ready || s.finishPending ||
         s.cancelled || s.resetSeen || s.resetCommitted || s.releaseRequested || s.rtFaultReported ||
@@ -20067,6 +21575,14 @@ void NCManager::ServiceEDM94SameThread()
     PollEDM206History(m_motion,static_cast<NCState>(m_state));
     if (!m_edm94.latched) return;
     auto& s = m_edm94;
+    // EDM231 FIX3: an operator's recoverable G76 HOLD is still an active
+    // session. Capture this before pause service can cancel its scope after a
+    // new RT fault; that cancellation is not an operator STOP/RESET request.
+    const bool operatorHoldFaultAlarm = m_state.load(std::memory_order_relaxed) == NCState::HOLD &&
+        m_edm157.active && s.program && EDM173::IsArm(s.gapHistoryArm) &&
+        !s.cancelled && !s.complete && !s.resetSeen && !s.resetCommitted &&
+        !s.releaseRequested && !s.rtFaultReported &&
+        m_resetContinuationPhase == ResetContinuationPhase::IDLE;
     // Sample before cancellation side effects. An RT fault may already have
     // revoked AUTO; logging the previous scan here would hide its first cause.
     EDM94::Feedback observed{};
@@ -20117,6 +21633,50 @@ void NCManager::ServiceEDM94SameThread()
             m_edm130.loggedSpeedStage = static_cast<std::uint32_t>(timed.coordinator.speedStage);
         }
     }
+    // EDM237 FIX1 observes existing publications on the NC thread only.
+    // Separate ticks are intentional: channel reads are not one atomic frame.
+    // No inferred pair is promoted to physical evidence or control authority.
+    if (feedbackCurrent && m_edm237.authorized && m_edm237.stageStarted &&
+        m_edm237.parentIndex < m_edm237.parentCount && m_edm237.kinds[m_edm237.parentIndex] == 5U &&
+        !s.cancelled && !s.releaseRequested &&
+        (!m_edm237.b2TraceTick || observed.lastTick < m_edm237.b2TraceTick ||
+            observed.lastTick - m_edm237.b2TraceTick >= 8000ULL))
+    {
+        m_edm237.b2TraceTick = observed.lastTick;
+        EDM128::MotionFeedback timed{}; EDM126::MotionFeedback history{};
+        const bool timerRead = m_motion.ReadEDM130Feedback(timed);
+        const bool historyRead = m_motion.ReadEDM126Feedback(history);
+        const bool identity = timerRead && historyRead && timed.enabled && history.enabled &&
+            timed.session == s.session && history.session == s.session &&
+            timed.armEpoch == s.armEpoch && history.armEpoch == s.armEpoch &&
+            timed.ownerGeneration == s.lease.generation && history.ownerGeneration == s.lease.generation &&
+            timed.liveEpoch == history.liveEpoch;
+        if (!identity)
+            PrintNCG76DiagnosticLine("[EDM237_FIX1] event=B2_TRACE_READ session=%llu tick=%llu timerRead=%u historyRead=%u identity=0 authority=NONE\n",
+                static_cast<unsigned long long>(s.session), static_cast<unsigned long long>(observed.lastTick),
+                timerRead?1U:0U, historyRead?1U:0U);
+        else if (timed.coordinator.policy.mode == EDM116::Mode::B2)
+        {
+            const auto& e = timed.coordinator; const auto& f = history.traversal;
+            PrintNCG76DiagnosticLine("[EDM237_FIX1] event=B2_CURSOR session=%llu tick=%llu historyTick=%llu mappedTick=%llu phase=%s eventIndex=%llu row=%llu cursor=%llu depth=%u q=%.17g station=%.17g v=%.17g a=%.17g seam=%u stable=%u back=%llu forward=%llu fault=%u reason=%u authority=NONE\n",
+                static_cast<unsigned long long>(s.session), static_cast<unsigned long long>(observed.lastTick),
+                static_cast<unsigned long long>(history.tick), static_cast<unsigned long long>(f.tick),
+                EDM128::PhaseName(e.phase), static_cast<unsigned long long>(e.eventIndex),
+                static_cast<unsigned long long>(f.authorizedSource.ordinal), static_cast<unsigned long long>(f.cursorSource.ordinal),
+                f.historyDepth, f.localMm, f.stationMm, f.velocityMmSec, f.accelerationMmSec2,
+                f.awaitingSeam?1U:0U, f.seamStableCycles,
+                static_cast<unsigned long long>(f.backwardCrossings), static_cast<unsigned long long>(f.forwardCrossings),
+                f.faulted?1U:0U, static_cast<unsigned>(f.reason));
+            PrintNCG76DiagnosticLine("[EDM237_FIX1] event=B2_TARGET session=%llu timerTick=%llu phase=%s eventIndex=%llu captured=%u top=%u exactReturn=%u targetRow=%llu targetQ=%.17g targetStation=%.17g anchorRow=%llu anchorQ=%.17g anchorStation=%.17g targetSpeed=%.17g triggered=%llu completed=%llu authority=NONE\n",
+                static_cast<unsigned long long>(s.session), static_cast<unsigned long long>(timed.tick),
+                EDM128::PhaseName(e.phase), static_cast<unsigned long long>(e.eventIndex),
+                e.targetCaptured?1U:0U, e.topCaptured?1U:0U, e.exactReturn?1U:0U,
+                static_cast<unsigned long long>(e.targetSource.ordinal), e.targetLocalMm, e.targetStationMm,
+                static_cast<unsigned long long>(e.anchor.cursorSource.ordinal), e.anchor.localMm, e.anchor.stationMm,
+                e.stageTargetMmSec, static_cast<unsigned long long>(e.work.triggeredEvents),
+                static_cast<unsigned long long>(e.work.completedEvents));
+        }
+    }
     if (feedbackCurrent) ServiceEDM147PhysicalGapSameThread();
     if (ServiceEDM118InterruptionSameThread(freshPhysical)) return;
     if (feedbackCurrent && ConsumeEDM94CompletionReleaseSameThread(observed)) return;
@@ -20125,6 +21685,7 @@ void NCManager::ServiceEDM94SameThread()
         CancelEDM94SameThread("NORMAL_RELEASE_REVOKED_RESET_REQUIRED");
     ServiceEDM200AutoFlushHoldSameThread(feedbackCurrent);
     ServiceEDM217AutoNominalHoldSameThread(feedbackCurrent);
+    ServiceEDM218AutoCenterFlushHoldSameThread(feedbackCurrent);
     ServiceEDM165AutoFlushHoldSameThread(feedbackCurrent);
     const bool resumablePause = ServiceEDM157SameThread(feedbackCurrent);
     const bool preserveStop = s.resetSeen || s.resetCommitted || s.releaseRequested || s.complete ||
@@ -20251,9 +21812,50 @@ void NCManager::ServiceEDM94SameThread()
         // Cancellation is not acknowledgement of an RT fault. Report once even
         // if the preceding owner/lifecycle check (or an earlier scan) cancelled.
         s.rtFaultReported = true;
-        const bool raiseAlarm = m_state == NCState::RUN && !preserveStop;
+        // Do not use the now-cancelled pause scope as acknowledgement of this
+        // fault. An actual RESET/release/completion observed meanwhile wins.
+        const bool holdFaultAlarmCurrent = operatorHoldFaultAlarm &&
+            (m_state == NCState::RUN || m_state == NCState::HOLD) &&
+            !s.resetSeen && !s.resetCommitted && !s.releaseRequested && !s.complete &&
+            m_resetContinuationPhase == ResetContinuationPhase::IDLE;
+        const bool raiseAlarm = (m_state == NCState::RUN && !preserveStop) || holdFaultAlarmCurrent;
         if (!s.cancelled && !s.releaseRequested) CancelEDM94SameThread("RT_GUARD_FAULT");
         LogEDM94SameThread("RT_FAULT", raiseAlarm ? "RT_GUARD_FAULT_ALARM" : "RT_GUARD_FAULT_DURING_STOP");
+        // EDM231 FIX3: read-only first-rejection evidence. A delayed or other
+        // session's pause receipt cannot explain this guard's first fault.
+        // A prior SOURCE/other-site fault on the same tick remains first.
+        // Pre-Tick rejection belongs to the guard's preceding frame context;
+        // keep that fault context separate from the callback capture tick.
+        if (EDM173::IsArm(s.gapHistoryArm))
+        {
+            EDM157::Feedback pause{};
+            const bool pauseRead = m_motion.ReadEDM157Feedback(pause);
+            const auto& d = pause.firstFailure;
+            const bool pauseFailureMatches = pauseRead &&
+                f.firstFault.reason == static_cast<std::uint32_t>(EDM94::Reason::Identity) &&
+                f.firstFault.site == static_cast<std::uint32_t>(EDM94::FaultSite::EngineFault) &&
+                pause.scope.authorizedSource.scope.session == s.session &&
+                d.site != EDM157::RejectSite::None && d.tick != 0ULL &&
+                d.guardContextTick != 0ULL && d.guardContextTick == f.firstFault.tick;
+            if (pauseFailureMatches)
+            {
+                PrintNCG76DiagnosticLine("[EDM231_FIX3] event=PAUSE_FIRST session=%llu faultTick=%llu captureTick=%llu nowUs=%llu site=%s priorPhase=%s physicalEvaluated=%08X physicalFailures=%08X physicalAxisMask=%02X proofEvaluated=%08X proofFailures=%08X observationOnly=1 authority=NONE\n",
+                    static_cast<unsigned long long>(s.session),static_cast<unsigned long long>(d.guardContextTick),
+                    static_cast<unsigned long long>(d.tick),
+                    static_cast<unsigned long long>(d.nowUs),EDM157::RejectSiteName(d.site),EDM157::PhaseName(d.priorPhase),
+                    static_cast<unsigned>(d.physicalEvaluated),static_cast<unsigned>(d.physicalFailures),
+                    static_cast<unsigned>(d.physicalAxisMask),static_cast<unsigned>(d.proofEvaluated),static_cast<unsigned>(d.proofFailures));
+                PrintNCG76DiagnosticLine("[EDM231_FIX3] event=PAUSE_FIRST_TIMING session=%llu faultTick=%llu physicalDiagnosticTick=%llu qualifySeedTick=%llu resumeSeedTick=%llu physicalTick=%llu mappedTick=%llu sentTick=%llu transportTick=%llu proofTick=%llu observationOnly=1 authority=NONE\n",
+                    static_cast<unsigned long long>(s.session),static_cast<unsigned long long>(d.guardContextTick),
+                    static_cast<unsigned long long>(d.physicalDiagnosticTick),static_cast<unsigned long long>(d.qualifySeedTick),
+                    static_cast<unsigned long long>(d.resumeSeedTick),static_cast<unsigned long long>(d.physicalTick),
+                    static_cast<unsigned long long>(d.mappedTick),static_cast<unsigned long long>(d.sentTick),
+                    static_cast<unsigned long long>(d.transportTick),static_cast<unsigned long long>(d.proofTick));
+            }
+            else
+                PrintNCG76DiagnosticLine("[EDM231_FIX3] event=PAUSE_FIRST session=%llu faultTick=%llu evidence=UNAVAILABLE pauseRead=%u observationOnly=1 authority=NONE\n",
+                    static_cast<unsigned long long>(s.session),static_cast<unsigned long long>(f.firstFault.tick),pauseRead?1U:0U);
+        }
         if (raiseAlarm)
         {
             AlarmManager::GetInstance().Trigger(AlarmManager::GAP_INPUT_TEST_FAILED, m_gapDryRun.sourceLine);
@@ -20904,7 +22506,15 @@ bool NCManager::IsEDM130RecipePreambleSameThread(const NCParsedBlock& block, int
     const auto& cache = GetBaseProgramCache();
     if (!cache.GetGeneration() || cache.Size() > 128U) return false;
     unsigned arms = 0U, selectedArm = 0U;
-    for (std::size_t i = 0U; i < cache.Size(); ++i)
+    int sequenceFirst=-1;std::array<unsigned,2U> sequenceArms{};std::array<unsigned,4U> chainKinds{};
+    const bool historySequence=E237ProgramShape(cache,sequenceFirst,sequenceArms);
+    if(historySequence)sequenceArms[0U]=E237ArmForKind(sequenceArms[0U]);
+    const bool chain=!historySequence&&E236ProgramShape(cache,sequenceFirst,chainKinds);
+    if(chain)sequenceArms[0U]=E236ArmForKind(chainKinds[0U]);
+    const bool sequence=historySequence||chain||E234ProgramShape(cache,sequenceFirst,sequenceArms)||E233ProgramShape(cache,sequenceFirst,sequenceArms,
+        &NCManager::IsEDM173BracketShapeValid,&NCManager::IsEDM173OrbitBlockShapeValid);
+    if(sequence&&pc<sequenceFirst-1){arms=1U;selectedArm=sequenceArms[0U];}
+    for (std::size_t i = 0U; !sequence && i < cache.Size(); ++i)
     {
         const auto* line = cache.TryGetLine(static_cast<int>(i));
         EDM97::Tuning tuning{}; EDM107::FlushProfile profile{};
@@ -22111,6 +23721,10 @@ bool NCManager::PreflightEDM167SixVisibleTravelSameThread() noexcept
 
 bool NCManager::BindEDM130WorkTimeSameThread() noexcept
 {
+    const auto* historyArm=GetBaseProgramCache().TryGetLine(m_edm94.armPC);
+    if(historyArm&&E237ArmSequence(historyArm->parsedBlock,m_edm94.gapHistoryArm))return BindEDM237RecipeSameThread();
+    const auto* mixedArm=GetBaseProgramCache().TryGetLine(m_edm94.armPC);
+    if(mixedArm&&E234ArmSequence(mixedArm->parsedBlock,m_edm94.gapHistoryArm))return BindEDM234RecipeSameThread();
     m_edm130 = EDM130NCState{};
     EDMRecipe::Summary summary{};
     if (!m_edm94.gapWorkTime || m_edm94.gapPhysicalAd != E149PhysicalExpected(m_edm94.gapHistoryArm) || !m_edmProcessReady ||
@@ -25041,6 +26655,10 @@ bool NCManager::RetainEDM114CompletedSameThread(const EDM94::Feedback& guard) no
     if (!s.gapHistoryServo && EDM116::IsArcStep(step, s.gapModeFixture, s.authoredGCode[step]) && !(step & 1U)) ++c.arcFlushRows;
     c.retained = f; c.acknowledgedRows = s.next;
     c.completionTick = guard.lastTick; c.completionCommit = b.commit;
+    if(m_edm237.authorized&&s.gapHistoryArm==274U&&
+        !BindEDM237ParentEpochSameThread(f.source.epoch,f.source.dispatch,f.source.sourcePC))return false;
+    if(m_edm234.authorized&&s.gapHistoryArm==274U&&
+        !BindEDM234ParentEpochSameThread(f.source.epoch,f.source.dispatch,f.source.sourcePC))return false;
     LogEDM114SameThread("PHYSICAL_CURVE_ROW");
     return true;
 }
@@ -26010,11 +27628,29 @@ bool NCManager::WaitEDM96InitialSourceSameThread()
 
 bool NCManager::WaitEDM94SameThread()
 {
+    const bool wasHistoryParentReleasePending=m_edm237.releasePending;
+    const bool wasMixedParentReleasePending=m_edm234.releasePending;
     // ProcessTask services an active GAP deadline before calling this wait.
     // Avoid counting that same scan twice; the legacy P85/P86 path is intact.
     if ((!m_edm94.gapBoundaryProfile && !m_edm94.gapSegmentProfile) || !m_edm94.gapWaiting)
         ServiceEDM94SameThread();
     auto& s = m_edm94; const auto& f = s.feedback;
+    if(wasHistoryParentReleasePending&&!m_edm237.releasePending&&m_state==NCState::RUN&&s.cancelled)
+    {RejectEDM94SameThread("EDM237_PARENT_RELEASE_CANCELLED",m_gapDryRun.sourceLine);return false;}
+    if(m_edm237.releasePending)
+    {
+        if(ConsumeEDM237ParentReleaseSameThread())return true;
+        if(m_edm237.releasePending&&++s.polls>1000U)RejectEDM94SameThread("EDM237_PARENT_RELEASE_TIMEOUT",m_gapDryRun.sourceLine);
+        return false;
+    }
+    if(wasMixedParentReleasePending&&!m_edm234.releasePending&&m_state==NCState::RUN&&s.cancelled)
+    {RejectEDM94SameThread("EDM234_PARENT_RELEASE_CANCELLED",m_gapDryRun.sourceLine);return false;}
+    if(m_edm234.releasePending)
+    {
+        if(ConsumeEDM234ParentReleaseSameThread())return true;
+        if(m_edm234.releasePending&&++s.polls>1000U)RejectEDM94SameThread("EDM234_PARENT_RELEASE_TIMEOUT",m_gapDryRun.sourceLine);
+        return false;
+    }
     if (!s.latched || s.cancelled || s.releaseRequested || m_state != NCState::RUN) return false;
     if (s.gapModeInterruption && s.finishPending)
     { RequestEDM118HoldSameThread(false, "NORMAL_FINISH_FORBIDDEN"); return false; }
@@ -26060,6 +27696,8 @@ bool NCManager::WaitEDM94SameThread()
             f.lastSentTick <= f.lastTick && m_motion.IsGroupDone())
         {
             s.finishPending = false; s.complete = true; s.terminalLogged = true;
+            if(m_edm237.authorized&&!FinishEDM237ParentSameThread())return false;
+            if(m_edm234.authorized&&!FinishEDM234ParentSameThread())return false;
             LogEDM94SameThread("PASS", "PHYSICAL_ZERO_WINDOW_WAIT_M30_RETIREMENT"); return true;
         }
     }
@@ -26069,6 +27707,9 @@ bool NCManager::WaitEDM94SameThread()
 
 void NCManager::ResetEDM94SameThread() noexcept
 {
+    m_edm237 = EDM237NCState{};
+    m_edm234 = EDM234NCState{};
+    m_edm233 = EDM233NCState{};
     InvalidateEDM109CommonPathSameThread("RESET");
     if (!m_edm94.latched) return;
     if (m_edm94.gapModeInterruption && !m_edm118.terminalLogged)
@@ -26109,7 +27750,7 @@ bool NCManager::IsEDM149ConfirmationBlockSameThread(const NCParsedBlock& block, 
 {
     if (pc < 0 || pc == (std::numeric_limits<int>::max)() || !E149M00Shape(block)) return false;
     const auto* next = GetBaseProgramCache().TryGetLine(pc + 1);
-    if (!next) return false;
+    if (!next||!E251SquareConfirmationSource(GetBaseProgramCache(),pc+1)) return false;
     EDM97::Tuning tuning{}; EDM107::FlushProfile profile{};
     return E108ProfileOnlyNPQRSIJK(next->parsedBlock,230U,tuning,profile) ||
         E108ProfileOnlyNPQRSIJK(next->parsedBlock,232U,tuning,profile) ||
@@ -26184,7 +27825,8 @@ void NCManager::CommitEDM149ConfirmationResumeSameThread() noexcept
         m_motion.HasPendingSafetyOrRecoveryRequests() || !m_motion.IsMotionOwnerLeaseCurrent(m_programMotionLease))
     { c = EDM149Confirmation{}; return; }
     const auto* arm = GetBaseProgramCache().TryGetLine(c.armPC);
-    if (!arm || !EDM77::Detail::EqualLiteral(arm->parsedBlock.expression('P'),c.arm))
+    if (!arm || !EDM77::Detail::EqualLiteral(arm->parsedBlock.expression('P'),c.arm)||
+        !E251SquareConfirmationSource(GetBaseProgramCache(),c.armPC))
     { c = EDM149Confirmation{}; return; }
     c.waiting = false; c.confirmed = true; c.startRequests = m_startDiagnosticRequests;
     if (EDM173::IsArm(c.arm)) { m_g76PowerInhibited=true; ForceEDMPLCOutputsOffSameThread("EDM173_CONFIRMED"); }
@@ -26194,6 +27836,32 @@ void NCManager::CommitEDM149ConfirmationResumeSameThread() noexcept
 
 bool NCManager::ConsumeEDM149ConfirmationSameThread(int armPC) noexcept
 {
+    if(m_edm237.authorized)return ConsumeEDM237ConfirmationSameThread(armPC);
+    if(m_edm234.program==236U)return ConsumeEDM236ConfirmationSameThread(armPC);
+    if(m_edm234.authorized&&armPC==m_edm234.firstArmPC+3)
+    {
+        auto& q=m_edm234;const auto& s=m_edm94;
+        if(!IsEDM234SequenceScopeCurrentSameThread()||!q.firstRecipeBound||!q.firstReleased||q.releasePending||q.secondStarted||
+            !q.firstSession||!q.firstFinishDispatch||q.releaseTick<=q.releaseFloorTick||s.session<=q.firstSession||
+            s.armPC!=armPC||s.gapHistoryArm!=q.arms[1U]||s.run!=q.run||s.cache!=q.cache||s.armEpoch!=q.epoch||
+            !s.lease.Matches(q.lease)||s.latched||!m_edm130.bound||GetBasePC()!=armPC||GetActiveDispatchPC()!=armPC||
+            m_currentExecutingBlockDispatchId<=q.firstFinishDispatch)return false;
+        q.secondStarted=true;m_edm149Confirmation=EDM149Confirmation{};return true;
+    }
+    if(m_edm233.authorized&&armPC==m_edm233.firstArmPC+3)
+    {
+        // Retained whole-sequence consent is consumed only after the exact
+        // first-parent zero-release receipt. No START/confirmation is invented.
+        const auto& q=m_edm233;const auto& s=m_edm94;
+        if(!IsEDM233SequenceScopeCurrentSameThread()||!q.firstReleased||q.releasePending||q.secondStarted||
+            !q.firstSession||!q.releaseTick||!q.firstFinishDispatch||q.releaseTick<=q.releaseFloorTick||
+            s.session<=q.firstSession||s.armPC!=armPC||s.gapHistoryArm!=q.arms[1U]||
+            s.run!=q.run||s.cache!=q.cache||s.armEpoch!=q.epoch||!s.lease.Matches(q.lease)||s.latched||
+            GetBasePC()!=armPC||GetActiveDispatchPC()!=armPC||m_currentExecutingBlockDispatchId<=q.firstFinishDispatch)return false;
+        m_edm233.secondStarted=true;
+        m_edm149Confirmation=EDM149Confirmation{};
+        return true;
+    }
     const auto c = m_edm149Confirmation;
     m_edm149Confirmation = EDM149Confirmation{};
     return c.confirmed && !c.waiting && c.run && c.run == m_pathCoreLiveBookkeeping.currentRunToken &&
@@ -26206,18 +27874,42 @@ bool NCManager::ConsumeEDM149ConfirmationSameThread(int armPC) noexcept
 
 // EDM173 is one authored compound instruction. These NC receipts authorize no
 // output by themselves; the existing RT GAP/coordinator/guard owns each sample.
+bool NCManager::IsEDM234BracketShapeValid(const NCBlock& b) noexcept
+{return E234BracketLiteralShape(b);}
+
 bool NCManager::IsEDM173BracketShapeValid(const NCBlock& b) noexcept
 {
     if (b.isEmpty || b.isGoto || b.isBlockSkip || !b.hasG || b.gCode!=180 || b.gCount!=1 ||
         b.gCodes[0]!=180 || b.mCount || !b.has('P') ||
         (b.val('P')!=292.0 && b.val('P')!=293.0 && b.val('P')!=294.0 && b.val('P')!=295.0 && b.val('P')!=296.0 && b.val('P')!=297.0 && b.val('P')!=298.0 && b.val('P')!=299.0 && b.val('P')!=300.0 && b.val('P')!=301.0)) return false;
     const bool arm=b.val('P')==292.0||b.val('P')==294.0||b.val('P')==296.0||b.val('P')==298.0||b.val('P')==300.0;
-    const bool autoB2=b.val('P')==294.0&&b.has('L')&&b.val('L')==3.0;
+    const bool squareB1=(b.val('P')==292.0&&b.has('L')&&b.val('L')==250.0)||
+        (b.val('P')==294.0&&b.has('L')&&b.val('L')==251.0)||
+        (b.val('P')==296.0&&b.has('L')&&b.val('L')==252.0)||
+        (b.val('P')==298.0&&b.has('L')&&b.val('L')==253.0)||
+        (b.val('P')==292.0&&b.has('L')&&b.val('L')==255.0)||
+        (b.val('P')==294.0&&b.has('L')&&b.val('L')==256.0)||
+        (b.val('P')==296.0&&b.has('L')&&b.val('L')==257.0)||
+        (b.val('P')==298.0&&b.has('L')&&b.val('L')==258.0)||
+        ((b.val('P')==292.0||b.val('P')==296.0||b.val('P')==298.0)&&b.has('L')&&
+            (b.val('L')==260.0||b.val('L')==261.0||b.val('L')==262.0||b.val('L')==263.0))||
+        (b.val('P')==294.0&&b.has('L')&&b.val('L')==264.0);
+    const bool expansion=b.has('L')&&std::isfinite(b.val('L'))&&std::floor(b.val('L'))==b.val('L')&&
+        (((b.val('P')==292.0||b.val('P')==296.0||b.val('P')==298.0)&&b.val('L')>=265.0&&b.val('L')<=268.0)||
+         (b.val('P')==294.0&&b.val('L')>=269.0&&b.val('L')<=272.0));
+    const bool autoB2=b.val('P')==294.0&&b.has('L')&&(b.val('L')==3.0||b.val('L')==234.0||b.val('L')==235.0||b.val('L')==236.0||(b.val('L')==237.0||b.val('L')==238.0||b.val('L')==241.0||b.val('L')==242.0||b.val('L')==243.0||b.val('L')==244.0||b.val('L')==245.0||b.val('L')==246.0||b.val('L')==247.0||b.val('L')==248.0));
     const bool rejectBeforeArm=(b.val('P')==296.0||b.val('P')==298.0)&&b.has('L')&&b.val('L')==216.0;
     const bool centerNominalHold=(b.val('P')==296.0||b.val('P')==298.0)&&b.has('L')&&b.val('L')==1.0;
+    const bool centerRepeat=(b.val('P')==296.0||b.val('P')==298.0)&&b.has('L')&&b.val('L')==230.0;
+    const bool centerSecondFlushHold=(b.val('P')==296.0||b.val('P')==298.0)&&b.has('L')&&b.val('L')==231.0;
+    const bool centerSecondReturnHold=(b.val('P')==296.0||b.val('P')==298.0)&&b.has('L')&&b.val('L')==232.0;
+    const bool parentSequence=(b.val('P')==296.0||b.val('P')==298.0)&&b.has('L')&&b.val('L')==233.0;
+    const bool centerHistorySequence=b.has('L')&&(((b.val('P')==296.0||b.val('P')==298.0)&&(b.val('L')==239.0||b.val('L')==240.0||b.val('L')==241.0||b.val('L')==242.0||b.val('L')==243.0||b.val('L')==244.0))||(b.val('P')==296.0&&b.val('L')==245.0)||(b.val('P')==298.0&&b.val('L')==246.0)||(b.val('P')==296.0&&b.val('L')==247.0)||(b.val('P')==298.0&&b.val('L')==248.0));
+    const bool centerFlushHold=(b.val('P')==296.0||b.val('P')==298.0)&&b.has('L')&&
+        (b.val('L')==2.0||b.val('L')==3.0||b.val('L')==4.0||b.val('L')==5.0||b.val('L')==6.0||b.val('L')==7.0||b.val('L')==8.0||b.val('L')==9.0||b.val('L')==10.0||b.val('L')==11.0);
     for(char word='A';word<='Z';++word)
         if(b.has(word) && (!std::isfinite(b.val(word)) ||
-            (word!='N' && word!='P' && !(word=='L'&&(autoB2||rejectBeforeArm||centerNominalHold)) &&
+            (word!='N' && word!='P' && !(word=='L'&&(autoB2||rejectBeforeArm||centerNominalHold||centerFlushHold||centerRepeat||centerSecondFlushHold||centerSecondReturnHold||parentSequence||centerHistorySequence||squareB1||expansion)) &&
                 (!arm || (word!='Q' && word!='R' && word!='S' && word!='I' && word!='J' && word!='K'))))) return false;
     return !arm || (b.has('Q')&&b.has('R')&&b.has('S')&&b.has('I')&&b.has('J')&&b.has('K')&&
         b.val('Q')==8.0&&b.val('R')==1.0&&b.val('S')==1.0&&b.val('I')==10.0&&b.val('J')==50.0&&b.val('K')==100.0);
@@ -26226,19 +27918,1083 @@ bool NCManager::IsEDM173BracketShapeValid(const NCBlock& b) noexcept
 bool NCManager::IsEDM173OrbitBlockShapeValid(const NCBlock& b) noexcept
 {
     if(b.isEmpty||b.isGoto||b.isBlockSkip||!b.hasG||b.gCode!=76||b.gCount!=1||b.gCodes[0]!=76||b.mCount||
-        !b.has('P')||b.val('P')!=11.0||!b.has('R')||!b.has('F')||b.val('F')!=0.12||
+        !b.has('P')||(b.val('P')!=11.0&&!((b.val('P')==12.0&&b.has('B')&&(b.val('B')==1.0||b.val('B')==2.0||b.val('B')==3.0||b.val('B')==4.0))||
+            (b.val('P')==13.0&&b.has('B')&&(b.val('B')==1.0||b.val('B')==2.0||b.val('B')==3.0||b.val('B')==4.0))||
+            (b.val('P')==16.0&&b.has('B')&&(b.val('B')==1.0||b.val('B')==2.0||b.val('B')==3.0||b.val('B')==4.0)&&E261PolygonOrbitShape(b))||E263ExpansionOrbitShape(b)))||!b.has('R')||!b.has('F')||b.val('F')!=0.12||
         E181EffectiveOrbitMode(b)==255U||!(b.has('X')||b.has('Y')||b.has('Z'))) return false;
     // Authored G90 values are coordinates, not travel. The frozen-frame
     // builder proves the actual displacement before any arm publication.
     for(char word='A';word<='Z';++word) if(b.has(word))
-        if(!std::isfinite(b.val(word))||(word!='N'&&word!='P'&&word!='R'&&word!='F'&&word!='B'&&word!='X'&&word!='Y'&&word!='Z'&&word!='K')) return false;
+        if(!std::isfinite(b.val(word))||(word!='N'&&word!='P'&&word!='R'&&word!='F'&&word!='B'&&word!='X'&&word!='Y'&&word!='Z'&&word!='K'&&!(word=='Q'&&(b.val('P')==16.0||b.val('P')==26.0)))) return false;
     const unsigned mode=E181EffectiveOrbitMode(b);
     const double radiusLimit=mode==3U||mode==4U?EDM173::MaximumCenterRadiusMm:EDM173::MaximumRadiusMm;
     return b.val('R')>0.0&&b.val('R')<=radiusLimit&&
         (!b.has('K')||NCG76::ValidShapeAngle(b.val('K')));
 }
 
-bool NCManager::IsEDM173BracketBlockSameThread(const NCBlock& b) const noexcept
+// This scope is an NC-only continuation grant, never an RT motion permit.
+// The frozen translation and first fresh START must survive both parents.
+bool NCManager::IsEDM234SequenceScopeCurrentSameThread() noexcept
+{
+    if(m_edm234.program==236U)return IsEDM236SequenceScopeCurrentSameThread();
+    const auto& q=m_edm234;int first=-1;std::array<unsigned,2U> arms{};unsigned program=0U,ordinaryCode=0U;
+    return q.authorized&&q.run&&q.cache&&q.confirmationDispatch&&q.startRequests&&q.firstArmPC>0&&
+        q.epoch!=MOTION_EXECUTION_EPOCH_INVALID&&q.lease.IsValid()&&q.lease.owner==MotionOwner::AUTO&&
+        q.run==m_pathCoreLiveBookkeeping.currentRunToken&&q.cache==GetBaseProgramCache().GetGeneration()&&
+        q.epoch==m_motion.GetCurrentExecutionEpoch()&&q.lease.Matches(m_programMotionLease)&&
+        m_motion.IsMotionOwnerLeaseCurrent(q.lease)&&!m_motion.HasPendingSafetyOrRecoveryRequests()&&
+        q.startRequests==m_startDiagnosticRequests&&q.recipeGeneration==m_recipe.Current().generation&&
+        q.processGeneration==m_edmProcessTuningGeneration&&m_state==NCState::RUN&&m_mode==NCOperationMode::MEMORY&&
+        !Close_System_Com_flag&&m_externalReadyInterlock&&!m_isSingleBlockEnabled&&!m_isG66Active&&
+        m_macroStack.empty()&&!Homing.IsActive()&&!AlarmManager::GetInstance().HasAlarm()&&
+        m_resetContinuationPhase==ResetContinuationPhase::IDLE&&CoordSys.IsTranslationRunFrozen()&&
+        IsNCXYZCUVFeedNeutralFrame(CoordSys.GetTranslationSnapshot())&&CoordSys.GetTranslationSnapshot().distanceMode==91&&
+        IsPathCoreLiveNativeConfigCurrentSameThread()&&IsFixedTranslationTravelCurrentSameThread()&&
+        SameNCTranslationSnapshot(q.translation,CoordSys.GetTranslationSnapshot())&&m_motion.MatchesNCTranslation(q.translation)&&
+        E234ProgramShape(GetBaseProgramCache(),first,arms,&program,&ordinaryCode)&&first==q.firstArmPC&&arms==q.arms&&
+        program==q.program&&ordinaryCode==q.ordinaryGCode;
+}
+
+bool NCManager::IsEDM234NextArmCurrentSameThread(int pc,unsigned arm) noexcept
+{
+    if(m_edm234.program==236U)return IsEDM236NextArmCurrentSameThread(pc,arm);
+    const auto& q=m_edm234;const auto& s=m_edm94;
+    return IsEDM234SequenceScopeCurrentSameThread()&&q.firstRecipeBound&&q.firstReleased&&!q.releasePending&&!q.secondStarted&&
+        q.firstSession&&q.releaseTick>q.releaseFloorTick&&q.firstFinishDispatch&&q.motionDispatch&&
+        !s.latched&&s.session==q.firstSession&&s.complete&&s.terminalLogged&&!s.cancelled&&!s.resetSeen&&!s.resetCommitted&&
+        !s.releaseRequested&&!s.rtFaultReported&&pc==q.firstArmPC+3&&arm==q.arms[1U]&&GetActiveDispatchPC()==pc&&
+        m_currentExecutingBlockDispatchId>q.firstFinishDispatch&&m_motion.IsGroupDone()&&m_motion.IsGroupNCDrained()&&
+        !m_motion.GetCommandIngressSize()&&!m_motion.GetCommandReplaySize()&&!m_motion.GetAxisCommandMailboxDepth()&&
+        !m_g76Orbit->active&&!m_pathFeed.pending&&!m_pathArc.pending&&!m_pathReplay.pending&&!m_pathHold.armed&&!m_pathHold.bound;
+}
+
+bool NCManager::BeginEDM234SequenceSameThread(int pc) noexcept
+{
+    const auto* chainArm=GetBaseProgramCache().TryGetLine(pc);
+    if(m_edm234.program==236U||(chainArm&&EDM77::Detail::EqualLiteral(chainArm->parsedBlock.expression('L'),236U)))return BeginEDM236SequenceSameThread(pc);
+    int first=-1;std::array<unsigned,2U> arms{};unsigned program=0U,ordinaryCode=0U;
+    if(!E234ProgramShape(GetBaseProgramCache(),first,arms,&program,&ordinaryCode))return false;
+    if(pc==first+3)return IsEDM234NextArmCurrentSameThread(pc,arms[1U]);
+    const auto& c=m_edm149Confirmation;
+    if(pc!=first||!c.confirmed||c.waiting||c.armPC!=pc||c.arm!=arms[0U]||
+        c.run!=m_pathCoreLiveBookkeeping.currentRunToken||c.cache!=GetBaseProgramCache().GetGeneration()||
+        !c.dispatch||m_currentExecutingBlockDispatchId<=c.dispatch||c.startRequests!=m_startDiagnosticRequests||
+        !CoordSys.IsTranslationRunFrozen()||!m_motion.IsMotionOwnerLeaseCurrent(m_programMotionLease))return false;
+    m_edm234=EDM234NCState{};auto& q=m_edm234;
+    q.translation=CoordSys.GetTranslationSnapshot();q.lease=m_programMotionLease;q.epoch=m_motion.GetCurrentExecutionEpoch();
+    q.run=c.run;q.cache=c.cache;q.confirmationDispatch=c.dispatch;q.startRequests=c.startRequests;
+    q.recipeGeneration=m_recipe.Current().generation;q.processGeneration=m_edmProcessTuningGeneration;q.firstArmPC=first;q.arms=arms;q.program=program;q.ordinaryGCode=ordinaryCode;q.authorized=true;
+    return IsEDM234SequenceScopeCurrentSameThread();
+}
+
+bool NCManager::PreflightEDM234LineSameThread(int pc) noexcept
+{
+    const auto* chainArm=GetBaseProgramCache().TryGetLine(pc);
+    if(m_edm234.program==236U||(chainArm&&EDM77::Detail::EqualLiteral(chainArm->parsedBlock.expression('L'),236U)))return PreflightEDM236OrdinarySameThread(pc);
+    int first=-1;std::array<unsigned,2U> arms{};unsigned program=0U,ordinaryCode=0U;const auto& cache=GetBaseProgramCache();
+    if(!E234ProgramShape(cache,first,arms,&program,&ordinaryCode)||(pc!=first&&pc!=first+3)||arms[pc==first?0U:1U]!=274U||
+        !FreezeEDM173TranslationSameThread()||!BeginEDM234SequenceSameThread(pc))return false;
+    m_edm94=EDM94NCState{};auto& s=m_edm94;
+    s.program=true;s.inspectedCache=cache.GetGeneration();s.gapHistoryArm=274U;s.moves=1U;
+    s.gapHistoryServo=s.gapHistoryMode=s.gapWorkTime=s.gapSegmentProfile=s.gapGainProfile=s.gapPhysicalCurve=true;
+    s.gapModeFixture=EDM116::Fixture::ModalProgram156;s.gapTuning={8.0,1.0,1.0};
+    if(!EDM107::ParseFlushProfile(10.0,50.0,100.0,s.gapFlushParameters))return false;
+    s.pc[0U]=pc+1;s.pc[1U]=pc+2;s.pc[2U]=pc+3;s.feed[0U]=0.12;
+    if(ordinaryCode==1U)s.increment[0U][2U]=-0.0015;
+    else{s.increment[0U][0U]=ordinaryCode==2U?0.001:-0.001;s.increment[0U][1U]=0.001;}
+    s.authoredGCode[0U]=static_cast<std::uint8_t>(ordinaryCode);s.selectorPC[0U]=pc+1;
+    m_edm127=EDM127NCState{};m_edm129=EDM129NCState{};m_edm140=EDM140NCState{};m_edm141=EDM141NCState{};
+    m_edm127.expectedMode[0U]=EDM116::Mode::B1;m_edm127.expectedOriginPC[0U]=pc+1;
+    m_edm127.expectedOriginRevision[0U]=2ULL;m_edm127.authoredInline[0U]=true;
+    return true;
+}
+
+bool NCManager::BindEDM234RecipeSameThread() noexcept
+{
+    if(m_edm234.program==236U)return BindEDM236RecipeSameThread();
+    m_edm130=EDM130NCState{};m_edm200=EDM200AutoHoldState{};
+    const auto& s=m_edm94;auto& q=m_edm234;const auto& cache=GetBaseProgramCache();const auto* arm=cache.TryGetLine(s.armPC);
+    const unsigned stage=q.firstReleased?1U:0U;const unsigned kind=E234ParentKind(s.gapHistoryArm,q.program,q.ordinaryGCode);
+    EDM97::Tuning tuning{};EDM107::FlushProfile flush{};EDMRecipe::Summary summary{};
+    if(!m_edmProcessReady||!kind||!arm||!E234ArmSequence(arm->parsedBlock,s.gapHistoryArm)||
+        !E108ProfileOnlyNPQRSIJK(arm->parsedBlock,s.gapHistoryArm,tuning,flush)||!IsEDM234SequenceScopeCurrentSameThread()||
+        q.releasePending||q.secondStarted||s.latched||s.armPC!=q.firstArmPC+static_cast<int>(stage*3U)||s.gapHistoryArm!=q.arms[stage]||
+        s.run!=q.run||s.cache!=q.cache||s.armEpoch!=q.epoch||!s.lease.Matches(q.lease)||!s.session||
+        !EDM97::SameTuning(tuning,s.gapTuning)||!EDM107::SameFlushProfile(flush,s.gapFlushParameters))return false;
+    if(stage)
+    {
+        if(!q.firstRecipeBound||!q.firstSession||s.session<=q.firstSession||!q.firstFinishDispatch||
+            !q.releaseTick||q.releaseTick<=q.releaseFloorTick||m_currentExecutingBlockDispatchId<=q.firstFinishDispatch||
+            m_recipeRecoveryDisplayOnly||m_recipeHoldSeen||m_edmState==EDMState::NOT_READY||!m_recipe.Ready())return false;
+        summary=m_recipe.Current();
+        if(!summary.catalogReady||!summary.tableSelected||!summary.rowSelected||summary.generation!=q.recipeGeneration)return false;
+    }
+    else if(!ReadEDMRecipeSummarySameThread(summary))return false;
+    const auto binding=kind==2U?
+        EDM130::BindG76B2Gap175(m_recipe,m_edmProcessProfile.machineProfileId,m_edmProcessProfile,m_edmProcessTuningGeneration):
+        EDM130::BindWorkTimeHeightSpeedDeepMachiningReferenceCurveAndFlushStages(m_recipe,m_edmProcessProfile.machineProfileId,
+            m_edmProcessProfile,m_edmProcessTuningGeneration);
+    if(!binding.ready)return false;
+    auto recipe=binding.recipe;recipe.diagnosticControlSource=3U;recipe.planRows=kind==2U?25U:1U;recipe.planMovementMask=kind==2U?7U:kind==1U?4U:3U;
+    if(!EDM130::ValidHistoryRecipeBinding(kind==2U?EDM173::HistoryFixture:EDM149::ProgramHistoryFixture,recipe)||
+        recipe.workTimeUs!=500000ULL||recipe.jumpHeightScaled!=1000ULL||recipe.jumpSpeedPercentScaled!=100000000U||
+        recipe.flushHoldTest||recipe.holdRetreatMode||recipe.deepFlushCycleInterval||
+        recipe.deepFlushHeightMultiplierScaled!=1000000ULL||!EDM97::ValidMotionTestCurve(s.gapTuning,recipe))return false;
+    if(stage)
+    {
+        const unsigned firstKind=E234ParentKind(q.arms[0U],q.program,q.ordinaryGCode);
+        if(!firstKind||q.firstRecipe.commissioningProfile!=(firstKind==2U?EDM130::G76B2Profile175:0U)||
+            q.firstRecipe.planRows!=(firstKind==2U?25U:1U)||q.firstRecipe.planMovementMask!=(firstKind==2U?7U:firstKind==1U?4U:3U)||
+            !EDM130::ValidHistoryRecipeBinding(firstKind==2U?EDM173::HistoryFixture:EDM149::ProgramHistoryFixture,q.firstRecipe))return false;
+        auto expected=q.firstRecipe;expected.commissioningProfile=recipe.commissioningProfile;
+        expected.planRows=recipe.planRows;expected.planMovementMask=recipe.planMovementMask;
+        if(!EDM130::SameRecipe(expected,recipe))return false;
+    }
+    else{q.firstRecipe=recipe;q.firstRecipeBound=true;q.firstSession=s.session;}
+    if(!IsEDM234SequenceScopeCurrentSameThread())return false;
+    m_edm130.recipe=recipe;m_edm94.gapFlushParameters.speedRatio=EDM130::FrozenSpeedRatio(recipe);
+    if(!EDM130::MatchesFlushSpeed(recipe,m_edm94.gapFlushParameters.speedRatio)||
+        !EDM130::MatchesFlushHeight(recipe,m_edm94.gapFlushParameters.strokeRatio,m_edm94.gapFlushParameters.dwellUs))return false;
+    m_edm130.bound=true;q.motionDispatch=0ULL;
+    PrintNCG76DiagnosticLine("[EDM%u] event=PARENT_RECIPE_BOUND parent=%u kind=%u session=%llu firstSession=%llu generation=%llu E5policy=FRESH_PER_PARENT globalRecipeScope=UNCHANGED discharge=0\n",
+        q.program,stage+1U,kind,static_cast<unsigned long long>(s.session),static_cast<unsigned long long>(q.firstSession),static_cast<unsigned long long>(summary.generation));
+    return true;
+}
+
+bool NCManager::BindEDM234ParentEpochSameThread(MotionExecutionEpoch epoch,std::uint64_t dispatch,int pc) noexcept
+{
+    if(m_edm234.program==236U)return BindEDM236ParentEpochSameThread(epoch,dispatch,pc);
+    auto& q=m_edm234;const auto& s=m_edm94;const unsigned stage=q.secondStarted?1U:0U;
+    const auto expected=s.armEpoch==(std::numeric_limits<MotionExecutionEpoch>::max)()?1U:s.armEpoch+1U;
+    if(!q.authorized||!q.firstRecipeBound||q.releasePending||q.firstReleased!=q.secondStarted||q.motionDispatch||
+        !s.latched||!s.ready||s.cancelled||s.resetSeen||s.resetCommitted||s.releaseRequested||s.rtFaultReported||
+        s.armPC!=q.firstArmPC+static_cast<int>(stage*3U)||s.gapHistoryArm!=q.arms[stage]||
+        s.run!=q.run||s.cache!=q.cache||!s.lease.Matches(q.lease)||q.epoch!=s.armEpoch||epoch!=expected||
+        epoch!=m_motion.GetCurrentExecutionEpoch()||!dispatch||dispatch<=s.armDispatch||pc!=s.pc[0U]||
+        (stage?s.session<=q.firstSession:s.session!=q.firstSession))return false;
+    q.epoch=epoch;
+    if(!IsEDM234SequenceScopeCurrentSameThread())return false;
+    q.motionDispatch=dispatch;
+    PrintNCG76DiagnosticLine("[EDM%u] event=PARENT_EPOCH_BOUND parent=%u kind=%u session=%llu armEpoch=%llu liveEpoch=%llu dispatch=%llu proof=EXACT_NATIVE_OR_COMPLETED_GEOMETRY discharge=0\n",
+        q.program,stage+1U,E234ParentKind(s.gapHistoryArm,q.program,q.ordinaryGCode),static_cast<unsigned long long>(s.session),static_cast<unsigned long long>(s.armEpoch),
+        static_cast<unsigned long long>(epoch),static_cast<unsigned long long>(dispatch));
+    return true;
+}
+
+bool NCManager::FinishEDM234ParentSameThread()
+{
+    if(m_edm234.program==236U)return FinishEDM236ParentSameThread();
+    auto& q=m_edm234;auto& s=m_edm94;const auto& f=s.feedback;
+    if(!IsEDM234SequenceScopeCurrentSameThread()||!q.firstRecipeBound||!q.motionDispatch||
+        !s.latched||!s.complete||!s.terminalLogged||s.armPC!=q.firstArmPC+(q.secondStarted?3:0)||
+        s.cancelled||s.resetSeen||s.resetCommitted||s.releaseRequested||s.rtFaultReported||
+        GetActiveDispatchPC()!=s.armPC+2||m_waitingBlockDispatchId!=q.currentFinishDispatch)
+    {RejectEDM94SameThread("EDM234_FINISHED_SCOPE",m_gapDryRun.sourceLine);return false;}
+    if(!q.secondStarted)
+    {
+        const unsigned kind=E234ParentKind(s.gapHistoryArm,q.program,q.ordinaryGCode);
+        if(q.firstReleased||s.session!=q.firstSession||!m_motion.RequestEDM234ParentRelease(s.session,s.armEpoch,s.lease,
+            kind,s.run,s.cache,s.pc[0U],q.motionDispatch,m_edm130.recipe,q.program))
+        {RejectEDM94SameThread("EDM234_PARENT_RELEASE_REQUEST",m_gapDryRun.sourceLine);return false;}
+        q.releaseFloorTick=f.lastSentTick;q.releasePending=true;s.polls=0U;
+        PrintNCG76DiagnosticLine("[EDM%u] event=PARENT_FINISH parent=1 kind=%u session=%llu next=EXACT_ZERO_RETIREMENT discharge=0\n",q.program,kind,static_cast<unsigned long long>(s.session));
+        return false;
+    }
+    if(!q.firstReleased||s.session<=q.firstSession)
+    {RejectEDM94SameThread("EDM234_FIRST_PARENT_REQUIRED",m_gapDryRun.sourceLine);return false;}
+    PrintNCG76DiagnosticLine("[EDM%u] event=SEQUENCE_COMPLETE parents=2 ordinaryRows=1 ordinaryG=%u G76children=25 firstSession=%llu secondSession=%llu history=CLEARED_AT_HANDOFF E5policy=FRESH_PER_PARENT discharge=0\n",
+        q.program,q.ordinaryGCode,static_cast<unsigned long long>(q.firstSession),static_cast<unsigned long long>(s.session));
+    return true;
+}
+
+bool NCManager::ConsumeEDM234ParentReleaseSameThread()
+{
+    if(m_edm234.program==236U)return ConsumeEDM236ParentReleaseSameThread();
+    auto& q=m_edm234;auto& s=m_edm94;const auto& f=s.feedback;
+    if(!q.releasePending)return false;
+    const unsigned kind=E234ParentKind(q.arms[0U],q.program,q.ordinaryGCode);
+    if(!IsEDM234SequenceScopeCurrentSameThread()||q.firstReleased||q.secondStarted||!q.firstRecipeBound||
+        s.session!=q.firstSession||s.armPC!=q.firstArmPC||s.next!=2U||!s.latched||!s.complete||!s.terminalLogged||
+        s.cancelled||s.resetSeen||s.resetCommitted||s.releaseRequested||s.rtFaultReported||
+        GetActiveDispatchPC()!=q.firstArmPC+2||m_waitingBlockDispatchId!=q.firstFinishDispatch||
+        f.faulted||f.cancelled||f.parentReleasePhase==EDM94::ParentReleasePhase::Revoked)
+    {RejectEDM94SameThread("EDM234_PARENT_RELEASE_SCOPE",m_gapDryRun.sourceLine);return false;}
+    if(!f.parentReleased||f.parentReleasePhase!=EDM94::ParentReleasePhase::Released)return false;
+    if(f.parentReleaseProgram!=q.program||f.parentReleaseKind!=kind||!f.released||f.active||!f.pass||!f.armAccepted||
+        !f.finishRequested||!f.stopped||!f.forceZero||f.identity.session!=s.session||f.identity.epoch!=s.armEpoch||
+        f.identity.ownerGeneration!=s.lease.generation||f.currentIdentity.session!=s.session||f.currentIdentity.epoch!=q.epoch||
+        f.currentIdentity.ownerGeneration!=q.lease.generation||!f.parentReleaseTick||f.parentReleaseTick<=q.releaseFloorTick||
+        f.parentReleaseTick!=f.lastTick||f.lastSentTick!=f.lastTick||f.requiredCycles<200U||f.settledCycles<f.requiredCycles||
+        !E156FinishTargetMatches(s,m_edm130.recipe,f,m_edm114.retained)||!EDM130::SameRecipe(q.firstRecipe,m_edm130.recipe)||
+        !m_motion.IsGroupDone()||!m_motion.IsGroupNCDrained()||m_motion.GetCommandIngressSize()||m_motion.GetCommandReplaySize()||
+        m_motion.GetAxisCommandMailboxDepth()||m_g76Orbit->active||m_pathFeed.pending||m_pathArc.pending)
+    {RejectEDM94SameThread("EDM234_PARENT_RELEASE_RECEIPT",m_gapDryRun.sourceLine);return false;}
+    q.releasePending=false;q.firstReleased=true;q.releaseTick=f.parentReleaseTick;
+    PrintNCG76DiagnosticLine("[EDM%u] event=PARENT_RELEASED parent=1 kind=%u session=%llu tick=%llu nextArmPC=%d sameAUTO=1 discharge=0\n",
+        q.program,kind,static_cast<unsigned long long>(s.session),static_cast<unsigned long long>(q.releaseTick),q.firstArmPC+3);
+    s.latched=s.armPending=s.ready=s.finishPending=false;m_edm149Confirmation=EDM149Confirmation{};
+    m_edm157=EDM157NCState{};m_edm200=EDM200AutoHoldState{};m_edm130.bound=false;
+    return true;
+}
+
+bool NCManager::IsEDM236SequenceScopeCurrentSameThread() noexcept
+{
+    const auto& q=m_edm234;int first=-1;std::array<unsigned,4U> kinds{};
+    if(!q.authorized||q.program!=236U||q.parentIndex>=4U||q.retiredMask!=((1U<<q.parentIndex)-1U)||
+        !q.run||!q.cache||!q.confirmationDispatch||!q.startRequests||q.firstArmPC<=0||
+        q.epoch==MOTION_EXECUTION_EPOCH_INVALID||!q.lease.IsValid()||q.lease.owner!=MotionOwner::AUTO||
+        q.run!=m_pathCoreLiveBookkeeping.currentRunToken||q.cache!=GetBaseProgramCache().GetGeneration()||
+        q.epoch!=m_motion.GetCurrentExecutionEpoch()||!q.lease.Matches(m_programMotionLease)||
+        !m_motion.IsMotionOwnerLeaseCurrent(q.lease)||m_motion.HasPendingSafetyOrRecoveryRequests()||
+        q.startRequests!=m_startDiagnosticRequests||q.recipeGeneration!=m_recipe.Current().generation||
+        q.processGeneration!=m_edmProcessTuningGeneration||m_state!=NCState::RUN||m_mode!=NCOperationMode::MEMORY||
+        Close_System_Com_flag||!m_externalReadyInterlock||m_isSingleBlockEnabled||m_isG66Active||
+        !m_macroStack.empty()||Homing.IsActive()||AlarmManager::GetInstance().HasAlarm()||
+        m_resetContinuationPhase!=ResetContinuationPhase::IDLE||!CoordSys.IsTranslationRunFrozen()||
+        !IsNCXYZCUVFeedNeutralFrame(CoordSys.GetTranslationSnapshot())||CoordSys.GetTranslationSnapshot().distanceMode!=91||
+        !IsPathCoreLiveNativeConfigCurrentSameThread()||!IsFixedTranslationTravelCurrentSameThread()||
+        !SameNCTranslationSnapshot(q.translation,CoordSys.GetTranslationSnapshot())||!m_motion.MatchesNCTranslation(q.translation)||
+        !E236ProgramShape(GetBaseProgramCache(),first,kinds)||first!=q.firstArmPC||kinds!=q.kinds)return false;
+    if(q.parentIndex==0U)
+    {if(q.previousSession||q.awaitNext)return false;}
+    else if(!q.firstRecipeBound||!q.firstSession||q.previousSession<q.firstSession||
+        !q.firstFinishDispatch||!q.releaseTick||q.releaseTick<=q.previousReleaseFloorTick)return false;
+    if(q.parentIndex>0U&&!q.stageStarted&&!q.awaitNext)return false;
+    if(q.stageStarted&&(!q.stageRecipeBound||q.awaitNext))return false;
+    if(q.awaitNext&&(!q.parentIndex||q.stageStarted))return false;
+    if(q.releasePending&&(!q.stageStarted||!q.stageRecipeBound||q.parentIndex>=3U))return false;
+    if(!q.stageRecipeBound)return !q.currentSession&&!q.stageStarted;
+    if(!q.firstRecipeBound||!q.firstSession||!q.currentSession||
+        (q.parentIndex?q.currentSession<=q.previousSession:q.currentSession!=q.firstSession)||
+        !E236RecipeForKind(q.firstRecipe,q.kinds[0U])||!E236RecipeForKind(q.currentRecipe,q.kinds[q.parentIndex]))return false;
+    auto expected=q.firstRecipe;expected.commissioningProfile=q.currentRecipe.commissioningProfile;
+    expected.planRows=q.currentRecipe.planRows;expected.planMovementMask=q.currentRecipe.planMovementMask;
+    return EDM130::SameRecipe(expected,q.currentRecipe);
+}
+
+bool NCManager::IsEDM236NextArmCurrentSameThread(int pc,unsigned arm) noexcept
+{
+    const auto& q=m_edm234;const auto& s=m_edm94;
+    return IsEDM236SequenceScopeCurrentSameThread()&&q.parentIndex>0U&&q.parentIndex<4U&&q.awaitNext&&
+        !q.stageRecipeBound&&!q.stageStarted&&!q.releasePending&&q.firstRecipeBound&&q.previousSession&&
+        q.firstFinishDispatch&&q.motionDispatch&&!s.latched&&s.session==q.previousSession&&s.complete&&s.terminalLogged&&
+        !s.cancelled&&!s.resetSeen&&!s.resetCommitted&&!s.releaseRequested&&!s.rtFaultReported&&
+        pc==q.firstArmPC+static_cast<int>(q.parentIndex*3U)&&arm==E236ArmForKind(q.kinds[q.parentIndex])&&
+        GetActiveDispatchPC()==pc&&m_currentExecutingBlockDispatchId>q.firstFinishDispatch&&
+        m_motion.IsGroupDone()&&m_motion.IsGroupNCDrained()&&!m_motion.GetCommandIngressSize()&&
+        !m_motion.GetCommandReplaySize()&&!m_motion.GetAxisCommandMailboxDepth()&&!m_g76Orbit->active&&
+        !m_pathFeed.pending&&!m_pathArc.pending&&!m_pathReplay.pending&&!m_pathHold.armed&&!m_pathHold.bound;
+}
+
+bool NCManager::BeginEDM236SequenceSameThread(int pc) noexcept
+{
+    int first=-1;std::array<unsigned,4U> kinds{};
+    if(!E236ProgramShape(GetBaseProgramCache(),first,kinds))return false;
+    auto& q=m_edm234;
+    if(q.authorized)
+    {
+        if(q.program!=236U||q.parentIndex>=4U)return false;
+        if(q.parentIndex>0U)return IsEDM236NextArmCurrentSameThread(pc,E236ArmForKind(q.kinds[q.parentIndex]));
+        return pc==first&&!q.firstRecipeBound&&!q.stageRecipeBound&&!q.stageStarted&&IsEDM236SequenceScopeCurrentSameThread();
+    }
+    const auto& c=m_edm149Confirmation;
+    if(pc!=first||!c.confirmed||c.waiting||c.armPC!=pc||c.arm!=E236ArmForKind(kinds[0U])||
+        c.run!=m_pathCoreLiveBookkeeping.currentRunToken||c.cache!=GetBaseProgramCache().GetGeneration()||
+        !c.dispatch||m_currentExecutingBlockDispatchId<=c.dispatch||c.startRequests!=m_startDiagnosticRequests||
+        !CoordSys.IsTranslationRunFrozen()||!m_motion.IsMotionOwnerLeaseCurrent(m_programMotionLease))return false;
+    q=EDM234NCState{};q.translation=CoordSys.GetTranslationSnapshot();q.lease=m_programMotionLease;
+    q.epoch=m_motion.GetCurrentExecutionEpoch();q.run=c.run;q.cache=c.cache;q.confirmationDispatch=c.dispatch;
+    q.startRequests=c.startRequests;q.recipeGeneration=m_recipe.Current().generation;
+    q.processGeneration=m_edmProcessTuningGeneration;q.firstArmPC=first;q.kinds=kinds;q.program=236U;q.authorized=true;
+    return IsEDM236SequenceScopeCurrentSameThread();
+}
+
+bool NCManager::PreflightEDM236OrdinarySameThread(int pc) noexcept
+{
+    int first=-1;std::array<unsigned,4U> kinds{};const auto& cache=GetBaseProgramCache();
+    if(!E236ProgramShape(cache,first,kinds)||pc<first||(pc-first)%3||pc>first+9||
+        kinds[static_cast<unsigned>(pc-first)/3U]==2U||
+        !FreezeEDM173TranslationSameThread()||!BeginEDM236SequenceSameThread(pc))return false;
+    const unsigned code=E236GCodeForKind(kinds[static_cast<unsigned>(pc-first)/3U]);
+    m_edm94=EDM94NCState{};auto& s=m_edm94;
+    s.program=true;s.inspectedCache=cache.GetGeneration();s.gapHistoryArm=274U;s.moves=1U;
+    s.gapHistoryServo=s.gapHistoryMode=s.gapWorkTime=s.gapSegmentProfile=s.gapGainProfile=s.gapPhysicalCurve=true;
+    s.gapModeFixture=EDM116::Fixture::ModalProgram156;s.gapTuning={8.0,1.0,1.0};
+    if(!EDM107::ParseFlushProfile(10.0,50.0,100.0,s.gapFlushParameters))return false;
+    s.pc[0U]=pc+1;s.pc[1U]=pc+2;s.pc[2U]=pc+3;s.feed[0U]=0.12;
+    if(code==1U)s.increment[0U][2U]=-0.0015;
+    else{s.increment[0U][0U]=code==2U?0.001:-0.001;s.increment[0U][1U]=0.001;}
+    s.authoredGCode[0U]=static_cast<std::uint8_t>(code);s.selectorPC[0U]=pc+1;
+    m_edm127=EDM127NCState{};m_edm129=EDM129NCState{};m_edm140=EDM140NCState{};m_edm141=EDM141NCState{};
+    m_edm127.expectedMode[0U]=EDM116::Mode::B1;m_edm127.expectedOriginPC[0U]=pc+1;
+    m_edm127.expectedOriginRevision[0U]=2ULL;m_edm127.authoredInline[0U]=true;
+    return true;
+}
+
+bool NCManager::BindEDM236RecipeSameThread() noexcept
+{
+    m_edm130=EDM130NCState{};m_edm200=EDM200AutoHoldState{};
+    const auto& s=m_edm94;auto& q=m_edm234;const auto& cache=GetBaseProgramCache();const auto* arm=cache.TryGetLine(s.armPC);
+    if(!IsEDM236SequenceScopeCurrentSameThread()||q.stageRecipeBound||q.stageStarted||q.releasePending||
+        !m_edmProcessReady||!arm||s.latched||s.armPC!=q.firstArmPC+static_cast<int>(q.parentIndex*3U)||
+        s.gapHistoryArm!=E236ArmForKind(q.kinds[q.parentIndex])||s.run!=q.run||s.cache!=q.cache||
+        s.armEpoch!=q.epoch||!s.lease.Matches(q.lease)||!s.session||
+        (q.parentIndex?(!q.awaitNext||s.session<=q.previousSession):q.awaitNext))return false;
+    const unsigned kind=q.kinds[q.parentIndex];EDM97::Tuning tuning{};EDM107::FlushProfile flush{};EDMRecipe::Summary summary{};
+    if(!E234ArmSequence(arm->parsedBlock,s.gapHistoryArm)||!EDM77::Detail::EqualLiteral(arm->parsedBlock.expression('L'),236U)||
+        !E108ProfileOnlyNPQRSIJK(arm->parsedBlock,s.gapHistoryArm,tuning,flush)||
+        !EDM97::SameTuning(tuning,s.gapTuning)||!EDM107::SameFlushProfile(flush,s.gapFlushParameters))return false;
+    if(q.parentIndex)
+    {
+        if(m_currentExecutingBlockDispatchId<=q.firstFinishDispatch||m_recipeRecoveryDisplayOnly||m_recipeHoldSeen||
+            m_edmState==EDMState::NOT_READY||!m_recipe.Ready())return false;
+        summary=m_recipe.Current();
+        if(!summary.catalogReady||!summary.tableSelected||!summary.rowSelected||summary.generation!=q.recipeGeneration)return false;
+    }
+    else if(!ReadEDMRecipeSummarySameThread(summary))return false;
+    const auto binding=kind==2U?
+        EDM130::BindG76B2Gap175(m_recipe,m_edmProcessProfile.machineProfileId,m_edmProcessProfile,m_edmProcessTuningGeneration):
+        EDM130::BindWorkTimeHeightSpeedDeepMachiningReferenceCurveAndFlushStages(m_recipe,m_edmProcessProfile.machineProfileId,
+            m_edmProcessProfile,m_edmProcessTuningGeneration);
+    if(!binding.ready)return false;
+    auto recipe=binding.recipe;recipe.diagnosticControlSource=3U;recipe.planRows=kind==2U?25U:1U;
+    recipe.planMovementMask=kind==2U?7U:kind==1U?4U:3U;
+    if(!E236RecipeForKind(recipe,kind)||!EDM97::ValidMotionTestCurve(s.gapTuning,recipe))return false;
+    if(q.parentIndex)
+    {
+        if(!q.firstRecipeBound||!E236RecipeForKind(q.firstRecipe,q.kinds[0U]))return false;
+        auto expected=q.firstRecipe;expected.commissioningProfile=recipe.commissioningProfile;
+        expected.planRows=recipe.planRows;expected.planMovementMask=recipe.planMovementMask;
+        if(!EDM130::SameRecipe(expected,recipe))return false;
+    }
+    else{q.firstRecipe=recipe;q.firstRecipeBound=true;q.firstSession=s.session;}
+    q.currentRecipe=recipe;q.currentSession=s.session;q.stageRecipeBound=true;q.motionDispatch=0ULL;
+    if(!IsEDM236SequenceScopeCurrentSameThread())return false;
+    m_edm130.recipe=recipe;m_edm94.gapFlushParameters.speedRatio=EDM130::FrozenSpeedRatio(recipe);
+    if(!EDM130::MatchesFlushSpeed(recipe,m_edm94.gapFlushParameters.speedRatio)||
+        !EDM130::MatchesFlushHeight(recipe,m_edm94.gapFlushParameters.strokeRatio,m_edm94.gapFlushParameters.dwellUs))return false;
+    m_edm130.bound=true;
+    PrintNCG76DiagnosticLine("[EDM236] event=PARENT_RECIPE_BOUND parent=%u kind=%u session=%llu firstSession=%llu previousSession=%llu generation=%llu retiredMask=%u E5policy=FRESH_PER_PARENT discharge=0\n",
+        q.parentIndex+1U,kind,static_cast<unsigned long long>(s.session),static_cast<unsigned long long>(q.firstSession),
+        static_cast<unsigned long long>(q.previousSession),static_cast<unsigned long long>(summary.generation),q.retiredMask);
+    return true;
+}
+
+bool NCManager::ConsumeEDM236ConfirmationSameThread(int armPC) noexcept
+{
+    auto& q=m_edm234;const auto& s=m_edm94;
+    if(!IsEDM236SequenceScopeCurrentSameThread()||!q.stageRecipeBound||q.stageStarted||q.releasePending||
+        !m_edm130.bound||!EDM130::SameRecipe(q.currentRecipe,m_edm130.recipe)||s.latched||s.session!=q.currentSession||
+        s.armPC!=armPC||armPC!=q.firstArmPC+static_cast<int>(q.parentIndex*3U)||
+        s.gapHistoryArm!=E236ArmForKind(q.kinds[q.parentIndex])||s.run!=q.run||s.cache!=q.cache||
+        s.armEpoch!=q.epoch||!s.lease.Matches(q.lease)||GetBasePC()!=armPC||GetActiveDispatchPC()!=armPC)return false;
+    if(q.parentIndex)
+    {
+        if(!q.awaitNext||s.session<=q.previousSession||m_currentExecutingBlockDispatchId<=q.firstFinishDispatch)return false;
+    }
+    else
+    {
+        const auto& c=m_edm149Confirmation;
+        if(!c.confirmed||c.waiting||c.run!=q.run||c.cache!=q.cache||c.armPC!=armPC||c.arm!=s.gapHistoryArm||
+            c.dispatch!=q.confirmationDispatch||c.startRequests!=q.startRequests||
+            m_currentExecutingBlockDispatchId<=c.dispatch)return false;
+    }
+    q.awaitNext=false;q.stageStarted=true;m_edm149Confirmation=EDM149Confirmation{};return true;
+}
+
+bool NCManager::BindEDM236ParentEpochSameThread(MotionExecutionEpoch epoch,std::uint64_t dispatch,int pc) noexcept
+{
+    auto& q=m_edm234;const auto& s=m_edm94;
+    const auto expected=s.armEpoch==(std::numeric_limits<MotionExecutionEpoch>::max)()?1U:s.armEpoch+1U;
+    if(!q.authorized||q.program!=236U||q.parentIndex>=4U||!q.stageRecipeBound||!q.stageStarted||q.awaitNext||q.releasePending||
+        !q.firstRecipeBound||q.motionDispatch||!s.latched||!s.ready||s.cancelled||s.resetSeen||s.resetCommitted||
+        s.releaseRequested||s.rtFaultReported||s.session!=q.currentSession||
+        s.armPC!=q.firstArmPC+static_cast<int>(q.parentIndex*3U)||s.gapHistoryArm!=E236ArmForKind(q.kinds[q.parentIndex])||
+        s.run!=q.run||s.cache!=q.cache||!s.lease.Matches(q.lease)||q.epoch!=s.armEpoch||epoch!=expected||
+        epoch!=m_motion.GetCurrentExecutionEpoch()||!dispatch||dispatch<=s.armDispatch||pc!=s.pc[0U]||
+        !m_edm130.bound||!EDM130::SameRecipe(q.currentRecipe,m_edm130.recipe))return false;
+    q.epoch=epoch;if(!IsEDM236SequenceScopeCurrentSameThread())return false;q.motionDispatch=dispatch;
+    PrintNCG76DiagnosticLine("[EDM236] event=PARENT_EPOCH_BOUND parent=%u kind=%u session=%llu armEpoch=%llu liveEpoch=%llu dispatch=%llu retiredMask=%u discharge=0\n",
+        q.parentIndex+1U,q.kinds[q.parentIndex],static_cast<unsigned long long>(s.session),
+        static_cast<unsigned long long>(s.armEpoch),static_cast<unsigned long long>(epoch),static_cast<unsigned long long>(dispatch),q.retiredMask);
+    return true;
+}
+
+bool NCManager::FinishEDM236ParentSameThread()
+{
+    auto& q=m_edm234;auto& s=m_edm94;const auto& f=s.feedback;
+    if(!IsEDM236SequenceScopeCurrentSameThread()||!q.stageRecipeBound||!q.stageStarted||q.awaitNext||q.releasePending||
+        !q.motionDispatch||!s.latched||!s.complete||!s.terminalLogged||s.session!=q.currentSession||
+        s.armPC!=q.firstArmPC+static_cast<int>(q.parentIndex*3U)||s.gapHistoryArm!=E236ArmForKind(q.kinds[q.parentIndex])||
+        s.cancelled||s.resetSeen||s.resetCommitted||s.releaseRequested||s.rtFaultReported||
+        GetActiveDispatchPC()!=s.armPC+2||m_waitingBlockDispatchId!=q.currentFinishDispatch||
+        q.currentFinishDispatch<=q.motionDispatch||!m_edm130.bound||!EDM130::SameRecipe(q.currentRecipe,m_edm130.recipe))
+    {RejectEDM94SameThread("EDM236_FINISHED_SCOPE",m_gapDryRun.sourceLine);return false;}
+    if(q.parentIndex<3U)
+    {
+        if(!m_motion.RequestEDM234ParentRelease(s.session,s.armEpoch,s.lease,q.kinds[q.parentIndex],s.run,s.cache,
+            s.pc[0U],q.motionDispatch,q.currentRecipe,236U))
+        {RejectEDM94SameThread("EDM236_PARENT_RELEASE_REQUEST",m_gapDryRun.sourceLine);return false;}
+        q.releaseFloorTick=f.lastSentTick;q.releasePending=true;s.polls=0U;
+        PrintNCG76DiagnosticLine("[EDM236] event=PARENT_FINISH parent=%u kind=%u session=%llu retiredMask=%u next=EXACT_ZERO_RETIREMENT discharge=0\n",
+            q.parentIndex+1U,q.kinds[q.parentIndex],static_cast<unsigned long long>(s.session),q.retiredMask);
+        return false;
+    }
+    PrintNCG76DiagnosticLine("[EDM236] event=SEQUENCE_COMPLETE parents=4 ordinaryRows=3 G76children=25 firstSession=%llu lastSession=%llu retiredMask=%u history=CLEARED_AT_EACH_HANDOFF E5policy=FRESH_PER_PARENT discharge=0\n",
+        static_cast<unsigned long long>(q.firstSession),static_cast<unsigned long long>(q.currentSession),q.retiredMask);
+    return true;
+}
+
+bool NCManager::ConsumeEDM236ParentReleaseSameThread()
+{
+    auto& q=m_edm234;auto& s=m_edm94;const auto& f=s.feedback;
+    if(!q.releasePending)return false;
+    if(!IsEDM236SequenceScopeCurrentSameThread()||q.parentIndex>=3U||!q.stageRecipeBound||!q.stageStarted||q.awaitNext||
+        !q.motionDispatch||s.session!=q.currentSession||s.armPC!=q.firstArmPC+static_cast<int>(q.parentIndex*3U)||
+        s.gapHistoryArm!=E236ArmForKind(q.kinds[q.parentIndex])||s.next!=2U||!s.latched||!s.complete||!s.terminalLogged||
+        s.cancelled||s.resetSeen||s.resetCommitted||s.releaseRequested||s.rtFaultReported||
+        GetActiveDispatchPC()!=s.armPC+2||m_waitingBlockDispatchId!=q.currentFinishDispatch||
+        f.faulted||f.cancelled||f.parentReleasePhase==EDM94::ParentReleasePhase::Revoked)
+    {RejectEDM94SameThread("EDM236_PARENT_RELEASE_SCOPE",m_gapDryRun.sourceLine);return false;}
+    if(!f.parentReleased||f.parentReleasePhase!=EDM94::ParentReleasePhase::Released)return false;
+    if(f.parentReleaseProgram!=236U||f.parentReleaseKind!=q.kinds[q.parentIndex]||!f.released||f.active||!f.pass||!f.armAccepted||
+        !f.finishRequested||!f.stopped||!f.forceZero||f.identity.session!=s.session||f.identity.epoch!=s.armEpoch||
+        f.identity.ownerGeneration!=s.lease.generation||f.currentIdentity.session!=s.session||f.currentIdentity.epoch!=q.epoch||
+        f.currentIdentity.ownerGeneration!=q.lease.generation||!f.parentReleaseTick||f.parentReleaseTick<=q.releaseFloorTick||
+        f.parentReleaseTick<=q.releaseTick||f.parentReleaseTick!=f.lastTick||f.lastSentTick!=f.lastTick||
+        f.requiredCycles<200U||f.settledCycles<f.requiredCycles||
+        !E156FinishTargetMatches(s,m_edm130.recipe,f,m_edm114.retained)||!m_edm130.bound||
+        !EDM130::SameRecipe(q.currentRecipe,m_edm130.recipe)||!m_motion.IsGroupDone()||!m_motion.IsGroupNCDrained()||
+        m_motion.GetCommandIngressSize()||m_motion.GetCommandReplaySize()||m_motion.GetAxisCommandMailboxDepth()||
+        m_g76Orbit->active||m_pathFeed.pending||m_pathArc.pending)
+    {RejectEDM94SameThread("EDM236_PARENT_RELEASE_RECEIPT",m_gapDryRun.sourceLine);return false;}
+    const unsigned retired=q.parentIndex;q.retiredMask|=1U<<retired;q.previousSession=q.currentSession;
+    q.firstFinishDispatch=q.currentFinishDispatch;q.previousReleaseFloorTick=q.releaseFloorTick;
+    q.releaseTick=f.parentReleaseTick;q.releasePending=false;
+    ++q.parentIndex;q.currentSession=0ULL;q.currentRecipe=EDM130::Recipe{};
+    q.stageRecipeBound=q.stageStarted=false;q.awaitNext=true;
+    PrintNCG76DiagnosticLine("[EDM236] event=PARENT_RELEASED parent=%u kind=%u session=%llu tick=%llu retiredMask=%u nextArmPC=%d sameAUTO=1 discharge=0\n",
+        retired+1U,q.kinds[retired],static_cast<unsigned long long>(q.previousSession),static_cast<unsigned long long>(q.releaseTick),
+        q.retiredMask,q.firstArmPC+static_cast<int>(q.parentIndex*3U));
+    s.latched=s.armPending=s.ready=s.finishPending=false;m_edm149Confirmation=EDM149Confirmation{};
+    m_edm157=EDM157NCState{};m_edm200=EDM200AutoHoldState{};m_edm130.bound=false;
+    return true;
+}
+
+
+// EDM237's continuation consent is NC-owned. The genuine ordinary GAP runtime
+// still owns all four rows, one history bank, and the shared RT E5 clock.
+// One stopped E6 edit belongs to the exact released parent. This grant never
+// refreshes the generic recipe selection, opens motion, or changes its epoch.
+bool NCManager::IsEDM240RecipeBridgeCurrentSameThread(int pc,bool afterApply) noexcept
+{
+    const auto& q=m_edm237;const auto& s=m_edm94;
+    if(!E237BridgeRequired(q.program,q.parentIndex,q.kinds[0U])||q.parentIndex==0U||q.parentIndex>=4U||q.parentIndex>=q.parentCount||
+        !IsEDM237SequenceScopeCurrentSameThread(false,afterApply)||!q.awaitNext||!q.firstReleased||
+        q.stageRecipeBound||q.stageStarted||q.releasePending||!q.firstRecipeBound||!q.previousSession||
+        !q.previousFinishDispatch||!q.motionDispatch||s.latched||s.armPending||s.ready||s.finishPending||
+        s.session!=q.previousSession||!s.complete||!s.terminalLogged||s.cancelled||s.resetSeen||s.resetCommitted||
+        s.releaseRequested||s.rtFaultReported||pc!=q.armPC[q.parentIndex]-1||GetBasePC()!=pc||GetActiveDispatchPC()!=pc||
+        m_currentExecutingBlockDispatchId<=q.previousFinishDispatch||
+        q.bridgeMask!=(E237RequiredBridgeMask(q.program,q.kinds[0U])&((1U<<(q.parentIndex-1U))-1U))||m_recipeControlExhausted||!m_recipeControlGeneration||
+        m_recipeRecoveryDisplayOnly||m_recipeHoldSeen||!m_edmProcessReady||!m_recipe.Ready()||
+        !IsEDMRecipeStoppedAuthorityCurrentSameThread()||m_motion.GetAxisCommandMailboxDepth()||
+        m_g76Orbit->active||m_pathFeed.pending||m_pathArc.pending||m_pathReplay.pending||m_pathHold.armed||m_pathHold.bound)return false;
+    // ServiceEDM94 stops sampling when the released session is unlatched;
+    // retain and recheck its exact zero/200-cycle receipt before the edit.
+    const auto& f=s.feedback;
+    if(!f.parentReleased||f.parentReleasePhase!=EDM94::ParentReleasePhase::Released||f.parentReleaseProgram!=q.program||
+        f.parentReleaseKind!=q.kinds[q.parentIndex-1U]||!f.released||f.active||!f.pass||!f.armAccepted||
+        !f.finishRequested||!f.stopped||!f.forceZero||f.faulted||f.cancelled||
+        f.identity.session!=q.previousSession||f.identity.epoch!=s.armEpoch||f.identity.ownerGeneration!=q.lease.generation||
+        f.currentIdentity.session!=q.previousSession||f.currentIdentity.epoch!=q.epoch||f.currentIdentity.ownerGeneration!=q.lease.generation||
+        f.parentReleaseTick!=q.releaseTick||f.lastTick!=q.releaseTick||f.lastSentTick!=q.releaseTick||
+        f.requiredCycles<200U||f.settledCycles<f.requiredCycles)return false;
+    const auto* source=GetBaseProgramCache().TryGetLine(pc);EDMRecipe::ParameterSnapshot height{};
+    const unsigned heightKind=q.kinds[afterApply?q.parentIndex:q.parentIndex-1U];
+    if(!source||!E240RecipeBridgeShape(source->parsedBlock,q.kinds[q.parentIndex],q.program)||
+        !m_recipe.ReadField(6U,height)||height.actualValue!=static_cast<EDMRecipe::Value>((heightKind==2U||heightKind==5U)?1000ULL:200000ULL))return false;
+    const auto& r=q.bridges[q.parentIndex-1U];
+    if(r.committed||(afterApply&&!r.prepared))return false;
+    if(!r.prepared)return !afterApply;
+    const auto& p=m_recipeEditPrepared;auto expectedKey=r.beforeKey;expectedKey.generation=r.afterGeneration;
+    return EDMRecipeControl::SameKey(expectedKey,r.afterKey)&&r.pc==pc&&r.line==source->sourceLineNumber&&r.dispatch==m_currentExecutingBlockDispatchId&&
+        r.controlGeneration==m_recipeControlGeneration&&r.run==q.run&&r.cache==q.cache&&r.epoch==q.epoch&&
+        r.lease.Matches(q.lease)&&r.releaseTick==q.releaseTick&&r.previousSession==q.previousSession&&
+        r.finishDispatch==q.previousFinishDispatch&&r.beforeGeneration==q.recipeGeneration&&
+        r.beforeGeneration<(std::numeric_limits<std::uint64_t>::max)()&&r.afterGeneration==r.beforeGeneration+1ULL&&
+        p.sourcePC==pc&&p.line==r.line&&p.dispatch==r.dispatch&&p.request.requestId==r.dispatch&&
+        p.request.fieldId==6U&&p.request.op==EDMRecipeControl::Operation::SetActual&&
+        p.request.argument==static_cast<EDMRecipe::Value>((q.kinds[q.parentIndex]==2U||q.kinds[q.parentIndex]==5U)?1000ULL:200000ULL)&&
+        p.context.run==q.run&&p.context.cache==q.cache&&p.context.epoch==q.epoch&&p.context.lease.Matches(q.lease)&&
+        p.context.controlGeneration==m_recipeControlGeneration&&EDMRecipeControl::SameKey(p.context.key,r.beforeKey)&&
+        EDMRecipeControl::SameKey(EDMRecipeControl::CaptureKey(m_recipe.Current()),afterApply?r.afterKey:r.beforeKey)&&
+        r.previewRecipe.generation==r.afterGeneration&&E237RecipeForProgramKind(r.previewRecipe,q.kinds[q.parentIndex],q.program)&&
+        E237SameParentRecipe(q.firstRecipe,r.previewRecipe,q.program);
+}
+
+bool NCManager::PrepareEDM240RecipeBridgeSameThread(const NCBlock& block,int pc,int line,NCBlockDispatchId dispatch)
+{
+    m_recipeEditPrepared.ready=false;auto& q=m_edm237;
+    const auto reject=[&](const char* why){RejectEDM94SameThread(why,line);return false;};
+    if(!IsEDM240RecipeBridgeCurrentSameThread(pc)||dispatch==NC_BLOCK_DISPATCH_ID_INVALID||
+        dispatch!=m_currentExecutingBlockDispatchId)return reject("EDM240_BRIDGE_PREPARE_SCOPE");
+    auto& receipt=q.bridges[q.parentIndex-1U];
+    if(receipt.prepared||receipt.committed)return reject("EDM240_BRIDGE_REPLAY");
+    const auto* source=GetBaseProgramCache().TryGetLine(pc);EDMRecipeControl::Request request{};
+    if(!source||source->sourceLineNumber!=line||!DecodeEDMRecipeEditBlock(block,source->parsedBlock,request)||
+        request.fieldId!=6U||request.op!=EDMRecipeControl::Operation::SetActual||
+        request.argument!=static_cast<EDMRecipe::Value>((q.kinds[q.parentIndex]==2U||q.kinds[q.parentIndex]==5U)?1000ULL:200000ULL))
+        return reject("EDM240_BRIDGE_SOURCE");
+    request.requestId=dispatch;
+    const auto key=EDMRecipeControl::CaptureKey(m_recipe.Current());
+    if(!EDMRecipeControl::IsKeyValid(key)||key.generation!=q.recipeGeneration||
+        key.generation==(std::numeric_limits<std::uint64_t>::max)())return reject("EDM240_BRIDGE_KEY");
+    // The existing fixed NC-thread preview is discarded on every exit. No
+    // controller-sized stack temporary or synthetic field remapping is used.
+    auto& preview=m_edmRecipeSequencePreview;
+    if(!preview.ForkPreviewFrom(m_recipe)){preview.DiscardPreview();return reject("EDM240_BRIDGE_PREVIEW_FORK");}
+    EDMRecipeControl::Result result{};
+    if(!EDMRecipeControl::Apply(preview,key,request,result)||!result.success||!result.applied||
+        !result.afterFieldValid||result.afterField.actualValue!=request.argument||
+        result.after.generation!=key.generation+1ULL)
+    {preview.DiscardPreview();return reject("EDM240_BRIDGE_PREVIEW_EDIT");}
+    const unsigned kind=q.kinds[q.parentIndex];
+    const auto binding=kind==5U?
+        EDM130::BindWorkTimeHeightSpeedDeepMachiningReferenceCurveAndFlushStages(preview,m_edmProcessProfile.machineProfileId,
+            m_edmProcessProfile,m_edmProcessTuningGeneration):kind==2U?
+        EDM130::BindG76B2Gap175(preview,m_edmProcessProfile.machineProfileId,m_edmProcessProfile,m_edmProcessTuningGeneration):q.program==248U?
+        EDM130::BindG76CenterSequence248(preview,m_edmProcessProfile.machineProfileId,m_edmProcessProfile,
+            m_edmProcessTuningGeneration,EDM130::G76B4Profile177):q.program==247U?
+        EDM130::BindG76CenterSequence247(preview,m_edmProcessProfile.machineProfileId,m_edmProcessProfile,
+            m_edmProcessTuningGeneration,EDM130::G76B3Profile176):q.program==246U?
+        EDM130::BindG76CenterSequence246(preview,m_edmProcessProfile.machineProfileId,m_edmProcessProfile,
+            m_edmProcessTuningGeneration,EDM130::G76B4Profile177):q.program==245U?
+        EDM130::BindG76CenterSequence245(preview,m_edmProcessProfile.machineProfileId,m_edmProcessProfile,
+            m_edmProcessTuningGeneration,EDM130::G76B3Profile176):q.program==244U?
+        EDM130::BindG76CenterSequence244(preview,m_edmProcessProfile.machineProfileId,m_edmProcessProfile,
+            m_edmProcessTuningGeneration,kind==6U?EDM130::G76B3Profile176:EDM130::G76B4Profile177):q.program==243U?
+        EDM130::BindG76CenterSequence243(preview,m_edmProcessProfile.machineProfileId,m_edmProcessProfile,
+            m_edmProcessTuningGeneration,kind==6U?EDM130::G76B3Profile176:EDM130::G76B4Profile177):q.program==242U?
+        EDM130::BindG76CenterSequence242(preview,m_edmProcessProfile.machineProfileId,m_edmProcessProfile,
+            m_edmProcessTuningGeneration,kind==6U?EDM130::G76B3Profile176:EDM130::G76B4Profile177):q.program==241U?
+        EDM130::BindG76CenterSequence241(preview,m_edmProcessProfile.machineProfileId,m_edmProcessProfile,
+            m_edmProcessTuningGeneration,kind==6U?EDM130::G76B3Profile176:EDM130::G76B4Profile177):
+        EDM130::BindG76CenterSequence240(preview,m_edmProcessProfile.machineProfileId,m_edmProcessProfile,
+            m_edmProcessTuningGeneration,kind==6U?EDM130::G76B3Profile176:EDM130::G76B4Profile177);
+    auto recipe=binding.recipe;recipe.diagnosticControlSource=3U;recipe.planRows=kind==5U?4U:25U;recipe.planMovementMask=7U;
+    const auto afterKey=EDMRecipeControl::CaptureKey(preview.Current());preview.DiscardPreview();
+    if(!binding.ready||recipe.heightFieldId!=6U||recipe.generation!=key.generation+1ULL||
+        !E237RecipeForProgramKind(recipe,kind,q.program)||!E237SameParentRecipe(q.firstRecipe,recipe,q.program)||
+        !IsEDM240RecipeBridgeCurrentSameThread(pc)||!EDMRecipeControl::SameKey(key,EDMRecipeControl::CaptureKey(m_recipe.Current())))
+        return reject("EDM240_BRIDGE_PREVIEW_IDENTITY");
+    receipt=EDM237NCState::EDM240Bridge{};receipt.previewRecipe=recipe;receipt.beforeKey=key;receipt.afterKey=afterKey;
+    receipt.lease=q.lease;receipt.epoch=q.epoch;receipt.run=q.run;receipt.cache=q.cache;receipt.dispatch=dispatch;
+    receipt.controlGeneration=m_recipeControlGeneration;receipt.releaseTick=q.releaseTick;receipt.previousSession=q.previousSession;
+    receipt.finishDispatch=q.previousFinishDispatch;receipt.beforeGeneration=key.generation;receipt.afterGeneration=afterKey.generation;
+    receipt.pc=pc;receipt.line=line;receipt.prepared=true;
+    auto& prepared=m_recipeEditPrepared;prepared.context.key=key;prepared.context.run=q.run;prepared.context.cache=q.cache;
+    prepared.context.epoch=q.epoch;prepared.context.lease=q.lease;prepared.context.controlGeneration=m_recipeControlGeneration;
+    prepared.request=request;prepared.sourcePC=pc;prepared.line=line;prepared.dispatch=dispatch;prepared.ready=true;
+    if(IsEDM240RecipeBridgeCurrentSameThread(pc))return true;
+    prepared.ready=false;receipt.prepared=false;return reject("EDM240_BRIDGE_PREPARE_REVOKED");
+}
+
+bool NCManager::AcceptEDM240RecipeBridgeSameThread(const EDMRecipeControl::Result& result,const EDM130::Recipe& recipe) noexcept
+{
+    auto& q=m_edm237;
+    if(q.parentIndex==0U||q.parentIndex>=4U||!IsEDM240RecipeBridgeCurrentSameThread(q.armPC[q.parentIndex]-1,true))return false;
+    auto& r=q.bridges[q.parentIndex-1U];
+    if(!result.success||!result.applied||result.requestId!=r.dispatch||result.fieldId!=6U||
+        result.op!=EDMRecipeControl::Operation::SetActual||!result.beforeFieldValid||!result.afterFieldValid||
+        result.afterField.actualValue!=static_cast<EDMRecipe::Value>((q.kinds[q.parentIndex]==2U||q.kinds[q.parentIndex]==5U)?1000ULL:200000ULL)||
+        !EDMRecipeControl::SameKey(EDMRecipeControl::CaptureKey(result.before),r.beforeKey)||
+        !EDMRecipeControl::SameKey(EDMRecipeControl::CaptureKey(result.after),r.afterKey)||
+        !EDM130::SameRecipe(recipe,r.previewRecipe)||!E237RecipeForProgramKind(recipe,q.kinds[q.parentIndex],q.program)||
+        !E237SameParentRecipe(q.firstRecipe,recipe,q.program))return false;
+    q.recipeGeneration=r.afterGeneration;r.prepared=false;r.committed=true;q.bridgeMask|=1U<<(q.parentIndex-1U);
+    if(IsEDM237SequenceScopeCurrentSameThread())return true;
+    // The live edit is never retried or rolled back. Revoke continuation if
+    // concurrent safety intent arrived after the synchronous receipt proof.
+    q.recipeGeneration=r.beforeGeneration;r.prepared=true;r.committed=false;q.bridgeMask&=~(1U<<(q.parentIndex-1U));return false;
+}
+
+bool NCManager::CommitEDM240RecipeBridgeSameThread(const NCBlock& block)
+{
+    auto& q=m_edm237;const int pc=GetActiveDispatchPC();const int line=m_recipeEditPrepared.line;
+    const auto reject=[&](const char* why){m_recipeEditPrepared.ready=false;RejectEDM94SameThread(why,line);return false;};
+    if(!m_recipeEditPrepared.ready||!IsEDM240RecipeBridgeCurrentSameThread(pc))return reject("EDM240_BRIDGE_COMMIT_SCOPE");
+    auto& receipt=q.bridges[q.parentIndex-1U];const auto* source=GetBaseProgramCache().TryGetLine(pc);
+    EDMRecipeControl::Request decoded{};
+    if(!receipt.prepared||!source||!DecodeEDMRecipeEditBlock(block,source->parsedBlock,decoded)||
+        decoded.fieldId!=m_recipeEditPrepared.request.fieldId||decoded.op!=m_recipeEditPrepared.request.op||
+        decoded.argument!=m_recipeEditPrepared.request.argument)return reject("EDM240_BRIDGE_COMMIT_SOURCE");
+    // Consume the one prepared token before the only live controller mutation.
+    m_recipeEditPrepared.ready=false;EDMRecipeControl::Result result{};
+    if(!EDMRecipeControl::Apply(m_recipe,receipt.beforeKey,m_recipeEditPrepared.request,result))
+        return reject("EDM240_BRIDGE_LIVE_EDIT");
+    const unsigned kind=q.kinds[q.parentIndex];
+    const auto binding=kind==5U?
+        EDM130::BindWorkTimeHeightSpeedDeepMachiningReferenceCurveAndFlushStages(m_recipe,m_edmProcessProfile.machineProfileId,
+            m_edmProcessProfile,m_edmProcessTuningGeneration):kind==2U?
+        EDM130::BindG76B2Gap175(m_recipe,m_edmProcessProfile.machineProfileId,m_edmProcessProfile,m_edmProcessTuningGeneration):q.program==248U?
+        EDM130::BindG76CenterSequence248(m_recipe,m_edmProcessProfile.machineProfileId,m_edmProcessProfile,
+            m_edmProcessTuningGeneration,EDM130::G76B4Profile177):q.program==247U?
+        EDM130::BindG76CenterSequence247(m_recipe,m_edmProcessProfile.machineProfileId,m_edmProcessProfile,
+            m_edmProcessTuningGeneration,EDM130::G76B3Profile176):q.program==246U?
+        EDM130::BindG76CenterSequence246(m_recipe,m_edmProcessProfile.machineProfileId,m_edmProcessProfile,
+            m_edmProcessTuningGeneration,EDM130::G76B4Profile177):q.program==245U?
+        EDM130::BindG76CenterSequence245(m_recipe,m_edmProcessProfile.machineProfileId,m_edmProcessProfile,
+            m_edmProcessTuningGeneration,EDM130::G76B3Profile176):q.program==244U?
+        EDM130::BindG76CenterSequence244(m_recipe,m_edmProcessProfile.machineProfileId,m_edmProcessProfile,
+            m_edmProcessTuningGeneration,kind==6U?EDM130::G76B3Profile176:EDM130::G76B4Profile177):q.program==243U?
+        EDM130::BindG76CenterSequence243(m_recipe,m_edmProcessProfile.machineProfileId,m_edmProcessProfile,
+            m_edmProcessTuningGeneration,kind==6U?EDM130::G76B3Profile176:EDM130::G76B4Profile177):q.program==242U?
+        EDM130::BindG76CenterSequence242(m_recipe,m_edmProcessProfile.machineProfileId,m_edmProcessProfile,
+            m_edmProcessTuningGeneration,kind==6U?EDM130::G76B3Profile176:EDM130::G76B4Profile177):q.program==241U?
+        EDM130::BindG76CenterSequence241(m_recipe,m_edmProcessProfile.machineProfileId,m_edmProcessProfile,
+            m_edmProcessTuningGeneration,kind==6U?EDM130::G76B3Profile176:EDM130::G76B4Profile177):
+        EDM130::BindG76CenterSequence240(m_recipe,m_edmProcessProfile.machineProfileId,m_edmProcessProfile,
+            m_edmProcessTuningGeneration,kind==6U?EDM130::G76B3Profile176:EDM130::G76B4Profile177);
+    auto recipe=binding.recipe;recipe.diagnosticControlSource=3U;recipe.planRows=kind==5U?4U:25U;recipe.planMovementMask=7U;
+    if(!binding.ready||!AcceptEDM240RecipeBridgeSameThread(result,recipe))return reject("EDM240_BRIDGE_POST_COMMIT_SCOPE");
+    PrintNCG76DiagnosticLine("[EDM%u] event=RECIPE_BRIDGE_COMMITTED parent=%u pc=%d dispatch=%llu beforeGeneration=%llu afterGeneration=%llu heightMicroMm=%llu bridgeMask=%u releaseTick=%llu motion=0 discharge=0\n",
+        q.program,q.parentIndex+1U,pc,static_cast<unsigned long long>(receipt.dispatch),
+        static_cast<unsigned long long>(receipt.beforeGeneration),static_cast<unsigned long long>(receipt.afterGeneration),
+        static_cast<unsigned long long>(recipe.jumpHeightScaled),q.bridgeMask,static_cast<unsigned long long>(receipt.releaseTick));return true;
+}
+
+bool NCManager::IsEDM237SequenceScopeCurrentSameThread(bool nativeParentReceipt,bool recipeBridgeReceipt) noexcept
+{
+    const auto& q=m_edm237;int first=-1;std::array<unsigned,4U> kinds{};unsigned program=0U,count=0U;
+    // EDM237 FIX2: a committed G76 native transaction publishes its own
+    // next epoch before RT acknowledges EXECUTION_EPOCH_PUBLICATION_PENDING.
+    // Only this call-local receipt may tolerate that acknowledgement window.
+    // Every normal entry stays strict, and actual safety intent always wins.
+    if(nativeParentReceipt)
+    {
+        if(!m_g76Orbit||!m_edm173||q.parentIndex>=q.parentCount||q.parentIndex>=4U||!E237NativeKind(q.kinds[q.parentIndex])||q.currentRowBound!=1U||
+            !q.stageRecipeBound||!q.stageStarted||q.awaitNext||q.releasePending)return false;
+        const auto& g=*m_g76Orbit;const auto& r=g.receipt;const auto& scope=m_edm173->plan.scope;
+        if(scope.session!=q.currentSession||scope.run!=q.run||scope.cache!=q.cache||
+            scope.armEpoch!=q.currentArmEpoch||!scope.owner.Matches(q.lease)||
+            scope.dispatch!=g.dispatch||scope.sourcePC!=g.pc||scope.line!=g.line)return false;
+        if(g.run!=q.run||g.cache!=q.cache||g.dispatch!=q.motionDispatch||!g.dispatch||
+            g.pc!=m_edm94.pc[0U]||!r.valid||!r.commandAccepted||!r.captureBound||!r.tailCommitted||
+            r.count!=25U||r.axisMask!=7U||!r.ownerLease.Matches(q.lease)||!r.tail.IsCommitted()||
+            !r.tail.identity.Matches(r.identities[24U])||!r.tail.ownerLease.Matches(q.lease)||
+            r.tail.identity.source!=r.identities[24U].source||
+            r.tail.identity.sourceBlockId!=r.identities[24U].sourceBlockId||
+            !r.identities[0U].IsAssigned()||r.identities[0U].epoch!=q.epoch||
+            r.identities[0U].source!=MotionCommandSource::NC_MEMORY||
+            r.identities[0U].sourceBlockId!=static_cast<MotionSourceBlockId>(g.pc))return false;
+    }
+    // Only the synchronous post-Apply receipt may observe the one expected
+    // recipe generation before adoption; all normal scope checks stay strict.
+    if(recipeBridgeReceipt&&(nativeParentReceipt||!E237BridgeRequired(q.program,q.parentIndex,q.kinds[0U])||q.parentIndex==0U||q.parentIndex>=4U||
+        !q.bridges[q.parentIndex-1U].prepared||q.bridges[q.parentIndex-1U].committed||
+        q.bridges[q.parentIndex-1U].beforeGeneration!=q.recipeGeneration||
+        q.recipeGeneration==(std::numeric_limits<std::uint64_t>::max)()||
+        q.bridges[q.parentIndex-1U].afterGeneration!=q.recipeGeneration+1ULL))return false;
+    if(!E240BridgeHistory(q))return false;
+    if(!q.authorized||!q.run||!q.cache||!q.confirmationDispatch||!q.startRequests||q.firstArmPC<1||q.parentIndex>=q.parentCount||q.parentIndex>=4U||
+        q.epoch==MOTION_EXECUTION_EPOCH_INVALID||!q.lease.IsValid()||q.lease.owner!=MotionOwner::AUTO||
+        q.run!=m_pathCoreLiveBookkeeping.currentRunToken||q.cache!=GetBaseProgramCache().GetGeneration()||
+        q.epoch!=m_motion.GetCurrentExecutionEpoch()||!q.lease.Matches(m_programMotionLease)||
+        !m_motion.IsMotionOwnerLeaseCurrent(q.lease)||
+        (nativeParentReceipt?m_motion.HasPendingSafetyIntent():m_motion.HasPendingSafetyOrRecoveryRequests())||
+        q.startRequests!=m_startDiagnosticRequests||(recipeBridgeReceipt?q.recipeGeneration+1ULL:q.recipeGeneration)!=m_recipe.Current().generation||
+        q.processGeneration!=m_edmProcessTuningGeneration||m_state!=NCState::RUN||m_mode!=NCOperationMode::MEMORY||
+        Close_System_Com_flag||!m_externalReadyInterlock||m_isSingleBlockEnabled||m_isG66Active||
+        !m_macroStack.empty()||Homing.IsActive()||AlarmManager::GetInstance().HasAlarm()||
+        m_resetContinuationPhase!=ResetContinuationPhase::IDLE||!CoordSys.IsTranslationRunFrozen()||
+        !IsNCXYZCUVFeedNeutralFrame(CoordSys.GetTranslationSnapshot())||CoordSys.GetTranslationSnapshot().distanceMode!=91||
+        !IsPathCoreLiveNativeConfigCurrentSameThread()||!IsFixedTranslationTravelCurrentSameThread()||
+        !SameNCTranslationSnapshot(q.translation,CoordSys.GetTranslationSnapshot())||!m_motion.MatchesNCTranslation(q.translation)||
+        !E237HistoryProgramShape(GetBaseProgramCache(),first,kinds,program,count)||first!=q.firstArmPC||kinds!=q.kinds||program!=q.program||count!=q.parentCount||
+        q.armPC[0U]!=first||q.armPC[1U]!=first+static_cast<int>(E237ArmStride(program,kinds[0U],1U,kinds[0U]))||
+        q.currentRowBound>E237RowsForKind(q.kinds[q.parentIndex])||
+        q.retiredMask!=(1U<<q.parentIndex)-1U)return false;
+    for(unsigned i=1U;i<q.parentCount;++i)
+        if(q.armPC[i]!=q.armPC[i-1U]+static_cast<int>(E237ArmStride(q.program,q.kinds[i-1U],i,q.kinds[0U])))return false;
+    if(q.parentIndex==0U)
+    {if(q.firstReleased||q.awaitNext||q.previousSession||q.releaseTick||q.previousFinishDispatch||q.previousReleaseFloorTick)return false;}
+    else if(!q.firstReleased||!q.firstRecipeBound||!q.firstSession||q.previousSession<q.firstSession||
+        !q.firstFinishDispatch||q.previousFinishDispatch<q.firstFinishDispatch||
+        (q.parentIndex==1U?(q.previousSession!=q.firstSession||q.previousFinishDispatch!=q.firstFinishDispatch):
+            (q.previousSession<=q.firstSession||q.previousFinishDispatch<=q.firstFinishDispatch))||
+        !q.releaseTick||q.releaseTick<=q.previousReleaseFloorTick)return false;
+    if(q.awaitNext&&(!q.parentIndex||q.stageStarted||q.releasePending))return false;
+    if(q.stageStarted&&(!q.stageRecipeBound||q.awaitNext))return false;
+    if(q.releasePending&&(q.parentIndex+1U>=q.parentCount||!q.stageRecipeBound||!q.stageStarted||q.awaitNext||
+        (q.parentIndex&&q.releaseFloorTick<q.releaseTick)))return false;
+    if(!q.stageRecipeBound)return !q.currentSession&&!q.stageStarted&&!q.currentRowBound;
+    if(!q.firstRecipeBound||!q.firstSession||!q.currentSession||
+        (q.parentIndex?q.currentSession<=q.previousSession:q.currentSession!=q.firstSession)||
+        !E237RecipeForProgramKind(q.firstRecipe,q.kinds[0U],q.program)||!E237RecipeForProgramKind(q.currentRecipe,q.kinds[q.parentIndex],q.program))return false;
+    return E237SameParentRecipe(q.firstRecipe,q.currentRecipe,q.program);
+}
+
+bool NCManager::IsEDM237NextArmCurrentSameThread(int pc,unsigned arm) noexcept
+{
+    const auto& q=m_edm237;const auto& s=m_edm94;
+    return IsEDM237SequenceScopeCurrentSameThread()&&q.parentIndex>0U&&q.parentIndex<q.parentCount&&q.awaitNext&&q.firstReleased&&
+        !q.stageRecipeBound&&!q.stageStarted&&!q.releasePending&&q.firstRecipeBound&&q.previousSession&&
+        q.previousFinishDispatch&&q.motionDispatch&&!s.latched&&s.session==q.previousSession&&s.complete&&s.terminalLogged&&
+        !s.cancelled&&!s.resetSeen&&!s.resetCommitted&&!s.releaseRequested&&!s.rtFaultReported&&
+        pc==q.armPC[q.parentIndex]&&arm==E237ArmForKind(q.kinds[q.parentIndex])&&GetActiveDispatchPC()==pc&&
+        m_currentExecutingBlockDispatchId>q.previousFinishDispatch&&
+        (!E237RequiredBridgeMask(q.program,q.kinds[0U])||(q.bridgeMask==(E237RequiredBridgeMask(q.program,q.kinds[0U])&((1U<<q.parentIndex)-1U))&&
+            (!E237BridgeRequired(q.program,q.parentIndex,q.kinds[0U])||m_currentExecutingBlockDispatchId>q.bridges[q.parentIndex-1U].dispatch)))&&m_motion.IsGroupDone()&&m_motion.IsGroupNCDrained()&&
+        !m_motion.GetCommandIngressSize()&&!m_motion.GetCommandReplaySize()&&!m_motion.GetAxisCommandMailboxDepth()&&
+        !m_g76Orbit->active&&!m_pathFeed.pending&&!m_pathArc.pending&&!m_pathReplay.pending&&!m_pathHold.armed&&!m_pathHold.bound;
+}
+
+bool NCManager::BeginEDM237SequenceSameThread(int pc) noexcept
+{
+    int first=-1;std::array<unsigned,4U> kinds{};unsigned program=0U,count=0U;
+    if(!E237HistoryProgramShape(GetBaseProgramCache(),first,kinds,program,count))return false;
+    auto& q=m_edm237;
+    if(q.authorized)
+    {
+        if(q.parentIndex>=q.parentCount||q.parentIndex>=4U)return false;
+        if(q.parentIndex)return IsEDM237NextArmCurrentSameThread(pc,E237ArmForKind(q.kinds[q.parentIndex]));
+        return pc==first&&!q.firstRecipeBound&&!q.stageRecipeBound&&!q.stageStarted&&IsEDM237SequenceScopeCurrentSameThread();
+    }
+    const auto& c=m_edm149Confirmation;
+    if(m_edm233.authorized||m_edm234.authorized||pc!=first||!c.confirmed||c.waiting||c.armPC!=pc||
+        c.arm!=E237ArmForKind(kinds[0U])||c.run!=m_pathCoreLiveBookkeeping.currentRunToken||
+        c.cache!=GetBaseProgramCache().GetGeneration()||!c.dispatch||m_currentExecutingBlockDispatchId<=c.dispatch||
+        c.startRequests!=m_startDiagnosticRequests||!CoordSys.IsTranslationRunFrozen()||
+        !m_motion.IsMotionOwnerLeaseCurrent(m_programMotionLease))return false;
+    q=EDM237NCState{};q.translation=CoordSys.GetTranslationSnapshot();q.lease=m_programMotionLease;
+    q.epoch=m_motion.GetCurrentExecutionEpoch();q.run=c.run;q.cache=c.cache;q.confirmationDispatch=c.dispatch;
+    q.startRequests=c.startRequests;q.recipeGeneration=m_recipe.Current().generation;
+    if(E237RequiredBridgeMask(program,kinds[0U])&&q.recipeGeneration>(std::numeric_limits<std::uint64_t>::max)()-((program==242U||program==245U||program==246U||program==247U||program==248U)?1ULL:(program==243U||program==244U)?2ULL:3ULL))return false;
+    q.processGeneration=m_edmProcessTuningGeneration;q.firstArmPC=first;q.kinds=kinds;
+    q.program=program;q.parentCount=count;q.armPC[0U]=first;
+    for(unsigned i=1U;i<count;++i)q.armPC[i]=q.armPC[i-1U]+static_cast<int>(E237ArmStride(program,kinds[i-1U],i,kinds[0U]));
+    q.authorized=true;
+    return IsEDM237SequenceScopeCurrentSameThread();
+}
+
+bool NCManager::PreflightEDM237OrdinarySameThread(int pc) noexcept
+{
+    int first=-1;std::array<unsigned,4U> kinds{};unsigned program=0U,count=0U;const auto& cache=GetBaseProgramCache();
+    if(!E237HistoryProgramShape(cache,first,kinds,program,count))return false;
+    int candidate=first;bool ordinary=false;
+    for(unsigned i=0U;i<count;++i){if(pc==candidate&&kinds[i]==5U)ordinary=true;
+        candidate+=static_cast<int>(E237ArmStride(program,kinds[i],i+1U,kinds[0U]));}
+    if(!ordinary||!FreezeEDM173TranslationSameThread()||!BeginEDM237SequenceSameThread(pc))return false;
+    m_edm94=EDM94NCState{};auto& s=m_edm94;
+    s.program=true;s.inspectedCache=cache.GetGeneration();s.gapHistoryArm=274U;s.moves=4U;
+    s.gapHistoryServo=s.gapHistoryMode=s.gapWorkTime=s.gapSegmentProfile=s.gapGainProfile=s.gapPhysicalCurve=true;
+    s.gapModeFixture=EDM116::Fixture::ModalProgram156;s.gapTuning={8.0,1.0,1.0};
+    if(!EDM107::ParseFlushProfile(10.0,50.0,100.0,s.gapFlushParameters))return false;
+    m_edm127=EDM127NCState{};m_edm129=EDM129NCState{};m_edm140=EDM140NCState{};m_edm141=EDM141NCState{};
+    const unsigned codes[4]={1U,2U,3U,1U};
+    const EDM116::Mode modes[4]={EDM116::Mode::B0,EDM116::Mode::B1,EDM116::Mode::B2,EDM116::Mode::B2};
+    for(unsigned row=0U;row<4U;++row)
+    {
+        s.pc[row]=pc+1+static_cast<int>(row);s.feed[row]=0.12;s.authoredGCode[row]=static_cast<std::uint8_t>(codes[row]);
+        s.selectorPC[row]=s.pc[row];
+        if(row==0U||row==3U)s.increment[row][2U]=-0.0015;
+        else{s.increment[row][0U]=row==1U?0.001:-0.001;s.increment[row][1U]=0.001;}
+        m_edm127.expectedMode[row]=modes[row];m_edm127.expectedOriginPC[row]=pc+1+static_cast<int>((std::min)(row,2U));
+        m_edm127.expectedOriginRevision[row]=2ULL+(std::min)(row,2U);m_edm127.authoredInline[row]=row!=3U;
+    }
+    s.pc[4U]=pc+5;s.pc[5U]=pc+6;return true;
+}
+
+bool NCManager::BindEDM237RecipeSameThread() noexcept
+{
+    m_edm130=EDM130NCState{};m_edm200=EDM200AutoHoldState{};
+    const auto& s=m_edm94;auto& q=m_edm237;const auto& cache=GetBaseProgramCache();const auto* arm=cache.TryGetLine(s.armPC);
+    if(!IsEDM237SequenceScopeCurrentSameThread()||q.stageRecipeBound||q.stageStarted||q.releasePending||
+        !m_edmProcessReady||!arm||s.latched||s.armPC!=q.armPC[q.parentIndex]||
+        s.gapHistoryArm!=E237ArmForKind(q.kinds[q.parentIndex])||s.moves!=E237RowsForKind(q.kinds[q.parentIndex])||
+        s.run!=q.run||s.cache!=q.cache||s.armEpoch!=q.epoch||!s.lease.Matches(q.lease)||!s.session||
+        (q.parentIndex?(!q.awaitNext||s.session<=q.previousSession):q.awaitNext))return false;
+    const unsigned kind=q.kinds[q.parentIndex];EDM97::Tuning tuning{};EDM107::FlushProfile flush{};EDMRecipe::Summary summary{};
+    if(!E237ArmSequence(arm->parsedBlock,s.gapHistoryArm)||
+        !E108ProfileOnlyNPQRSIJK(arm->parsedBlock,s.gapHistoryArm,tuning,flush)||
+        !EDM97::SameTuning(tuning,s.gapTuning)||!EDM107::SameFlushProfile(flush,s.gapFlushParameters))return false;
+    if(q.parentIndex)
+    {
+        if(m_currentExecutingBlockDispatchId<=q.previousFinishDispatch||m_recipeRecoveryDisplayOnly||m_recipeHoldSeen||
+            m_edmState==EDMState::NOT_READY||!m_recipe.Ready())return false;
+        summary=m_recipe.Current();
+        if(!summary.catalogReady||!summary.tableSelected||!summary.rowSelected||summary.generation!=q.recipeGeneration)return false;
+    }
+    else if(!ReadEDMRecipeSummarySameThread(summary))return false;
+    const auto binding=q.program==248U&&kind==7U?
+        EDM130::BindG76CenterSequence248(m_recipe,m_edmProcessProfile.machineProfileId,m_edmProcessProfile,
+            m_edmProcessTuningGeneration,EDM130::G76B4Profile177):q.program==247U&&kind==6U?
+        EDM130::BindG76CenterSequence247(m_recipe,m_edmProcessProfile.machineProfileId,m_edmProcessProfile,
+            m_edmProcessTuningGeneration,EDM130::G76B3Profile176):q.program==246U&&kind==7U?
+        EDM130::BindG76CenterSequence246(m_recipe,m_edmProcessProfile.machineProfileId,m_edmProcessProfile,
+            m_edmProcessTuningGeneration,EDM130::G76B4Profile177):q.program==245U&&kind==6U?
+        EDM130::BindG76CenterSequence245(m_recipe,m_edmProcessProfile.machineProfileId,m_edmProcessProfile,
+            m_edmProcessTuningGeneration,EDM130::G76B3Profile176):q.program==244U&&(kind==6U||kind==7U)?
+        EDM130::BindG76CenterSequence244(m_recipe,m_edmProcessProfile.machineProfileId,m_edmProcessProfile,
+            m_edmProcessTuningGeneration,kind==6U?EDM130::G76B3Profile176:EDM130::G76B4Profile177):q.program==243U&&(kind==6U||kind==7U)?
+        EDM130::BindG76CenterSequence243(m_recipe,m_edmProcessProfile.machineProfileId,m_edmProcessProfile,
+            m_edmProcessTuningGeneration,kind==6U?EDM130::G76B3Profile176:EDM130::G76B4Profile177):q.program==242U&&(kind==6U||kind==7U)?
+        EDM130::BindG76CenterSequence242(m_recipe,m_edmProcessProfile.machineProfileId,m_edmProcessProfile,
+            m_edmProcessTuningGeneration,kind==6U?EDM130::G76B3Profile176:EDM130::G76B4Profile177):q.program==241U&&(kind==6U||kind==7U)?
+        EDM130::BindG76CenterSequence241(m_recipe,m_edmProcessProfile.machineProfileId,m_edmProcessProfile,
+            m_edmProcessTuningGeneration,kind==6U?EDM130::G76B3Profile176:EDM130::G76B4Profile177):q.program==240U&&(kind==6U||kind==7U)?
+        EDM130::BindG76CenterSequence240(m_recipe,m_edmProcessProfile.machineProfileId,m_edmProcessProfile,
+            m_edmProcessTuningGeneration,kind==6U?EDM130::G76B3Profile176:EDM130::G76B4Profile177):(kind==6U||kind==7U)?
+        EDM130::BindG76CenterSequence239(m_recipe,m_edmProcessProfile.machineProfileId,m_edmProcessProfile,
+            m_edmProcessTuningGeneration,kind==6U?EDM130::G76B3Profile176:EDM130::G76B4Profile177):kind==2U?
+        EDM130::BindG76B2Gap175(m_recipe,m_edmProcessProfile.machineProfileId,m_edmProcessProfile,m_edmProcessTuningGeneration):
+        EDM130::BindWorkTimeHeightSpeedDeepMachiningReferenceCurveAndFlushStages(m_recipe,m_edmProcessProfile.machineProfileId,
+            m_edmProcessProfile,m_edmProcessTuningGeneration);
+    if(!binding.ready)return false;
+    auto recipe=binding.recipe;recipe.diagnosticControlSource=3U;recipe.planRows=E237NativeKind(kind)?25U:4U;recipe.planMovementMask=7U;
+    if(!E237RecipeForProgramKind(recipe,kind,q.program)||!EDM97::ValidMotionTestCurve(s.gapTuning,recipe))return false;
+    if(q.parentIndex)
+    {
+        if(!q.firstRecipeBound||!E237RecipeForProgramKind(q.firstRecipe,q.kinds[0U],q.program))return false;
+        if(!E237SameParentRecipe(q.firstRecipe,recipe,q.program))return false;
+    }
+    else{q.firstRecipe=recipe;q.firstRecipeBound=true;q.firstSession=s.session;}
+    q.currentRecipe=recipe;q.currentSession=s.session;q.stageRecipeBound=true;q.currentArmEpoch=s.armEpoch;
+    q.motionDispatch=q.currentFinishDispatch=0ULL;q.currentRowBound=0U;
+    if(!IsEDM237SequenceScopeCurrentSameThread())return false;
+    m_edm130.recipe=recipe;m_edm94.gapFlushParameters.speedRatio=EDM130::FrozenSpeedRatio(recipe);
+    if(!EDM130::MatchesFlushSpeed(recipe,m_edm94.gapFlushParameters.speedRatio)||
+        !EDM130::MatchesFlushHeight(recipe,m_edm94.gapFlushParameters.strokeRatio,m_edm94.gapFlushParameters.dwellUs))return false;
+    m_edm130.bound=true;
+    PrintNCG76DiagnosticLine("[EDM%u] event=PARENT_RECIPE_BOUND parent=%u kind=%u session=%llu rows=%u history=SAME_PARENT E5policy=SHARED_ROWS_FRESH_PARENT discharge=0 recipeGeneration=%llu bridgeMask=%u\n",
+        q.program,q.parentIndex+1U,kind,static_cast<unsigned long long>(s.session),recipe.planRows,
+        static_cast<unsigned long long>(recipe.generation),q.bridgeMask);
+    return true;
+}
+
+bool NCManager::ConsumeEDM237ConfirmationSameThread(int armPC) noexcept
+{
+    auto& q=m_edm237;const auto& s=m_edm94;
+    if(!IsEDM237SequenceScopeCurrentSameThread()||!q.stageRecipeBound||q.stageStarted||q.releasePending||
+        !m_edm130.bound||!EDM130::SameRecipe(q.currentRecipe,m_edm130.recipe)||s.latched||s.session!=q.currentSession||
+        s.armPC!=armPC||armPC!=q.armPC[q.parentIndex]||s.gapHistoryArm!=E237ArmForKind(q.kinds[q.parentIndex])||
+        s.run!=q.run||s.cache!=q.cache||s.armEpoch!=q.epoch||!s.lease.Matches(q.lease)||
+        GetBasePC()!=armPC||GetActiveDispatchPC()!=armPC)return false;
+    if(q.parentIndex)
+    {if(!q.awaitNext||!q.firstReleased||s.session<=q.previousSession||m_currentExecutingBlockDispatchId<=q.previousFinishDispatch)return false;}
+    else
+    {
+        const auto& c=m_edm149Confirmation;
+        if(!c.confirmed||c.waiting||c.run!=q.run||c.cache!=q.cache||c.armPC!=armPC||c.arm!=s.gapHistoryArm||
+            c.dispatch!=q.confirmationDispatch||c.startRequests!=q.startRequests||m_currentExecutingBlockDispatchId<=c.dispatch)return false;
+    }
+    q.awaitNext=false;q.stageStarted=true;m_edm149Confirmation=EDM149Confirmation{};return true;
+}
+
+bool NCManager::BindEDM237ParentEpochSameThread(MotionExecutionEpoch epoch,std::uint64_t dispatch,int pc) noexcept
+{
+    auto& q=m_edm237;const auto& s=m_edm94;
+    const unsigned rows=q.parentIndex<q.parentCount&&q.parentIndex<4U?E237RowsForKind(q.kinds[q.parentIndex]):0U;
+    const auto expected=q.epoch==(std::numeric_limits<MotionExecutionEpoch>::max)()?1U:q.epoch+1U;
+    if(!q.authorized||q.parentIndex>=q.parentCount||q.parentIndex>=4U||!rows||q.currentRowBound>=rows||!q.stageRecipeBound||!q.stageStarted||
+        q.awaitNext||q.releasePending||!q.firstRecipeBound||!s.latched||!s.ready||s.cancelled||s.resetSeen||
+        s.resetCommitted||s.releaseRequested||s.rtFaultReported||s.session!=q.currentSession||
+        s.armPC!=q.armPC[q.parentIndex]||s.gapHistoryArm!=E237ArmForKind(q.kinds[q.parentIndex])||
+        s.run!=q.run||s.cache!=q.cache||!s.lease.Matches(q.lease)||s.armEpoch!=q.currentArmEpoch||epoch!=expected||
+        epoch!=m_motion.GetCurrentExecutionEpoch()||!dispatch||dispatch<=s.armDispatch||
+        (q.currentRowBound?dispatch<=q.motionDispatch:q.epoch!=s.armEpoch)||
+        s.next!=q.currentRowBound+1U||pc!=s.pc[q.currentRowBound]||
+        !m_edm130.bound||!EDM130::SameRecipe(q.currentRecipe,m_edm130.recipe))return false;
+    q.epoch=epoch;q.motionDispatch=dispatch;++q.currentRowBound;
+    // The G76 caller has verified all 25 identities and exact native tail.
+    // Ordinary row receipts and all other scope checks retain the strict gate.
+    const bool nativeParentReceipt=E237NativeKind(q.kinds[q.parentIndex]);
+    if(!IsEDM237SequenceScopeCurrentSameThread(nativeParentReceipt))return false;
+    if(nativeParentReceipt)
+        PrintNCG76DiagnosticLine("[EDM237_FIX2] event=NATIVE_EPOCH_RECEIPT session=%llu armEpoch=%llu acceptedEpoch=%llu dispatch=%llu children=25 scope=EXACT_COMMITTED_RECEIPT safetyGate=NO_PENDING_SAFETY aggregateCommit=STILL_REQUIRED discharge=0\n",
+            static_cast<unsigned long long>(s.session),static_cast<unsigned long long>(s.armEpoch),
+            static_cast<unsigned long long>(epoch),static_cast<unsigned long long>(dispatch));
+    PrintNCG76DiagnosticLine("[EDM%u] event=PARENT_EPOCH_BOUND parent=%u kind=%u row=%u session=%llu armEpoch=%llu liveEpoch=%llu dispatch=%llu sameHistory=1 sameE5=1 discharge=0\n",
+        q.program,q.parentIndex+1U,q.kinds[q.parentIndex],q.currentRowBound,static_cast<unsigned long long>(s.session),
+        static_cast<unsigned long long>(s.armEpoch),static_cast<unsigned long long>(epoch),static_cast<unsigned long long>(dispatch));
+    return true;
+}
+
+bool NCManager::FinishEDM237ParentSameThread()
+{
+    auto& q=m_edm237;auto& s=m_edm94;const auto& f=s.feedback;
+    const unsigned rows=q.parentIndex<q.parentCount&&q.parentIndex<4U?E237RowsForKind(q.kinds[q.parentIndex]):0U;
+    if(!IsEDM237SequenceScopeCurrentSameThread()||!rows||!q.stageRecipeBound||!q.stageStarted||q.awaitNext||q.releasePending||
+        !q.motionDispatch||q.currentRowBound!=rows||!s.latched||!s.complete||!s.terminalLogged||s.session!=q.currentSession||
+        s.armPC!=q.armPC[q.parentIndex]||s.gapHistoryArm!=E237ArmForKind(q.kinds[q.parentIndex])||s.next!=rows+1U||
+        s.cancelled||s.resetSeen||s.resetCommitted||s.releaseRequested||s.rtFaultReported||
+        GetActiveDispatchPC()!=s.armPC+static_cast<int>(rows)+1||m_waitingBlockDispatchId!=q.currentFinishDispatch||
+        q.currentFinishDispatch<=q.motionDispatch||!m_edm130.bound||!EDM130::SameRecipe(q.currentRecipe,m_edm130.recipe))
+    {RejectEDM94SameThread("EDM237_FINISHED_SCOPE",m_gapDryRun.sourceLine);return false;}
+    if(q.parentIndex+1U<q.parentCount)
+    {
+        if(!m_motion.RequestEDM234ParentRelease(s.session,s.armEpoch,s.lease,q.kinds[q.parentIndex],s.run,s.cache,
+            s.pc[rows-1U],q.motionDispatch,q.currentRecipe,q.program))
+        {RejectEDM94SameThread("EDM237_PARENT_RELEASE_REQUEST",m_gapDryRun.sourceLine);return false;}
+        q.releaseFloorTick=f.lastSentTick;q.releasePending=true;s.polls=0U;
+        PrintNCG76DiagnosticLine("[EDM%u] event=PARENT_FINISH parent=%u kind=%u session=%llu next=EXACT_ZERO_200_RETIREMENT discharge=0\n",
+            q.program,q.parentIndex+1U,q.kinds[q.parentIndex],static_cast<unsigned long long>(s.session));return false;
+    }
+    if(!IsEDM237FinalStateSameThread())
+    {RejectEDM94SameThread("EDM237_FINAL_STATE",m_gapDryRun.sourceLine);return false;}
+    PrintNCG76DiagnosticLine("[EDM%u] event=SEQUENCE_COMPLETE parents=%u ordinaryRows=%u G76children=%u retiredMask=%u bridgeMask=%u firstSession=%llu lastSession=%llu history=SHARED_WITHIN_ORDINARY_CLEARED_AT_HANDOFF E5policy=SHARED_ROWS_FRESH_PARENT discharge=0\n",
+        q.program,q.parentCount,(q.program==241U||q.program==242U||q.program==243U||q.program==244U||q.program==247U||q.program==248U)?4U:q.program==239U?0U:q.parentCount*2U,
+        ((q.program==241U||q.program==242U||q.program==243U||q.program==244U||q.program==247U||q.program==248U)?3U:q.program==239U?q.parentCount:q.parentCount/2U)*25U,q.retiredMask,q.bridgeMask,
+        static_cast<unsigned long long>(q.firstSession),static_cast<unsigned long long>(q.currentSession));return true;
+}
+
+bool NCManager::ConsumeEDM237ParentReleaseSameThread()
+{
+    auto& q=m_edm237;auto& s=m_edm94;const auto& f=s.feedback;
+    if(!q.releasePending)return false;
+    const unsigned rows=q.parentIndex<4U?E237RowsForKind(q.kinds[q.parentIndex]):0U;
+    if(!IsEDM237SequenceScopeCurrentSameThread()||q.parentIndex+1U>=q.parentCount||!q.stageRecipeBound||!q.stageStarted||q.awaitNext||
+        !q.motionDispatch||q.currentRowBound!=rows||s.session!=q.currentSession||
+        s.armPC!=q.armPC[q.parentIndex]||s.next!=rows+1U||!s.latched||!s.complete||!s.terminalLogged||
+        s.cancelled||s.resetSeen||s.resetCommitted||s.releaseRequested||s.rtFaultReported||
+        GetActiveDispatchPC()!=q.armPC[q.parentIndex]+static_cast<int>(rows)+1||m_waitingBlockDispatchId!=q.currentFinishDispatch||
+        f.faulted||f.cancelled||f.parentReleasePhase==EDM94::ParentReleasePhase::Revoked)
+    {RejectEDM94SameThread("EDM237_PARENT_RELEASE_SCOPE",m_gapDryRun.sourceLine);return false;}
+    if(!f.parentReleased||f.parentReleasePhase!=EDM94::ParentReleasePhase::Released)return false;
+    if(f.parentReleaseProgram!=q.program||f.parentReleaseKind!=q.kinds[q.parentIndex]||!f.released||f.active||!f.pass||!f.armAccepted||
+        !f.finishRequested||!f.stopped||!f.forceZero||f.identity.session!=s.session||f.identity.epoch!=s.armEpoch||
+        f.identity.ownerGeneration!=s.lease.generation||f.currentIdentity.session!=s.session||f.currentIdentity.epoch!=q.epoch||
+        f.currentIdentity.ownerGeneration!=q.lease.generation||!f.parentReleaseTick||f.parentReleaseTick<=q.releaseFloorTick||
+        f.parentReleaseTick!=f.lastTick||f.lastSentTick!=f.lastTick||f.requiredCycles<200U||f.settledCycles<f.requiredCycles||
+        !E156FinishTargetMatches(s,m_edm130.recipe,f,m_edm114.retained)||!m_edm130.bound||
+        !EDM130::SameRecipe(q.currentRecipe,m_edm130.recipe)||!m_motion.IsGroupDone()||!m_motion.IsGroupNCDrained()||
+        m_motion.GetCommandIngressSize()||m_motion.GetCommandReplaySize()||m_motion.GetAxisCommandMailboxDepth()||
+        m_g76Orbit->active||m_pathFeed.pending||m_pathArc.pending)
+    {RejectEDM94SameThread("EDM237_PARENT_RELEASE_RECEIPT",m_gapDryRun.sourceLine);return false;}
+    const unsigned retiredParent=q.parentIndex;
+    q.firstReleased=true;q.previousSession=q.currentSession;q.previousFinishDispatch=q.currentFinishDispatch;
+    q.previousReleaseFloorTick=q.releaseFloorTick;q.releaseTick=f.parentReleaseTick;q.releasePending=false;
+    q.retiredMask|=1U<<retiredParent;++q.parentIndex;
+    q.currentSession=0ULL;q.currentRecipe=EDM130::Recipe{};q.currentRowBound=0U;q.b2TraceTick=0ULL;
+    q.stageRecipeBound=q.stageStarted=false;q.awaitNext=true;
+    PrintNCG76DiagnosticLine("[EDM%u] event=PARENT_RELEASED parent=%u kind=%u session=%llu tick=%llu nextArmPC=%d retiredMask=%u sameAUTO=1 freshSessionRequired=1 discharge=0\n",
+        q.program,retiredParent+1U,q.kinds[retiredParent],static_cast<unsigned long long>(q.previousSession),
+        static_cast<unsigned long long>(q.releaseTick),q.armPC[q.parentIndex],q.retiredMask);
+    s.latched=s.armPending=s.ready=s.finishPending=false;m_edm149Confirmation=EDM149Confirmation{};
+    m_edm157=EDM157NCState{};m_edm200=EDM200AutoHoldState{};m_edm130.bound=false;return true;
+}
+
+// Structural final-parent evidence remains valid after M30 commits owner NONE
+// and a newer completion epoch; never call the RUN/live-scope gate here.
+bool NCManager::IsEDM237FinalStateSameThread() const noexcept
+{
+    const auto& q=m_edm237;const auto& s=m_edm94;int first=-1;std::array<unsigned,4U> kinds{};unsigned program=0U,count=0U;
+    if(!E240BridgeHistory(q)||(E237RequiredBridgeMask(q.program,q.kinds[0U])&&q.bridgeMask!=E237RequiredBridgeMask(q.program,q.kinds[0U])))return false;
+    if(!q.authorized||(q.parentCount!=2U&&q.parentCount!=4U)||q.parentIndex+1U!=q.parentCount||
+        q.retiredMask!=(1U<<q.parentIndex)-1U||!q.firstReleased||q.releasePending||!q.stageRecipeBound||!q.stageStarted||q.awaitNext||
+        !q.firstRecipeBound||!q.firstSession||q.previousSession<q.firstSession||s.session!=q.currentSession||
+        q.currentSession<=q.previousSession||!q.releaseTick||q.releaseTick<=q.previousReleaseFloorTick||
+        !q.firstFinishDispatch||q.previousFinishDispatch<q.firstFinishDispatch||!q.motionDispatch||q.currentFinishDispatch<=q.motionDispatch||
+        q.currentRowBound!=E237RowsForKind(q.kinds[q.parentIndex])||s.moves!=E237RowsForKind(q.kinds[q.parentIndex])||s.armEpoch!=q.currentArmEpoch||
+        s.armPC!=q.armPC[q.parentIndex]||s.gapHistoryArm!=E237ArmForKind(q.kinds[q.parentIndex])||
+        s.armDispatch<=q.previousFinishDispatch||q.run!=s.run||q.cache!=s.cache||q.cache!=GetBaseProgramCache().GetGeneration()||
+        !q.lease.Matches(s.lease)||!EDM130::SameRecipe(q.currentRecipe,m_edm130.recipe)||
+        !E237RecipeForProgramKind(q.firstRecipe,q.kinds[0U],q.program)||!E237RecipeForProgramKind(q.currentRecipe,q.kinds[q.parentIndex],q.program)||
+        !E237HistoryProgramShape(GetBaseProgramCache(),first,kinds,program,count)||first!=q.firstArmPC||kinds!=q.kinds||program!=q.program||count!=q.parentCount||
+        q.armPC[0U]!=first||q.armPC[1U]!=first+static_cast<int>(E237ArmStride(program,kinds[0U],1U,kinds[0U])))return false;
+    for(unsigned i=1U;i<q.parentCount;++i)
+        if(q.armPC[i]!=q.armPC[i-1U]+static_cast<int>(E237ArmStride(q.program,q.kinds[i-1U],i,q.kinds[0U])))return false;
+    if(q.parentIndex==1U?(q.previousSession!=q.firstSession||q.previousFinishDispatch!=q.firstFinishDispatch):
+        (q.previousSession<=q.firstSession||q.previousFinishDispatch<=q.firstFinishDispatch))return false;
+    return E237SameParentRecipe(q.firstRecipe,q.currentRecipe,q.program);
+}
+
+bool NCManager::IsEDM233SequenceScopeCurrentSameThread() noexcept
+{
+    const auto& q=m_edm233;
+    int first=-1;std::array<unsigned,2U> arms{};
+    return q.authorized&&q.run&&q.cache&&q.confirmationDispatch&&q.startRequests&&q.firstArmPC>0&&
+        q.epoch!=MOTION_EXECUTION_EPOCH_INVALID&&q.lease.IsValid()&&q.lease.owner==MotionOwner::AUTO&&
+        q.run==m_pathCoreLiveBookkeeping.currentRunToken&&q.cache==GetBaseProgramCache().GetGeneration()&&
+        q.epoch==m_motion.GetCurrentExecutionEpoch()&&q.lease.Matches(m_programMotionLease)&&
+        m_motion.IsMotionOwnerLeaseCurrent(q.lease)&&!m_motion.HasPendingSafetyOrRecoveryRequests()&&
+        q.startRequests==m_startDiagnosticRequests&&q.recipeGeneration==m_recipe.Current().generation&&
+        q.processGeneration==m_edmProcessTuningGeneration&&m_state==NCState::RUN&&m_mode==NCOperationMode::MEMORY&&
+        !Close_System_Com_flag&&m_externalReadyInterlock&&!m_isSingleBlockEnabled&&!m_isG66Active&&
+        m_macroStack.empty()&&!Homing.IsActive()&&!AlarmManager::GetInstance().HasAlarm()&&
+        m_resetContinuationPhase==ResetContinuationPhase::IDLE&&CoordSys.IsTranslationRunFrozen()&&
+        IsG76OrbitFrameCurrentSameThread(true,true)&&IsPathCoreLiveNativeConfigCurrentSameThread()&&
+        IsFixedTranslationTravelCurrentSameThread()&&
+        SameNCTranslationSnapshot(q.translation,CoordSys.GetTranslationSnapshot())&&
+        m_motion.MatchesNCTranslation(q.translation)&&
+        E233ProgramShape(GetBaseProgramCache(),first,arms,&NCManager::IsEDM173BracketShapeValid,
+            &NCManager::IsEDM173OrbitBlockShapeValid)&&first==q.firstArmPC&&arms==q.arms;
+}
+
+bool NCManager::IsEDM233SecondArmCurrentSameThread(int pc,unsigned arm) noexcept
+{
+    const auto& q=m_edm233;const auto& s=m_edm94;
+    return IsEDM233SequenceScopeCurrentSameThread()&&q.firstReleased&&!q.releasePending&&!q.secondStarted&&
+        q.firstSession&&q.releaseTick&&q.firstFinishDispatch&&q.releaseTick>q.releaseFloorTick&&
+        !s.latched&&s.session==q.firstSession&&s.complete&&s.terminalLogged&&!s.cancelled&&
+        !s.resetSeen&&!s.resetCommitted&&!s.releaseRequested&&!s.rtFaultReported&&
+        pc==q.firstArmPC+3&&arm==q.arms[1U]&&GetActiveDispatchPC()==pc&&
+        m_currentExecutingBlockDispatchId>q.firstFinishDispatch&&m_motion.IsGroupDone()&&m_motion.IsGroupNCDrained()&&
+        !m_motion.GetCommandIngressSize()&&!m_motion.GetCommandReplaySize()&&!m_motion.GetAxisCommandMailboxDepth()&&
+        !m_g76Orbit->active&&!m_pathFeed.pending&&!m_pathArc.pending&&!m_pathReplay.pending&&
+        !m_pathHold.armed&&!m_pathHold.bound;
+}
+
+bool NCManager::BeginEDM233SequenceSameThread(int pc) noexcept
+{
+    int first=-1;std::array<unsigned,2U> arms{};
+    if(!E233ProgramShape(GetBaseProgramCache(),first,arms,&NCManager::IsEDM173BracketShapeValid,
+        &NCManager::IsEDM173OrbitBlockShapeValid))return false;
+    if(pc==first+3)return IsEDM233SecondArmCurrentSameThread(pc,arms[1U]);
+    const auto& c=m_edm149Confirmation;
+    if(pc!=first||!c.confirmed||c.waiting||c.armPC!=pc||c.arm!=arms[0U]||
+        c.run!=m_pathCoreLiveBookkeeping.currentRunToken||c.cache!=GetBaseProgramCache().GetGeneration()||
+        !c.dispatch||m_currentExecutingBlockDispatchId<=c.dispatch||c.startRequests!=m_startDiagnosticRequests||
+        !CoordSys.IsTranslationRunFrozen()||!m_motion.IsMotionOwnerLeaseCurrent(m_programMotionLease))return false;
+    m_edm233=EDM233NCState{};auto& q=m_edm233;
+    q.translation=CoordSys.GetTranslationSnapshot();q.lease=m_programMotionLease;q.epoch=m_motion.GetCurrentExecutionEpoch();
+    q.run=c.run;q.cache=c.cache;q.confirmationDispatch=c.dispatch;q.startRequests=c.startRequests;
+    q.recipeGeneration=m_recipe.Current().generation;q.processGeneration=m_edmProcessTuningGeneration;
+    q.firstArmPC=first;q.arms=arms;q.authorized=true;
+    return IsEDM233SequenceScopeCurrentSameThread();
+}
+
+bool NCManager::ConsumeEDM233ParentReleaseSameThread()
+{
+    auto& q=m_edm233;auto& s=m_edm94;const auto& f=s.feedback;
+    if(!q.releasePending)return false;
+    if(!IsEDM233SequenceScopeCurrentSameThread()||q.firstReleased||q.secondStarted||
+        s.session!=q.firstSession||s.armPC!=q.firstArmPC||s.next!=2U||!s.latched||!s.complete||
+        !s.terminalLogged||s.cancelled||s.resetSeen||s.resetCommitted||s.releaseRequested||s.rtFaultReported||
+        GetActiveDispatchPC()!=q.firstArmPC+2||m_waitingBlockDispatchId!=q.firstFinishDispatch||
+        f.faulted||f.cancelled||f.parentReleasePhase==EDM94::ParentReleasePhase::Revoked)
+    {RejectEDM94SameThread("EDM233_PARENT_RELEASE_SCOPE",m_gapDryRun.sourceLine);return false;}
+    if(!f.parentReleased||f.parentReleasePhase!=EDM94::ParentReleasePhase::Released)return false;
+    if(!f.released||f.active||!f.pass||!f.armAccepted||!f.finishRequested||!f.stopped||!f.forceZero||
+        f.identity.session!=s.session||f.identity.epoch!=s.armEpoch||f.identity.ownerGeneration!=s.lease.generation||
+        f.currentIdentity.session!=s.session||f.currentIdentity.epoch!=q.epoch||
+        f.currentIdentity.ownerGeneration!=q.lease.generation||!f.parentReleaseTick||
+        f.parentReleaseTick<=q.releaseFloorTick||f.parentReleaseTick!=f.lastTick||f.lastSentTick!=f.lastTick||
+        f.requiredCycles<200U||f.settledCycles<f.requiredCycles||!E156FinishTargetMatches(s,m_edm130.recipe,f,m_edm114.retained)||
+        !m_motion.IsGroupDone()||!m_motion.IsGroupNCDrained()||m_motion.GetCommandIngressSize()||
+        m_motion.GetCommandReplaySize()||m_motion.GetAxisCommandMailboxDepth()||m_g76Orbit->active)
+    {RejectEDM94SameThread("EDM233_PARENT_RELEASE_RECEIPT",m_gapDryRun.sourceLine);return false;}
+    q.releasePending=false;q.firstReleased=true;q.releaseTick=f.parentReleaseTick;
+    PrintNCG76DiagnosticLine("[EDM233] event=PARENT_RELEASED parent=1 session=%llu tick=%llu nextArmPC=%d sameAUTO=1 freshSessionRequired=1 discharge=0\n",
+        static_cast<unsigned long long>(s.session),static_cast<unsigned long long>(q.releaseTick),q.firstArmPC+3);
+    s.latched=s.armPending=s.ready=s.finishPending=false;
+    m_edm149Confirmation=EDM149Confirmation{};m_edm157=EDM157NCState{};m_edm200=EDM200AutoHoldState{};
+    m_edm130.bound=false;
+    return true;
+}
+
+bool NCManager::IsEDM173BracketBlockSameThread(const NCBlock& b) noexcept
 {
     if(!IsEDM173BracketShapeValid(b)||m_mode!=NCOperationMode::MEMORY||m_state!=NCState::RUN||Close_System_Com_flag||
         !m_externalReadyInterlock||m_isSingleBlockEnabled||m_isG66Active||!m_macroStack.empty()||Homing.IsActive()||
@@ -26248,6 +29004,13 @@ bool NCManager::IsEDM173BracketBlockSameThread(const NCBlock& b) const noexcept
     const unsigned selector=static_cast<unsigned>(b.val('P'));
     if(EDM173::IsArm(selector))
     {
+        if(!E251SquareConfirmationSource(GetBaseProgramCache(),pc))return false;
+        if(b.has('L')&&(b.val('L')==237.0||b.val('L')==238.0||b.val('L')==239.0||b.val('L')==240.0||b.val('L')==241.0||b.val('L')==242.0||b.val('L')==243.0||b.val('L')==244.0||b.val('L')==245.0||b.val('L')==246.0||b.val('L')==247.0||b.val('L')==248.0)&&m_edm237.authorized)return IsEDM237NextArmCurrentSameThread(pc,selector);
+        if(b.has('L')&&b.val('L')==236.0&&m_edm234.authorized)return IsEDM236NextArmCurrentSameThread(pc,selector);
+        if(b.has('L')&&(b.val('L')==234.0||b.val('L')==235.0)&&m_edm234.authorized&&pc==m_edm234.firstArmPC+3)
+            return IsEDM234NextArmCurrentSameThread(pc,selector);
+        if(b.has('L')&&b.val('L')==233.0&&m_edm233.authorized&&pc==m_edm233.firstArmPC+3)
+            return IsEDM233SecondArmCurrentSameThread(pc,selector);
         const auto& c=m_edm149Confirmation;
         return !s.latched&&c.confirmed&&!c.waiting&&c.arm==selector&&c.armPC==pc&&
             c.run==m_pathCoreLiveBookkeeping.currentRunToken&&c.cache==GetBaseProgramCache().GetGeneration()&&
@@ -26296,24 +29059,52 @@ bool NCManager::PreflightEDM173ProgramSameThread(int armPC) noexcept
     workspace.prepared=false;workspace.coordinateRow=EDM179::Row{};workspace.coordinateScope=EDM173::Scope{};
     const auto& cache=GetBaseProgramCache();
     if(armPC<1||cache.Size()>128U||static_cast<std::size_t>(armPC)+3U>=cache.Size()) return false;
+    int sequenceFirst=-1;std::array<unsigned,2U> sequenceArms{};std::array<unsigned,4U> chainKinds{};
+    const bool historySequence=E237ProgramShape(cache,sequenceFirst,sequenceArms);
+    const bool chain=!historySequence&&E236ProgramShape(cache,sequenceFirst,chainKinds);
+    const bool mixedSequence=historySequence||chain||E234ProgramShape(cache,sequenceFirst,sequenceArms);
+    const bool sequence=mixedSequence||E233ProgramShape(cache,sequenceFirst,sequenceArms,
+        &NCManager::IsEDM173BracketShapeValid,&NCManager::IsEDM173OrbitBlockShapeValid);
     NCBlock arm{},orbit{},finish{},end{};
     const auto* armLine=cache.TryGetLine(armPC);
     const auto* a=cache.TryGetLine(armPC+1);const auto* b=cache.TryGetLine(armPC+2);const auto* c=cache.TryGetLine(armPC+3);
-    if(!armLine||!a||!b||!c||!NCPreparedBlockQueueShadow::TryBuildLiteralBlock(armLine->parsedBlock,arm)||
+    if(!armLine||!a||!b||!c||!E251SquareConfirmationSource(cache,armPC)||
+        !NCPreparedBlockQueueShadow::TryBuildLiteralBlock(armLine->parsedBlock,arm)||
         !IsEDM173BracketShapeValid(arm)||!EDM173::IsArm(static_cast<unsigned>(arm.val('P')))||
         (!NCPreparedBlockQueueShadow::TryBuildLiteralBlock(a->parsedBlock,orbit)&&
             !EDM179::Parse(a->parsedBlock,workspace.coordinateRow.source,orbit))||
         !NCPreparedBlockQueueShadow::TryBuildLiteralBlock(b->parsedBlock,finish)||
         !NCPreparedBlockQueueShadow::TryBuildLiteralBlock(c->parsedBlock,end)||!IsEDM173OrbitBlockShapeValid(orbit)||
+        !E251SquareSourcePair(armLine->parsedBlock,orbit)||
         ((orbit.has('K')||!orbit.has('B')||orbit.val('B')==0.0)&&!workspace.coordinateRow.source.expressionMask&&
             !E180LiteralAngleSourceMatches(a->parsedBlock,orbit))||
         E181EffectiveOrbitMode(orbit)!=EDM173::ModeForArm(static_cast<unsigned>(arm.val('P')))||
         !IsEDM173BracketShapeValid(finish)||finish.val('P')!=
-            static_cast<double>(EDM173::FinishForArm(static_cast<unsigned>(arm.val('P'))))||end.gCount||end.mCount!=1||end.mCode[0]!=30||
-        end.isGoto||end.isBlockSkip) return false;
-    for(char word='A';word<='Z';++word) if(end.has(word)&&(word!='N'||!std::isfinite(end.val(word)))) return false;
-    for(std::size_t pc=static_cast<std::size_t>(armPC)+4U;pc<cache.Size();++pc)
-    {const auto* line=cache.TryGetLine(static_cast<int>(pc));if(!line||!line->parsedBlock.isEmpty) return false;}
+            static_cast<double>(EDM173::FinishForArm(static_cast<unsigned>(arm.val('P'))))||
+        (!sequence&&(end.gCount||end.mCount!=1||end.mCode[0]!=30||end.isGoto||end.isBlockSkip)))return false;
+    if(sequence)
+    {
+        if(historySequence)
+        {
+            std::array<unsigned,4U> kinds{};unsigned program=0U,count=0U;int first=-1;
+            if(!E237HistoryProgramShape(cache,first,kinds,program,count))return false;
+            int candidate=first;bool matched=false;
+            for(unsigned i=0U;i<count;++i){if(armPC==candidate&&E237NativeKind(kinds[i]))matched=true;
+                candidate+=static_cast<int>(E237ArmStride(program,kinds[i],i+1U,kinds[0U]));}
+            if(!matched||!E237ArmSequence(armLine->parsedBlock,static_cast<unsigned>(arm.val('P'))))return false;
+        }
+        else if((chain?(armPC<sequenceFirst||armPC>sequenceFirst+9||(armPC-sequenceFirst)%3||
+                chainKinds[static_cast<unsigned>(armPC-sequenceFirst)/3U]!=2U):(armPC!=sequenceFirst&&armPC!=sequenceFirst+3))||
+            !(mixedSequence?E234ArmSequence(armLine->parsedBlock,static_cast<unsigned>(arm.val('P'))):
+                E233CenterParentSequence(armLine->parsedBlock,static_cast<unsigned>(arm.val('P')))))return false;
+    }
+    else
+    {
+        if(arm.has('L')&&(arm.val('L')==233.0||arm.val('L')==234.0||arm.val('L')==235.0||arm.val('L')==236.0||arm.val('L')==237.0||arm.val('L')==238.0||arm.val('L')==239.0||arm.val('L')==240.0||arm.val('L')==241.0||arm.val('L')==242.0||arm.val('L')==243.0||arm.val('L')==244.0||arm.val('L')==245.0||arm.val('L')==246.0||arm.val('L')==247.0||arm.val('L')==248.0))return false;
+        for(char word='A';word<='Z';++word) if(end.has(word)&&(word!='N'||!std::isfinite(end.val(word)))) return false;
+        for(std::size_t pc=static_cast<std::size_t>(armPC)+4U;pc<cache.Size();++pc)
+        {const auto* line=cache.TryGetLine(static_cast<int>(pc));if(!line||!line->parsedBlock.isEmpty) return false;}
+    }
     m_edm173->authored=orbit; m_edm173->prepared=true;m_edm173->published=m_edm173->parentCommitted=m_edm173->completed=false;
     return true;
 }
@@ -26407,11 +29198,98 @@ bool NCManager::MatchesEDM179CoordinatesSameThread(const NCParsedBlock& parsed,c
 
 bool NCManager::BindEDM173RecipeSameThread() noexcept
 {
+    const auto* historyArm=GetBaseProgramCache().TryGetLine(m_edm94.armPC);
+    if(historyArm&&E237ArmSequence(historyArm->parsedBlock,m_edm94.gapHistoryArm))return BindEDM237RecipeSameThread();
+    const auto* mixedArm=GetBaseProgramCache().TryGetLine(m_edm94.armPC);
+    if(mixedArm&&E234ArmSequence(mixedArm->parsedBlock,m_edm94.gapHistoryArm))return BindEDM234RecipeSameThread();
     m_edm130=EDM130NCState{};EDMRecipe::Summary summary{};
     m_edm200=EDM200AutoHoldState{};
-    if(!m_edmProcessReady||!ReadEDMRecipeSummarySameThread(summary)) return false;
-    if(!EDM173::IsArm(m_edm94.gapHistoryArm))return false;
-    const auto binding=m_edm94.gapHistoryArm==EDM173::B0ArmP?
+    if(!m_edmProcessReady||!EDM173::IsArm(m_edm94.gapHistoryArm))return false;
+    const auto& cache=GetBaseProgramCache();const auto* arm=cache.TryGetLine(m_edm94.armPC);
+    EDM97::Tuning tuning{};EDM107::FlushProfile profile{};
+    if(cache.GetGeneration()!=m_edm94.cache||!arm||
+        !E108ProfileOnlyNPQRSIJK(arm->parsedBlock,m_edm94.gapHistoryArm,tuning,profile)||
+        !EDM97::SameTuning(tuning,m_edm94.gapTuning)||
+        !EDM107::SameFlushProfile(profile,m_edm94.gapFlushParameters))return false;
+    // The short architecture stroke is bound only from this exact authored
+    // L233 arm. Legacy center binders keep their established height envelope.
+    const bool architecture=E233CenterParentSequence(arm->parsedBlock,m_edm94.gapHistoryArm);
+    const bool squareB1=E250SquareB1Arm(arm->parsedBlock,m_edm94.gapHistoryArm);
+    const bool squareB2=E251SquareB2Arm(arm->parsedBlock,m_edm94.gapHistoryArm);
+    const bool squareB3=E252SquareB3Arm(arm->parsedBlock,m_edm94.gapHistoryArm);
+    const bool squareB4=E253SquareB4Arm(arm->parsedBlock,m_edm94.gapHistoryArm);
+    const bool diamond=E255DiamondB1Arm(arm->parsedBlock,m_edm94.gapHistoryArm);
+    const bool diamondB2=E256DiamondB2Arm(arm->parsedBlock,m_edm94.gapHistoryArm);
+    const bool diamondB3=E257DiamondB3Arm(arm->parsedBlock,m_edm94.gapHistoryArm);
+    const bool diamondB4=E258DiamondB4Arm(arm->parsedBlock,m_edm94.gapHistoryArm);
+    const bool oneMm=E260OneMmArm(arm->parsedBlock,m_edm94.gapHistoryArm);
+    const bool polygonB2=E261PolygonB2Arm(arm->parsedBlock,m_edm94.gapHistoryArm);
+    const bool expansion=E263ExpansionArm(arm->parsedBlock,m_edm94.gapHistoryArm);
+    if(!E251SquareConfirmationSource(cache,m_edm94.armPC))return false;
+    // EDM233_RECIPE_CONTINUATION_BEGIN
+    // A completed first parent retains its immutable recipe/plan. Its exact
+    // sequence grant, not the generic idle recipe reader, admits the second
+    // parent after the native transaction advanced the execution epoch.
+    const bool continuation=architecture&&m_edm233.authorized&&m_edm94.armPC==m_edm233.firstArmPC+3;
+    EDM130::Recipe firstRecipe{};
+    if(continuation)
+    {
+        const auto& q=m_edm233;const auto& s=m_edm94;
+        if(!m_edm173||!IsEDM233SequenceScopeCurrentSameThread()||!q.firstReleased||q.releasePending||q.secondStarted||
+            !q.firstSession||!q.firstFinishDispatch||!q.releaseTick||q.releaseTick<=q.releaseFloorTick||
+            s.session<=q.firstSession||s.armPC!=q.firstArmPC+3||s.gapHistoryArm!=q.arms[1U]||
+            s.run!=q.run||s.cache!=q.cache||s.armEpoch!=q.epoch||!s.lease.Matches(q.lease)||
+            s.latched||s.next!=0U||s.moves!=1U||s.cancelled||s.resetSeen||s.resetCommitted||s.releaseRequested||s.rtFaultReported||
+            GetActiveDispatchPC()!=s.armPC||GetBasePC()!=s.armPC||m_currentExecutingBlockDispatchId<=q.firstFinishDispatch||
+            m_recipeRecoveryDisplayOnly||m_recipeHoldSeen||m_edmState==EDMState::NOT_READY||!m_recipe.Ready())return false;
+        const auto& first=m_edm173->plan;const auto& scope=first.scope;
+        const MotionExecutionEpoch firstLiveEpoch=scope.armEpoch==(std::numeric_limits<MotionExecutionEpoch>::max)()?1U:scope.armEpoch+1U;
+        const auto* firstSource=cache.TryGetLine(q.firstArmPC+1);
+        if(!EDM173::Valid(first)||!EDM130::IsG76ParentSequence233(first.recipe)||
+            !EDM173::RecipeMatchesArm(q.arms[0U],first.recipe)||!firstSource||
+            scope.session!=q.firstSession||scope.run!=q.run||scope.cache!=q.cache||
+            scope.sourcePC!=q.firstArmPC+1||scope.line!=firstSource->sourceLineNumber||
+            !scope.owner.Matches(q.lease)||scope.armEpoch==MOTION_EXECUTION_EPOCH_INVALID||firstLiveEpoch!=q.epoch||
+            !scope.dispatch||scope.dispatch>=q.firstFinishDispatch||
+            !SameNCTranslationSnapshot(first.nominal.translation,q.translation))return false;
+        summary=m_recipe.Current();
+        if(!summary.catalogReady||!summary.tableSelected||!summary.rowSelected||
+            !summary.generation||summary.generation!=q.recipeGeneration||summary.generation!=first.recipe.generation)return false;
+        firstRecipe=first.recipe;
+    }
+    else if(!ReadEDMRecipeSummarySameThread(summary))return false;
+    // The global recipe run/cache/epoch/lease and logical-only flag are never
+    // changed by this continuation. Other profiles keep the original reader.
+    // EDM233_RECIPE_CONTINUATION_END
+    const auto binding=expansion?
+        EDM130::BindG76Expansion263(m_recipe,m_edmProcessProfile.machineProfileId,m_edmProcessProfile,
+            m_edmProcessTuningGeneration,E263ExpansionMode(arm->parsedBlock),EDM173::ModeForArm(m_edm94.gapHistoryArm)):
+        polygonB2?
+        EDM130::BindG76PolygonB2_261(m_recipe,m_edmProcessProfile.machineProfileId,m_edmProcessProfile,m_edmProcessTuningGeneration):
+        oneMm?
+        EDM130::BindG76OneMm260(m_recipe,m_edmProcessProfile.machineProfileId,m_edmProcessProfile,
+            m_edmProcessTuningGeneration,E260OneMmMode(arm->parsedBlock),EDM173::ModeForArm(m_edm94.gapHistoryArm)):
+        diamondB4?
+        EDM130::BindG76DiamondB4_258(m_recipe,m_edmProcessProfile.machineProfileId,m_edmProcessProfile,m_edmProcessTuningGeneration):
+        diamondB3?
+        EDM130::BindG76DiamondB3_257(m_recipe,m_edmProcessProfile.machineProfileId,m_edmProcessProfile,m_edmProcessTuningGeneration):
+        diamondB2?
+        EDM130::BindG76DiamondB2_256(m_recipe,m_edmProcessProfile.machineProfileId,m_edmProcessProfile,m_edmProcessTuningGeneration):
+        diamond?
+        EDM130::BindG76DiamondB1_255(m_recipe,m_edmProcessProfile.machineProfileId,m_edmProcessProfile,m_edmProcessTuningGeneration):
+        squareB4?
+        EDM130::BindG76SquareB4_253(m_recipe,m_edmProcessProfile.machineProfileId,m_edmProcessProfile,m_edmProcessTuningGeneration):
+        squareB3?
+        EDM130::BindG76SquareB3_252(m_recipe,m_edmProcessProfile.machineProfileId,m_edmProcessProfile,m_edmProcessTuningGeneration):
+        squareB2?
+        EDM130::BindG76SquareB2_251(m_recipe,m_edmProcessProfile.machineProfileId,m_edmProcessProfile,m_edmProcessTuningGeneration):
+        squareB1?
+        EDM130::BindG76SquareB1_250(m_recipe,m_edmProcessProfile.machineProfileId,m_edmProcessProfile,m_edmProcessTuningGeneration):
+        architecture?
+        EDM130::BindG76CenterArchitecture233(m_recipe,m_edmProcessProfile.machineProfileId,m_edmProcessProfile,
+            m_edmProcessTuningGeneration,m_edm94.gapHistoryArm==EDM173::B3ArmP?
+                EDM130::G76B3Profile176:EDM130::G76B4Profile177):
+        m_edm94.gapHistoryArm==EDM173::B0ArmP?
         EDM130::BindG76B0Gap192(m_recipe,m_edmProcessProfile.machineProfileId,m_edmProcessProfile,m_edmProcessTuningGeneration):
         m_edm94.gapHistoryArm==EDM173::B4ArmP?
         EDM130::BindG76B4Gap177(m_recipe,m_edmProcessProfile.machineProfileId,m_edmProcessProfile,m_edmProcessTuningGeneration):
@@ -26421,16 +29299,31 @@ bool NCManager::BindEDM173RecipeSameThread() noexcept
         EDM130::BindG76B2Gap175(m_recipe,m_edmProcessProfile.machineProfileId,m_edmProcessProfile,m_edmProcessTuningGeneration):
         EDM130::BindG76Gap173(m_recipe,m_edmProcessProfile.machineProfileId,m_edmProcessProfile,m_edmProcessTuningGeneration);
     if(!binding.ready) return false;
-    auto& recipe=m_edm130.recipe;recipe=binding.recipe;recipe.diagnosticControlSource=3U;recipe.planRows=25U;recipe.planMovementMask=7U;
-    const auto& cache=GetBaseProgramCache();const auto* arm=cache.TryGetLine(m_edm94.armPC);
-    EDM97::Tuning tuning{};EDM107::FlushProfile profile{};
-    if(cache.GetGeneration()!=m_edm94.cache||!arm||
-        !E108ProfileOnlyNPQRSIJK(arm->parsedBlock,m_edm94.gapHistoryArm,tuning,profile)||
-        !EDM97::SameTuning(tuning,m_edm94.gapTuning)||
-        !EDM107::SameFlushProfile(profile,m_edm94.gapFlushParameters))return false;
-    if(arm->parsedBlock.has('L')&&!E216RejectBeforeArm(arm->parsedBlock,m_edm94.gapHistoryArm))
+    auto& recipe=m_edm130.recipe;recipe=binding.recipe;recipe.diagnosticControlSource=3U;recipe.planRows=static_cast<std::uint16_t>(EDM173::CountForRecipe(binding.recipe));recipe.planMovementMask=7U;
+    if((squareB1&&!EDM130::IsG76SquareB1_250(recipe))||(squareB2&&!EDM130::IsG76SquareB2_251(recipe))||
+        (squareB3&&!EDM130::IsG76SquareB3_252(recipe))||(squareB4&&!EDM130::IsG76SquareB4_253(recipe))||
+        (diamond&&!EDM130::IsG76DiamondB1_255(recipe))||(diamondB2&&!EDM130::IsG76DiamondB2_256(recipe))||
+        (diamondB3&&!EDM130::IsG76DiamondB3_257(recipe))||(diamondB4&&!EDM130::IsG76DiamondB4_258(recipe))||
+        (oneMm&&(!EDM130::IsG76OneMm260(recipe)||EDM130::G76PlanMode(recipe)!=E260OneMmMode(arm->parsedBlock)))||
+        (polygonB2&&!EDM130::IsG76PolygonB2_261(recipe))||
+        (expansion&&(!EDM130::IsG76Expansion263(recipe)||EDM130::G76PlanMode(recipe)!=E263ExpansionMode(arm->parsedBlock))))return false;
+    if(arm->parsedBlock.has('L')&&!squareB1&&!squareB2&&!squareB3&&!squareB4&&!diamond&&!diamondB2&&!diamondB3&&!diamondB4&&!oneMm&&!polygonB2&&!expansion&&!E216RejectBeforeArm(arm->parsedBlock,m_edm94.gapHistoryArm))
     {
         if(E217CenterNominalHold(arm->parsedBlock,m_edm94.gapHistoryArm))recipe.flushHoldTest=1U;
+        else if(E218CenterFlushHold(arm->parsedBlock,m_edm94.gapHistoryArm))recipe.flushHoldTest=2U;
+        else if(E219CenterReturnHold(arm->parsedBlock,m_edm94.gapHistoryArm))recipe.flushHoldTest=3U;
+        else if(E220CenterAnchorHold(arm->parsedBlock,m_edm94.gapHistoryArm))recipe.flushHoldTest=4U;
+        else if(E221CenterStartHold(arm->parsedBlock,m_edm94.gapHistoryArm))recipe.flushHoldTest=5U;
+        else if(E222CenterTopDwellHold(arm->parsedBlock,m_edm94.gapHistoryArm))recipe.flushHoldTest=6U;
+        else if(E224CenterDwellHold(arm->parsedBlock,m_edm94.gapHistoryArm))recipe.flushHoldTest=7U;
+        else if(E225CenterReturnDwellHold(arm->parsedBlock,m_edm94.gapHistoryArm))recipe.flushHoldTest=8U;
+        else if(E226CenterFinalDwellHold(arm->parsedBlock,m_edm94.gapHistoryArm))recipe.flushHoldTest=9U;
+        else if(E227CenterInitialDwellHold(arm->parsedBlock,m_edm94.gapHistoryArm))recipe.flushHoldTest=10U;
+        else if(E228CenterBrakeHold(arm->parsedBlock,m_edm94.gapHistoryArm))recipe.flushHoldTest=11U;
+        else if(E230CenterRepeat(arm->parsedBlock,m_edm94.gapHistoryArm))recipe.flushHoldTest=230U;
+        else if(E231CenterSecondFlushHold(arm->parsedBlock,m_edm94.gapHistoryArm))recipe.flushHoldTest=231U;
+        else if(E232CenterSecondReturnHold(arm->parsedBlock,m_edm94.gapHistoryArm))recipe.flushHoldTest=232U;
+        else if(E233CenterParentSequence(arm->parsedBlock,m_edm94.gapHistoryArm))recipe.flushHoldTest=233U;
         else
         {
             if(m_edm94.gapHistoryArm!=EDM173::B2ArmP||arm->parsedBlock.has('H')||
@@ -26442,12 +29335,70 @@ bool NCManager::BindEDM173RecipeSameThread() noexcept
         !EDM130::ValidG76FlushSpeedPercent(recipe.commissioningProfile,recipe.jumpSpeedPercentScaled)||
         recipe.workTimeUs<250000ULL||recipe.workTimeUs>2000000ULL||
         recipe.deepFlushCycleInterval||recipe.holdRetreatMode||
-        (recipe.flushHoldTest&&!EDM130::IsG76B2FlushHold200(recipe)&&!EDM130::IsG76CenterHold217(recipe))||
+        (recipe.flushHoldTest&&!EDM130::IsG76B2FlushHold200(recipe)&&!EDM130::IsG76CenterHold217(recipe)&&
+            !EDM130::IsG76CenterAnyFlushHold232(recipe)&&!EDM130::IsG76CenterRepeat230(recipe)&&!EDM130::IsG76ParentSequence233(recipe)&&!EDM130::IsG76CommissioningRecipe(recipe))||
         !EDM97::ValidMotionTestCurve(m_edm94.gapTuning,recipe)) return false;
     m_edm94.gapFlushParameters.speedRatio=EDM130::FrozenSpeedRatio(recipe);
     if(!EDM130::MatchesFlushSpeed(recipe,m_edm94.gapFlushParameters.speedRatio)||
         !EDM130::MatchesFlushHeight(recipe,m_edm94.gapFlushParameters.strokeRatio,m_edm94.gapFlushParameters.dwellUs)) return false;
+    if(continuation)
+    {
+        // Only the authored B3/B4 commissioning profile may differ. Rebuild
+        // from the actual controller, then compare every frozen recipe field.
+        firstRecipe.commissioningProfile=recipe.commissioningProfile;
+        if(!EDM130::SameRecipe(firstRecipe,recipe)||!IsEDM233SequenceScopeCurrentSameThread())return false;
+        PrintNCG76DiagnosticLine("[EDM233] event=RECIPE_CONTINUED firstSession=%llu secondSession=%llu generation=%llu armEpoch=%llu B=%u proof=FIRST_PARENT_FULL_RECIPE globalRecipeScope=UNCHANGED discharge=0\n",
+            static_cast<unsigned long long>(m_edm233.firstSession),static_cast<unsigned long long>(m_edm94.session),
+            static_cast<unsigned long long>(summary.generation),static_cast<unsigned long long>(m_edm94.armEpoch),EDM173::ModeForArm(m_edm94.gapHistoryArm));
+    }
     m_edm130.bound=true;
+    if(expansion)
+        PrintNCG76DiagnosticLine("[EDM263] event=EXPANSION_RECIPE_BOUND session=%llu L=%u modeP=%u Q=%u B=%u children=26 E5us=%llu E6microMm=%llu E7percent=100 expansion=TARGET_PLANE_GROW hold=0 discharge=0\n",
+            static_cast<unsigned long long>(m_edm94.session),static_cast<unsigned>(recipe.flushHoldTest),
+            EDM130::G76PlanMode(recipe),static_cast<unsigned>(m_edm173->authored.val('Q')),EDM173::ModeForArm(m_edm94.gapHistoryArm),
+            static_cast<unsigned long long>(recipe.workTimeUs),static_cast<unsigned long long>(recipe.jumpHeightScaled));
+    if(EDM130::G76PlanMode(recipe)==16U)
+        PrintNCG76DiagnosticLine("[EDM261] event=POLYGON_RECIPE_BOUND session=%llu L=%u modeP=16 Q=%u B=%u children=25 E5us=%llu E6microMm=%llu E7percent=100 hold=0 discharge=0\n",
+            static_cast<unsigned long long>(m_edm94.session),static_cast<unsigned>(recipe.flushHoldTest),
+            static_cast<unsigned>(m_edm173->authored.val('Q')),EDM173::ModeForArm(m_edm94.gapHistoryArm),
+            static_cast<unsigned long long>(recipe.workTimeUs),static_cast<unsigned long long>(recipe.jumpHeightScaled));
+    if(oneMm)
+        PrintNCG76DiagnosticLine("[EDM260] event=ONE_MM_RECIPE_BOUND session=%llu armP=%u L=%u modeP=%u B=%u children=25 E5us=%llu E6microMm=%llu E7percent=100 radiusScope=AUTHORED hold=0 discharge=0\n",
+            static_cast<unsigned long long>(m_edm94.session),m_edm94.gapHistoryArm,
+            static_cast<unsigned>(recipe.flushHoldTest),EDM130::G76PlanMode(recipe),EDM173::ModeForArm(m_edm94.gapHistoryArm),
+            static_cast<unsigned long long>(recipe.workTimeUs),static_cast<unsigned long long>(recipe.jumpHeightScaled));
+    if(squareB1)
+        PrintNCG76DiagnosticLine("[EDM250] event=P12_B1_RECIPE_BOUND session=%llu armP=292 L=250 modeP=12 shape=SQUARE B=1 children=25 E5us=%llu E6microMm=%llu E7percent=100 flushAxis=NATIVE_POSITIVE_Z hold=0 discharge=0\n",
+            static_cast<unsigned long long>(m_edm94.session),static_cast<unsigned long long>(recipe.workTimeUs),
+            static_cast<unsigned long long>(recipe.jumpHeightScaled));
+    if(squareB2)
+        PrintNCG76DiagnosticLine("[EDM251] event=P12_B2_RECIPE_BOUND session=%llu armP=294 L=251 modeP=12 shape=SQUARE B=2 children=25 E5us=%llu E6microMm=%llu flushPath=RETAINED_NOMINAL hold=0 discharge=0\n",
+            static_cast<unsigned long long>(m_edm94.session),static_cast<unsigned long long>(recipe.workTimeUs),
+            static_cast<unsigned long long>(recipe.jumpHeightScaled));
+    if(squareB3)
+        PrintNCG76DiagnosticLine("[EDM252] event=P12_B3_RECIPE_BOUND session=%llu armP=296 L=252 modeP=12 shape=SQUARE B=3 children=25 E5us=%llu E6microMm=%llu E7percent=100 flushAxis=SIGNED_MACHINING_REVERSE hold=0 discharge=0\n",
+            static_cast<unsigned long long>(m_edm94.session),static_cast<unsigned long long>(recipe.workTimeUs),
+            static_cast<unsigned long long>(recipe.jumpHeightScaled));
+    if(squareB4)
+        PrintNCG76DiagnosticLine("[EDM253] event=P12_B4_RECIPE_BOUND session=%llu armP=298 L=253 modeP=12 shape=SQUARE B=4 children=25 E5us=%llu E6microMm=%llu E7percent=100 centerJoin=DIAGONAL_45_DEG flushAxis=SIGNED_MACHINING_REVERSE hold=0 discharge=0\n",
+            static_cast<unsigned long long>(m_edm94.session),static_cast<unsigned long long>(recipe.workTimeUs),
+            static_cast<unsigned long long>(recipe.jumpHeightScaled));
+    if(diamond)
+        PrintNCG76DiagnosticLine("[EDM255] event=P13_B1_RECIPE_BOUND session=%llu armP=292 L=255 modeP=13 shape=DIAMOND B=1 children=25 E5us=%llu E6microMm=%llu E7percent=100 flushAxis=NATIVE_POSITIVE_Z hold=0 discharge=0\n",
+            static_cast<unsigned long long>(m_edm94.session),static_cast<unsigned long long>(recipe.workTimeUs),
+            static_cast<unsigned long long>(recipe.jumpHeightScaled));
+    if(diamondB2)
+        PrintNCG76DiagnosticLine("[EDM256] event=P13_B2_RECIPE_BOUND session=%llu armP=294 L=256 modeP=13 shape=DIAMOND B=2 children=25 E5us=%llu E6microMm=%llu E7percent=100 flushPath=RETAINED_NOMINAL hold=0 discharge=0\n",
+            static_cast<unsigned long long>(m_edm94.session),static_cast<unsigned long long>(recipe.workTimeUs),
+            static_cast<unsigned long long>(recipe.jumpHeightScaled));
+    if(diamondB3)
+        PrintNCG76DiagnosticLine("[EDM257] event=P13_B3_RECIPE_BOUND session=%llu armP=296 L=257 modeP=13 shape=DIAMOND B=3 children=25 E5us=%llu E6microMm=%llu E7percent=100 flushAxis=SIGNED_MACHINING_REVERSE hold=0 discharge=0\n",
+            static_cast<unsigned long long>(m_edm94.session),static_cast<unsigned long long>(recipe.workTimeUs),
+            static_cast<unsigned long long>(recipe.jumpHeightScaled));
+    if(diamondB4)
+        PrintNCG76DiagnosticLine("[EDM258] event=P13_B4_RECIPE_BOUND session=%llu armP=298 L=258 modeP=13 shape=DIAMOND B=4 children=25 E5us=%llu E6microMm=%llu E7percent=100 centerJoin=DIAGONAL_45_DEG flushAxis=SIGNED_MACHINING_REVERSE hold=0 discharge=0\n",
+            static_cast<unsigned long long>(m_edm94.session),static_cast<unsigned long long>(recipe.workTimeUs),
+            static_cast<unsigned long long>(recipe.jumpHeightScaled));
     if(EDM173::IsCenterRecipe(recipe))
         PrintNCG76DiagnosticLine("[EDM210] event=CENTER_FLUSH_RATE session=%llu mode=%u E7percent=%.9g axialScale=%.9g referenceCapMmSec=%.9g accelerationScale=%.9g hardDeadlineUs=%llu centerFeed=INDEPENDENT gains=CONFIGURED following=UNCHANGED discharge=0\n",
             static_cast<unsigned long long>(m_edm94.session),EDM173::ModeForArm(m_edm94.gapHistoryArm),
@@ -26463,13 +29414,63 @@ bool NCManager::BindEDM173RecipeSameThread() noexcept
         PrintNCG76DiagnosticLine("[EDM217] event=AUTO_HOLD_ARMED session=%llu armP=%u L=1 B=%u trigger=NOMINAL_GAP_WORK_25PCT confirmation=M00_FRESH_START_REQUIRED resume=MANUAL_FRESH_START holdRetreat=0 pausedJog=0 discharge=0\n",
             static_cast<unsigned long long>(m_edm94.session),m_edm94.gapHistoryArm,
             EDM173::ModeForArm(m_edm94.gapHistoryArm));
+    if(EDM130::IsG76CenterFlushHold218(recipe))
+        PrintNCG76DiagnosticLine("[EDM218] event=AUTO_HOLD_ARMED session=%llu armP=%u L=2 B=%u trigger=CENTER_E5_AXIAL_OUTBOUND_25PCT confirmation=M00_FRESH_START_REQUIRED resume=MANUAL_FRESH_START holdRetreat=0 pausedJog=0 discharge=0\n",
+            static_cast<unsigned long long>(m_edm94.session),m_edm94.gapHistoryArm,
+            EDM173::ModeForArm(m_edm94.gapHistoryArm));
+    if(EDM130::IsG76CenterReturnHold219(recipe))
+        PrintNCG76DiagnosticLine("[EDM219] event=AUTO_HOLD_ARMED session=%llu armP=%u L=3 B=%u trigger=CENTER_E5_AXIAL_RETURN_25PCT confirmation=M00_FRESH_START_REQUIRED resume=MANUAL_FRESH_START holdRetreat=0 pausedJog=0 discharge=0\n",
+            static_cast<unsigned long long>(m_edm94.session),m_edm94.gapHistoryArm,
+            EDM173::ModeForArm(m_edm94.gapHistoryArm));
+    if(EDM130::IsG76CenterAnchorHold220(recipe))
+        PrintNCG76DiagnosticLine("[EDM220] event=AUTO_HOLD_ARMED session=%llu armP=%u L=4 B=%u trigger=CENTER_E5_TO_ANCHOR_25PCT confirmation=M00_FRESH_START_REQUIRED resume=MANUAL_FRESH_START holdRetreat=0 pausedJog=0 discharge=0\n",
+            static_cast<unsigned long long>(m_edm94.session),m_edm94.gapHistoryArm,
+            EDM173::ModeForArm(m_edm94.gapHistoryArm));
+    if(EDM130::IsG76CenterStartHold221(recipe))
+        PrintNCG76DiagnosticLine("[EDM221] event=AUTO_HOLD_ARMED session=%llu armP=%u L=5 B=%u trigger=CENTER_E5_TO_CENTER_25PCT confirmation=M00_FRESH_START_REQUIRED resume=MANUAL_FRESH_START holdRetreat=0 pausedJog=0 discharge=0\n",
+            static_cast<unsigned long long>(m_edm94.session),m_edm94.gapHistoryArm,
+            EDM173::ModeForArm(m_edm94.gapHistoryArm));
+    if(EDM130::IsG76CenterTopDwellHold222(recipe))
+        PrintNCG76DiagnosticLine("[EDM223] event=AUTO_HOLD_ARMED session=%llu armP=%u L=6 B=%u trigger=CENTER_E5_TOP_DWELL_25PCT confirmation=M00_FRESH_START_REQUIRED resume=MANUAL_FRESH_START dwellRestart=FULL holdRetreat=0 pausedJog=0 discharge=0\n",
+            static_cast<unsigned long long>(m_edm94.session),m_edm94.gapHistoryArm,
+            EDM173::ModeForArm(m_edm94.gapHistoryArm));
+    if(EDM130::IsG76CenterDwellHold224(recipe))
+        PrintNCG76DiagnosticLine("[EDM224] event=AUTO_HOLD_ARMED session=%llu armP=%u L=7 B=%u trigger=CENTER_E5_CENTER_DWELL_25PCT confirmation=M00_FRESH_START_REQUIRED resume=MANUAL_FRESH_START dwellRestart=FULL holdRetreat=0 pausedJog=0 discharge=0\n",
+            static_cast<unsigned long long>(m_edm94.session),m_edm94.gapHistoryArm,
+            EDM173::ModeForArm(m_edm94.gapHistoryArm));
+    if(EDM130::IsG76CenterReturnDwellHold225(recipe))
+        PrintNCG76DiagnosticLine("[EDM225] event=AUTO_HOLD_ARMED session=%llu armP=%u L=8 B=%u trigger=CENTER_E5_CENTER_RETURN_DWELL_25PCT confirmation=M00_FRESH_START_REQUIRED resume=MANUAL_FRESH_START dwellRestart=FULL holdRetreat=0 pausedJog=0 discharge=0\n",
+            static_cast<unsigned long long>(m_edm94.session),m_edm94.gapHistoryArm,
+            EDM173::ModeForArm(m_edm94.gapHistoryArm));
+    if(EDM130::IsG76CenterFinalDwellHold226(recipe))
+        PrintNCG76DiagnosticLine("[EDM226] event=AUTO_HOLD_ARMED session=%llu armP=%u L=9 B=%u trigger=CENTER_E5_FINAL_RETURN_DWELL_25PCT confirmation=M00_FRESH_START_REQUIRED resume=MANUAL_FRESH_START dwellRestart=FULL holdRetreat=0 pausedJog=0 discharge=0\n",
+            static_cast<unsigned long long>(m_edm94.session),m_edm94.gapHistoryArm,
+            EDM173::ModeForArm(m_edm94.gapHistoryArm));
+    if(EDM130::IsG76CenterInitialDwellHold227(recipe))
+        PrintNCG76DiagnosticLine("[EDM227] event=AUTO_HOLD_ARMED session=%llu armP=%u L=10 B=%u trigger=CENTER_E5_INITIAL_ANCHOR_DWELL_25PCT confirmation=M00_FRESH_START_REQUIRED resume=MANUAL_FRESH_START dwellRestart=FULL holdRetreat=0 pausedJog=0 discharge=0\n",
+            static_cast<unsigned long long>(m_edm94.session),m_edm94.gapHistoryArm,
+            EDM173::ModeForArm(m_edm94.gapHistoryArm));
+    if(EDM130::IsG76CenterBrakeHold228(recipe))
+        PrintNCG76DiagnosticLine("[EDM228] event=AUTO_HOLD_ARMED session=%llu armP=%u L=11 B=%u trigger=CENTER_E5_BRAKE_MOVING confirmation=M00_FRESH_START_REQUIRED resume=MANUAL_FRESH_START initialDwell=FULL_AFTER_START holdRetreat=0 pausedJog=0 discharge=0\n",
+            static_cast<unsigned long long>(m_edm94.session),m_edm94.gapHistoryArm,
+            EDM173::ModeForArm(m_edm94.gapHistoryArm));
     return true;
 }
 
 bool NCManager::IsEDM173OrbitAllowedSameThread(const NCBlock& b) noexcept
 {
     const auto& s=m_edm94;const auto& w=*m_edm173;const int pc=GetActiveDispatchPC();
-    bool valid=IsEDM173OrbitBlockShapeValid(b)&&s.latched&&EDM173::IsArm(s.gapHistoryArm)&&
+    bool valid=(!m_edm237.authorized||(IsEDM237SequenceScopeCurrentSameThread()&&
+        m_edm237.parentIndex<m_edm237.parentCount&&m_edm237.stageStarted&&m_edm237.stageRecipeBound&&!m_edm237.awaitNext&&
+        E237NativeKind(m_edm237.kinds[m_edm237.parentIndex])&&s.armPC==m_edm237.armPC[m_edm237.parentIndex]&&
+        s.session==m_edm237.currentSession))&&(!m_edm234.authorized||(IsEDM234SequenceScopeCurrentSameThread()&&
+        s.armPC==m_edm234.firstArmPC+(m_edm234.program==236U?static_cast<int>(m_edm234.parentIndex*3U):(m_edm234.secondStarted?3:0))&&
+        s.gapHistoryArm==294U&&(m_edm234.program!=236U||(m_edm234.stageStarted&&m_edm234.stageRecipeBound&&
+            !m_edm234.awaitNext&&m_edm234.kinds[m_edm234.parentIndex]==2U&&s.session==m_edm234.currentSession))))&&
+        (!EDM130::IsG76ParentSequence233(m_edm130.recipe)||
+        (IsEDM233SequenceScopeCurrentSameThread()&&s.armPC==m_edm233.firstArmPC+(m_edm233.secondStarted?3:0)))&&
+        IsEDM173OrbitBlockShapeValid(b)&&s.latched&&EDM173::IsArm(s.gapHistoryArm)&&
+        b.val('P')==static_cast<double>(EDM130::G76PlanMode(m_edm130.recipe))&&
         E181EffectiveOrbitMode(b)==EDM173::ModeForArm(s.gapHistoryArm)&&
         E181EffectiveOrbitMode(w.authored)==EDM173::ModeForArm(s.gapHistoryArm)&&
         EDM173::RecipeMatchesArm(s.gapHistoryArm,m_edm130.recipe)&&s.ready&&s.everArmed&&
@@ -26482,6 +29483,8 @@ bool NCManager::IsEDM173OrbitAllowedSameThread(const NCBlock& b) noexcept
         !m_g76Orbit->active&&!m_pathFeed.pending&&!m_pathArc.pending&&!m_pathReplay.pending&&!m_pathHold.armed&&!m_pathHold.bound&&
         IsG76OrbitFrameCurrentSameThread(true,true)&&IsPathCoreLiveNativeConfigCurrentSameThread();
     const auto* authored=GetBaseProgramCache().TryGetLine(pc);
+    const auto* arm=GetBaseProgramCache().TryGetLine(s.armPC);
+    valid=valid&&arm&&E251SquareSourcePair(arm->parsedBlock,b);
     valid=valid&&authored&&(w.coordinateRow.source.expressionMask!=0U?
         MatchesEDM179CoordinatesSameThread(authored->parsedBlock,b,pc):E180LiteralAngleSourceMatches(authored->parsedBlock,b));
     for(char word='A';word<='Z'&&valid;++word)
@@ -26496,10 +29499,13 @@ bool NCManager::GuardEDM173BlockSameThread(const NCBlock& b,int pc,int line)
     if(!source||!(coordinateRow?MatchesEDM179CoordinatesSameThread(source->parsedBlock,b,pc):E180LiteralAngleSourceMatches(source->parsedBlock,b)))
     {RejectEDM94SameThread(coordinateRow?"EDM179_COORDINATE_SCOPE":"EDM173_LITERAL_SCOPE",line);return false;}
     if(b.isEmpty) return true;
-    bool valid=s.latched&&EDM173::IsArm(s.gapHistoryArm)&&!s.cancelled&&!s.armPending&&!s.releaseRequested&&
+    bool valid=(!EDM130::IsG76ParentSequence233(m_edm130.recipe)||
+        (IsEDM233SequenceScopeCurrentSameThread()&&s.armPC==m_edm233.firstArmPC+(m_edm233.secondStarted?3:0)))&&
+        s.latched&&EDM173::IsArm(s.gapHistoryArm)&&!s.cancelled&&!s.armPending&&!s.releaseRequested&&
         s.moves==1U&&s.next<3U&&s.run==m_pathCoreLiveBookkeeping.currentRunToken&&s.cache==GetBaseProgramCache().GetGeneration()&&
         s.lease.Matches(m_programMotionLease)&&m_motion.IsMotionOwnerLeaseCurrent(s.lease)&&pc==s.pc[s.next]&&(s.next<2U?s.ready:s.complete);
     if(valid&&s.next==0U) valid=IsEDM173OrbitBlockShapeValid(b)&&
+        b.val('P')==static_cast<double>(EDM130::G76PlanMode(m_edm130.recipe))&&
         E181EffectiveOrbitMode(b)==EDM173::ModeForArm(s.gapHistoryArm)&&m_edm173->prepared&&!m_edm173->published;
     else if(valid&&s.next==1U) valid=IsEDM173BracketShapeValid(b)&&
         b.val('P')==static_cast<double>(EDM173::FinishForArm(s.gapHistoryArm))&&m_edm173->completed&&!m_g76Orbit->active;
@@ -26514,6 +29520,20 @@ bool NCManager::GuardEDM173BlockSameThread(const NCBlock& b,int pc,int line)
 bool NCManager::IsEDM173TerminalBlockAllowedSameThread(const NCBlock& b) noexcept
 {
     const auto& s=m_edm94;const int pc=GetActiveDispatchPC();
+    if(m_edm237.authorized&&(!IsEDM237SequenceScopeCurrentSameThread()||
+        !IsEDM237FinalStateSameThread()||!E237NativeKind(m_edm237.kinds[m_edm237.parentIndex])))return false;
+    if(m_edm234.authorized&&m_edm234.program==236U)
+    {
+        const auto& q=m_edm234;
+        if(!IsEDM236SequenceScopeCurrentSameThread()||q.parentIndex!=3U||q.retiredMask!=7U||!q.stageRecipeBound||
+            !q.stageStarted||q.awaitNext||q.releasePending||q.kinds[3U]!=2U||s.armPC!=q.firstArmPC+9||
+            s.session!=q.currentSession||s.session<=q.previousSession)return false;
+    }
+    else if(m_edm234.authorized&&(!IsEDM234SequenceScopeCurrentSameThread()||!m_edm234.firstReleased||
+        !m_edm234.secondStarted||m_edm234.releasePending||s.armPC!=m_edm234.firstArmPC+3||s.session<=m_edm234.firstSession))return false;
+    if(EDM130::IsG76ParentSequence233(m_edm130.recipe)&&
+        (!IsEDM233SequenceScopeCurrentSameThread()||!m_edm233.firstReleased||!m_edm233.secondStarted||
+            m_edm233.releasePending||s.armPC!=m_edm233.firstArmPC+3||s.session<=m_edm233.firstSession))return false;
     if(!s.latched||!EDM173::IsArm(s.gapHistoryArm)||!s.everArmed||!s.complete||!s.terminalLogged||
         s.moves!=1U||s.next!=3U||pc!=s.pc[2U]||s.cancelled||s.resetSeen||s.resetCommitted||
         s.armPending||s.finishPending||s.releaseRequested||s.completionReleaseRequested||s.rtFaultReported||
@@ -26559,8 +29579,30 @@ WaitConditionFunc NCManager::StartEDM173SameThread(const NCBlock& b)
         if(s.next!=2U||!m_edm173->completed||!E156FinishTargetMatches(s,m_edm130.recipe,s.feedback,m_edm114.retained)||
             !m_motion.IsGroupDone()||!m_motion.IsGroupNCDrained()||m_g76Orbit->active)
         {RejectEDM94SameThread("EDM173_FINAL_PARENT_OR_TARGET",m_gapDryRun.sourceLine);return nullptr;}
+        if(EDM130::IsG76ParentSequence233(m_edm130.recipe))
+        {
+            if(!IsEDM233SequenceScopeCurrentSameThread()||s.armPC!=m_edm233.firstArmPC+(m_edm233.secondStarted?3:0))
+            {RejectEDM94SameThread("EDM233_FINISH_SCOPE",m_gapDryRun.sourceLine);return nullptr;}
+            if(!m_edm233.secondStarted)m_edm233.firstFinishDispatch=m_currentExecutingBlockDispatchId;
+        }
+        if(m_edm237.authorized)
+        {
+            if(!IsEDM237SequenceScopeCurrentSameThread()||!m_edm237.motionDispatch||
+                m_edm237.currentRowBound!=E237RowsForKind(m_edm237.kinds[m_edm237.parentIndex]))
+            {RejectEDM94SameThread("EDM237_FINISH_SCOPE",m_gapDryRun.sourceLine);return nullptr;}
+            m_edm237.currentFinishDispatch=m_currentExecutingBlockDispatchId;
+            if(!m_edm237.parentIndex)m_edm237.firstFinishDispatch=m_currentExecutingBlockDispatchId;
+        }
+        if(m_edm234.authorized)
+        {
+            if(!IsEDM234SequenceScopeCurrentSameThread()||!m_edm234.motionDispatch)
+            {RejectEDM94SameThread("EDM234_ORBIT_FINISH_SCOPE",m_gapDryRun.sourceLine);return nullptr;}
+            m_edm234.currentFinishDispatch=m_currentExecutingBlockDispatchId;
+            if(m_edm234.program!=236U&&!m_edm234.secondStarted)m_edm234.firstFinishDispatch=m_currentExecutingBlockDispatchId;
+        }
         s.ready=false;s.finishPending=true;s.polls=0U;m_motion.RequestEDM94Finish(s.session);
-        RtPrintf("[EDM173] event=FINISH_REQUEST session=%llu children=25 E5completed=1 await=PHYSICAL_ZERO_200 discharge=0\n",static_cast<unsigned long long>(s.session));
+        RtPrintf("[EDM173] event=FINISH_REQUEST session=%llu children=%u E5completed=%u await=PHYSICAL_ZERO_200 discharge=0\n",
+            static_cast<unsigned long long>(s.session),EDM173::CountForRecipe(m_edm130.recipe),EDM130::G76EventLimit(m_edm130.recipe));
         return [](NCManager* n){return n->WaitEDM173SameThread();};
     }
     if(m_edm94.latched||!m_pathFeed.armed||m_pathFeed.run!=m_pathCoreLiveBookkeeping.currentRunToken||
@@ -26572,13 +29614,35 @@ WaitConditionFunc NCManager::StartEDM173SameThread(const NCBlock& b)
         m_cncFeed.active||m_cncFeed.selected||m_cncFeed.count||m_cutterLine.leadOutRequired||
         m_edm94Serial==(std::numeric_limits<std::uint64_t>::max)()||!FreezeEDM173TranslationSameThread())
     {RejectEDM94SameThread("EDM173_ARM_NOT_READY",m_gapDryRun.sourceLine);return nullptr;}
+    const bool historySequence=b.has('L')&&(b.val('L')==237.0||b.val('L')==238.0||b.val('L')==239.0||b.val('L')==240.0||b.val('L')==241.0||b.val('L')==242.0||b.val('L')==243.0||b.val('L')==244.0||b.val('L')==245.0||b.val('L')==246.0||b.val('L')==247.0||b.val('L')==248.0);
+    if(historySequence&&!BeginEDM237SequenceSameThread(pc))
+    {RejectEDM94SameThread("EDM237_SEQUENCE_ADMISSION",m_gapDryRun.sourceLine);return nullptr;}
+    const bool mixedSequence=b.has('L')&&(b.val('L')==234.0||b.val('L')==235.0||b.val('L')==236.0);
+    if(mixedSequence&&!BeginEDM234SequenceSameThread(pc))
+    {RejectEDM94SameThread("EDM234_SEQUENCE_ADMISSION",m_gapDryRun.sourceLine);return nullptr;}
+    const bool parentSequence=b.has('L')&&b.val('L')==233.0;
+    if(parentSequence&&!BeginEDM233SequenceSameThread(pc))
+    {RejectEDM94SameThread("EDM233_SEQUENCE_ADMISSION",m_gapDryRun.sourceLine);return nullptr;}
     const auto inspected=GetBaseProgramCache().GetGeneration();m_edm94=EDM94NCState{};auto& s=m_edm94;
     s.program=true;s.inspectedCache=inspected;s.gapHistoryArm=static_cast<unsigned>(b.val('P'));s.gapWorkTime=true;s.moves=1U;s.authoredGCode[0U]=76U;s.feed[0U]=0.12;
     s.pc[0U]=pc+1;s.pc[1U]=pc+2;s.pc[2U]=pc+3;s.armPC=pc;s.armDispatch=m_currentExecutingBlockDispatchId;
     s.session=++m_edm94Serial;s.run=m_pathCoreLiveBookkeeping.currentRunToken;s.cache=inspected;
     s.armEpoch=m_motion.GetCurrentExecutionEpoch();s.lease=m_programMotionLease;s.gapTuning={8.0,1.0,1.0};
-    if(!EDM107::ParseFlushProfile(10.0,50.0,100.0,s.gapFlushParameters)||!BindEDM173RecipeSameThread()||!ConsumeEDM149ConfirmationSameThread(pc))
-    {RejectEDM94SameThread("EDM173_RECIPE_OR_CONFIRMATION",m_gapDryRun.sourceLine);return nullptr;}
+    if(!EDM107::ParseFlushProfile(10.0,50.0,100.0,s.gapFlushParameters))
+    {RejectEDM94SameThread(mixedSequence?"EDM234_FLUSH_PROFILE_BIND":parentSequence?"EDM233_FLUSH_PROFILE_BIND":"EDM173_RECIPE_OR_CONFIRMATION",m_gapDryRun.sourceLine);return nullptr;}
+    if(!BindEDM173RecipeSameThread())
+    {RejectEDM94SameThread(mixedSequence?"EDM234_RECIPE_BIND":parentSequence?"EDM233_RECIPE_BIND":"EDM173_RECIPE_OR_CONFIRMATION",m_gapDryRun.sourceLine);return nullptr;}
+    if(!ConsumeEDM149ConfirmationSameThread(pc))
+    {RejectEDM94SameThread(mixedSequence?"EDM234_SEQUENCE_CONFIRMATION":parentSequence?"EDM233_SEQUENCE_CONFIRMATION":"EDM173_RECIPE_OR_CONFIRMATION",m_gapDryRun.sourceLine);return nullptr;}
+    if(parentSequence)
+    {
+        if(!m_edm233.secondStarted)m_edm233.firstSession=s.session;
+        else if(s.session<=m_edm233.firstSession)
+        {RejectEDM94SameThread("EDM233_FRESH_SESSION_REQUIRED",m_gapDryRun.sourceLine);return nullptr;}
+        PrintNCG76DiagnosticLine("[EDM233] event=PARENT_ARM_REQUEST parent=%u session=%llu firstSession=%llu run=%llu cache=%llu E5policy=FRESH_PER_PARENT children=25 sameAUTO=1 discharge=0\n",
+            m_edm233.secondStarted?2U:1U,static_cast<unsigned long long>(s.session),
+            static_cast<unsigned long long>(m_edm233.firstSession),static_cast<unsigned long long>(s.run),static_cast<unsigned long long>(s.cache));
+    }
     auto& w=*m_edm173;
     if(w.coordinateRow.source.expressionMask!=0U&&!FreezeEDM179CoordinatesSameThread())
     {RejectEDM94SameThread("EDM179_COORDINATE_FREEZE",m_gapDryRun.sourceLine);return nullptr;}
@@ -26588,10 +29652,11 @@ WaitConditionFunc NCManager::StartEDM173SameThread(const NCBlock& b)
     NCG76::Point8 start{};for(unsigned axis=0U;axis<8U;++axis)start[axis]=CoordSys.commandedMCS[axis];
     const auto frozen=CoordSys.GetTranslationSnapshot();
     if(!EDM173::BuildOrbitInput(frozen,start,authoredXYZ,authoredMask,w.authored.val('R'),w.authored.val('F'),input,
-        w.authored.has('K')?w.authored.val('K'):0.0,EDM173::UsesTargetAxis(m_edm130.recipe),EDM173::IsCenterRecipe(m_edm130.recipe)))
+        w.authored.has('K')?w.authored.val('K'):0.0,EDM173::UsesTargetAxis(m_edm130.recipe),EDM173::IsCenterRecipe(m_edm130.recipe),
+        (w.authored.val('P')==16.0||w.authored.val('P')==26.0)?static_cast<unsigned>(w.authored.val('Q')):0U))
     {RejectEDM94SameThread("EDM178_COORDINATE_INPUT",m_gapDryRun.sourceLine);return nullptr;}
     NCG76::ProgramPlan& program=m_g76Orbit->program;
-    if(!NCG76::Build(input,program)||!NCG76::BuildNative(program,frozen,start,w.nominal,true,true,EDM173::PreservesG90StationaryZ(m_edm130.recipe))||w.nominal.count!=25U)
+    if(!NCG76::BuildMode(static_cast<std::uint32_t>(w.authored.val('P')),input,program)||!NCG76::BuildNative(program,frozen,start,w.nominal,true,true,EDM173::PreservesG90StationaryZ(m_edm130.recipe))||w.nominal.count!=EDM173::CountForRecipe(m_edm130.recipe))
     {RejectEDM94SameThread("EDM173_NOMINAL_PLAN",m_gapDryRun.sourceLine);return nullptr;}
     if(EDM173::IsB0Recipe(m_edm130.recipe))
     {
@@ -26606,7 +29671,7 @@ WaitConditionFunc NCManager::StartEDM173SameThread(const NCBlock& b)
         if(!input.targetAxis&&frozen.distanceMode==90&&input.start[2U]==input.end[2U])
             PrintNCG76DiagnosticLine("[EDM194] event=G90_Z_ANCHOR session=%llu parentPC=%d frameGeneration=%llu startNativeZ=%.17g finalNativeZ=%.17g authoredZStationary=1 points=25 rule=EXACT_PROGRAM_Z discharge=0\n",
                 static_cast<unsigned long long>(s.session),s.pc[0U],static_cast<unsigned long long>(frozen.generation),
-                start[2U],w.nominal.pointsMCS[24U][2U]);
+                start[2U],w.nominal.pointsMCS[EDM173::CountForRecipe(m_edm130.recipe)-1U][2U]);
     }
     if(EDM173::IsB2Recipe(m_edm130.recipe))
     {
@@ -26616,29 +29681,29 @@ WaitConditionFunc NCManager::StartEDM173SameThread(const NCBlock& b)
         m_edm130.recipe.planMovementMask=static_cast<std::uint16_t>(movementMask);
         if(!EDM130::ValidHistoryRecipeBinding(EDM173::HistoryFixture,m_edm130.recipe))
         {RejectEDM94SameThread("EDM197_MOVEMENT_RECIPE",m_gapDryRun.sourceLine);return nullptr;}
-        PrintNCG76DiagnosticLine("[EDM197] event=B2_MOVEMENT_FROZEN session=%llu parentPC=%d requiredMask=%u nominalChildren=25 ZcommandFixed=%u pathHeightMm=0.001 source=COMPENSATED_NATIVE_POINTS structuralMask=7 discharge=0\n",
-            static_cast<unsigned long long>(s.session),s.pc[0U],movementMask,movementMask==3U?1U:0U);
-        PrintNCG76DiagnosticLine("[EDM201] event=TARGET_AXIS_FROZEN session=%llu parentPC=%d frameGeneration=%llu mode=2 programDeltaX=%.17g programDeltaY=%.17g programDeltaZ=%.17g K=%.17g plane=PERPENDICULAR_XYZ_TARGET source=RESOLVED_PROGRAM_TARGET requiredMask=%u nominalChildren=25 discharge=0\n",
+        PrintNCG76DiagnosticLine("[EDM197] event=B2_MOVEMENT_FROZEN session=%llu parentPC=%d requiredMask=%u nominalChildren=%u ZcommandFixed=%u pathHeightMm=0.001 source=COMPENSATED_NATIVE_POINTS structuralMask=7 discharge=0\n",
+            static_cast<unsigned long long>(s.session),s.pc[0U],movementMask,EDM173::CountForRecipe(m_edm130.recipe),movementMask==3U?1U:0U);
+        PrintNCG76DiagnosticLine("[EDM201] event=TARGET_AXIS_FROZEN session=%llu parentPC=%d frameGeneration=%llu mode=2 programDeltaX=%.17g programDeltaY=%.17g programDeltaZ=%.17g K=%.17g plane=PERPENDICULAR_XYZ_TARGET source=RESOLVED_PROGRAM_TARGET requiredMask=%u nominalChildren=%u discharge=0\n",
             static_cast<unsigned long long>(s.session),s.pc[0U],static_cast<unsigned long long>(frozen.generation),
             input.end[0U]-input.start[0U],input.end[1U]-input.start[1U],input.end[2U]-input.start[2U],
-            input.shapeAngleDeg,movementMask);
+            input.shapeAngleDeg,movementMask,EDM173::CountForRecipe(m_edm130.recipe));
     }
     if(input.targetAxis&&!EDM173::IsB2Recipe(m_edm130.recipe)&&!EDM173::IsCenterRecipe(m_edm130.recipe))
-        PrintNCG76DiagnosticLine("[EDM202] event=TARGET_AXIS_FROZEN session=%llu parentPC=%d frameGeneration=%llu mode=%u programDeltaX=%.17g programDeltaY=%.17g programDeltaZ=%.17g K=%.17g plane=PERPENDICULAR_XYZ_TARGET source=RESOLVED_PROGRAM_TARGET requiredMask=%u nominalChildren=25 flushAxis=%s discharge=0\n",
+        PrintNCG76DiagnosticLine("[EDM202] event=TARGET_AXIS_FROZEN session=%llu parentPC=%d frameGeneration=%llu mode=%u programDeltaX=%.17g programDeltaY=%.17g programDeltaZ=%.17g K=%.17g plane=PERPENDICULAR_XYZ_TARGET source=RESOLVED_PROGRAM_TARGET requiredMask=%u nominalChildren=%u flushAxis=%s discharge=0\n",
             static_cast<unsigned long long>(s.session),s.pc[0U],static_cast<unsigned long long>(frozen.generation),
             E181EffectiveOrbitMode(w.authored),input.end[0U]-input.start[0U],input.end[1U]-input.start[1U],
-            input.end[2U]-input.start[2U],input.shapeAngleDeg,static_cast<unsigned>(m_edm130.recipe.planMovementMask),
+            input.end[2U]-input.start[2U],input.shapeAngleDeg,static_cast<unsigned>(m_edm130.recipe.planMovementMask),EDM173::CountForRecipe(m_edm130.recipe),
             EDM173::IsB0Recipe(m_edm130.recipe)?"NATIVE_TANGENT_REVERSE":"NATIVE_PLUS_Z");
     if(EDM173::IsCenterRecipe(m_edm130.recipe))
-        PrintNCG76DiagnosticLine("[EDM204] event=TARGET_AXIS_FROZEN session=%llu parentPC=%d frameGeneration=%llu mode=%u programDeltaX=%.17g programDeltaY=%.17g programDeltaZ=%.17g K=%.17g plane=PERPENDICULAR_XYZ_TARGET source=RESOLVED_PROGRAM_TARGET nominalChildren=25 center=XYZ flushAxis=NEGATIVE_COMPENSATED_XYZ_TARGET discharge=0\n",
+        PrintNCG76DiagnosticLine("[EDM204] event=TARGET_AXIS_FROZEN session=%llu parentPC=%d frameGeneration=%llu mode=%u programDeltaX=%.17g programDeltaY=%.17g programDeltaZ=%.17g K=%.17g plane=PERPENDICULAR_XYZ_TARGET source=RESOLVED_PROGRAM_TARGET nominalChildren=%u center=XYZ flushAxis=NEGATIVE_COMPENSATED_XYZ_TARGET discharge=0\n",
             static_cast<unsigned long long>(s.session),s.pc[0U],static_cast<unsigned long long>(frozen.generation),
             E181EffectiveOrbitMode(w.authored),input.end[0U]-input.start[0U],input.end[1U]-input.start[1U],
-            input.end[2U]-input.start[2U],input.shapeAngleDeg);
+            input.end[2U]-input.start[2U],input.shapeAngleDeg,EDM173::CountForRecipe(m_edm130.recipe));
     if(!EDM173::UsesNominalMovementMask(m_edm130.recipe)&&EDM173::PreservesG90StationaryZ(m_edm130.recipe)&&
         frozen.distanceMode==90&&input.start[2U]==input.end[2U])
         PrintNCG76DiagnosticLine("[EDM196] event=G90_Z_ANCHOR session=%llu parentPC=%d frameGeneration=%llu mode=%u startNativeZ=%.17g finalNativeZ=%.17g authoredZStationary=1 nominalPoints=25 centerAnchored=%u requiredMovementMask=%u flushNativeZ=%u rule=EXACT_PROGRAM_Z discharge=0\n",
             static_cast<unsigned long long>(s.session),s.pc[0U],static_cast<unsigned long long>(frozen.generation),
-            E181EffectiveOrbitMode(w.authored),start[2U],w.nominal.pointsMCS[24U][2U],EDM173::IsCenterRecipe(m_edm130.recipe)?1U:0U,
+            E181EffectiveOrbitMode(w.authored),start[2U],w.nominal.pointsMCS[EDM173::CountForRecipe(m_edm130.recipe)-1U][2U],EDM173::IsCenterRecipe(m_edm130.recipe)?1U:0U,
             static_cast<unsigned>(m_edm130.recipe.planMovementMask),EDM173::IsCenterRecipe(m_edm130.recipe)?0U:1U);
     PrintNCG76DiagnosticLine("[EDM181] event=B_MODE_FROZEN session=%llu parentPC=%d source=%s authoredBPresent=%u mode=%u arm=P%u modalUnchanged=1 scope=G76_CURRENT_BLOCK discharge=0\n",
         static_cast<unsigned long long>(s.session),s.pc[0U],w.authored.has('B')?"EXPLICIT":"DEFAULT",
@@ -26679,7 +29744,7 @@ WaitConditionFunc NCManager::StartEDM173SameThread(const NCBlock& b)
         static_cast<unsigned long long>(s.session),s.pc[0U],static_cast<unsigned long long>(frozen.generation),
         frozen.distanceMode,frozen.rotationMode,frozen.rotationAngleDeg,authoredMask,
         input.start[0U],input.start[1U],input.start[2U],input.end[0U],input.end[1U],input.end[2U],
-        w.nominal.pointsMCS[24U][0U],w.nominal.pointsMCS[24U][1U],w.nominal.pointsMCS[24U][2U]);
+        w.nominal.pointsMCS[EDM173::CountForRecipe(m_edm130.recipe)-1U][0U],w.nominal.pointsMCS[EDM173::CountForRecipe(m_edm130.recipe)-1U][1U],w.nominal.pointsMCS[EDM173::CountForRecipe(m_edm130.recipe)-1U][2U]);
     if(w.coordinateRow.valid)
         PrintNCG76DiagnosticLine("[EDM179] event=TARGETS_FROZEN session=%llu parentPC=%d cache=%llu frameGeneration=%llu distance=G90 expressionMask=%u programStartX=%.12g programStartY=%.12g programStartZ=%.12g programEndX=%.12g programEndY=%.12g programEndZ=%.12g source=COMMANDED_WCS resolved=ACTUAL_NC_RESOLVER discharge=0\n",
             static_cast<unsigned long long>(s.session),s.pc[0U],static_cast<unsigned long long>(s.cache),
@@ -26700,6 +29765,193 @@ WaitConditionFunc NCManager::StartEDM173SameThread(const NCBlock& b)
     {RejectEDM94SameThread("EDM216_PROBE_SOURCE_SCOPE",m_gapDryRun.sourceLine);return nullptr;}
     if((b.has('L')&&b.val('L')==1.0)!=E217CenterNominalHold(armSource->parsedBlock,s.gapHistoryArm))
     {RejectEDM94SameThread("EDM217_HOLD_SOURCE_SCOPE",m_gapDryRun.sourceLine);return nullptr;}
+    const bool centerFlushHold=E218CenterFlushHold(armSource->parsedBlock,s.gapHistoryArm);
+    if((b.has('L')&&b.val('L')==2.0)!=centerFlushHold||
+        centerFlushHold!=EDM130::IsG76CenterFlushHold218(m_edm130.recipe))
+    {RejectEDM94SameThread("EDM218_HOLD_SOURCE_SCOPE",m_gapDryRun.sourceLine);return nullptr;}
+    const bool centerReturnHold=E219CenterReturnHold(armSource->parsedBlock,s.gapHistoryArm);
+    if(((s.gapHistoryArm==EDM173::B3ArmP||s.gapHistoryArm==EDM173::B4ArmP)&&
+            b.has('L')&&b.val('L')==3.0)!=centerReturnHold||
+        centerReturnHold!=EDM130::IsG76CenterReturnHold219(m_edm130.recipe))
+    {RejectEDM94SameThread("EDM219_HOLD_SOURCE_SCOPE",m_gapDryRun.sourceLine);return nullptr;}
+    const bool centerAnchorHold=E220CenterAnchorHold(armSource->parsedBlock,s.gapHistoryArm);
+    if(((s.gapHistoryArm==EDM173::B3ArmP||s.gapHistoryArm==EDM173::B4ArmP)&&
+            b.has('L')&&b.val('L')==4.0)!=centerAnchorHold||
+        centerAnchorHold!=EDM130::IsG76CenterAnchorHold220(m_edm130.recipe))
+    {RejectEDM94SameThread("EDM220_HOLD_SOURCE_SCOPE",m_gapDryRun.sourceLine);return nullptr;}
+    const bool centerStartHold=E221CenterStartHold(armSource->parsedBlock,s.gapHistoryArm);
+    if(((s.gapHistoryArm==EDM173::B3ArmP||s.gapHistoryArm==EDM173::B4ArmP)&&
+            b.has('L')&&b.val('L')==5.0)!=centerStartHold||
+        centerStartHold!=EDM130::IsG76CenterStartHold221(m_edm130.recipe))
+    {RejectEDM94SameThread("EDM221_HOLD_SOURCE_SCOPE",m_gapDryRun.sourceLine);return nullptr;}
+    const bool centerTopDwellHold=E222CenterTopDwellHold(armSource->parsedBlock,s.gapHistoryArm);
+    if(((s.gapHistoryArm==EDM173::B3ArmP||s.gapHistoryArm==EDM173::B4ArmP)&&
+            b.has('L')&&b.val('L')==6.0)!=centerTopDwellHold||
+        centerTopDwellHold!=EDM130::IsG76CenterTopDwellHold222(m_edm130.recipe))
+    {RejectEDM94SameThread("EDM223_HOLD_SOURCE_SCOPE",m_gapDryRun.sourceLine);return nullptr;}
+    const bool centerDwellHold=E224CenterDwellHold(armSource->parsedBlock,s.gapHistoryArm);
+    if(((s.gapHistoryArm==EDM173::B3ArmP||s.gapHistoryArm==EDM173::B4ArmP)&&
+            b.has('L')&&b.val('L')==7.0)!=centerDwellHold||
+        centerDwellHold!=EDM130::IsG76CenterDwellHold224(m_edm130.recipe))
+    {RejectEDM94SameThread("EDM224_HOLD_SOURCE_SCOPE",m_gapDryRun.sourceLine);return nullptr;}
+    const bool centerReturnDwellHold=E225CenterReturnDwellHold(armSource->parsedBlock,s.gapHistoryArm);
+    if(((s.gapHistoryArm==EDM173::B3ArmP||s.gapHistoryArm==EDM173::B4ArmP)&&
+            b.has('L')&&b.val('L')==8.0)!=centerReturnDwellHold||
+        centerReturnDwellHold!=EDM130::IsG76CenterReturnDwellHold225(m_edm130.recipe))
+    {RejectEDM94SameThread("EDM225_HOLD_SOURCE_SCOPE",m_gapDryRun.sourceLine);return nullptr;}
+    const bool centerFinalDwellHold=E226CenterFinalDwellHold(armSource->parsedBlock,s.gapHistoryArm);
+    if(((s.gapHistoryArm==EDM173::B3ArmP||s.gapHistoryArm==EDM173::B4ArmP)&&
+            b.has('L')&&b.val('L')==9.0)!=centerFinalDwellHold||
+        centerFinalDwellHold!=EDM130::IsG76CenterFinalDwellHold226(m_edm130.recipe))
+    {RejectEDM94SameThread("EDM226_HOLD_SOURCE_SCOPE",m_gapDryRun.sourceLine);return nullptr;}
+    const bool centerInitialDwellHold=E227CenterInitialDwellHold(armSource->parsedBlock,s.gapHistoryArm);
+    if(((s.gapHistoryArm==EDM173::B3ArmP||s.gapHistoryArm==EDM173::B4ArmP)&&
+            b.has('L')&&b.val('L')==10.0)!=centerInitialDwellHold||
+        centerInitialDwellHold!=EDM130::IsG76CenterInitialDwellHold227(m_edm130.recipe))
+    {RejectEDM94SameThread("EDM227_HOLD_SOURCE_SCOPE",m_gapDryRun.sourceLine);return nullptr;}
+    const bool centerBrakeHold=E228CenterBrakeHold(armSource->parsedBlock,s.gapHistoryArm);
+    if(((s.gapHistoryArm==EDM173::B3ArmP||s.gapHistoryArm==EDM173::B4ArmP)&&
+            b.has('L')&&b.val('L')==11.0)!=centerBrakeHold||
+        centerBrakeHold!=EDM130::IsG76CenterBrakeHold228(m_edm130.recipe))
+    {RejectEDM94SameThread("EDM228_HOLD_SOURCE_SCOPE",m_gapDryRun.sourceLine);return nullptr;}
+    const bool centerRepeat=E230CenterRepeat(armSource->parsedBlock,s.gapHistoryArm);
+    if(((s.gapHistoryArm==EDM173::B3ArmP||s.gapHistoryArm==EDM173::B4ArmP)&&
+            b.has('L')&&b.val('L')==230.0)!=centerRepeat||
+        centerRepeat!=EDM130::IsG76CenterRepeat230(m_edm130.recipe))
+    {RejectEDM94SameThread("EDM230_REPEAT_SOURCE_SCOPE",m_gapDryRun.sourceLine);return nullptr;}
+    const bool centerSecondFlushHold=E231CenterSecondFlushHold(armSource->parsedBlock,s.gapHistoryArm);
+    if(((s.gapHistoryArm==EDM173::B3ArmP||s.gapHistoryArm==EDM173::B4ArmP)&&
+            b.has('L')&&b.val('L')==231.0)!=centerSecondFlushHold||
+        centerSecondFlushHold!=EDM130::IsG76CenterSecondFlushHold231(m_edm130.recipe))
+    {RejectEDM94SameThread("EDM231_HOLD_SOURCE_SCOPE",m_gapDryRun.sourceLine);return nullptr;}
+    const bool centerSecondReturnHold=E232CenterSecondReturnHold(armSource->parsedBlock,s.gapHistoryArm);
+    if(((s.gapHistoryArm==EDM173::B3ArmP||s.gapHistoryArm==EDM173::B4ArmP)&&
+            b.has('L')&&b.val('L')==232.0)!=centerSecondReturnHold||
+        centerSecondReturnHold!=EDM130::IsG76CenterSecondReturnHold232(m_edm130.recipe))
+    {RejectEDM94SameThread("EDM232_HOLD_SOURCE_SCOPE",m_gapDryRun.sourceLine);return nullptr;}
+    if(parentSequence!=E233CenterParentSequence(armSource->parsedBlock,s.gapHistoryArm)||
+        parentSequence!=EDM130::IsG76ParentSequence233(m_edm130.recipe))
+    {RejectEDM94SameThread("EDM233_SEQUENCE_SOURCE_SCOPE",m_gapDryRun.sourceLine);return nullptr;}
+    const bool centerSequence=b.has('L')&&b.val('L')==239.0;
+    if(centerSequence!=(E237ArmSequence(armSource->parsedBlock,s.gapHistoryArm)&&
+            EDM77::Detail::EqualLiteral(armSource->parsedBlock.expression('L'),239U))||
+        centerSequence!=EDM130::IsG76CenterSequence239(m_edm130.recipe))
+    {RejectEDM94SameThread("EDM239_SEQUENCE_SOURCE_SCOPE",m_gapDryRun.sourceLine);return nullptr;}
+    const bool mixedCenterSequence=b.has('L')&&b.val('L')==240.0;
+    if(mixedCenterSequence!=(E237ArmSequence(armSource->parsedBlock,s.gapHistoryArm)&&
+            EDM77::Detail::EqualLiteral(armSource->parsedBlock.expression('L'),240U))||
+        mixedCenterSequence!=EDM130::IsG76CenterSequence240(m_edm130.recipe))
+    {RejectEDM94SameThread("EDM240_SEQUENCE_SOURCE_SCOPE",m_gapDryRun.sourceLine);return nullptr;}
+    const bool allKindsCenter=(s.gapHistoryArm==EDM173::B3ArmP||s.gapHistoryArm==EDM173::B4ArmP)&&b.has('L')&&b.val('L')==241.0;
+    if(allKindsCenter!=((s.gapHistoryArm==EDM173::B3ArmP||s.gapHistoryArm==EDM173::B4ArmP)&&
+            E237ArmSequence(armSource->parsedBlock,s.gapHistoryArm)&&
+            EDM77::Detail::EqualLiteral(armSource->parsedBlock.expression('L'),241U))||
+        allKindsCenter!=EDM130::IsG76CenterSequence241(m_edm130.recipe))
+    {RejectEDM94SameThread("EDM241_SEQUENCE_SOURCE_SCOPE",m_gapDryRun.sourceLine);return nullptr;}
+    const bool adjacentCenter=(s.gapHistoryArm==EDM173::B3ArmP||s.gapHistoryArm==EDM173::B4ArmP)&&b.has('L')&&b.val('L')==242.0;
+    if(adjacentCenter!=((s.gapHistoryArm==EDM173::B3ArmP||s.gapHistoryArm==EDM173::B4ArmP)&&
+            E237ArmSequence(armSource->parsedBlock,s.gapHistoryArm)&&
+            EDM77::Detail::EqualLiteral(armSource->parsedBlock.expression('L'),242U))||
+        adjacentCenter!=EDM130::IsG76CenterSequence242(m_edm130.recipe))
+    {RejectEDM94SameThread("EDM242_SEQUENCE_SOURCE_SCOPE",m_gapDryRun.sourceLine);return nullptr;}
+    const bool twoBridgeCenter=(s.gapHistoryArm==EDM173::B3ArmP||s.gapHistoryArm==EDM173::B4ArmP)&&b.has('L')&&b.val('L')==243.0;
+    if(twoBridgeCenter!=((s.gapHistoryArm==EDM173::B3ArmP||s.gapHistoryArm==EDM173::B4ArmP)&&
+            E237ArmSequence(armSource->parsedBlock,s.gapHistoryArm)&&
+            EDM77::Detail::EqualLiteral(armSource->parsedBlock.expression('L'),243U))||
+        twoBridgeCenter!=EDM130::IsG76CenterSequence243(m_edm130.recipe))
+    {RejectEDM94SameThread("EDM243_SEQUENCE_SOURCE_SCOPE",m_gapDryRun.sourceLine);return nullptr;}
+    const bool repeatedCenter=(s.gapHistoryArm==EDM173::B3ArmP||s.gapHistoryArm==EDM173::B4ArmP)&&b.has('L')&&b.val('L')==244.0;
+    if(repeatedCenter!=((s.gapHistoryArm==EDM173::B3ArmP||s.gapHistoryArm==EDM173::B4ArmP)&&
+            E237ArmSequence(armSource->parsedBlock,s.gapHistoryArm)&&
+            EDM77::Detail::EqualLiteral(armSource->parsedBlock.expression('L'),244U))||
+        repeatedCenter!=EDM130::IsG76CenterSequence244(m_edm130.recipe))
+    {RejectEDM94SameThread("EDM244_SEQUENCE_SOURCE_SCOPE",m_gapDryRun.sourceLine);return nullptr;}
+    const bool ordinaryRepeatProgram=b.has('L')&&b.val('L')==245.0;
+    const bool ordinaryRepeatCenter=ordinaryRepeatProgram&&s.gapHistoryArm==EDM173::B3ArmP;
+    if((ordinaryRepeatProgram&&s.gapHistoryArm!=EDM173::B2ArmP&&s.gapHistoryArm!=EDM173::B3ArmP)||
+        ordinaryRepeatCenter!=(s.gapHistoryArm==EDM173::B3ArmP&&E237ArmSequence(armSource->parsedBlock,s.gapHistoryArm)&&
+            EDM77::Detail::EqualLiteral(armSource->parsedBlock.expression('L'),245U))||
+        ordinaryRepeatCenter!=EDM130::IsG76CenterSequence245(m_edm130.recipe))
+    {RejectEDM94SameThread("EDM245_SEQUENCE_SOURCE_SCOPE",m_gapDryRun.sourceLine);return nullptr;}
+    const bool ordinaryB4Program=b.has('L')&&b.val('L')==246.0;
+    const bool ordinaryB4Center=ordinaryB4Program&&s.gapHistoryArm==EDM173::B4ArmP;
+    if((ordinaryB4Program&&s.gapHistoryArm!=EDM173::B2ArmP&&s.gapHistoryArm!=EDM173::B4ArmP)||
+        ordinaryB4Center!=(s.gapHistoryArm==EDM173::B4ArmP&&E237ArmSequence(armSource->parsedBlock,s.gapHistoryArm)&&
+            EDM77::Detail::EqualLiteral(armSource->parsedBlock.expression('L'),246U))||
+        ordinaryB4Center!=EDM130::IsG76CenterSequence246(m_edm130.recipe))
+    {RejectEDM94SameThread("EDM246_SEQUENCE_SOURCE_SCOPE",m_gapDryRun.sourceLine);return nullptr;}
+    const bool repeatedB2Program=b.has('L')&&b.val('L')==247.0;
+    const bool repeatedB2Center=repeatedB2Program&&s.gapHistoryArm==EDM173::B3ArmP;
+    if((repeatedB2Program&&s.gapHistoryArm!=EDM173::B2ArmP&&s.gapHistoryArm!=EDM173::B3ArmP)||
+        repeatedB2Center!=(s.gapHistoryArm==EDM173::B3ArmP&&E237ArmSequence(armSource->parsedBlock,s.gapHistoryArm)&&
+            EDM77::Detail::EqualLiteral(armSource->parsedBlock.expression('L'),247U))||
+        repeatedB2Center!=EDM130::IsG76CenterSequence247(m_edm130.recipe))
+    {RejectEDM94SameThread("EDM247_SEQUENCE_SOURCE_SCOPE",m_gapDryRun.sourceLine);return nullptr;}
+    const bool repeatedB2B4Program=b.has('L')&&b.val('L')==248.0;
+    const bool repeatedB2B4Center=repeatedB2B4Program&&s.gapHistoryArm==EDM173::B4ArmP;
+    if((repeatedB2B4Program&&s.gapHistoryArm!=EDM173::B2ArmP&&s.gapHistoryArm!=EDM173::B4ArmP)||
+        repeatedB2B4Center!=(s.gapHistoryArm==EDM173::B4ArmP&&E237ArmSequence(armSource->parsedBlock,s.gapHistoryArm)&&
+            EDM77::Detail::EqualLiteral(armSource->parsedBlock.expression('L'),248U))||
+        repeatedB2B4Center!=EDM130::IsG76CenterSequence248(m_edm130.recipe))
+    {RejectEDM94SameThread("EDM248_SEQUENCE_SOURCE_SCOPE",m_gapDryRun.sourceLine);return nullptr;}
+    const bool squareB1Program=b.has('L')&&b.val('L')==250.0;
+    if(squareB1Program!=E250SquareB1Arm(armSource->parsedBlock,s.gapHistoryArm)||
+        squareB1Program!=EDM130::IsG76SquareB1_250(m_edm130.recipe)||
+        !E251SquareSourcePair(armSource->parsedBlock,w.authored))
+    {RejectEDM94SameThread("EDM250_SQUARE_SOURCE_SCOPE",m_gapDryRun.sourceLine);return nullptr;}
+    const bool squareB2Program=b.has('L')&&b.val('L')==251.0;
+    if(squareB2Program!=E251SquareB2Arm(armSource->parsedBlock,s.gapHistoryArm)||
+        squareB2Program!=EDM130::IsG76SquareB2_251(m_edm130.recipe))
+    {RejectEDM94SameThread("EDM251_SQUARE_SOURCE_SCOPE",m_gapDryRun.sourceLine);return nullptr;}
+    const bool squareB3Program=b.has('L')&&b.val('L')==252.0;
+    if(squareB3Program!=E252SquareB3Arm(armSource->parsedBlock,s.gapHistoryArm)||
+        squareB3Program!=EDM130::IsG76SquareB3_252(m_edm130.recipe))
+    {RejectEDM94SameThread("EDM252_SQUARE_SOURCE_SCOPE",m_gapDryRun.sourceLine);return nullptr;}
+    const bool squareB4Program=b.has('L')&&b.val('L')==253.0;
+    if(squareB4Program!=E253SquareB4Arm(armSource->parsedBlock,s.gapHistoryArm)||
+        squareB4Program!=EDM130::IsG76SquareB4_253(m_edm130.recipe))
+    {RejectEDM94SameThread("EDM253_SQUARE_SOURCE_SCOPE",m_gapDryRun.sourceLine);return nullptr;}
+    const bool diamondProgram=b.has('L')&&b.val('L')==255.0;
+    if(diamondProgram!=E255DiamondB1Arm(armSource->parsedBlock,s.gapHistoryArm)||
+        diamondProgram!=EDM130::IsG76DiamondB1_255(m_edm130.recipe))
+    {RejectEDM94SameThread("EDM255_DIAMOND_SOURCE_SCOPE",m_gapDryRun.sourceLine);return nullptr;}
+    const bool diamondB2Program=b.has('L')&&b.val('L')==256.0;
+    if(diamondB2Program!=E256DiamondB2Arm(armSource->parsedBlock,s.gapHistoryArm)||
+        diamondB2Program!=EDM130::IsG76DiamondB2_256(m_edm130.recipe))
+    {RejectEDM94SameThread("EDM256_DIAMOND_SOURCE_SCOPE",m_gapDryRun.sourceLine);return nullptr;}
+    const bool diamondB3Program=b.has('L')&&b.val('L')==257.0;
+    if(diamondB3Program!=E257DiamondB3Arm(armSource->parsedBlock,s.gapHistoryArm)||
+        diamondB3Program!=EDM130::IsG76DiamondB3_257(m_edm130.recipe))
+    {RejectEDM94SameThread("EDM257_DIAMOND_SOURCE_SCOPE",m_gapDryRun.sourceLine);return nullptr;}
+    const bool diamondB4Program=b.has('L')&&b.val('L')==258.0;
+    if(diamondB4Program!=E258DiamondB4Arm(armSource->parsedBlock,s.gapHistoryArm)||
+        diamondB4Program!=EDM130::IsG76DiamondB4_258(m_edm130.recipe))
+    {RejectEDM94SameThread("EDM258_DIAMOND_SOURCE_SCOPE",m_gapDryRun.sourceLine);return nullptr;}
+    const bool oneMmProgram=b.has('L')&&(b.val('L')==260.0||b.val('L')==261.0||b.val('L')==262.0||b.val('L')==263.0);
+    if(oneMmProgram!=E260OneMmArm(armSource->parsedBlock,s.gapHistoryArm)||
+        oneMmProgram!=EDM130::IsG76OneMm260(m_edm130.recipe)||
+        (oneMmProgram&&(b.val('L')!=static_cast<double>(m_edm130.recipe.flushHoldTest)||
+            E260OneMmMode(armSource->parsedBlock)!=EDM130::G76PlanMode(m_edm130.recipe))))
+    {RejectEDM94SameThread("EDM260_ONE_MM_SOURCE_SCOPE",m_gapDryRun.sourceLine);return nullptr;}
+    const bool polygonB2Program=b.has('L')&&b.val('L')==264.0;
+    const auto* polygonSource=EDM130::G76PlanMode(m_edm130.recipe)==16U?
+        GetBaseProgramCache().TryGetLine(s.pc[0U]):nullptr;
+    if(polygonB2Program!=E261PolygonB2Arm(armSource->parsedBlock,s.gapHistoryArm)||
+        polygonB2Program!=EDM130::IsG76PolygonB2_261(m_edm130.recipe)||
+        (EDM130::G76PlanMode(m_edm130.recipe)==16U&&
+            (!polygonSource||!E180LiteralAngleSourceMatches(polygonSource->parsedBlock,w.authored)||
+             !w.authored.has('Q')||w.nominal.program.input.polygonSides!=static_cast<unsigned>(w.authored.val('Q')))))
+    {RejectEDM94SameThread("EDM261_POLYGON_SOURCE_SCOPE",m_gapDryRun.sourceLine);return nullptr;}
+    const bool expansionProgram=b.has('L')&&b.val('L')>=265.0&&b.val('L')<=272.0&&std::floor(b.val('L'))==b.val('L');
+    const auto* expansionSource=EDM130::IsG76Expansion263(m_edm130.recipe)?GetBaseProgramCache().TryGetLine(s.pc[0U]):nullptr;
+    if(expansionProgram!=E263ExpansionArm(armSource->parsedBlock,s.gapHistoryArm)||
+        expansionProgram!=EDM130::IsG76Expansion263(m_edm130.recipe)||
+        (expansionProgram&&(!expansionSource||!E180LiteralAngleSourceMatches(expansionSource->parsedBlock,w.authored)||
+            b.val('L')!=static_cast<double>(m_edm130.recipe.flushHoldTest)||
+            E263ExpansionMode(armSource->parsedBlock)!=EDM130::G76PlanMode(m_edm130.recipe)||
+            !E263ExpansionOrbitShape(w.authored)||w.nominal.count!=EDM173::CountForRecipe(m_edm130.recipe)||
+            w.nominal.program.input.polygonSides!=(w.authored.val('P')==26.0?static_cast<unsigned>(w.authored.val('Q')):0U))))
+    {RejectEDM94SameThread("EDM263_EXPANSION_SOURCE_SCOPE",m_gapDryRun.sourceLine);return nullptr;}
     if(!m_motion.SubmitEDM173Arm(s.session,s.armEpoch,s.lease,s.gapTuning,s.gapFlushParameters,m_edm130.recipe,rejectBeforeArm))
     {RejectEDM94SameThread("EDM173_ARM_PUBLICATION",m_gapDryRun.sourceLine);return nullptr;}
     s.latched=s.armPending=true;
@@ -26724,11 +29976,24 @@ WaitConditionFunc NCManager::StartEDM173SameThread(const NCBlock& b)
         }
     }
     // EDM204_FIX1_CENTER_PID_CONFIG_END
-    RtPrintf("[EDM173] event=ARM_REQUEST session=%llu run=%llu cache=%llu armEpoch=%llu source=AUTO_WAVE ADrequired=0 parentPC=%d children=25 E5us=%llu E6microMm=%llu motion=REAL_ETHERCAT S92=0 S93=0 coreBuild=%u p50Bulk=QUIET timing=ON rtEvidence=ON B=%u arm=P%u\n",
+    if(EDM130::G76EventLimit(m_edm130.recipe)==2U)
+        PrintNCG76DiagnosticLine("[%s] event=TWO_E5_ARMED session=%llu B=%u L=%u expectedEvents=2 workTimeUs=%llu timer=COMMITTED_MACHINING_ONLY rearm=AFTER_EXACT_RETURN autoHold=%u discharge=0\n",
+            centerSecondReturnHold?"EDM232":centerSecondFlushHold?"EDM231":"EDM230",static_cast<unsigned long long>(s.session),
+            EDM173::ModeForArm(s.gapHistoryArm),static_cast<unsigned>(m_edm130.recipe.flushHoldTest),
+            static_cast<unsigned long long>(m_edm130.recipe.workTimeUs),(centerSecondFlushHold||centerSecondReturnHold)?1U:0U);
+    // Compiler macro evidence only; this does not certify optimization flags.
+#if defined(_DEBUG)
+    const char* const buildMode="DEBUG";
+#elif defined(NDEBUG)
+    const char* const buildMode="RELEASE";
+#else
+    const char* const buildMode="UNSPECIFIED";
+#endif
+    RtPrintf("[EDM173] event=ARM_REQUEST session=%llu run=%llu cache=%llu armEpoch=%llu source=AUTO_WAVE ADrequired=0 parentPC=%d children=%u E5us=%llu E6microMm=%llu motion=REAL_ETHERCAT S92=0 S93=0 coreBuild=%u diagPolicy=EDM231_FIX5 p50Bulk=QUIET_RUN_HOLD periodicTimingText=DEFER_RUN_HOLD scopeCheck=CALL_LOCAL_CENTER_FLUSH buildMode=%s buildEvidence=PREPROCESSOR_MACROS timing=ON rtEvidence=ON B=%u arm=P%u\n",
         static_cast<unsigned long long>(s.session),static_cast<unsigned long long>(s.run),static_cast<unsigned long long>(s.cache),
-        static_cast<unsigned long long>(s.armEpoch),s.pc[0U],static_cast<unsigned long long>(m_edm130.recipe.workTimeUs),
+        static_cast<unsigned long long>(s.armEpoch),s.pc[0U],EDM173::CountForRecipe(m_edm130.recipe),static_cast<unsigned long long>(m_edm130.recipe.workTimeUs),
         static_cast<unsigned long long>(m_edm130.recipe.jumpHeightScaled),
-        static_cast<unsigned>(m_motion.GetEDM173ImplementationRevision()),EDM173::ModeForArm(s.gapHistoryArm),s.gapHistoryArm);
+        static_cast<unsigned>(m_motion.GetEDM173ImplementationRevision()),buildMode,EDM173::ModeForArm(s.gapHistoryArm),s.gapHistoryArm);
     return [](NCManager* n){return n->WaitEDM173SameThread();};
 }
 
@@ -26766,16 +30031,17 @@ WaitConditionFunc NCManager::StartEDM173OrbitSameThread(const NCBlock& b)
             EDM173::IsB4Recipe(w.plan.recipe)?"G76_B4_CENTER_RETURN_MM_MIN":"G76_B3_CENTER_RETURN_MM_MIN",
             configuredCenterReturnFeed>0.0?"PARAMETER":"G76_F",configuredCenterReturnFeed,
             g.feed.feedMMMin,w.plan.centerReturnFeedMmMin);
+    const unsigned count=EDM173::CountForRecipe(w.plan.recipe);
     NCG76Mixed::Point8 stationaryRotaryModulo{};
     for(unsigned axis=3U;axis<6U;++axis)
         stationaryRotaryModulo[axis]=m_fixedTranslationTravel[axis].rotaryModulo;
     const bool accepted=m_motion.TryG76GapMoveTransactionalTail(w.plan,CoordSys.commandedMCS,g.receipt,&stationaryRotaryModulo);const auto& r=g.receipt;
-    bool valid=accepted&&r.valid&&r.commandAccepted&&r.captureBound&&r.tailCommitted&&r.count==25U&&r.axisMask==7U&&
+    bool valid=accepted&&r.valid&&r.commandAccepted&&r.captureBound&&r.tailCommitted&&r.count==count&&r.axisMask==7U&&
         r.ownerLease.Matches(s.lease)&&r.translationGeneration==w.nominal.translationGeneration&&
         r.tail.IsCommitted()&&r.tail.captureBound&&r.tail.endpointExact&&r.tail.accountingValid&&
         r.tail.axisMask==r.validAxisMask&&r.tail.ownerLease.Matches(r.ownerLease)&&
         r.validAxisMask!=0U&&(r.validAxisMask&7U)==7U;
-    for(unsigned k=0U;k<25U&&valid;++k)
+    for(unsigned k=0U;k<count&&valid;++k)
     {
         const auto& id=r.identities[k];valid=id.IsAssigned()&&id.epoch==m_motion.GetCurrentExecutionEpoch()&&
             id.source==MotionCommandSource::NC_MEMORY&&id.sourceBlockId==static_cast<MotionSourceBlockId>(g.pc)&&
@@ -26783,17 +30049,17 @@ WaitConditionFunc NCManager::StartEDM173OrbitSameThread(const NCBlock& b)
         for(unsigned axis=0U;axis<8U&&valid;++axis)valid=EDM109::SameDouble(r.legEndMCS[k][axis],w.nominal.pointsMCS[k][axis]);
     }
     valid=valid&&IsFixedTranslationTravelCurrentSameThread()&&
-        EDM173::BuildNominal(w.plan,r.startPulse,r.pulsePerUnit,w.canonical,&stationaryRotaryModulo)&&w.canonical.count==25U;
-    for(unsigned k=0U;k<25U&&valid;++k)
+        EDM173::BuildNominal(w.plan,r.startPulse,r.pulsePerUnit,w.canonical,&stationaryRotaryModulo)&&w.canonical.count==count;
+    for(unsigned k=0U;k<count&&valid;++k)
         for(unsigned axis=0U;axis<8U&&valid;++axis)
             valid=EDM109::SameDouble(r.legEndPulse[k][axis],w.canonical.geometry[k].endPulse[axis]);
-    valid=valid&&r.tail.identity.Matches(r.identities[24U])&&r.tail.identity.source==r.identities[24U].source&&
-        r.tail.identity.sourceBlockId==r.identities[24U].sourceBlockId;
+    valid=valid&&r.tail.identity.Matches(r.identities[count-1U])&&r.tail.identity.source==r.identities[count-1U].source&&
+        r.tail.identity.sourceBlockId==r.identities[count-1U].sourceBlockId;
     for(unsigned axis=0U;axis<8U&&valid;++axis)
         valid=EDM109::SameDouble(r.startMCS[axis],w.nominal.startMCS[axis])&&
-            EDM109::SameDouble(r.endMCS[axis],w.nominal.pointsMCS[24U][axis])&&
+            EDM109::SameDouble(r.endMCS[axis],w.nominal.pointsMCS[count-1U][axis])&&
             EDM109::SameDouble(CoordSys.commandedMCS[axis],r.endMCS[axis])&&
-            EDM109::SameDouble(r.endPulse[axis],w.canonical.geometry[24U].endPulse[axis]);
+            EDM109::SameDouble(r.endPulse[axis],w.canonical.geometry[count-1U].endPulse[axis]);
     if(!valid)
     {
         RtPrintf("[EDM173_FIX1] event=PARENT_REJECT session=%llu parentPC=%d accepted=%u gate=%s reason=%u axis=%d segment=%d discharge=0\n",
@@ -26801,9 +30067,44 @@ WaitConditionFunc NCManager::StartEDM173OrbitSameThread(const NCBlock& b)
             static_cast<unsigned>(r.rejectionReason),r.rejectionAxis,r.rejectionSegment);
         RejectG76OrbitSameThread("EDM173_NATIVE_RECEIPT",AlarmManager::MOTION_GROUP_MAPPING_INTEGRITY);return nullptr;
     }
+    // EDM233_PARENT_EPOCH_BIND_BEGIN
+    // The native transaction above owns the one authorized epoch advance.
+    // Bind only its fully committed, exact 25-child receipt; the guard's arm
+    // identity remains unchanged and the later NC aggregate commit is required.
+    if(EDM130::IsG76ParentSequence233(w.plan.recipe))
+    {
+        auto& q=m_edm233;
+        const MotionExecutionEpoch nativeEpoch=r.identities[0U].epoch;
+        const MotionExecutionEpoch expectedEpoch=s.armEpoch==(std::numeric_limits<MotionExecutionEpoch>::max)()?1U:s.armEpoch+1U;
+        const bool parentBound=q.authorized&&!q.releasePending&&q.firstReleased==q.secondStarted&&q.firstSession&&
+            (q.secondStarted?s.session>q.firstSession:s.session==q.firstSession)&&
+            q.epoch==s.armEpoch&&nativeEpoch==expectedEpoch&&nativeEpoch==m_motion.GetCurrentExecutionEpoch()&&
+            s.armPC==q.firstArmPC+(q.secondStarted?3:0)&&s.gapHistoryArm==q.arms[q.secondStarted?1U:0U]&&
+            s.run==q.run&&s.cache==q.cache&&s.lease.Matches(q.lease)&&
+            g.run==q.run&&g.cache==q.cache&&g.pc==s.pc[0U]&&g.dispatch>s.armDispatch&&
+            w.plan.scope.session==s.session&&w.plan.scope.run==q.run&&w.plan.scope.cache==q.cache&&
+            w.plan.scope.armEpoch==s.armEpoch&&w.plan.scope.owner.Matches(q.lease)&&
+            w.plan.scope.dispatch==g.dispatch&&w.plan.scope.sourcePC==g.pc&&w.plan.scope.line==g.line;
+        if(!parentBound)
+        {RejectG76OrbitSameThread("EDM233_PARENT_EPOCH_RECEIPT",AlarmManager::MOTION_GROUP_MAPPING_INTEGRITY);return nullptr;}
+        // This NC-owner mutation is provisional until all non-epoch sequence
+        // fences are rechecked. A rejection clears the entire grant and stops
+        // the already accepted parent through the existing rejection path.
+        q.epoch=nativeEpoch;
+        if(!IsEDM233SequenceScopeCurrentSameThread())
+        {RejectG76OrbitSameThread("EDM233_PARENT_EPOCH_SCOPE",AlarmManager::MOTION_GROUP_MAPPING_INTEGRITY);return nullptr;}
+        PrintNCG76DiagnosticLine("[EDM233] event=PARENT_EPOCH_BOUND parent=%u session=%llu armEpoch=%llu liveEpoch=%llu dispatch=%llu children=25 proof=COMMITTED_NATIVE_RECEIPT aggregateCommit=STILL_REQUIRED discharge=0\n",
+            q.secondStarted?2U:1U,static_cast<unsigned long long>(s.session),static_cast<unsigned long long>(s.armEpoch),
+            static_cast<unsigned long long>(nativeEpoch),static_cast<unsigned long long>(g.dispatch));
+    }
+    // EDM233_PARENT_EPOCH_BIND_END
+    if(m_edm237.authorized&&!BindEDM237ParentEpochSameThread(r.identities[0U].epoch,g.dispatch,g.pc))
+    {RejectG76OrbitSameThread("EDM237_PARENT_EPOCH_RECEIPT",AlarmManager::MOTION_GROUP_MAPPING_INTEGRITY);return nullptr;}
+    if(m_edm234.authorized&&!BindEDM234ParentEpochSameThread(r.identities[0U].epoch,g.dispatch,g.pc))
+    {RejectG76OrbitSameThread("EDM234_PARENT_EPOCH_RECEIPT",AlarmManager::MOTION_GROUP_MAPPING_INTEGRITY);return nullptr;}
     g.active=true;w.published=true;
-    RtPrintf("[EDM173] event=PARENT_PUBLISHED session=%llu parentPC=%d dispatch=%llu children=25 fingerprint=%llu trigger=E5_COMMITTED_MACHINING_TIME discharge=0\n",
-        static_cast<unsigned long long>(s.session),g.pc,static_cast<unsigned long long>(g.dispatch),static_cast<unsigned long long>(w.plan.fingerprint));
+    RtPrintf("[EDM173] event=PARENT_PUBLISHED session=%llu parentPC=%d dispatch=%llu children=%u fingerprint=%llu trigger=E5_COMMITTED_MACHINING_TIME discharge=0\n",
+        static_cast<unsigned long long>(s.session),g.pc,static_cast<unsigned long long>(g.dispatch),count,static_cast<unsigned long long>(w.plan.fingerprint));
     return [](NCManager* n){return n->CompleteG76OrbitSameThread();};
 }
 
@@ -26813,6 +30114,16 @@ bool NCManager::IsEDM173RuntimeCompleteSameThread() noexcept
     if(!w.published||!w.parentCommitted||!EDM173::Valid(w.plan)||!s.latched||!EDM173::IsArm(s.gapHistoryArm)||s.cancelled||
         !EDM173::RecipeMatchesArm(s.gapHistoryArm,w.plan.recipe)||g.mode!=EDM173::ModeForArm(s.gapHistoryArm)||
         s.resetSeen||s.releaseRequested||s.rtFaultReported||s.run!=g.run||s.cache!=g.cache||!s.lease.Matches(g.receipt.ownerLease)) return false;
+    const unsigned count=EDM173::CountForRecipe(w.plan.recipe);
+    if(g.receipt.count!=count||w.nominal.count!=count||w.nominal.modeP!=w.plan.nominal.modeP)return false;
+    if(NCG76Mode::IsPolygon(EDM130::G76PlanMode(w.plan.recipe))||EDM130::IsG76Expansion263(w.plan.recipe))
+    {
+        const auto* source=GetBaseProgramCache().TryGetLine(g.pc);
+        if(!source||!E180LiteralAngleSourceMatches(source->parsedBlock,w.authored)||
+            !IsEDM173OrbitBlockShapeValid(w.authored)||w.authored.val('P')!=static_cast<double>(EDM130::G76PlanMode(w.plan.recipe))||
+            (NCG76Mode::IsPolygon(EDM130::G76PlanMode(w.plan.recipe))?static_cast<unsigned>(w.authored.val('Q')):0U)!=w.plan.nominal.program.input.polygonSides||
+            w.nominal.program.input.polygonSides!=w.plan.nominal.program.input.polygonSides)return false;
+    }
     EDM173::Feedback feedback{};EDM126::MotionFeedback history{};EDM128::MotionFeedback timed{};EDM114::Feedback geometry{};
     if(!m_motion.ReadEDM173Feedback(feedback)||!m_motion.ReadEDM126Feedback(history)||!m_motion.ReadEDM130Feedback(timed)||
         !m_motion.ReadEDM114Feedback(geometry)) return false;
@@ -26825,28 +30136,27 @@ bool NCManager::IsEDM173RuntimeCompleteSameThread() noexcept
         scope.sourcePC==g.pc&&scope.line==g.line&&scope.armEpoch==s.armEpoch&&scope.owner.Matches(s.lease)&&
         feedback.fingerprint==plan.fingerprint&&feedback.liveEpoch==m_motion.GetCurrentExecutionEpoch();
     if(!identity||!feedback.enabled||!feedback.active||feedback.faulted||!feedback.tick||!feedback.eventRetained||
-        feedback.authorizedChildren!=25U||feedback.completedChildren!=25U||!history.enabled||history.faulted||history.physicalAd||
+        feedback.authorizedChildren!=count||feedback.completedChildren!=count||!history.enabled||history.faulted||history.physicalAd||
         history.session!=s.session||history.armEpoch!=s.armEpoch||history.liveEpoch!=feedback.liveEpoch||history.ownerGeneration!=s.lease.generation||
-        history.fixture!=14U||history.reason!=EDM126::Reason::None||!history.tick||!history.nowUs||!history.sourceSequence||history.authorizedRows!=25U||history.completedRows!=25U||history.rowActive||!history.rowCompleted||
+        history.fixture!=14U||history.reason!=EDM126::Reason::None||!history.tick||!history.nowUs||!history.sourceSequence||history.authorizedRows!=count||history.completedRows!=count||history.rowActive||!history.rowCompleted||
         !history.sourceReady||history.sourceReason!=EDM88::Reason::None||!history.sourceCapturedUs||
         history.nowUs<history.sourceCapturedUs||history.nowUs-history.sourceCapturedUs>EDM126::MaximumSourceAgeUs||
         !timed.enabled||timed.faulted||!timed.workTimeFlush||timed.physicalAd||timed.session!=s.session||timed.armEpoch!=s.armEpoch||
         timed.liveEpoch!=feedback.liveEpoch||timed.ownerGeneration!=s.lease.generation||timed.fixture!=14U||
-        timed.authorizedRows!=25U||timed.completedRows!=25U||!EDM130::SameRecipe(timed.timerRecipe,m_edm130.recipe)) return false;
-    const auto& cursor=history.traversal;const auto& last=g.receipt.identities[24U];
-    if(cursor.faulted||cursor.stopRequested||cursor.stopped||!cursor.completeReady||cursor.historyDepth||cursor.velocityMmSec!=0.0||
-        cursor.authorizedSource.ordinal!=24U||cursor.authorizedSource.dispatch!=g.dispatch||cursor.authorizedSource.sourcePC!=g.pc||
+        timed.authorizedRows!=count||timed.completedRows!=count||!EDM130::SameRecipe(timed.timerRecipe,m_edm130.recipe)) return false;
+    const unsigned expectedEvents=EDM130::G76EventLimit(plan.recipe);
+    const auto& cursor=history.traversal;const auto& last=g.receipt.identities[count-1U];
+    if(feedback.retainedEvents!=expectedEvents||cursor.faulted||cursor.stopRequested||cursor.stopped||
+        !cursor.completeReady||cursor.historyDepth||cursor.velocityMmSec!=0.0||
+        cursor.authorizedSource.ordinal!=count-1U||cursor.authorizedSource.dispatch!=g.dispatch||cursor.authorizedSource.sourcePC!=g.pc||
         cursor.authorizedSource.segment!=last.segmentId||cursor.authorizedSource.epoch!=last.epoch||
         !EDM126::SameSource(cursor.authorizedSource,cursor.cursorSource)||
-        e.policy.mode!=expectedMode||e.policy.fixture!=EDM116::Fixture::ModalG76Gap173||
-        e.eventCount!=1U||e.modeEvents[mode]!=1U||
-        e.work.triggeredEvents!=1ULL||e.work.completedEvents!=1ULL||!e.exactReturn||!e.rowEventComplete||
-        !EDM128::ValidHeightProof(e,EDM173::FrozenHeightMm(plan.recipe),0U,1.0,true)||!EDM128::ValidSpeedProof(e,m_edm130.recipe.flushStages)||
-        timed.coordinator.work.triggeredEvents!=1ULL||timed.coordinator.work.completedEvents!=1ULL||
-        timed.coordinator.eventCount!=1U||timed.coordinator.modeEvents[mode]!=1U||
-        timed.coordinator.policy.mode!=expectedMode||timed.coordinator.policy.fixture!=EDM116::Fixture::ModalG76Gap173) return false;
+        timed.coordinator.work.triggeredEvents!=expectedEvents||timed.coordinator.work.completedEvents!=expectedEvents||
+        timed.coordinator.eventCount!=expectedEvents||timed.coordinator.modeEvents[mode]!=expectedEvents||
+        timed.coordinator.policy.mode!=expectedMode||timed.coordinator.policy.fixture!=EDM116::Fixture::ModalG76Gap173||
+        EDM116::PolicyRows(timed.coordinator.policy)!=count||EDM116::PolicyRows(timed.rowPolicy)!=count) return false;
     for(unsigned eventMode=0U;eventMode<EDM116::ModeCount;++eventMode)
-        if(eventMode!=mode&&(e.modeEvents[eventMode]||timed.coordinator.modeEvents[eventMode]))return false;
+        if(eventMode!=mode&&timed.coordinator.modeEvents[eventMode])return false;
     if(!b2&&(feedback.eventBackwardCrossings||feedback.eventForwardCrossings))return false;
     const auto& work=e.work;const auto& finalWork=timed.coordinator.work;
     if(work.workTimeUs!=plan.recipe.workTimeUs||finalWork.workTimeUs!=plan.recipe.workTimeUs||
@@ -26855,170 +30165,221 @@ bool NCManager::IsEDM173RuntimeCompleteSameThread() noexcept
         work.lastCompleteTick!=finalWork.lastCompleteTick||work.lastCompleteUs!=finalWork.lastCompleteUs||
         work.lastCompleteTick>feedback.tick||work.lastCompleteTick>history.tick||work.lastCompleteUs>history.nowUs||
         !EDM130::ValidWorkEvidence(finalWork)) return false;
-    const auto& anchor=e.anchor.authorizedSource;const auto& anchorCursor=e.anchor.cursorSource;
-    const unsigned authorizedChild=static_cast<unsigned>(anchor.ordinal),child=static_cast<unsigned>(anchorCursor.ordinal);
-    const auto sourceFits=[&](const EDM126::Source& source,unsigned ordinal) noexcept {
-        return ordinal<25U&&source.ordinal==ordinal&&source.scope.session==s.session&&source.scope.run==s.run&&
-            source.scope.cache==s.cache&&source.scope.ownerGeneration==s.lease.generation&&
-            source.scope.translationGeneration==plan.nominal.translationGeneration&&source.scope.configTag&&source.scope.mappingTag&&
-            source.dispatch==g.dispatch&&source.sourcePC==g.pc&&source.epoch==g.receipt.identities[ordinal].epoch&&
-            source.segment==g.receipt.identities[ordinal].segmentId;
-    };
-    if(!sourceFits(cursor.authorizedSource,24U)||!sourceFits(anchor,authorizedChild)||!sourceFits(anchorCursor,child)||
-        child>authorizedChild||!EDM109::SameScope(anchor.scope,anchorCursor.scope)||
-        !EDM109::SameScope(anchor.scope,cursor.authorizedSource.scope)||
-        !EDM116::PolicyMatchesBinding(e.policy,authorizedChild,g.pc,g.dispatch)) return false;
-    EDM126::Point anchorStart{},anchorEnd{},anchorScale{},expectedAnchor{};
-    for(unsigned axis=0U;axis<6U;++axis)
-    {
-        anchorStart[axis]=child?g.receipt.legEndPulse[child-1U][axis]:g.receipt.startPulse[axis];
-        anchorEnd[axis]=g.receipt.legEndPulse[child][axis];anchorScale[axis]=g.receipt.pulsePerUnit[axis];
-    }
-    EDM109::Line anchorLine{};EDM112::Curve anchorCurve{};
-    if(!EDM109::BuildLine(anchorStart,anchorEnd,anchorScale,anchorLine)||!EDM112::BuildLine(anchorLine,anchorCurve)||
-        !std::isfinite(e.anchor.localMm)||e.anchor.localMm<0.0||e.anchor.localMm>anchorCurve.lengthMm||
-        !EDM112::EvaluateUnit(anchorCurve,e.anchor.localMm/anchorCurve.lengthMm,expectedAnchor)) return false;
-    for(unsigned axis=0U;axis<6U;++axis)
-    {
-        const double budget=64.0*(std::numeric_limits<double>::epsilon)()*(std::max)(1.0,std::fabs(expectedAnchor[axis]));
-        if(!std::isfinite(e.anchor.positionPulse[axis])||std::fabs(e.anchor.positionPulse[axis]-expectedAnchor[axis])>budget) return false;
-    }
-    if(b0)
-    {
-        // Reconstruct the native tangent from the genuine stopped child,
-        // independently of the runtime's captured direction. E6 is native
-        // distance; the nominal child already contains every compensation.
-        // Later children clear their local capture. The retained event owns
-        // geometry; the final coordinator contributes work/count/dwell totals.
-        if(e.detached||e.qualifiedDwells!=3U||timed.coordinator.qualifiedDwells!=3U||
-            plan.recipe.planMovementMask!=EDM173::NominalMovementMask(plan.nominal))return false;
-        const bool planar=plan.recipe.planMovementMask==3U;
-        if(planar&&(anchorStart[2U]!=g.receipt.startPulse[2U]||anchorEnd[2U]!=g.receipt.startPulse[2U]||
-            e.anchor.positionPulse[2U]!=g.receipt.startPulse[2U]||e.topPositionPulse[2U]!=g.receipt.startPulse[2U]||
-            e.tangentPulsePerMm[2U]!=0.0))return false;
-        EDM126::Point tangent{};double norm=0.0;
-        for(unsigned axis=0U;axis<6U;++axis)
-        {
-            if(axis>=3U&&!EDM109::SameDouble(anchorStart[axis],anchorEnd[axis]))return false;
-            tangent[axis]=(anchorEnd[axis]-anchorStart[axis])/anchorCurve.lengthMm;
-            if(axis<3U)norm=std::hypot(norm,tangent[axis]/anchorScale[axis]);
-        }
-        if(!EDM126::Positive(norm))return false;
-        for(unsigned axis=0U;axis<6U;++axis)
-        {
-            tangent[axis]/=norm;
-            const double top=tangent[axis]==0.0?e.anchor.positionPulse[axis]:
-                e.anchor.positionPulse[axis]-EDM173::FrozenHeightMm(plan.recipe)*tangent[axis];
-            if(!std::isfinite(tangent[axis])||!std::isfinite(top)||
-                !EDM109::SameDouble(e.tangentPulsePerMm[axis],tangent[axis])||
-                !EDM109::SameDouble(e.topPositionPulse[axis],top)||
-                (axis>=3U&&(!EDM109::SameDouble(tangent[axis],0.0)||
-                    !EDM109::SameDouble(top,e.anchor.positionPulse[axis]))))return false;
-        }
-    }
-    if(b2)
-    {
-        // The B2 apex is a cursor on the same sealed nominal parent, not a
-        // detached Z lift or a newly published child. Rebuild both stations
-        // from genuine child geometry; E6 is retained path length, not chord.
-        const unsigned targetChild=static_cast<unsigned>(e.targetSource.ordinal);
-        if(!sourceFits(e.targetSource,targetChild)||targetChild>child||
-            !EDM109::SameScope(anchorCursor.scope,e.targetSource.scope)||
-            e.qualifiedDwells!=3U||timed.coordinator.qualifiedDwells!=3U||
-            feedback.eventBackwardCrossings!=static_cast<std::uint64_t>(child-targetChild)||
-            feedback.eventForwardCrossings!=feedback.eventBackwardCrossings||
-            plan.recipe.planMovementMask!=EDM173::NominalMovementMask(plan.nominal))return false;
-        if(plan.recipe.planMovementMask==3U)
-        {
-            const double fixedZ=g.receipt.startPulse[2U];
-            if(anchorStart[2U]!=fixedZ||anchorEnd[2U]!=fixedZ||
-                e.anchor.positionPulse[2U]!=fixedZ||e.topPositionPulse[2U]!=fixedZ)return false;
-            for(unsigned k=0U;k<EDM173::NominalCount;++k)
-                if(g.receipt.legEndPulse[k][2U]!=fixedZ)return false;
-        }
-        const auto canonicalCursor=[&](unsigned ordinal,double localMm,EDM126::Point& point,double& station) noexcept {
-            station=0.0;
-            EDM126::Point from{},to{};EDM109::Line line{};EDM112::Curve curve{};
-            for(unsigned k=0U;k<=ordinal;++k)
-            {
-                for(unsigned axis=0U;axis<6U;++axis)
-                {
-                    from[axis]=k?g.receipt.legEndPulse[k-1U][axis]:g.receipt.startPulse[axis];
-                    to[axis]=g.receipt.legEndPulse[k][axis];
-                }
-                if(!EDM109::BuildLine(from,to,anchorScale,line)||!EDM112::BuildLine(line,curve))return false;
-                if(k==ordinal)
-                {
-                    if(!std::isfinite(localMm)||localMm<0.0||localMm>curve.lengthMm||
-                        !EDM112::EvaluateUnit(curve,localMm/curve.lengthMm,point))return false;
-                    station+=localMm;return std::isfinite(station);
-                }
-                station+=curve.lengthMm;
-                if(!std::isfinite(station))return false;
-            }
-            return false;
+    if(expectedEvents==2U&&!EDM173::FollowsCompletedEvent230(feedback.firstCompletedEvent,e))return false;
+    const auto validateEvent=[&](const EDM128::Feedback& e,unsigned ordinal) noexcept -> bool {
+        if(!ordinal||ordinal>expectedEvents||e.policy.mode!=expectedMode||
+            e.policy.fixture!=EDM116::Fixture::ModalG76Gap173||EDM116::PolicyRows(e.policy)!=count||e.eventIndex!=ordinal||
+            e.eventCount!=ordinal||e.modeEvents[mode]!=ordinal||e.work.triggeredEvents!=ordinal||
+            e.work.completedEvents!=ordinal||!e.exactReturn||!e.rowEventComplete||!e.topCaptured||
+            e.phase!=EDM128::Phase::Gap||e.detached||e.faulted||e.stopped||
+            e.work.workTimeUs!=plan.recipe.workTimeUs||!EDM130::ValidWorkEvidence(e.work)||
+            e.work.lastCompleteTick>feedback.tick||e.work.lastCompleteTick>history.tick||
+            e.work.lastCompleteUs>history.nowUs||
+            !EDM128::ValidHeightProof(e,EDM173::FrozenHeightMm(plan.recipe),0U,1.0,true)||
+            !EDM128::ValidSpeedProof(e,m_edm130.recipe.flushStages))return false;
+        // Modern commissioning events retain their complete dwell sequence and
+        // surround the genuine stop anchor. The four current clocks match above.
+        if(EDM130::IsG76CommissioningRecipe(plan.recipe)&&
+            (e.qualifiedDwells!=((b3||b4)?5U:3U)||timed.coordinator.qualifiedDwells!=((b3||b4)?5U:3U)||
+             !(e.work.lastTriggerTick<e.anchor.tick&&e.anchor.tick<e.work.lastCompleteTick&&
+               e.work.lastTriggerUs<e.anchor.nowUs&&e.anchor.nowUs<e.work.lastCompleteUs)))return false;
+        for(unsigned eventMode=0U;eventMode<EDM116::ModeCount;++eventMode)
+            if(eventMode!=mode&&e.modeEvents[eventMode])return false;
+        const auto& anchor=e.anchor.authorizedSource;const auto& anchorCursor=e.anchor.cursorSource;
+        const unsigned authorizedChild=static_cast<unsigned>(anchor.ordinal),child=static_cast<unsigned>(anchorCursor.ordinal);
+        const auto sourceFits=[&](const EDM126::Source& source,unsigned ordinal) noexcept {
+            return ordinal<count&&source.ordinal==ordinal&&source.scope.session==s.session&&source.scope.run==s.run&&
+                source.scope.cache==s.cache&&source.scope.ownerGeneration==s.lease.generation&&
+                source.scope.translationGeneration==plan.nominal.translationGeneration&&source.scope.configTag&&source.scope.mappingTag&&
+                source.dispatch==g.dispatch&&source.sourcePC==g.pc&&source.epoch==g.receipt.identities[ordinal].epoch&&
+                source.segment==g.receipt.identities[ordinal].segmentId;
         };
-        EDM126::Point canonicalAnchor{},canonicalTop{};double anchorStation=0.0,targetStation=0.0;
-        if(!canonicalCursor(child,e.anchor.localMm,canonicalAnchor,anchorStation)||
-            !canonicalCursor(targetChild,e.targetLocalMm,canonicalTop,targetStation)||
-            std::fabs(e.anchor.stationMm-anchorStation)>EDM126::Roundoff(anchorStation)||
-            std::fabs(e.targetStationMm-targetStation)>EDM126::Roundoff(targetStation)||
-            std::fabs((anchorStation-targetStation)-EDM173::FrozenHeightMm(plan.recipe))>
-                EDM126::Roundoff(anchorStation))return false;
+        if(!sourceFits(cursor.authorizedSource,count-1U)||!sourceFits(anchor,authorizedChild)||!sourceFits(anchorCursor,child)||
+            child>authorizedChild||!EDM109::SameScope(anchor.scope,anchorCursor.scope)||
+            !EDM109::SameScope(anchor.scope,cursor.authorizedSource.scope)||
+            !EDM116::PolicyMatchesBinding(e.policy,authorizedChild,g.pc,g.dispatch)) return false;
+        EDM126::Point anchorStart{},anchorEnd{},anchorScale{},expectedAnchor{};
         for(unsigned axis=0U;axis<6U;++axis)
         {
-            const double budget=64.0*(std::numeric_limits<double>::epsilon)()*(std::max)(1.0,std::fabs(canonicalTop[axis]));
-            if(!std::isfinite(e.topPositionPulse[axis])||std::fabs(e.topPositionPulse[axis]-canonicalTop[axis])>budget)return false;
+            anchorStart[axis]=child?g.receipt.legEndPulse[child-1U][axis]:g.receipt.startPulse[axis];
+            anchorEnd[axis]=g.receipt.legEndPulse[child][axis];anchorScale[axis]=g.receipt.pulsePerUnit[axis];
         }
-    }
-    EDM204::Geometry centerGeometry{};
-    if(b3||b4)
-    {
-        NCG76::Point8 centerStartMCS{},centerEndMCS{};
-        EDM126::Point nominalCenter{},axisNative{},axisPulse{};
-        if(!EDM128::ValidB3Proof(e)||!e.centerCaptured||e.centerLegsCompleted!=15U||
-            e.qualifiedDwells!=5U||timed.coordinator.qualifiedDwells!=5U||
-            !EDM109::SameDouble(e.centerReturnMmMin,plan.centerReturnFeedMmMin)||
-            !EDM173::CenterBoundary(plan,child,centerStartMCS)||
-            !EDM173::CenterBoundary(plan,child+1U,centerEndMCS)||
-            !EDM173::MachiningAxisNative(plan,axisNative))return false;
+        EDM109::Line anchorLine{};EDM112::Curve anchorCurve{};
+        if(!EDM109::BuildLine(anchorStart,anchorEnd,anchorScale,anchorLine)||!EDM112::BuildLine(anchorLine,anchorCurve)||
+            !std::isfinite(e.anchor.localMm)||e.anchor.localMm<0.0||e.anchor.localMm>anchorCurve.lengthMm||
+            !EDM112::EvaluateUnit(anchorCurve,e.anchor.localMm/anchorCurve.lengthMm,expectedAnchor)) return false;
         for(unsigned axis=0U;axis<6U;++axis)
         {
-            const double from=axis>=3U||centerStartMCS[axis]==plan.nominal.startMCS[axis]?g.receipt.startPulse[axis]:
-                centerStartMCS[axis]*g.receipt.pulsePerUnit[axis];
-            const double to=axis>=3U||centerEndMCS[axis]==plan.nominal.startMCS[axis]?g.receipt.startPulse[axis]:
-                centerEndMCS[axis]*g.receipt.pulsePerUnit[axis];
-            const double ratio=e.anchor.localMm/anchorCurve.lengthMm;
-            nominalCenter[axis]=ratio==0.0?from:ratio==1.0?to:from+(to-from)*ratio;
-            axisPulse[axis]=axisNative[axis]*anchorScale[axis];
-            const double budget=EDM204::Roundoff(nominalCenter[axis]);
-            if(!std::isfinite(nominalCenter[axis])||!std::isfinite(e.nominalCenterPositionPulse[axis])||
-                std::fabs(e.nominalCenterPositionPulse[axis]-nominalCenter[axis])>budget||
-                e.tangentPulsePerMm[axis]!=axisPulse[axis]||
-                (axis>=3U&&(!EDM109::SameDouble(nominalCenter[axis],e.anchor.positionPulse[axis])||
-                    !EDM109::SameDouble(e.nominalCenterPositionPulse[axis],e.anchor.positionPulse[axis]))))return false;
+            const double budget=64.0*(std::numeric_limits<double>::epsilon)()*(std::max)(1.0,std::fabs(expectedAnchor[axis]));
+            if(!std::isfinite(e.anchor.positionPulse[axis])||std::fabs(e.anchor.positionPulse[axis]-expectedAnchor[axis])>budget) return false;
         }
-        // Reconstruct from the sealed signed XYZ target, never the child tangent
-        // or the undirected orbit-plane normal. E6 is measured from nominal C.
-        if(!EDM204::Build(e.anchor.positionPulse,nominalCenter,axisPulse,anchorScale,
-            EDM173::FrozenHeightMm(plan.recipe),b3?3U:4U,centerGeometry))return false;
-        for(unsigned axis=0U;axis<6U;++axis)
+        if(b0)
         {
-            if(!std::isfinite(e.centerPositionPulse[axis])||!std::isfinite(e.topPositionPulse[axis])||
-                std::fabs(e.centerPositionPulse[axis]-centerGeometry.centerPulse[axis])>EDM204::Roundoff(centerGeometry.centerPulse[axis])||
-                std::fabs(e.topPositionPulse[axis]-centerGeometry.topPulse[axis])>EDM204::Roundoff(centerGeometry.topPulse[axis])||
-                (axis>=3U&&(!EDM109::SameDouble(e.centerPositionPulse[axis],e.anchor.positionPulse[axis])||
-                    !EDM109::SameDouble(e.topPositionPulse[axis],e.anchor.positionPulse[axis]))))return false;
+            // Reconstruct the native tangent from the genuine stopped child,
+            // independently of the runtime's captured direction. E6 is native
+            // distance; the nominal child already contains every compensation.
+            // Later children clear their local capture. The retained event owns
+            // geometry; the final coordinator contributes work/count/dwell totals.
+            if(e.detached||e.qualifiedDwells!=3U||timed.coordinator.qualifiedDwells!=3U||
+                plan.recipe.planMovementMask!=EDM173::NominalMovementMask(plan.nominal))return false;
+            const bool planar=plan.recipe.planMovementMask==3U;
+            if(planar&&(anchorStart[2U]!=g.receipt.startPulse[2U]||anchorEnd[2U]!=g.receipt.startPulse[2U]||
+                e.anchor.positionPulse[2U]!=g.receipt.startPulse[2U]||e.topPositionPulse[2U]!=g.receipt.startPulse[2U]||
+                e.tangentPulsePerMm[2U]!=0.0))return false;
+            EDM126::Point tangent{};double norm=0.0;
+            for(unsigned axis=0U;axis<6U;++axis)
+            {
+                if(axis>=3U&&!EDM109::SameDouble(anchorStart[axis],anchorEnd[axis]))return false;
+                tangent[axis]=(anchorEnd[axis]-anchorStart[axis])/anchorCurve.lengthMm;
+                if(axis<3U)norm=std::hypot(norm,tangent[axis]/anchorScale[axis]);
+            }
+            if(!EDM126::Positive(norm))return false;
+            for(unsigned axis=0U;axis<6U;++axis)
+            {
+                tangent[axis]/=norm;
+                const double top=tangent[axis]==0.0?e.anchor.positionPulse[axis]:
+                    e.anchor.positionPulse[axis]-EDM173::FrozenHeightMm(plan.recipe)*tangent[axis];
+                if(!std::isfinite(tangent[axis])||!std::isfinite(top)||
+                    !EDM109::SameDouble(e.tangentPulsePerMm[axis],tangent[axis])||
+                    !EDM109::SameDouble(e.topPositionPulse[axis],top)||
+                    (axis>=3U&&(!EDM109::SameDouble(tangent[axis],0.0)||
+                        !EDM109::SameDouble(top,e.anchor.positionPulse[axis]))))return false;
+            }
         }
-    }
-    else if(!EDM128::EmptyB3Proof(e))return false;
-    for(unsigned axis=0U;axis<6U;++axis)
-        if(!EDM109::SameDouble(cursor.positionPulse[axis],g.receipt.endPulse[axis])||
-            e.heightPulsePerNative[axis]!=g.receipt.pulsePerUnit[axis]) return false;
-    if(!geometry.enabled||geometry.failed||!geometry.completed||!geometry.rowComplete||geometry.completedRows!=25U||
+        if(b2)
+        {
+            // The B2 apex is a cursor on the same sealed nominal parent, not a
+            // detached Z lift or a newly published child. Rebuild both stations
+            // from genuine child geometry; E6 is retained path length, not chord.
+            const unsigned targetChild=static_cast<unsigned>(e.targetSource.ordinal);
+            if(!sourceFits(e.targetSource,targetChild)||targetChild>child||
+                ((EDM130::IsG76SquareB2_251(plan.recipe)||EDM130::IsG76DiamondB2_256(plan.recipe))&&targetChild==child)||
+                !EDM109::SameScope(anchorCursor.scope,e.targetSource.scope)||
+                e.qualifiedDwells!=3U||timed.coordinator.qualifiedDwells!=3U||
+                feedback.eventBackwardCrossings!=static_cast<std::uint64_t>(child-targetChild)||
+                feedback.eventForwardCrossings!=feedback.eventBackwardCrossings||
+                plan.recipe.planMovementMask!=EDM173::NominalMovementMask(plan.nominal))return false;
+            if(plan.recipe.planMovementMask==3U)
+            {
+                const double fixedZ=g.receipt.startPulse[2U];
+                if(anchorStart[2U]!=fixedZ||anchorEnd[2U]!=fixedZ||
+                    e.anchor.positionPulse[2U]!=fixedZ||e.topPositionPulse[2U]!=fixedZ)return false;
+                for(unsigned k=0U;k<count;++k)
+                    if(g.receipt.legEndPulse[k][2U]!=fixedZ)return false;
+            }
+            const auto canonicalCursor=[&](unsigned ordinal,double localMm,EDM126::Point& point,double& station) noexcept {
+                station=0.0;
+                EDM126::Point from{},to{};EDM109::Line line{};EDM112::Curve curve{};
+                for(unsigned k=0U;k<=ordinal;++k)
+                {
+                    for(unsigned axis=0U;axis<6U;++axis)
+                    {
+                        from[axis]=k?g.receipt.legEndPulse[k-1U][axis]:g.receipt.startPulse[axis];
+                        to[axis]=g.receipt.legEndPulse[k][axis];
+                    }
+                    if(!EDM109::BuildLine(from,to,anchorScale,line)||!EDM112::BuildLine(line,curve))return false;
+                    if(k==ordinal)
+                    {
+                        if(!std::isfinite(localMm)||localMm<0.0||localMm>curve.lengthMm||
+                            !EDM112::EvaluateUnit(curve,localMm/curve.lengthMm,point))return false;
+                        station+=localMm;return std::isfinite(station);
+                    }
+                    station+=curve.lengthMm;
+                    if(!std::isfinite(station))return false;
+                }
+                return false;
+            };
+            EDM126::Point canonicalAnchor{},canonicalTop{};double anchorStation=0.0,targetStation=0.0;
+            if(!canonicalCursor(child,e.anchor.localMm,canonicalAnchor,anchorStation)||
+                !canonicalCursor(targetChild,e.targetLocalMm,canonicalTop,targetStation)||
+                std::fabs(e.anchor.stationMm-anchorStation)>EDM126::Roundoff(anchorStation)||
+                std::fabs(e.targetStationMm-targetStation)>EDM126::Roundoff(targetStation)||
+                std::fabs((anchorStation-targetStation)-EDM173::FrozenHeightMm(plan.recipe))>
+                    EDM126::Roundoff(anchorStation))return false;
+            for(unsigned axis=0U;axis<6U;++axis)
+            {
+                const double budget=64.0*(std::numeric_limits<double>::epsilon)()*(std::max)(1.0,std::fabs(canonicalTop[axis]));
+                if(!std::isfinite(e.topPositionPulse[axis])||std::fabs(e.topPositionPulse[axis]-canonicalTop[axis])>budget)return false;
+            }
+        }
+        EDM204::Geometry centerGeometry{};
+        if(b3||b4)
+        {
+            NCG76::Point8 centerStartMCS{},centerEndMCS{};
+            EDM126::Point nominalCenter{},axisNative{},axisPulse{};
+            if(!EDM128::ValidB3Proof(e)||!e.centerCaptured||e.centerLegsCompleted!=15U||
+                e.qualifiedDwells!=5U*ordinal||timed.coordinator.qualifiedDwells!=5U*expectedEvents||
+                !EDM109::SameDouble(e.centerReturnMmMin,plan.centerReturnFeedMmMin)||
+                !EDM173::CenterBoundary(plan,child,centerStartMCS)||
+                !EDM173::CenterBoundary(plan,child+1U,centerEndMCS)||
+                !EDM173::MachiningAxisNative(plan,axisNative))return false;
+            for(unsigned axis=0U;axis<6U;++axis)
+            {
+                const double from=axis>=3U||centerStartMCS[axis]==plan.nominal.startMCS[axis]?g.receipt.startPulse[axis]:
+                    centerStartMCS[axis]*g.receipt.pulsePerUnit[axis];
+                const double to=axis>=3U||centerEndMCS[axis]==plan.nominal.startMCS[axis]?g.receipt.startPulse[axis]:
+                    centerEndMCS[axis]*g.receipt.pulsePerUnit[axis];
+                const double ratio=e.anchor.localMm/anchorCurve.lengthMm;
+                nominalCenter[axis]=ratio==0.0?from:ratio==1.0?to:from+(to-from)*ratio;
+                axisPulse[axis]=axisNative[axis]*anchorScale[axis];
+                const double budget=EDM204::Roundoff(nominalCenter[axis]);
+                if(!std::isfinite(nominalCenter[axis])||!std::isfinite(e.nominalCenterPositionPulse[axis])||
+                    std::fabs(e.nominalCenterPositionPulse[axis]-nominalCenter[axis])>budget||
+                    e.tangentPulsePerMm[axis]!=axisPulse[axis]||
+                    (axis>=3U&&(!EDM109::SameDouble(nominalCenter[axis],e.anchor.positionPulse[axis])||
+                        !EDM109::SameDouble(e.nominalCenterPositionPulse[axis],e.anchor.positionPulse[axis]))))return false;
+            }
+            // Reconstruct from the sealed signed XYZ target, never the child tangent
+            // or the undirected orbit-plane normal. E6 is measured from nominal C.
+            if(!EDM204::Build(e.anchor.positionPulse,nominalCenter,axisPulse,anchorScale,
+                EDM173::FrozenHeightMm(plan.recipe),b3?3U:4U,centerGeometry))return false;
+            for(unsigned axis=0U;axis<6U;++axis)
+            {
+                if(!std::isfinite(e.centerPositionPulse[axis])||!std::isfinite(e.topPositionPulse[axis])||
+                    std::fabs(e.centerPositionPulse[axis]-centerGeometry.centerPulse[axis])>EDM204::Roundoff(centerGeometry.centerPulse[axis])||
+                    std::fabs(e.topPositionPulse[axis]-centerGeometry.topPulse[axis])>EDM204::Roundoff(centerGeometry.topPulse[axis])||
+                    (axis>=3U&&(!EDM109::SameDouble(e.centerPositionPulse[axis],e.anchor.positionPulse[axis])||
+                        !EDM109::SameDouble(e.topPositionPulse[axis],e.anchor.positionPulse[axis]))))return false;
+            }
+        }
+        else if(!EDM128::EmptyB3Proof(e))return false;
+        for(unsigned axis=0U;axis<6U;++axis)
+            if(!EDM109::SameDouble(cursor.positionPulse[axis],g.receipt.endPulse[axis])||
+                e.heightPulsePerNative[axis]!=g.receipt.pulsePerUnit[axis]) return false;
+        if(b0)
+            PrintNCG76DiagnosticLine("[EDM192] event=B0_TANGENT_VERIFIED session=%llu parentPC=%d eventIndex=%u anchorChild=%u nativeTangentX=%.12g nativeTangentY=%.12g nativeTangentZ=%.12g heightMm=%.12g dwells=%u proof=GENUINE_SEALED_CHILD_NATIVE_TANGENT exactReturn=1 CUVfixed=1 discharge=0\n",
+                static_cast<unsigned long long>(s.session),g.pc,ordinal,child+1U,
+                e.tangentPulsePerMm[0U]/anchorScale[0U],e.tangentPulsePerMm[1U]/anchorScale[1U],
+                e.tangentPulsePerMm[2U]/anchorScale[2U],e.actualJumpHeightMm,e.qualifiedDwells);
+        if(b2)
+            PrintNCG76DiagnosticLine("[EDM175] event=B2_PATH_VERIFIED session=%llu parentPC=%d eventIndex=%u anchorChild=%u targetChild=%u anchorStationMm=%.12g targetStationMm=%.12g pathHeightMm=%.12g eventBackward=%llu eventForward=%llu proof=GENUINE_SEALED_CHILD_CANONICAL_POINT_AND_STATION exactReturn=1 discharge=0\n",
+                static_cast<unsigned long long>(s.session),g.pc,ordinal,child+1U,static_cast<unsigned>(e.targetSource.ordinal)+1U,
+                e.anchor.stationMm,e.targetStationMm,e.actualJumpHeightMm,
+                static_cast<unsigned long long>(feedback.eventBackwardCrossings),static_cast<unsigned long long>(feedback.eventForwardCrossings));
+        if(b3||b4)
+        {
+            PrintNCG76DiagnosticLine("[EDM204] event=CENTER_AXIS_VERIFIED session=%llu parentPC=%d eventIndex=%u mode=%u anchorChild=%u machiningX=%.12g machiningY=%.12g machiningZ=%.12g radiusMm=%.12g axialSpanMm=%.12g withdrawalMm=%.12g centerF=%.12g settledLegs=4 dwells=%u exactReturn=1 CUVfixed=1 discharge=0\n",
+                static_cast<unsigned long long>(s.session),g.pc,ordinal,mode,child+1U,
+                e.tangentPulsePerMm[0U]/anchorScale[0U],e.tangentPulsePerMm[1U]/anchorScale[1U],e.tangentPulsePerMm[2U]/anchorScale[2U],
+                centerGeometry.radiusMm,centerGeometry.axialSpanMm,centerGeometry.heightMm,
+                (std::min)(e.centerReturnMmMin,EDM173::FeedMmMin),e.qualifiedDwells);
+            PrintNCG76DiagnosticLine("[EDM204] event=CENTER_ORIGIN_POINTS session=%llu parentPC=%d eventIndex=%u mode=%u anchorXpulse=%.12g anchorYpulse=%.12g anchorZpulse=%.12g nominalCenterXpulse=%.12g nominalCenterYpulse=%.12g nominalCenterZpulse=%.12g discharge=0\n",
+                static_cast<unsigned long long>(s.session),g.pc,ordinal,mode,e.anchor.positionPulse[0U],e.anchor.positionPulse[1U],e.anchor.positionPulse[2U],
+                e.nominalCenterPositionPulse[0U],e.nominalCenterPositionPulse[1U],e.nominalCenterPositionPulse[2U]);
+            PrintNCG76DiagnosticLine("[EDM204] event=CENTER_ROUTE_POINTS session=%llu parentPC=%d eventIndex=%u mode=%u waypointXpulse=%.12g waypointYpulse=%.12g waypointZpulse=%.12g topXpulse=%.12g topYpulse=%.12g topZpulse=%.12g discharge=0\n",
+                static_cast<unsigned long long>(s.session),g.pc,ordinal,mode,e.centerPositionPulse[0U],e.centerPositionPulse[1U],e.centerPositionPulse[2U],
+                e.topPositionPulse[0U],e.topPositionPulse[1U],e.topPositionPulse[2U]);
+        }
+        return true;
+    };
+    // Both exact-return receipts must independently rebuild from the same
+    // sealed parent. A last-event total alone cannot replace the first proof.
+    for(unsigned ordinal=1U;ordinal<=expectedEvents;++ordinal)
+        if(!validateEvent(ordinal==expectedEvents?e:feedback.firstCompletedEvent,ordinal))return false;
+    if(!geometry.enabled||geometry.failed||!geometry.completed||!geometry.rowComplete||geometry.completedRows!=count||
         geometry.session!=s.session||geometry.armEpoch!=s.armEpoch||geometry.ownerGeneration!=s.lease.generation||
         geometry.source.scope.run!=s.run||geometry.source.scope.cache!=s.cache||geometry.source.dispatch!=g.dispatch||
-        geometry.source.sourcePC!=g.pc||geometry.source.step!=24U||geometry.source.segment!=last.segmentId||geometry.source.epoch!=last.epoch||
+        geometry.source.sourcePC!=g.pc||geometry.source.step!=count-1U||geometry.source.segment!=last.segmentId||geometry.source.epoch!=last.epoch||
         !geometry.geometryValid||!EDM109::SameScope(geometry.source.scope,cursor.authorizedSource.scope)) return false;
     for(unsigned axis=0U;axis<6U;++axis)if(!EDM109::SameDouble(geometry.endPulse[axis],g.receipt.endPulse[axis])) return false;
     if(!IsEDM200AutoHoldCheckpointCompleteSameThread())
@@ -27032,32 +30393,64 @@ bool NCManager::IsEDM173RuntimeCompleteSameThread() noexcept
         PrintNCG76DiagnosticLine("[EDM217] event=CHECKPOINT_COMPLETE session=%llu hold=%llu start=%llu B=%u holdEventIndex=0 children=25 E5events=1 exactReturn=1 proof=VALIDATED_PARENT_AND_RT_RUNNING discharge=0\n",
             static_cast<unsigned long long>(s.session),static_cast<unsigned long long>(m_edm200.holdSequence),
             static_cast<unsigned long long>(m_edm200.resumeStartSequence),mode);
-    RtPrintf("[EDM173] event=GAP_E5_VERIFIED session=%llu parentPC=%d children=25 triggered=1 completed=1 B%uevents=1 heightMicroMm=%llu exactReturn=1 discharge=0\n",
-        static_cast<unsigned long long>(s.session),g.pc,mode,static_cast<unsigned long long>(plan.recipe.jumpHeightScaled));
-    if(b0)
-        PrintNCG76DiagnosticLine("[EDM192] event=B0_TANGENT_VERIFIED session=%llu parentPC=%d anchorChild=%u nativeTangentX=%.12g nativeTangentY=%.12g nativeTangentZ=%.12g heightMm=%.12g dwells=%u proof=GENUINE_SEALED_CHILD_NATIVE_TANGENT exactReturn=1 CUVfixed=1 discharge=0\n",
-            static_cast<unsigned long long>(s.session),g.pc,child+1U,
-            e.tangentPulsePerMm[0U]/anchorScale[0U],e.tangentPulsePerMm[1U]/anchorScale[1U],
-            e.tangentPulsePerMm[2U]/anchorScale[2U],e.actualJumpHeightMm,e.qualifiedDwells);
-    if(b2)
-        PrintNCG76DiagnosticLine("[EDM175] event=B2_PATH_VERIFIED session=%llu parentPC=%d anchorChild=%u targetChild=%u anchorStationMm=%.12g targetStationMm=%.12g pathHeightMm=%.12g eventBackward=%llu eventForward=%llu proof=GENUINE_SEALED_CHILD_CANONICAL_POINT_AND_STATION exactReturn=1 discharge=0\n",
-            static_cast<unsigned long long>(s.session),g.pc,child+1U,static_cast<unsigned>(e.targetSource.ordinal)+1U,
-            e.anchor.stationMm,e.targetStationMm,e.actualJumpHeightMm,
+    if(EDM130::IsG76CenterAnyFlushHold232(plan.recipe))
+        PrintNCG76DiagnosticLine("[%s] event=CHECKPOINT_COMPLETE session=%llu hold=%llu start=%llu B=%u holdEventIndex=%llu children=25 E5events=%u exactReturn=1 proof=VALIDATED_PARENT_AND_RT_RUNNING discharge=0\n",
+            EDM130::IsG76CenterSecondReturnHold232(plan.recipe)?"EDM232":EDM130::IsG76CenterSecondFlushHold231(plan.recipe)?"EDM231":EDM130::IsG76CenterBrakeHold228(plan.recipe)?"EDM228":EDM130::IsG76CenterInitialDwellHold227(plan.recipe)?"EDM227":EDM130::IsG76CenterFinalDwellHold226(plan.recipe)?"EDM226":EDM130::IsG76CenterReturnDwellHold225(plan.recipe)?"EDM225":EDM130::IsG76CenterDwellHold224(plan.recipe)?"EDM224":EDM130::IsG76CenterTopDwellHold222(plan.recipe)?"EDM223":EDM130::IsG76CenterStartHold221(plan.recipe)?"EDM221":EDM130::IsG76CenterAnchorHold220(plan.recipe)?"EDM220":EDM130::IsG76CenterReturnHold219(plan.recipe)?"EDM219":"EDM218",
+            static_cast<unsigned long long>(s.session),static_cast<unsigned long long>(m_edm200.holdSequence),
+            static_cast<unsigned long long>(m_edm200.resumeStartSequence),mode,
+            static_cast<unsigned long long>(m_edm200.eventIndex),expectedEvents);
+    RtPrintf("[EDM173] event=GAP_E5_VERIFIED session=%llu parentPC=%d children=%u triggered=%u completed=%u B%uevents=%u heightMicroMm=%llu exactReturn=1 discharge=0\n",
+        static_cast<unsigned long long>(s.session),g.pc,count,expectedEvents,expectedEvents,mode,expectedEvents,
+        static_cast<unsigned long long>(plan.recipe.jumpHeightScaled));
+    if(EDM130::IsG76Expansion263(plan.recipe))
+        PrintNCG76DiagnosticLine("[EDM263] event=EXPANSION_E5_VERIFIED session=%llu L=%u modeP=%u Q=%u B=%u children=26 E5events=1 dwells=%u settledLegs=%u E6microMm=%llu exactReturn=1 CUVfixed=1 expansion=TARGET_PLANE_GROW hold=0 discharge=0\n",
+            static_cast<unsigned long long>(s.session),static_cast<unsigned>(plan.recipe.flushHoldTest),EDM130::G76PlanMode(plan.recipe),
+            plan.nominal.program.input.polygonSides,mode,e.qualifiedDwells,(b3||b4)?4U:0U,
+            static_cast<unsigned long long>(plan.recipe.jumpHeightScaled));
+    if(EDM130::G76PlanMode(plan.recipe)==16U)
+        PrintNCG76DiagnosticLine("[EDM261] event=POLYGON_E5_VERIFIED session=%llu L=%u modeP=16 Q=%u B=%u children=25 E5events=1 dwells=%u settledLegs=%u E6microMm=%llu exactReturn=1 CUVfixed=1 hold=0 discharge=0\n",
+            static_cast<unsigned long long>(s.session),static_cast<unsigned>(plan.recipe.flushHoldTest),
+            plan.nominal.program.input.polygonSides,mode,e.qualifiedDwells,(b3||b4)?4U:0U,
+            static_cast<unsigned long long>(plan.recipe.jumpHeightScaled));
+    if(EDM130::IsG76OneMm260(plan.recipe))
+        PrintNCG76DiagnosticLine("[EDM260] event=ONE_MM_E5_VERIFIED session=%llu L=%u modeP=%u B=%u children=25 E5events=1 dwells=%u settledLegs=%u E6microMm=%llu exactReturn=1 CUVfixed=1 hold=0 discharge=0\n",
+            static_cast<unsigned long long>(s.session),static_cast<unsigned>(plan.recipe.flushHoldTest),
+            EDM130::G76PlanMode(plan.recipe),mode,e.qualifiedDwells,(b3||b4)?4U:0U,
+            static_cast<unsigned long long>(plan.recipe.jumpHeightScaled));
+    if(EDM130::IsG76SquareB1_250(plan.recipe))
+        PrintNCG76DiagnosticLine("[EDM250] event=P12_B1_E5_VERIFIED session=%llu modeP=12 shape=SQUARE B=1 children=25 E5events=1 dwells=3 E6microMm=%llu exactReturn=1 hold=0 discharge=0\n",
+            static_cast<unsigned long long>(s.session),static_cast<unsigned long long>(plan.recipe.jumpHeightScaled));
+    if(EDM130::IsG76SquareB2_251(plan.recipe))
+        PrintNCG76DiagnosticLine("[EDM251] event=P12_B2_E5_VERIFIED session=%llu modeP=12 shape=SQUARE B=2 children=25 E5events=1 dwells=3 pathMicroMm=%llu eventBackward=%llu eventForward=%llu exactReturn=1 hold=0 discharge=0\n",
+            static_cast<unsigned long long>(s.session),static_cast<unsigned long long>(plan.recipe.jumpHeightScaled),
             static_cast<unsigned long long>(feedback.eventBackwardCrossings),static_cast<unsigned long long>(feedback.eventForwardCrossings));
-    if(b3||b4)
-    {
-        PrintNCG76DiagnosticLine("[EDM204] event=CENTER_AXIS_VERIFIED session=%llu parentPC=%d mode=%u anchorChild=%u machiningX=%.12g machiningY=%.12g machiningZ=%.12g radiusMm=%.12g axialSpanMm=%.12g withdrawalMm=%.12g centerF=%.12g settledLegs=4 dwells=%u exactReturn=1 CUVfixed=1 discharge=0\n",
-            static_cast<unsigned long long>(s.session),g.pc,mode,child+1U,
-            e.tangentPulsePerMm[0U]/anchorScale[0U],e.tangentPulsePerMm[1U]/anchorScale[1U],e.tangentPulsePerMm[2U]/anchorScale[2U],
-            centerGeometry.radiusMm,centerGeometry.axialSpanMm,centerGeometry.heightMm,
-            (std::min)(e.centerReturnMmMin,EDM173::FeedMmMin),e.qualifiedDwells);
-        PrintNCG76DiagnosticLine("[EDM204] event=CENTER_ORIGIN_POINTS session=%llu parentPC=%d mode=%u anchorXpulse=%.12g anchorYpulse=%.12g anchorZpulse=%.12g nominalCenterXpulse=%.12g nominalCenterYpulse=%.12g nominalCenterZpulse=%.12g discharge=0\n",
-            static_cast<unsigned long long>(s.session),g.pc,mode,e.anchor.positionPulse[0U],e.anchor.positionPulse[1U],e.anchor.positionPulse[2U],
-            e.nominalCenterPositionPulse[0U],e.nominalCenterPositionPulse[1U],e.nominalCenterPositionPulse[2U]);
-        PrintNCG76DiagnosticLine("[EDM204] event=CENTER_ROUTE_POINTS session=%llu parentPC=%d mode=%u waypointXpulse=%.12g waypointYpulse=%.12g waypointZpulse=%.12g topXpulse=%.12g topYpulse=%.12g topZpulse=%.12g discharge=0\n",
-            static_cast<unsigned long long>(s.session),g.pc,mode,e.centerPositionPulse[0U],e.centerPositionPulse[1U],e.centerPositionPulse[2U],
-            e.topPositionPulse[0U],e.topPositionPulse[1U],e.topPositionPulse[2U]);
-    }
+    if(EDM130::IsG76SquareB3_252(plan.recipe))
+        PrintNCG76DiagnosticLine("[EDM252] event=P12_B3_E5_VERIFIED session=%llu modeP=12 shape=SQUARE B=3 children=25 E5events=1 dwells=5 settledLegs=4 E6microMm=%llu exactReturn=1 CUVfixed=1 hold=0 discharge=0\n",
+            static_cast<unsigned long long>(s.session),static_cast<unsigned long long>(plan.recipe.jumpHeightScaled));
+    if(EDM130::IsG76DiamondB3_257(plan.recipe))
+        PrintNCG76DiagnosticLine("[EDM257] event=P13_B3_E5_VERIFIED session=%llu modeP=13 shape=DIAMOND B=3 children=25 E5events=1 dwells=5 settledLegs=4 E6microMm=%llu exactReturn=1 CUVfixed=1 hold=0 discharge=0\n",
+            static_cast<unsigned long long>(s.session),static_cast<unsigned long long>(plan.recipe.jumpHeightScaled));
+    if(EDM130::IsG76SquareB4_253(plan.recipe))
+        PrintNCG76DiagnosticLine("[EDM253] event=P12_B4_E5_VERIFIED session=%llu modeP=12 shape=SQUARE B=4 children=25 E5events=1 dwells=5 settledLegs=4 E6microMm=%llu centerJoin=DIAGONAL_45_DEG exactReturn=1 CUVfixed=1 hold=0 discharge=0\n",
+            static_cast<unsigned long long>(s.session),static_cast<unsigned long long>(plan.recipe.jumpHeightScaled));
+    if(EDM130::IsG76DiamondB4_258(plan.recipe))
+        PrintNCG76DiagnosticLine("[EDM258] event=P13_B4_E5_VERIFIED session=%llu modeP=13 shape=DIAMOND B=4 children=25 E5events=1 dwells=5 settledLegs=4 E6microMm=%llu centerJoin=DIAGONAL_45_DEG exactReturn=1 CUVfixed=1 hold=0 discharge=0\n",
+            static_cast<unsigned long long>(s.session),static_cast<unsigned long long>(plan.recipe.jumpHeightScaled));
+    if(EDM130::IsG76DiamondB1_255(plan.recipe))
+        PrintNCG76DiagnosticLine("[EDM255] event=P13_B1_E5_VERIFIED session=%llu modeP=13 shape=DIAMOND B=1 children=25 E5events=1 dwells=3 E6microMm=%llu exactReturn=1 hold=0 discharge=0\n",
+            static_cast<unsigned long long>(s.session),static_cast<unsigned long long>(plan.recipe.jumpHeightScaled));
+    if(EDM130::IsG76DiamondB2_256(plan.recipe))
+        PrintNCG76DiagnosticLine("[EDM256] event=P13_B2_E5_VERIFIED session=%llu modeP=13 shape=DIAMOND B=2 children=25 E5events=1 dwells=3 pathMicroMm=%llu eventBackward=%llu eventForward=%llu exactReturn=1 hold=0 discharge=0\n",
+            static_cast<unsigned long long>(s.session),static_cast<unsigned long long>(plan.recipe.jumpHeightScaled),
+            static_cast<unsigned long long>(feedback.eventBackwardCrossings),static_cast<unsigned long long>(feedback.eventForwardCrossings));
+    if(expectedEvents==2U)
+        PrintNCG76DiagnosticLine("[%s] event=TWO_E5_VERIFIED session=%llu B=%u expected=2 retained=2 dwells=10 firstCompleteTick=%llu secondTriggerTick=%llu secondWorkUs=%llu requiredWorkUs=%llu exactReturns=2 discharge=0\n",
+            EDM130::IsG76CenterSecondReturnHold232(plan.recipe)?"EDM232":EDM130::IsG76CenterSecondFlushHold231(plan.recipe)?"EDM231":"EDM230",
+            static_cast<unsigned long long>(s.session),mode,
+            static_cast<unsigned long long>(feedback.firstCompletedEvent.work.lastCompleteTick),
+            static_cast<unsigned long long>(e.work.lastTriggerTick),
+            static_cast<unsigned long long>(e.work.lastTriggerTotalUs-feedback.firstCompletedEvent.work.totalWorkUs),
+            static_cast<unsigned long long>(plan.recipe.workTimeUs));
     return true;
 }
 
@@ -27077,7 +30470,34 @@ void NCManager::ServiceEDM173SameThread() noexcept
 
 bool NCManager::WaitEDM173SameThread()
 {
+    const bool wasParentReleasePending=m_edm233.releasePending;
+    const bool wasHistoryParentReleasePending=m_edm237.releasePending;
+    const bool wasMixedParentReleasePending=m_edm234.releasePending;
     ServiceEDM94SameThread();auto& s=m_edm94;const auto& guard=s.feedback;
+    if(wasParentReleasePending&&!m_edm233.releasePending&&m_state==NCState::RUN&&s.cancelled)
+    {RejectEDM94SameThread("EDM233_PARENT_RELEASE_CANCELLED",m_gapDryRun.sourceLine);return false;}
+    if(wasHistoryParentReleasePending&&!m_edm237.releasePending&&m_state==NCState::RUN&&s.cancelled)
+    {RejectEDM94SameThread("EDM237_PARENT_RELEASE_CANCELLED",m_gapDryRun.sourceLine);return false;}
+    if(m_edm237.releasePending)
+    {
+        if(ConsumeEDM237ParentReleaseSameThread())return true;
+        if(m_edm237.releasePending&&++s.polls>1000U)RejectEDM94SameThread("EDM237_PARENT_RELEASE_TIMEOUT",m_gapDryRun.sourceLine);
+        return false;
+    }
+    if(wasMixedParentReleasePending&&!m_edm234.releasePending&&m_state==NCState::RUN&&s.cancelled)
+    {RejectEDM94SameThread("EDM234_PARENT_RELEASE_CANCELLED",m_gapDryRun.sourceLine);return false;}
+    if(m_edm234.releasePending)
+    {
+        if(ConsumeEDM234ParentReleaseSameThread())return true;
+        if(m_edm234.releasePending&&++s.polls>1000U)RejectEDM94SameThread("EDM234_PARENT_RELEASE_TIMEOUT",m_gapDryRun.sourceLine);
+        return false;
+    }
+    if(m_edm233.releasePending)
+    {
+        if(ConsumeEDM233ParentReleaseSameThread())return true;
+        if(m_edm233.releasePending&&++s.polls>1000U)RejectEDM94SameThread("EDM233_PARENT_RELEASE_TIMEOUT",m_gapDryRun.sourceLine);
+        return false;
+    }
     if(!s.latched||!EDM173::IsArm(s.gapHistoryArm)||s.cancelled||s.releaseRequested||m_state!=NCState::RUN) return false;
     if(s.finishPending&&!IsEDM200AutoHoldCheckpointCompleteSameThread())
     {RejectEDM94SameThread("EDM200_FINISH_CHECKPOINT_NOT_COMPLETED",m_gapDryRun.sourceLine);return false;}
@@ -27116,7 +30536,32 @@ bool NCManager::WaitEDM173SameThread()
         guard.active&&guard.pass&&guard.stopped&&guard.forceZero&&guard.finishRequested&&!guard.faulted&&!guard.cancelled&&
         EDM94::MovementProven(guard,E156RequiredMovementMask(s,m_edm130.recipe))&&guard.sentFrames>=200ULL&&guard.requiredCycles>=200U&&
         guard.settledCycles>=guard.requiredCycles&&guard.lastSentTick&&guard.lastSentTick<=guard.lastTick&&m_motion.IsGroupDone())
-    {s.finishPending=false;s.complete=s.terminalLogged=true;LogEDM94SameThread("PASS","EDM173_G76_GAP_E5_ONE_EVENT_WAIT_M30");return true;}
+    {s.finishPending=false;s.complete=s.terminalLogged=true;
+        if(m_edm237.authorized&&!FinishEDM237ParentSameThread())return false;
+            if(m_edm234.authorized&&!FinishEDM234ParentSameThread())return false;
+        if(EDM130::IsG76ParentSequence233(m_edm130.recipe))
+        {
+            if(!IsEDM233SequenceScopeCurrentSameThread()||s.armPC!=m_edm233.firstArmPC+(m_edm233.secondStarted?3:0))
+            {RejectEDM94SameThread("EDM233_FINISHED_SEQUENCE_SCOPE",m_gapDryRun.sourceLine);return false;}
+            if(!m_edm233.secondStarted)
+            {
+                if(m_edm233.firstReleased||s.session!=m_edm233.firstSession||
+                    !m_motion.RequestEDM233ParentRelease(s.session,s.armEpoch,s.lease))
+                {RejectEDM94SameThread("EDM233_PARENT_RELEASE_REQUEST",m_gapDryRun.sourceLine);return false;}
+                m_edm233.releaseFloorTick=guard.lastSentTick;m_edm233.releasePending=true;s.polls=0U;
+                PrintNCG76DiagnosticLine("[EDM233] event=PARENT_FINISH parent=1 session=%llu children=25 E5completed=1 next=EXACT_ZERO_RETIREMENT discharge=0\n",static_cast<unsigned long long>(s.session));
+                return false;
+            }
+            if(!m_edm233.firstReleased||s.session<=m_edm233.firstSession)
+            {RejectEDM94SameThread("EDM233_FIRST_PARENT_RECEIPT_REQUIRED",m_gapDryRun.sourceLine);return false;}
+            PrintNCG76DiagnosticLine("[EDM233] event=SEQUENCE_COMPLETE parents=2 children=50 E5completed=2 firstSession=%llu secondSession=%llu firstReleaseTick=%llu E5policy=FRESH_PER_PARENT discharge=0\n",
+                static_cast<unsigned long long>(m_edm233.firstSession),static_cast<unsigned long long>(s.session),static_cast<unsigned long long>(m_edm233.releaseTick));
+        }
+        LogEDM94SameThread("PASS",EDM130::IsG76ParentSequence233(m_edm130.recipe)?
+            "EDM233_TWO_G76_PARENTS_GAP_E5_WAIT_M30":EDM130::IsG76CenterSecondReturnHold232(m_edm130.recipe)?
+            "EDM232_G76_GAP_E5_TWO_EVENTS_RETURN_HOLD_WAIT_M30":EDM130::IsG76CenterSecondFlushHold231(m_edm130.recipe)?
+            "EDM231_G76_GAP_E5_TWO_EVENTS_HOLD_WAIT_M30":EDM130::IsG76CenterRepeat230(m_edm130.recipe)?
+            "EDM230_G76_GAP_E5_TWO_EVENTS_WAIT_M30":"EDM173_G76_GAP_E5_ONE_EVENT_WAIT_M30");return true;}
     if(++s.polls>1000U) RejectEDM94SameThread("EDM173_WAIT_TIMEOUT",m_gapDryRun.sourceLine);
     return false;
 }

@@ -13,6 +13,11 @@
 namespace EDM173
 {
 constexpr unsigned ArmP=292U, FinishP=293U, HistoryFixture=14U, CommissioningProfile=4U, NominalCount=25U;
+constexpr unsigned MaximumNominalCount=26U;
+inline unsigned CountForMode(unsigned modeP) noexcept
+{return NCG76Mode::IsHoleExpansion(modeP)?MaximumNominalCount:NominalCount;}
+inline unsigned CountForRecipe(const EDM130::Recipe& recipe) noexcept
+{return EDM130::G76PlanRows(recipe);}
 constexpr unsigned B2ArmP=294U, B2FinishP=295U, B2CommissioningProfile=5U;
 constexpr unsigned B3ArmP=296U, B3FinishP=297U, B3CommissioningProfile=6U;
 constexpr unsigned B4ArmP=298U, B4FinishP=299U, B4CommissioningProfile=7U;
@@ -121,7 +126,7 @@ inline bool NominalPrecisionWithinLimit(const NCG76::NativePlan& nominal) noexce
         NCG76::Point3 center{},local{};
         for(unsigned axis=0U;axis<3U;++axis)
         {
-            center[axis]=delta[axis]*t;
+            center[axis]=NCG76Mode::IsHoleExpansion(nominal.modeP)?delta[axis]:delta[axis]*t;
             local[axis]=center[axis]+point.orbit[axis];
         }
         // Rebuild local geometry before adding a large author origin. Using
@@ -140,17 +145,19 @@ inline bool NominalPrecisionWithinLimit(const NCG76::NativePlan& nominal) noexce
 // A G91 omitted axis contributes zero. Failure always clears the output.
 inline bool BuildOrbitInput(const NCTranslationSnapshot& translation,const NCG76::Point8& startMCS,
     const NCG76::Point3& authoredXYZ,unsigned authoredMask,double radiusMm,double feedMmMin,
-    NCG76::PlanInput& out,double shapeAngleDeg=0.0,bool targetAxis=false,bool centerFamily=false) noexcept
+    NCG76::PlanInput& out,double shapeAngleDeg=0.0,bool targetAxis=false,bool centerFamily=false,
+    unsigned polygonSides=0U) noexcept
 {
     const NCG76::Point8 frozenStart=startMCS;
     const NCG76::Point3 frozenAuthored=authoredXYZ;
     out=NCG76::PlanInput{};
     if(!FrameSupported(translation)||!authoredMask||(authoredMask&~7U)!=0U||
         !Detail::RadiusWithinLimit(radiusMm,translation.scalingFactor,centerFamily)||feedMmMin!=FeedMmMin||
-        !NCG76::ValidShapeAngle(shapeAngleDeg))return false;
+        !NCG76::ValidShapeAngle(shapeAngleDeg)||
+        (polygonSides!=0U&&!NCG76Mode::ValidPolygonSides(polygonSides)))return false;
     for(double value:frozenAuthored)if(!std::isfinite(value))return false;
     NCG76::PlanInput input{};input.radiusMm=radiusMm;input.feedMmMin=feedMmMin;input.shapeAngleDeg=shapeAngleDeg;
-    input.targetAxis=targetAxis;
+    input.targetAxis=targetAxis;input.polygonSides=polygonSides;
     NCG76::Point8 programStart{};
     if(!Detail::TryOrbitProgramStart(translation,frozenStart,programStart))return false;
     for(unsigned axis=0U;axis<3U;++axis)
@@ -198,17 +205,19 @@ inline bool RecipeMatchesArm(unsigned p,const EDM130::Recipe& recipe) noexcept
 inline EDM116::Mode ExpectedMode(const EDM130::Recipe& recipe) noexcept
 {return IsB0Recipe(recipe)?EDM116::Mode::B0:IsB4Recipe(recipe)?EDM116::Mode::B4:IsB3Recipe(recipe)?EDM116::Mode::B3:IsB2Recipe(recipe)?EDM116::Mode::B2:EDM130::IsVisibleFlush173(recipe)?EDM116::Mode::B1:EDM116::Mode::Invalid;}
 inline double FrozenHeightMm(const EDM130::Recipe& recipe) noexcept
-{return IsCenterRecipe(recipe)?EDM130::FrozenJumpHeightMm(recipe):IsB0Recipe(recipe)?2.0:IsB2Recipe(recipe)?0.001:EDM130::IsVisibleFlush173(recipe)?2.0:0.0;}
+{return (IsCenterRecipe(recipe)||EDM130::IsG76OneMmB1_260(recipe)||EDM130::IsG76ExpansionB1_263(recipe))?EDM130::FrozenJumpHeightMm(recipe):
+    IsB0Recipe(recipe)?2.0:IsB2Recipe(recipe)?0.001:EDM130::IsVisibleFlush173(recipe)?2.0:0.0;}
 // EDM193 movement evidence is derived from the frozen compensated endpoints,
 // not the authored word mask or the producer's structural XYZ axis mask.
 // Exact numeric equality treats signed zero as stationary; no tolerance can
 // hide a nonzero Z command. Full native-plan validation remains with Inputs.
 inline unsigned NominalMovementMask(const NCG76::NativePlan& nominal) noexcept
 {
-    if(nominal.count!=NominalCount||nominal.program.count!=NominalCount)return 0U;
+    const unsigned count=CountForMode(nominal.modeP);
+    if(nominal.count!=count||nominal.program.count!=count)return 0U;
     for(double value:nominal.startMCS)if(!std::isfinite(value))return 0U;
     unsigned mask=0U;
-    for(unsigned child=0U;child<NominalCount;++child)
+    for(unsigned child=0U;child<count;++child)
         for(unsigned axis=0U;axis<8U;++axis)
         {
             const double value=nominal.pointsMCS[child][axis];
@@ -252,11 +261,43 @@ struct Feedback
     std::uint64_t fingerprint=0ULL,liveEpoch=0ULL,tick=0ULL;
     unsigned authorizedChildren=0U,completedChildren=0U;
     EDM128::Feedback completedEvent{};
+    // EDM230 retains the first exact return independently from the latest
+    // one. The bounded two-event fixture must prove both mapped returns.
+    EDM128::Feedback firstCompletedEvent{};
+    unsigned retainedEvents=0U;
     // Captured with completedEvent on its final mapped tick, not final-run
     // traversal totals (which also include ordinary GAP direction changes).
     std::uint64_t eventBackwardCrossings=0ULL,eventForwardCrossings=0ULL;
     bool enabled=false,active=false,faulted=false,eventRetained=false;
 };
+// A second event must earn a new complete E5 interval after the first
+// mapped return. Total work before the first trigger cannot fund it.
+inline bool FollowsCompletedEvent230(const EDM128::Feedback& first,
+    const EDM128::Feedback& second) noexcept
+{
+    const auto& a=first.work;const auto& b=second.work;
+    return EDM130::ValidWorkEvidence(a)&&EDM130::ValidWorkEvidence(b)&&
+        a.workTimeUs&&a.workTimeUs==b.workTimeUs&&
+        first.eventIndex==1ULL&&first.eventCount==1U&&a.triggeredEvents==1ULL&&a.completedEvents==1ULL&&
+        second.eventIndex==2ULL&&second.eventCount==2U&&b.triggeredEvents==2ULL&&b.completedEvents==2ULL&&
+        !a.elapsedUs&&!b.elapsedUs&&!a.due&&!b.due&&!a.previousEligible&&!b.previousEligible&&
+        a.totalWorkUs==a.lastTriggerTotalUs&&b.totalWorkUs==b.lastTriggerTotalUs&&
+        b.lastTriggerTick>a.lastCompleteTick&&b.lastTriggerUs>a.lastCompleteUs&&
+        b.lastTriggerTotalUs>=a.totalWorkUs&&b.lastTriggerTotalUs-a.totalWorkUs>=b.workTimeUs&&
+        first.phase==EDM128::Phase::Gap&&second.phase==EDM128::Phase::Gap&&
+        !first.detached&&!second.detached&&!first.faulted&&!second.faulted&&!first.stopped&&!second.stopped&&
+        first.anchorCaptured&&second.anchorCaptured&&first.exactReturn&&second.exactReturn&&
+        first.rowEventComplete&&second.rowEventComplete&&
+        first.policy.fixture==EDM116::Fixture::ModalG76Gap173&&second.policy.fixture==first.policy.fixture&&
+        EDM116::IsCenterMode(first.policy.mode)&&second.policy.mode==first.policy.mode&&
+        first.qualifiedDwells==5U&&second.qualifiedDwells==10U&&
+        first.anchor.tick>=a.lastTriggerTick&&second.anchor.tick>=b.lastTriggerTick&&
+        first.anchor.nowUs>=a.lastTriggerUs&&second.anchor.nowUs>=b.lastTriggerUs&&
+        EDM109::SameScope(first.anchor.authorizedSource.scope,second.anchor.authorizedSource.scope)&&
+        first.anchor.authorizedSource.dispatch==second.anchor.authorizedSource.dispatch&&
+        first.anchor.authorizedSource.sourcePC==second.anchor.authorizedSource.sourcePC;
+}
+static_assert(sizeof(Feedback)<=4096U,"EDM230 bounded two-event return evidence");
 namespace Detail
 {
 inline void Word(std::uint64_t& h,std::uint64_t v) noexcept
@@ -331,28 +372,43 @@ inline std::uint64_t Fingerprint(const Scope& s,const NCG76::NativePlan& n,
     // Preserve the entire legacy stream for false. Bind the target-axis
     // contract even for a pure Z target whose generated points can coincide.
     if(in.targetAxis){Word(h,0x4737364158323031ULL);Word(h,1U);} // G76AX201
+    // Only P16 adds the polygon-side identity; every legacy hash stream is
+    // unchanged. Geometry validation separately rejects Q on old modes.
+    if(n.modeP==16U){Word(h,0x4737365031365131ULL);Word(h,in.polygonSides);} // G76P16Q1
+    if(NCG76Mode::IsHoleExpansion(n.modeP))
+    {Word(h,0x4737364558503236ULL);Word(h,n.modeP);Word(h,in.polygonSides);} // G76EXP26
     // A geometrically identical vertical plan must not reuse the old native
     // +Z center-flush contract. Other modes retain their complete old stream.
     if(IsCenterRecipe(r))Word(h,0x4737364146323034ULL); // G76AF204
     return h?h:1ULL;
 }
+inline NCG76::Phase PhaseForChild(unsigned modeP,unsigned child) noexcept
+{
+    if(NCG76Mode::IsHoleExpansion(modeP))
+        return child==0U?NCG76::Phase::ApproachCenter:child<25U?NCG76::Phase::Grow:NCG76::Phase::FinishCenter;
+    return child<24U?NCG76::Phase::Grow:NCG76::Phase::FinishCenter;
+}
 inline bool Inputs(const Scope& scope,const NCG76::NativePlan& nominal,
     const EDM130::Recipe& recipe,const EDM97::Tuning& tuning) noexcept
 {
+    const unsigned count=CountForRecipe(recipe);
     if(!ValidScope(scope)||!EDM130::IsG76Gap173(recipe)||
+        nominal.modeP!=EDM130::G76PlanMode(recipe)||
+        nominal.program.modeP!=nominal.modeP||
+        (NCG76Mode::IsPolygon(nominal.modeP)?!NCG76Mode::ValidPolygonSides(nominal.program.input.polygonSides):nominal.program.input.polygonSides!=0U)||
         nominal.program.input.targetAxis!=UsesTargetAxis(recipe)||
         !EDM130::ValidHistoryRecipeBinding(HistoryFixture,recipe)||!EDM97::ValidMotionTestCurve(tuning,recipe)||
         !NCG76::ValidNative(nominal,true,true,PreservesG90StationaryZ(recipe))||!FrameSupported(nominal.translation)||
-        nominal.translation.runToken!=scope.run||nominal.count!=NominalCount||nominal.program.count!=NominalCount||
+        nominal.translation.runToken!=scope.run||nominal.count!=count||nominal.program.count!=count||
         nominal.program.growCount!=24U||nominal.program.input.flushMode!=0U||nominal.program.flushLegCount!=0U||
         nominal.program.input.heightMm!=0.0||nominal.program.input.centerReturnFeedMmMin!=0.0||
         !RadiusWithinLimit(nominal.program.input.radiusMm,nominal.translation.scalingFactor,IsCenterRecipe(recipe))||nominal.program.input.feedMmMin!=FeedMmMin||
         !CenterTravelWithinLimit(nominal.program.input,nominal.translation.scalingFactor)||!NominalPrecisionWithinLimit(nominal)||
         (UsesNominalMovementMask(recipe)&&recipe.planMovementMask!=NominalMovementMask(nominal)))return false;
-    for(unsigned k=0U;k<NominalCount;++k)
+    for(unsigned k=0U;k<count;++k)
     {
         if(nominal.feedMmMin[k]!=FeedMmMin||nominal.program.points[k].phase!=
-            (k<24U?NCG76::Phase::Grow:NCG76::Phase::FinishCenter))return false;
+            PhaseForChild(nominal.modeP,k))return false;
         for(unsigned a=0U;a<8U;++a)
             if(a<3U?std::fabs(nominal.pointsMCS[k][a]-nominal.startMCS[a])>MaximumNominalExcursionMm:
                 EDM97::DoubleBits(nominal.pointsMCS[k][a])!=EDM97::DoubleBits(nominal.startMCS[a]))return false;
@@ -387,8 +443,8 @@ inline bool MachiningAxisNative(const Plan& plan,EDM128::Point& axis) noexcept
 {
     axis=EDM128::Point{};
     const auto& n=plan.nominal;const auto& in=n.program.input;
-    if(!IsCenterRecipe(plan.recipe)||!in.targetAxis||n.count!=NominalCount||
-        n.program.count!=NominalCount||!FrameSupported(n.translation)||
+    if(!IsCenterRecipe(plan.recipe)||!in.targetAxis||n.count!=CountForRecipe(plan.recipe)||
+        n.program.count!=CountForRecipe(plan.recipe)||!FrameSupported(n.translation)||
         !Detail::CenterTravelWithinLimit(in,n.translation.scalingFactor))return false;
     NCG76::Point3 delta{},native{};
     for(unsigned i=0U;i<3U;++i) {
@@ -419,8 +475,9 @@ inline bool MachiningAxisNative(const Plan& plan,EDM128::Point& axis) noexcept
 inline bool CenterBoundary(const Plan& plan,unsigned boundary,NCG76::Point8& centerMCS) noexcept
 {
     centerMCS=NCG76::Point8{};
-    if(!IsCenterRecipe(plan.recipe)||boundary>NominalCount||plan.nominal.count!=NominalCount||
-        plan.nominal.program.count!=NominalCount||!FrameSupported(plan.nominal.translation))return false;
+    const unsigned count=CountForRecipe(plan.recipe);
+    if(!IsCenterRecipe(plan.recipe)||boundary>count||plan.nominal.count!=count||
+        plan.nominal.program.count!=count||!FrameSupported(plan.nominal.translation))return false;
     const auto& n=plan.nominal;const auto& p=n.program;
     centerMCS=n.startMCS;
     if(!boundary)return true;
@@ -454,7 +511,7 @@ inline bool CenterBoundary(const Plan& plan,unsigned boundary,NCG76::Point8& cen
 inline bool CenterForCursor(const Plan& plan,unsigned child,double ratio,NCG76::Point8& centerMCS) noexcept
 {
     centerMCS=NCG76::Point8{};
-    if(child>=NominalCount||!std::isfinite(ratio)||ratio<0.0||ratio>1.0)return false;
+    if(child>=CountForRecipe(plan.recipe)||!std::isfinite(ratio)||ratio<0.0||ratio>1.0)return false;
     NCG76::Point8 from{},to{};
     if(!CenterBoundary(plan,child,from)||!CenterBoundary(plan,child+1U,to))return false;
     for(unsigned axis=0U;axis<8U;++axis)
@@ -468,6 +525,7 @@ inline void ClearB3Orbit(EDM128::B3Orbit& out) noexcept
 {
     for(auto& center:out.centers)for(auto& value:center)value=0.0;
     out.scope=EDM109::Scope{};out.centerReturnMmMin=0.0;out.machiningAxisNative=EDM128::Point{};
+    out.rows=EDM116::G76GapRows173;
 }
 // Shared B3/B4 table: centers stay on the nominal orbit plane. The coordinator
 // derives B4's retracted on-axis center after capturing the actual anchor.
@@ -479,12 +537,12 @@ inline bool BuildB3Orbit(const Plan& plan,const NCG76::Point8& startPulse,const 
         !EDM109::ValidScope(scope)||scope.session!=plan.scope.session||scope.run!=plan.scope.run||
         scope.cache!=plan.scope.cache||scope.ownerGeneration!=plan.scope.owner.generation||
         scope.translationGeneration!=plan.nominal.translationGeneration)return false;
-    out.scope=scope;out.centerReturnMmMin=plan.centerReturnFeedMmMin;
+    out.scope=scope;out.centerReturnMmMin=plan.centerReturnFeedMmMin;out.rows=CountForRecipe(plan.recipe);
     if(!MachiningAxisNative(plan,out.machiningAxisNative)){ClearB3Orbit(out);return false;}
     for(unsigned axis=0U;axis<6U;++axis)
         if(!std::isfinite(startPulse[axis])||!std::isfinite(pulsePerUnit[axis])||pulsePerUnit[axis]<=0.0)
         {ClearB3Orbit(out);return false;}
-    for(unsigned boundary=0U;boundary<=NominalCount;++boundary)
+    for(unsigned boundary=0U;boundary<=out.rows;++boundary)
     {
         NCG76::Point8 center{};
         if(!CenterBoundary(plan,boundary,center)){ClearB3Orbit(out);return false;}
@@ -554,7 +612,7 @@ inline bool BuildNominal(const Plan& plan,const NCG76Mixed::Point8& startPulse,
                 StationaryRotaryUnit(initial[a],plan.nominal.startMCS[a],ppu[a],modulo[a]):
                 NCG76Mixed::Detail::Unit(initial[a],plan.nominal.startMCS[a],ppu[a]))))return false;
     NCG76Mixed::Point8 previous=initial;
-    for(unsigned k=0U;k<NominalCount;++k)
+    for(unsigned k=0U;k<CountForRecipe(plan.recipe);++k)
     {
         if(!NCG76Mixed::Detail::CanonicalOrbitRow(plan.nominal,k,initial,ppu,previous,out.geometry[k])||
             !StationaryAuxiliaryRowValid(out.geometry[k],plan.nominal.startMCS,initial)||
@@ -563,7 +621,7 @@ inline bool BuildNominal(const Plan& plan,const NCG76Mixed::Point8& startPulse,
         {NCG76Mixed::Detail::ClearNominal(out);return false;}
         previous=out.geometry[k].endPulse;out.feedMmMin[k]=FeedMmMin;
     }
-    out.count=NominalCount;out.kind=NCG76Mixed::Kind::G76;out.orbit=plan.nominal;
+    out.count=CountForRecipe(plan.recipe);out.kind=NCG76Mixed::Kind::G76;out.orbit=plan.nominal;
     out.pc=plan.scope.sourcePC;out.line=plan.scope.line;out.triggerAfter=0U;
     return true;
 }
@@ -580,7 +638,8 @@ inline bool SamePlan(const Plan& a,const Plan& b) noexcept
         EDM97::DoubleBits(x.input.feedMmMin)!=EDM97::DoubleBits(y.input.feedMmMin)||
         EDM97::DoubleBits(x.input.heightMm)!=EDM97::DoubleBits(y.input.heightMm)||
         EDM97::DoubleBits(x.input.centerReturnFeedMmMin)!=EDM97::DoubleBits(y.input.centerReturnFeedMmMin)||
-        EDM97::DoubleBits(x.input.shapeAngleDeg)!=EDM97::DoubleBits(y.input.shapeAngleDeg))return false;
+        EDM97::DoubleBits(x.input.shapeAngleDeg)!=EDM97::DoubleBits(y.input.shapeAngleDeg)||
+        x.input.polygonSides!=y.input.polygonSides)return false;
     if(x.version!=y.version||x.modeP!=y.modeP||x.count!=y.count||x.growCount!=y.growCount||
         x.flushBeginIndex!=y.flushBeginIndex||x.flushEndIndex!=y.flushEndIndex||x.flushLegCount!=y.flushLegCount||
         x.flushLegIndices!=y.flushLegIndices||EDM97::DoubleBits(x.chordErrorBoundMm)!=EDM97::DoubleBits(y.chordErrorBoundMm))return false;
@@ -604,7 +663,7 @@ inline bool SamePlan(const Plan& a,const Plan& b) noexcept
     }
     return true;
 }
-static_assert(NominalCount<=NCG76::MaximumPoints,"EDM173 keeps existing native plan capacity");
+static_assert(MaximumNominalCount<=NCG76::MaximumPoints,"EDM173 keeps existing native plan capacity");
 static_assert(std::is_trivially_copyable<Plan>::value,"EDM173 is an immutable value plan");
 
 // Opt-in full validation for the RT seal consumer. Scratch is private startup
@@ -615,20 +674,24 @@ namespace Detail
 inline bool Inputs(const Scope& scope,const NCG76::NativePlan& nominal,
     const EDM130::Recipe& recipe,const EDM97::Tuning& tuning,ValidationScratch& scratch) noexcept
 {
+    const unsigned count=CountForRecipe(recipe);
     if(!ValidScope(scope)||!EDM130::IsG76Gap173(recipe)||
+        nominal.modeP!=EDM130::G76PlanMode(recipe)||
+        nominal.program.modeP!=nominal.modeP||
+        (NCG76Mode::IsPolygon(nominal.modeP)?!NCG76Mode::ValidPolygonSides(nominal.program.input.polygonSides):nominal.program.input.polygonSides!=0U)||
         nominal.program.input.targetAxis!=UsesTargetAxis(recipe)||
         !EDM130::ValidHistoryRecipeBinding(HistoryFixture,recipe)||!EDM97::ValidMotionTestCurve(tuning,recipe)||
         !NCG76::ValidNative(nominal,scratch,true,true,PreservesG90StationaryZ(recipe))||!FrameSupported(nominal.translation)||
-        nominal.translation.runToken!=scope.run||nominal.count!=NominalCount||nominal.program.count!=NominalCount||
+        nominal.translation.runToken!=scope.run||nominal.count!=count||nominal.program.count!=count||
         nominal.program.growCount!=24U||nominal.program.input.flushMode!=0U||nominal.program.flushLegCount!=0U||
         nominal.program.input.heightMm!=0.0||nominal.program.input.centerReturnFeedMmMin!=0.0||
         !RadiusWithinLimit(nominal.program.input.radiusMm,nominal.translation.scalingFactor,IsCenterRecipe(recipe))||nominal.program.input.feedMmMin!=FeedMmMin||
         !CenterTravelWithinLimit(nominal.program.input,nominal.translation.scalingFactor)||!NominalPrecisionWithinLimit(nominal)||
         (UsesNominalMovementMask(recipe)&&recipe.planMovementMask!=NominalMovementMask(nominal)))return false;
-    for(unsigned k=0U;k<NominalCount;++k)
+    for(unsigned k=0U;k<count;++k)
     {
         if(nominal.feedMmMin[k]!=FeedMmMin||nominal.program.points[k].phase!=
-            (k<24U?NCG76::Phase::Grow:NCG76::Phase::FinishCenter))return false;
+            PhaseForChild(nominal.modeP,k))return false;
         for(unsigned a=0U;a<8U;++a)
             if(a<3U?std::fabs(nominal.pointsMCS[k][a]-nominal.startMCS[a])>MaximumNominalExcursionMm:
                 EDM97::DoubleBits(nominal.pointsMCS[k][a])!=EDM97::DoubleBits(nominal.startMCS[a]))return false;

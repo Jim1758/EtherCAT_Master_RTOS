@@ -5954,7 +5954,10 @@ int EtherCatMaster::RunRealTimeCycle_EDM_SINKER_MODE()//主要程式迴圈執行
         // It only submits/polls the existing PDO-owner async command slot.
         ProcessEtherCatEngineeringService(this);
         PrintEDM174CommunicationTrace();
-        PrintEDM174G76LeafTiming();
+        // EDM231 FIX4: keep first-fault communication evidence immediate;
+        // defer periodic text only. RT collectors continue unchanged.
+        if (!m_NC->IsEDM173DiagnosticQuietSameThread())
+            PrintEDM174G76LeafTiming();
 
         HMI_Bridge::ProcessTask(m_NC);//高速API共享記憶體作業任務
         ncPLCManager.Process();
@@ -6010,9 +6013,14 @@ int EtherCatMaster::RunRealTimeCycle_EDM_SINKER_MODE()//主要程式迴圈執行
         {
             timer_1000ms = 0; // 執行完立刻歸零
             timer_1000ms_Count += 1;
-            PrintEDM142PdoTiming(m_NC, &m_Motion);
-            PrintEDM144RuntimeTiming();
-            PrintEDM173Fix19AxesTiming();
+            // Recheck after ProcessTask: fault/reset/completion can reopen
+            // diagnostics in this same supervisory iteration.
+            if (!m_NC->IsEDM173DiagnosticQuietSameThread())
+            {
+                PrintEDM142PdoTiming(m_NC, &m_Motion);
+                PrintEDM144RuntimeTiming();
+                PrintEDM173Fix19AxesTiming();
+            }
             HMI_Bridge::ProcessTask_1000ms(m_NC); // 呼叫 1000ms 任務
 
             // HOME 成功時 HomingManager 只 Queue 記憶體資料。

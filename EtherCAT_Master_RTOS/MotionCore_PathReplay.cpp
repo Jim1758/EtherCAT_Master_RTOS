@@ -728,7 +728,7 @@ namespace
                     !unit(a,initial[a],plan.nominal.startMCS[a])))
                 {cause="INITIAL_UNIT";failedAxis=static_cast<int>(a);break;}
         if(!cause)
-            for(unsigned k=0U;k<EDM173::NominalCount;++k)
+            for(unsigned k=0U;k<EDM173::CountForRecipe(plan.recipe);++k)
             {
                 if(!NCG76Mixed::Detail::CanonicalOrbitRow(plan.nominal,k,initial,ppu,previousPulse,row))
                     cause="CANONICAL_ROW";
@@ -898,7 +898,7 @@ bool MotionCore::TryG76GapMoveTransactionalTail(const EDM173::Plan& plan,
         return reject(true,true,MotionRejectReason::INVALID_GEOMETRY,MotionG76AdmissionGate::AXIS_MAPPING);
     result.startPulse=work.startPulse; result.validAxisMask=enabled; receipt.axisMask=enabled;
     const bool nominalBuilt=EDM173::BuildNominal(plan,work.startPulse,result.pulsePerUnit,work.rebuiltNominal,stationaryRotaryModulo);
-    if(!nominalBuilt || work.rebuiltNominal.count!=25U)
+    if(!nominalBuilt || work.rebuiltNominal.count!=EDM173::CountForRecipe(plan.recipe))
     {
         PrintEDM183NominalInputFailure(plan,work.startPulse,result.pulsePerUnit,stationaryRotaryModulo,nominalBuilt,work.rebuiltNominal.count);
         return reject(true,true,MotionRejectReason::INVALID_GEOMETRY,MotionG76AdmissionGate::PLAN_INPUT);
@@ -997,7 +997,7 @@ bool MotionCore::TryG76GapMoveTransactionalTail(const EDM173::Plan& plan,
         if (!std::isfinite(velocity) || velocity<1.0 || !std::isfinite(velocity/acc) || !std::isfinite(velocity/dec))
             return reject(true,true,MotionRejectReason::INVALID_GEOMETRY,MotionG76AdmissionGate::POINT_DYNAMICS,-1,static_cast<int>(k));
         auto& cmd=work.commands[k]; ClearRetainedCommand(cmd);
-        cmd.edm173G76Gap=true;cmd.edm173ChildOrdinal=static_cast<std::uint8_t>(k);cmd.edm173ChildCount=25U;
+        cmd.edm173G76Gap=true;cmd.edm173ChildOrdinal=static_cast<std::uint8_t>(k);cmd.edm173ChildCount=static_cast<std::uint8_t>(EDM173::CountForRecipe(plan.recipe));
         cmd.dir=arc?(reverse?-g.direction:g.direction):0;
         cmd.mode=!arc?InterpolationMode::LINEAR:cmd.dir==1?InterpolationMode::CIRCULAR_CCW:InterpolationMode::CIRCULAR_CW;
         for (unsigned a=0U;a<8U;++a) {
@@ -1022,9 +1022,9 @@ bool MotionCore::TryG76GapMoveTransactionalTail(const EDM173::Plan& plan,
     if (!m_Group.cmdQueue.ProducerHasCapacity(native.count))
         return reject(false,true,MotionRejectReason::QUEUE_FULL,MotionG76AdmissionGate::QUEUE_CAPACITY);
     const MotionExecutionEpoch expected=epoch==(std::numeric_limits<MotionExecutionEpoch>::max)()?1U:epoch+1U;
-    for(unsigned k=0U;k<25U;++k){AssignExecutionIdentity(work.commands[k],expected,source,owner);result.identities[k]=work.commands[k].execution;}
-    auto& seal=m_edm173->producer;seal.plan=plan;seal.epoch=expected;seal.startPulse=work.startPulse;seal.pulsePerUnit=result.pulsePerUnit;
-    for(unsigned k=0U;k<25U;++k){seal.identities[k]=result.identities[k];seal.endPulse[k]=result.legEndPulse[k];}
+    for(unsigned k=0U;k<native.count;++k){AssignExecutionIdentity(work.commands[k],expected,source,owner);result.identities[k]=work.commands[k].execution;}
+    auto& seal=m_edm173->producer;seal=MotionEDM173Seal{};seal.plan=plan;seal.epoch=expected;seal.startPulse=work.startPulse;seal.pulsePerUnit=result.pulsePerUnit;
+    for(unsigned k=0U;k<native.count;++k){seal.identities[k]=result.identities[k];seal.endPulse[k]=result.legEndPulse[k];}
     auto previous=m_edm173->publishedSession.load(std::memory_order_acquire);
     if(previous>=plan.scope.session || !m_edm173->publishedSession.compare_exchange_strong(previous,plan.scope.session,std::memory_order_acq_rel) ||
         !m_edm173->messages.ProducerTryPush(seal))

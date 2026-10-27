@@ -8786,7 +8786,8 @@ void MotionCore::ServiceEDM94MotionPass(bool complete) noexcept
             armConfig.commissioningProfile==EDM130::VisibleFlushProfile173&&
             (EDM130::IsG76SquareB1_250(arm.timerRecipe)||EDM130::IsG76DiamondB1_255(arm.timerRecipe)||
                 EDM130::IsG76OneMmB1_260(arm.timerRecipe)||
-                EDM130::IsG76Expansion263(arm.timerRecipe));
+                EDM130::IsG76Expansion263(arm.timerRecipe)||EDM130::IsG76FixedRadius266(arm.timerRecipe)||
+                EDM130::IsG76FixedRadiusWork267(arm.timerRecipe));
         if(g76B2||g76B0)armConfig.maxDurationUs=EDM94::MaximumDurationUs;
         if((arm.ordinarySequenceProgram==247U||arm.ordinarySequenceProgram==248U)&&boundedProgram&&requiredMovementMask==7U&&
             !visibleFlush&&!armConfig.commissioningProfile&&

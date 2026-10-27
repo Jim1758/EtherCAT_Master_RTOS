@@ -15,6 +15,8 @@
     <RootNamespace>EtherCAT_Master_RTOS</RootNamespace>
     <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
     <PlatformToolset>v142</PlatformToolset>
+    <!-- EDM267 FIX1: use the x64 compiler host for the existing x64 RTSS target. -->
+    <PreferredToolArchitecture>x64</PreferredToolArchitecture>
     <ProjectName>EtherCAT_Master_RTOS</ProjectName>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
@@ -186,6 +188,7 @@
     <ClInclude Include="NCGCodeSemantics.h" />
     <ClInclude Include="NCLifecycleInterruptionBoundary.h" />
     <ClInclude Include="NCManager.h" />
+    <ClInclude Include="NCManager_GapInternal.h" />
     <ClInclude Include="NCMainThreadStackPolicy.h" />
     <ClInclude Include="EDMToolHeadKinematics.h" />
     <ClInclude Include="NCPathCoreCutterContour.h" />
@@ -357,6 +360,12 @@
     <ClCompile Include="NCLifecycleInterruptionBoundary.cpp" />
     <ClCompile Include="NCManager.cpp" />
     <ClCompile Include="NCManager_Gap.cpp" />
+    <ClCompile Include="NCManager_GapPhysical.cpp" />
+    <ClCompile Include="NCManager_GapFixture.cpp" />
+    <ClCompile Include="NCManager_GapBracket.cpp" />
+    <ClCompile Include="NCManager_GapWorkTime.cpp" />
+    <ClCompile Include="NCManager_GapG76.cpp" />
+    <ClCompile Include="NCManager_GapDiagnostics.cpp" />
     <ClCompile Include="NCManager_EDMServo.cpp" />
     <ClCompile Include="NCManager_Cutter.cpp" />
     <ClCompile Include="NCManager_PathArc.cpp" />

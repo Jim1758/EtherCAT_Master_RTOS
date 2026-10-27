@@ -1,4 +1,5 @@
 #pragma once
+#include <cstddef>
 #include "EDMSixAxisCurveB2Excursion.h"
 #include "EDMSixAxisGapFlushPath.h"
 
@@ -104,6 +105,9 @@ struct Policy
 {
     Mode mode = Mode::Invalid;
     Fixture fixture = Fixture::Canonical116;
+    // EDM263 FIX1: reuse the original alignment gap before profile. Appending
+    // this count enlarged every embedded Policy and exceeded fixed budgets.
+    unsigned g76Rows = G76GapRows173;
     EDM107::FlushProfile profile{};
     int selectorPC = -1;
     std::uint64_t selectorDispatch = 0ULL, revision = 0ULL;
@@ -112,10 +116,13 @@ struct Policy
     // fabricated B dispatch. Legacy explicit-P131 policies keep origin empty.
     int modeOriginPC = -1;
     std::uint64_t modeOriginDispatch = 0ULL, modeOriginRevision = 0ULL;
-    // EDM263 explicitly seals the 26-child target-plane expansion. Existing
-    // compound and unrelated fixtures retain their original 25-row default.
-    unsigned g76Rows = G76GapRows173;
 };
+static_assert(sizeof(Policy)==80U && alignof(Policy)==8U &&
+    offsetof(Policy,mode)==0U && offsetof(Policy,fixture)==1U && offsetof(Policy,g76Rows)==4U &&
+    offsetof(Policy,profile)==8U && offsetof(Policy,selectorPC)==32U &&
+    offsetof(Policy,selectorDispatch)==40U && offsetof(Policy,revision)==48U &&
+    offsetof(Policy,modeOriginPC)==56U && offsetof(Policy,modeOriginDispatch)==64U &&
+    offsetof(Policy,modeOriginRevision)==72U,"EDM263 FIX1 preserves bounded Policy layout and existing field offsets");
 inline unsigned PolicyRows(const Policy& policy) noexcept
 {
     if (policy.fixture != Fixture::ModalG76Gap173)

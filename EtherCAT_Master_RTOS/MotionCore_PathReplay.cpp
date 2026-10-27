@@ -621,6 +621,21 @@ bool MotionCore::TryG76MixedMoveTransactionalTail(const NCG76Mixed::Plan& plan,
         cmd.startRadius=cmd.endRadius=cmd.mem_radius=g.radiusPulse;
         cmd.mem_startAngle=g.startAngle; cmd.mem_totalAngle=g.sweepRadians; cmd.mem_totalDist=g.lengthPulse;
         cmd.mem_transformOrigin[0]=leg.startU; cmd.mem_transformOrigin[1]=leg.endU; cmd.mem_transformOrigin[2]=2.0;
+        if(input.translation.workMode==168)
+        {
+            // Disabled transform storage carries immutable ordinary WORK B2
+            // provenance; the native interval is already transformed exactly once.
+            const double kind=static_cast<double>(static_cast<unsigned>(input.nominal.kind));
+            const double ordinal=static_cast<double>(k+1U);
+            cmd.mem_transformMatrix[0U][0U]=269.0; cmd.mem_transformMatrix[0U][1U]=1.0;
+            cmd.mem_transformMatrix[0U][2U]=kind; cmd.mem_transformMatrix[1U][0U]=static_cast<double>(plan.count);
+            cmd.mem_transformMatrix[1U][1U]=ordinal;
+            cmd.mem_transformMatrix[1U][2U]=static_cast<double>(static_cast<unsigned>(leg.phase));
+            cmd.mem_transformMatrix[2U][0U]=2690000000.0+kind*1000000.0+static_cast<double>(plan.count)*1000.0+ordinal;
+            cmd.mem_transformMatrix[2U][1U]=input.nominal.kind==NCG76Mixed::Kind::G76 ?
+                static_cast<double>(input.nominal.orbit.modeP) : 0.0;
+            cmd.mem_transformMatrix[2U][2U]=static_cast<double>(input.nominal.count);
+        }
         cmd.targetVel=velocity; cmd.accTime=acc; cmd.decTime=dec; cmd.commandPathMode=MotionCommandPathMode::EXACT_STOP;
         cmd.pathCorePlanarCircle=arc; cmd.pathCoreFullCircle=arc&&g.fullCircle; cmd.pathCoreRetainedTraversal=true; cmd.pathCoreRetainedReverse=reverse;
         cmd.sourceLinePC=m_pendingSourcePC; cmd.sourceWCS=m_pendingSourceWCS; cmd.sourceTranslation=m_pendingTranslation;

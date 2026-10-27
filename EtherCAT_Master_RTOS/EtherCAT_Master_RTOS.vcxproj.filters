@@ -483,6 +483,24 @@
     <ClCompile Include="NCManager_Gap.cpp">
       <Filter>Source Files\NC\EDM</Filter>
     </ClCompile>
+    <ClCompile Include="NCManager_GapPhysical.cpp">
+      <Filter>Source Files\NC\EDM</Filter>
+    </ClCompile>
+    <ClCompile Include="NCManager_GapFixture.cpp">
+      <Filter>Source Files\NC\EDM</Filter>
+    </ClCompile>
+    <ClCompile Include="NCManager_GapBracket.cpp">
+      <Filter>Source Files\NC\EDM</Filter>
+    </ClCompile>
+    <ClCompile Include="NCManager_GapWorkTime.cpp">
+      <Filter>Source Files\NC\EDM</Filter>
+    </ClCompile>
+    <ClCompile Include="NCManager_GapG76.cpp">
+      <Filter>Source Files\NC\EDM</Filter>
+    </ClCompile>
+    <ClCompile Include="NCManager_GapDiagnostics.cpp">
+      <Filter>Source Files\NC\EDM</Filter>
+    </ClCompile>
     <ClCompile Include="EDMConditionService.cpp">
       <Filter>Source Files\NC\EDM</Filter>
     </ClCompile>
@@ -497,6 +515,9 @@
     </ClCompile>
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="NCManager_GapInternal.h">
+      <Filter>Source Files\NC\EDM</Filter>
+    </ClInclude>
     <ClInclude Include="EtherCAT_Master_RTOS.h">
       <Filter>Header Files</Filter>
     </ClInclude>

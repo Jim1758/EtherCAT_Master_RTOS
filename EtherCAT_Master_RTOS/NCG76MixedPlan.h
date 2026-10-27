@@ -86,6 +86,25 @@ struct Plan
     void Clear() noexcept;
 };
 
+// Taper plans retain the established 24 contour samples plus target-center finish.
+// Expansion and fixed-radius add one entry; their reversal follows sample 12.
+inline unsigned NominalCountForOrbit(const NCG76::NativePlan& orbit) noexcept
+{
+    if (orbit.modeP!=orbit.program.modeP || orbit.program.input.flushMode!=2U) return 0U;
+    if ((orbit.modeP==NCG76::ModeP11 && !orbit.program.input.targetAxis) ||
+        (NCG76::IsTaperRetainedMode268(orbit.modeP) && orbit.program.input.targetAxis))
+        return NCG76::GrowSegments+1U;
+    if ((NCG76Mode::IsHoleExpansion(orbit.modeP) || NCG76Mode::IsFixedRadius(orbit.modeP)) && orbit.program.input.targetAxis)
+        return NCG76::GrowSegments+2U;
+    return 0U;
+}
+inline unsigned TriggerAfterForOrbit(const NCG76::NativePlan& orbit) noexcept
+{
+    const unsigned count=NominalCountForOrbit(orbit);
+    return count==0U ? 0U : NCG76::FlushSample+
+        ((NCG76Mode::IsHoleExpansion(orbit.modeP) || NCG76Mode::IsFixedRadius(orbit.modeP))?1U:0U);
+}
+
 bool SameGeometry(const Geometry&, const Geometry&) noexcept;
 bool SameScope(const Scope&, const Scope&) noexcept;
 bool FrameSupported(const NCTranslationSnapshot&) noexcept;
@@ -160,7 +179,11 @@ inline bool GeometryValid(const Geometry& g,unsigned mask,const Point8& ppu) noe
     if (!IsNCPathCoreRetainedGeometryValid(g) || g.point ||
         (g.kind!=NCPathCoreRetainedKind::LINE && g.kind!=NCPathCoreRetainedKind::ARC) ||
         !(g.lengthMM>0.0) || !(g.lengthPulse>0.0) || (g.axisMask&mask)!=g.axisMask) return false;
-    for (unsigned a=0U;a<8U;++a)
+    // Retained geometry interpolates XYZ only. Stationary outer axes preserve
+    // their exact accepted native/pulse tuple; a rotary native coordinate may
+    // be modulo-normalized while its accepted pulse position is unwrapped.
+    // Do not reinterpret that fixed tuple as an XYZ dimensional conversion.
+    for (unsigned a=0U;a<3U;++a)
         if ((mask&(1U<<a))!=0U &&
             (!Unit(g.startPulse[a],g.startMCS[a],ppu[a]) || !Unit(g.endPulse[a],g.endMCS[a],ppu[a]))) return false;
     return g.kind!=NCPathCoreRetainedKind::ARC || (ppu[0]==ppu[1] &&
@@ -254,8 +277,9 @@ inline Status Generate(const Input& in,Emit emit,double& available,unsigned& rev
     if ((n.kind==Kind::LINE && (n.count!=1U || n.triggerAfter!=1U || n.geometry[0].kind!=NCPathCoreRetainedKind::LINE)) ||
         (n.kind==Kind::ARC && (n.count!=1U || n.triggerAfter!=1U || n.geometry[0].kind!=NCPathCoreRetainedKind::ARC)) ||
         (n.kind!=Kind::LINE && n.kind!=Kind::ARC && n.kind!=Kind::G76)) return Status::INVALID_NOMINAL;
-    if (n.kind==Kind::G76 && (n.count!=25U || n.triggerAfter!=12U ||
-        n.orbit.program.input.flushMode!=2U || !NCG76::ValidNativeBase(n.orbit) ||
+    if (n.kind==Kind::G76 && (NominalCountForOrbit(n.orbit)==0U ||
+        n.count!=NominalCountForOrbit(n.orbit) || n.triggerAfter!=TriggerAfterForOrbit(n.orbit) ||
+        n.orbit.program.input.flushMode!=2U || !NCG76::ValidNativeBase(n.orbit,true,true) ||
         !SameNCTranslationSnapshot(n.orbit.translation,in.translation))) return Status::INVALID_NOMINAL;
     Point8 previousPulse=n.geometry[0].startPulse;
     const Point8 initialPulse=previousPulse;
@@ -283,6 +307,20 @@ inline Status Generate(const Input& in,Emit emit,double& available,unsigned& rev
         if (!Finite(available)) return Status::INVALID_HISTORY;
     }
     if (in.retreatMm>available) return Status::INSUFFICIENT_HISTORY;
+    unsigned exactExpansionBoundary=NoIndex;
+    if (n.kind==Kind::G76 && (NCG76Mode::IsHoleExpansion(n.orbit.modeP) || NCG76Mode::IsFixedRadius(n.orbit.modeP)))
+    {
+        // A requested published suffix length names its exact source seam.
+        // Repeated subtraction in the opposite order can otherwise invent a
+        // tiny extra partial leg. Match exact forward sums, never a tolerance;
+        // legacy 25-row callers retain their original interval arithmetic.
+        for (unsigned boundary=lower;boundary<total;++boundary)
+        {
+            double suffix=0.0;
+            for (unsigned i=boundary;i<total;++i) suffix+=Source(in,i).lengthMM;
+            if (in.retreatMm==suffix) { exactExpansionBoundary=boundary; break; }
+        }
+    }
     struct Interval { unsigned source=0U; double start=0.0,end=0.0; };
     std::array<Interval,HistoryCapacity> reverse{};
     double remaining=in.retreatMm;
@@ -291,7 +329,12 @@ inline Status Generate(const Input& in,Emit emit,double& available,unsigned& rev
         --cursor; const double length=Source(in,cursor).lengthMM;
         if (reverseCount>=HistoryCapacity) return Status::CAPACITY;
         Interval& step=reverse[reverseCount++]; step.source=cursor; step.start=1.0;
-        if (remaining>=length)
+        if (exactExpansionBoundary!=NoIndex)
+        {
+            step.end=0.0;
+            if (cursor==exactExpansionBoundary) remaining=0.0;
+        }
+        else if (remaining>=length)
         {
             step.end=0.0; remaining-=length;
             // Exact requested equality to the published full available length
@@ -356,10 +399,11 @@ inline bool SameScope(const Scope& a,const Scope& b) noexcept
 }
 inline bool FrameSupported(const NCTranslationSnapshot& s) noexcept
 {
-    // Marker-2 admission is a separately qualified native lane. Its original
-    // geometry/pulses are already frozen; no authored transform is applied a
-    // second time. Legacy retained marker-0/1 frame gates remain unchanged.
-    return NCG76::FrameSupported(s);
+    // EDM269: marker-2 mixed admission qualifies a fixed XYZ WORK offset and
+    // XY yaw. Geometry and pulses are already native in this frozen frame;
+    // retained traversal never applies the authored transform a second time.
+    // Legacy OrbitPlan defaults and retained marker-0/1 gates stay unchanged.
+    return NCG76::FrameSupported(s,true,true);
 }
 inline const char* StatusName(Status status) noexcept
 {
@@ -389,7 +433,8 @@ inline bool BuildG76Nominal(const NCG76::NativePlan& orbit,const Point8& startPu
     const Point8& ppu,int pc,int line,NominalSource& out) noexcept
 {
     Detail::ClearNominal(out);
-    if (!NCG76::ValidNativeBase(orbit) || orbit.program.input.flushMode!=2U || orbit.count!=25U ||
+    const unsigned count=NominalCountForOrbit(orbit);
+    if (count==0U || !NCG76::ValidNativeBase(orbit,true,true) || orbit.count!=count ||
         !FrameSupported(orbit.translation) || pc<0 || line<=0) return false;
     Point8 previous=startPulse;
     for (unsigned a=0U;a<8U;++a)
@@ -401,7 +446,7 @@ inline bool BuildG76Nominal(const NCG76::NativePlan& orbit,const Point8& startPu
         { Detail::ClearNominal(out); return false; }
         previous=out.geometry[i].endPulse; out.feedMmMin[i]=orbit.feedMmMin[i];
     }
-    out.count=orbit.count; out.triggerAfter=12U; out.kind=Kind::G76; out.orbit=orbit; out.pc=pc; out.line=line;
+    out.count=orbit.count; out.triggerAfter=TriggerAfterForOrbit(orbit); out.kind=Kind::G76; out.orbit=orbit; out.pc=pc; out.line=line;
     return true;
 }
 inline bool Build(const Input& in,Plan& out) noexcept

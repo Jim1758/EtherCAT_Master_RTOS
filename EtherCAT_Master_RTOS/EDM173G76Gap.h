@@ -15,7 +15,7 @@ namespace EDM173
 constexpr unsigned ArmP=292U, FinishP=293U, HistoryFixture=14U, CommissioningProfile=4U, NominalCount=25U;
 constexpr unsigned MaximumNominalCount=26U;
 inline unsigned CountForMode(unsigned modeP) noexcept
-{return NCG76Mode::IsHoleExpansion(modeP)?MaximumNominalCount:NominalCount;}
+{return NCG76Mode::IsHoleExpansion(modeP)||NCG76Mode::IsFixedRadius(modeP)?MaximumNominalCount:NominalCount;}
 inline unsigned CountForRecipe(const EDM130::Recipe& recipe) noexcept
 {return EDM130::G76PlanRows(recipe);}
 constexpr unsigned B2ArmP=294U, B2FinishP=295U, B2CommissioningProfile=5U;
@@ -205,7 +205,7 @@ inline bool RecipeMatchesArm(unsigned p,const EDM130::Recipe& recipe) noexcept
 inline EDM116::Mode ExpectedMode(const EDM130::Recipe& recipe) noexcept
 {return IsB0Recipe(recipe)?EDM116::Mode::B0:IsB4Recipe(recipe)?EDM116::Mode::B4:IsB3Recipe(recipe)?EDM116::Mode::B3:IsB2Recipe(recipe)?EDM116::Mode::B2:EDM130::IsVisibleFlush173(recipe)?EDM116::Mode::B1:EDM116::Mode::Invalid;}
 inline double FrozenHeightMm(const EDM130::Recipe& recipe) noexcept
-{return (IsCenterRecipe(recipe)||EDM130::IsG76OneMmB1_260(recipe)||EDM130::IsG76ExpansionB1_263(recipe))?EDM130::FrozenJumpHeightMm(recipe):
+{return (IsCenterRecipe(recipe)||EDM130::IsG76OneMmB1_260(recipe)||EDM130::IsG76ExpansionB1_263(recipe)||EDM130::IsG76FixedRadiusB1_266(recipe)||EDM130::IsG76FixedRadiusWorkB1_267(recipe))?EDM130::FrozenJumpHeightMm(recipe):
     IsB0Recipe(recipe)?2.0:IsB2Recipe(recipe)?0.001:EDM130::IsVisibleFlush173(recipe)?2.0:0.0;}
 // EDM193 movement evidence is derived from the frozen compensated endpoints,
 // not the authored word mask or the producer's structural XYZ axis mask.
@@ -377,6 +377,9 @@ inline std::uint64_t Fingerprint(const Scope& s,const NCG76::NativePlan& n,
     if(n.modeP==16U){Word(h,0x4737365031365131ULL);Word(h,in.polygonSides);} // G76P16Q1
     if(NCG76Mode::IsHoleExpansion(n.modeP))
     {Word(h,0x4737364558503236ULL);Word(h,n.modeP);Word(h,in.polygonSides);} // G76EXP26
+    if(NCG76Mode::IsFixedRadius(n.modeP))
+    {Word(h,0x4737364649583236ULL);Word(h,n.modeP);Word(h,in.polygonSides);} // G76FIX26
+    if(EDM130::IsG76FixedRadiusWork267(r))Word(h,0x473736574f524b32ULL); // G76WORK2
     // A geometrically identical vertical plan must not reuse the old native
     // +Z center-flush contract. Other modes retain their complete old stream.
     if(IsCenterRecipe(r))Word(h,0x4737364146323034ULL); // G76AF204
@@ -384,6 +387,8 @@ inline std::uint64_t Fingerprint(const Scope& s,const NCG76::NativePlan& n,
 }
 inline NCG76::Phase PhaseForChild(unsigned modeP,unsigned child) noexcept
 {
+    if(NCG76Mode::IsFixedRadius(modeP))
+        return child==0U?NCG76::Phase::ApproachOrbit:child<25U?NCG76::Phase::Grow:NCG76::Phase::FinishCenter;
     if(NCG76Mode::IsHoleExpansion(modeP))
         return child==0U?NCG76::Phase::ApproachCenter:child<25U?NCG76::Phase::Grow:NCG76::Phase::FinishCenter;
     return child<24U?NCG76::Phase::Grow:NCG76::Phase::FinishCenter;
@@ -399,6 +404,8 @@ inline bool Inputs(const Scope& scope,const NCG76::NativePlan& nominal,
         nominal.program.input.targetAxis!=UsesTargetAxis(recipe)||
         !EDM130::ValidHistoryRecipeBinding(HistoryFixture,recipe)||!EDM97::ValidMotionTestCurve(tuning,recipe)||
         !NCG76::ValidNative(nominal,true,true,PreservesG90StationaryZ(recipe))||!FrameSupported(nominal.translation)||
+        (EDM130::IsG76FixedRadius266(recipe)&&nominal.translation.workMode!=169)||
+        (EDM130::IsG76FixedRadiusWork267(recipe)&&nominal.translation.workMode!=168)||
         nominal.translation.runToken!=scope.run||nominal.count!=count||nominal.program.count!=count||
         nominal.program.growCount!=24U||nominal.program.input.flushMode!=0U||nominal.program.flushLegCount!=0U||
         nominal.program.input.heightMm!=0.0||nominal.program.input.centerReturnFeedMmMin!=0.0||
@@ -480,7 +487,9 @@ inline bool CenterBoundary(const Plan& plan,unsigned boundary,NCG76::Point8& cen
         plan.nominal.program.count!=count||!FrameSupported(plan.nominal.translation))return false;
     const auto& n=plan.nominal;const auto& p=n.program;
     centerMCS=n.startMCS;
-    if(!boundary)return true;
+    // The fixed-radius radial entry has not advanced its center. Preserve
+    // the captured native start exactly instead of inverse/forward rounding.
+    if(!boundary||((EDM130::IsG76FixedRadius266(plan.recipe)||EDM130::IsG76FixedRadiusWork267(plan.recipe))&&boundary==1U))return true;
     double author[8]{},machine[8]{};
     if(n.translation.distanceMode==91)
     {
@@ -682,6 +691,8 @@ inline bool Inputs(const Scope& scope,const NCG76::NativePlan& nominal,
         nominal.program.input.targetAxis!=UsesTargetAxis(recipe)||
         !EDM130::ValidHistoryRecipeBinding(HistoryFixture,recipe)||!EDM97::ValidMotionTestCurve(tuning,recipe)||
         !NCG76::ValidNative(nominal,scratch,true,true,PreservesG90StationaryZ(recipe))||!FrameSupported(nominal.translation)||
+        (EDM130::IsG76FixedRadius266(recipe)&&nominal.translation.workMode!=169)||
+        (EDM130::IsG76FixedRadiusWork267(recipe)&&nominal.translation.workMode!=168)||
         nominal.translation.runToken!=scope.run||nominal.count!=count||nominal.program.count!=count||
         nominal.program.growCount!=24U||nominal.program.input.flushMode!=0U||nominal.program.flushLegCount!=0U||
         nominal.program.input.heightMm!=0.0||nominal.program.input.centerReturnFeedMmMin!=0.0||

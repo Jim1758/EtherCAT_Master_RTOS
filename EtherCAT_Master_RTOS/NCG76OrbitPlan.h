@@ -13,7 +13,7 @@
 // CNC line producer; this header owns no motion, GAP, power or I/O authority.
 // G90 inputs are absolute program XYZ. G91 uses a zero program origin and
 // literal canonical XYZ displacements, preserving small moves at large origins.
-// Growth is a polygonal approximation. Legacy callers use program G17 XY;
+// Orbit contours use a polygonal approximation. Legacy callers use program G17 XY;
 // the sealed targetAxis caller uses the plane normal to start -> XYZ target.
 #if defined(__FAST_MATH__) || defined(_M_FP_FAST)
 #error G76_orbit_requires_precise_floating_point_semantics
@@ -27,6 +27,10 @@ namespace NCG76
 using Point3 = std::array<double, 3U>;
 using Point8 = std::array<double, 8U>;
 constexpr std::uint32_t Version = 1U;
+constexpr std::uint32_t ModeP01 = 1U;
+constexpr std::uint32_t ModeP02 = 2U;
+constexpr std::uint32_t ModeP03 = 3U;
+constexpr std::uint32_t ModeP06 = 6U;
 constexpr std::uint32_t ModeP11 = 11U;
 constexpr std::uint32_t ModeP12 = 12U;
 constexpr std::uint32_t ModeP13 = 13U;
@@ -51,6 +55,16 @@ inline bool ValidShapeAngle(double angleDeg) noexcept
     return std::isfinite(angleDeg) && angleDeg >= -180.0 && angleDeg <= 180.0;
 }
 
+// Ordinary expansion/fixed-radius AIR may use a frozen XYZ work offset and XY
+// work yaw. Retained-path B2 keeps its established neutral work frame.
+inline bool AllowsFixedWorkFrame(std::uint32_t modeP,unsigned flushMode) noexcept
+{ return (NCG76Mode::IsHoleExpansion(modeP) || NCG76Mode::IsFixedRadius(modeP)) && flushMode==0U; }
+
+// EDM268: noncircular taper B2 uses the target-axis contour and retained proof.
+// The established P11 retained lane remains its legacy G17 contour.
+inline bool IsTaperRetainedMode268(std::uint32_t modeP) noexcept
+{ return modeP==ModeP12 || modeP==ModeP13 || modeP==ModeP16; }
+
 struct PlanInput
 {
     Point3 start{}, end{};
@@ -60,7 +74,7 @@ struct PlanInput
     double heightMm = 0.0;  // Total height above sample-12 center, not an addition.
     double centerReturnFeedMmMin = 0.0; // Physical mm/min; zero inherits F.
     double shapeAngleDeg = 0.0; // K: local orbit orientation; center path is unchanged.
-    unsigned polygonSides = 0U; // Literal Q for P16/P26 only; other modes require zero.
+    unsigned polygonSides = 0U; // Literal Q for P06/P16/P26 only; other modes require zero.
     bool targetAxis = false; // Internal sealed-lane opt-in; no additional NC word.
 };
 
@@ -72,7 +86,8 @@ enum class Phase : std::uint8_t
     ReturnCenter = 3U,
     Resume = 4U,
     FinishCenter = 5U,
-    ApproachCenter = 6U // Expansion first reaches the target center before growing.
+    ApproachCenter = 6U, // Expansion first reaches the target center before growing.
+    ApproachOrbit = 7U // Fixed-radius radial entry at the start center, before advancing.
 };
 
 struct Endpoint
@@ -97,6 +112,22 @@ struct ProgramPlan
     Point3 boundsMin{}, boundsMax{};
 };
 using Plan = ProgramPlan;
+
+inline bool UsesExpansionAirWorkFrame264(const ProgramPlan& p) noexcept
+{
+    return NCG76Mode::IsHoleExpansion(p.modeP) && AllowsFixedWorkFrame(p.modeP,p.input.flushMode) && p.input.targetAxis &&
+        p.count==GrowSegments+2U && p.growCount==GrowSegments &&
+        p.points[0U].phase==Phase::ApproachCenter &&
+        p.points[GrowSegments+1U].phase==Phase::FinishCenter;
+}
+
+inline bool UsesFixedRadiusAirWorkFrame265(const ProgramPlan& p) noexcept
+{
+    return NCG76Mode::IsFixedRadius(p.modeP) && p.input.flushMode==0U && p.input.targetAxis &&
+        p.count==GrowSegments+2U && p.growCount==GrowSegments &&
+        p.points[0U].phase==Phase::ApproachOrbit &&
+        p.points[GrowSegments+1U].phase==Phase::FinishCenter;
+}
 
 // NC freezes all eight machine-coordinate slots and its translation generation
 // before asking the normal transactional CNC producer to accept this batch.
@@ -238,7 +269,8 @@ inline bool Append(ProgramPlan& p, const Endpoint& point, bool flush) noexcept
     }
     return true;
 }
-inline bool ValidInput(const PlanInput& in, Point3& delta, double& coordinateScale) noexcept
+inline bool ValidInput(const PlanInput& in, Point3& delta, double& coordinateScale,
+    bool allowTargetAxisRetained = false) noexcept
 {
     if (!FinitePoint(in.start) || !FinitePoint(in.end) ||
         !Finite(in.radiusMm) || !(in.radiusMm > 0.0) || in.radiusMm > MaximumRadiusMm ||
@@ -247,7 +279,8 @@ inline bool ValidInput(const PlanInput& in, Point3& delta, double& coordinateSca
         in.centerReturnFeedMmMin < 0.0 || in.centerReturnFeedMmMin > MaximumFeedMmMin ||
         (in.flushMode != 0U && in.flushMode != 2U && in.flushMode != 3U && in.flushMode != 4U))
         return false;
-    if (in.targetAxis && in.flushMode != 0U) return false;
+    if (in.targetAxis && in.flushMode != 0U &&
+        !(allowTargetAxisRetained && in.flushMode==2U)) return false;
     if (in.flushMode == 0U || in.flushMode == 2U)
     {
         if (in.heightMm != 0.0 || in.centerReturnFeedMmMin != 0.0) return false;
@@ -283,12 +316,15 @@ inline bool BuildMode(std::uint32_t modeP,const PlanInput& in, ProgramPlan& out)
     const PlanInput frozen = in;
     out = ProgramPlan{};
     const bool expansion = NCG76Mode::IsHoleExpansion(modeP);
-    if(!NCG76Mode::IsImplemented(modeP)||(modeP!=ModeP11&&frozen.flushMode!=0U)||
-        (expansion&&!frozen.targetAxis)||
+    const bool fixedRadius = NCG76Mode::IsFixedRadius(modeP);
+    const bool targetAxisRetained = frozen.flushMode==2U &&
+        ((expansion || fixedRadius) || (IsTaperRetainedMode268(modeP) && frozen.targetAxis));
+    if(!NCG76Mode::IsImplemented(modeP)||(modeP!=ModeP11&&frozen.flushMode!=0U&&!targetAxisRetained)||
+        ((expansion||fixedRadius)&&!frozen.targetAxis)||
         (NCG76Mode::IsPolygon(modeP)?!NCG76Mode::ValidPolygonSides(frozen.polygonSides):frozen.polygonSides!=0U))return false;
     Point3 delta{};
     double coordinateScale = 0.0;
-    if (!Detail::ValidInput(frozen,delta,coordinateScale)) return false;
+    if (!Detail::ValidInput(frozen,delta,coordinateScale,targetAxisRetained)) return false;
     Detail::OrbitBasis basis{};
     if (!Detail::BuildOrbitBasis(frozen,delta,basis)) return false;
     ProgramPlan p{};
@@ -303,11 +339,22 @@ inline bool BuildMode(std::uint32_t modeP,const PlanInput& in, ProgramPlan& out)
         approach.phase = Phase::ApproachCenter; approach.feedMmMin = frozen.feedMmMin;
         if (!Detail::Append(p,approach,false)) return false;
     }
+    if (fixedRadius)
+    {
+        Endpoint approach{};
+        approach.center = frozen.start; approach.radiusMm = frozen.radiusMm;
+        approach.phase = Phase::ApproachOrbit; approach.feedMmMin = frozen.feedMmMin;
+        double x = 0.0, y = 0.0;
+        if (!NCG76Mode::UnitBoundary(modeP,0U,x,y,frozen.polygonSides)) return false;
+        approach.orbit = Detail::OrbitOffset({{frozen.radiusMm*x,frozen.radiusMm*y,0.0}},frozen.shapeAngleDeg,basis);
+        for (unsigned j = 0U; j < 3U; ++j) approach.position[j] = frozen.start[j]+approach.orbit[j];
+        if (!Detail::Append(p,approach,false)) return false;
+    }
     for (unsigned k = 1U; k <= GrowSegments; ++k)
     {
         const double t = static_cast<double>(k)/static_cast<double>(GrowSegments);
         Endpoint e{};
-        e.phase = Phase::Grow; e.growIndex = k; e.radiusMm = frozen.radiusMm*t;
+        e.phase = Phase::Grow; e.growIndex = k; e.radiusMm = fixedRadius ? frozen.radiusMm : frozen.radiusMm*t;
         e.feedMmMin = frozen.feedMmMin;
         for (unsigned j = 0U; j < 3U; ++j)
             e.center[j] = expansion || k == GrowSegments ? frozen.end[j] : frozen.start[j] + delta[j]*t;
@@ -394,8 +441,9 @@ inline bool FrameSupported(const NCTranslationSnapshot& s, bool allowFixedWorkTr
     if (!(IsNCTranslationSnapshotValid(s) && s.rotationPlane == 17 &&
         s.cutterMode == 40 && s.polarMode == 15 &&
         s.axisIdentity.eccentricEnabled == 0U)) return false;
-    // EDM183/184 opt in only the bounded EDM173 lane. Generic AIR/mixed callers
-    // retain G169/W0, even when an active W row happens to contain all zeros.
+    // EDM183/184 and ordinary expansion/fixed-radius AIR opt in at validated callers.
+    // Legacy AIR and retained-path mixed callers retain G169/W0, even when an
+    // active W row happens to contain all zeros.
     // The earlier translation-only opt-in still rejects a nonzero work yaw.
     if (s.workMode != 169 || s.workWCode != 0)
     {
@@ -567,12 +615,15 @@ inline bool BuildValidationProgramMode(std::uint32_t modeP,const PlanInput& in, 
     const PlanInput frozen = in;
     ClearValidationProgram(out);
     const bool expansion = NCG76Mode::IsHoleExpansion(modeP);
-    if(!NCG76Mode::IsImplemented(modeP)||(modeP!=ModeP11&&frozen.flushMode!=0U)||
-        (expansion&&!frozen.targetAxis)||
+    const bool fixedRadius = NCG76Mode::IsFixedRadius(modeP);
+    const bool targetAxisRetained = frozen.flushMode==2U &&
+        ((expansion || fixedRadius) || (IsTaperRetainedMode268(modeP) && frozen.targetAxis));
+    if(!NCG76Mode::IsImplemented(modeP)||(modeP!=ModeP11&&frozen.flushMode!=0U&&!targetAxisRetained)||
+        ((expansion||fixedRadius)&&!frozen.targetAxis)||
         (NCG76Mode::IsPolygon(modeP)?!NCG76Mode::ValidPolygonSides(frozen.polygonSides):frozen.polygonSides!=0U))return ClearValidationProgramFalse(out);
     Point3 delta{};
     double coordinateScale = 0.0;
-    if (!Detail::ValidInput(frozen,delta,coordinateScale)) return ClearValidationProgramFalse(out);
+    if (!Detail::ValidInput(frozen,delta,coordinateScale,targetAxisRetained)) return ClearValidationProgramFalse(out);
     Detail::OrbitBasis basis{};
     if (!Detail::BuildOrbitBasis(frozen,delta,basis)) return ClearValidationProgramFalse(out);
     ProgramPlan& p = out;
@@ -587,11 +638,22 @@ inline bool BuildValidationProgramMode(std::uint32_t modeP,const PlanInput& in, 
         approach.phase = Phase::ApproachCenter; approach.feedMmMin = frozen.feedMmMin;
         if (!Detail::Append(p,approach,false)) return ClearValidationProgramFalse(out);
     }
+    if (fixedRadius)
+    {
+        Endpoint approach{};
+        approach.center = frozen.start; approach.radiusMm = frozen.radiusMm;
+        approach.phase = Phase::ApproachOrbit; approach.feedMmMin = frozen.feedMmMin;
+        double x = 0.0, y = 0.0;
+        if (!NCG76Mode::UnitBoundary(modeP,0U,x,y,frozen.polygonSides)) return ClearValidationProgramFalse(out);
+        approach.orbit = OrbitOffset({{frozen.radiusMm*x,frozen.radiusMm*y,0.0}},frozen.shapeAngleDeg,basis);
+        for (unsigned j = 0U; j < 3U; ++j) approach.position[j] = frozen.start[j]+approach.orbit[j];
+        if (!Detail::Append(p,approach,false)) return ClearValidationProgramFalse(out);
+    }
     for (unsigned k = 1U; k <= GrowSegments; ++k)
     {
         const double t = static_cast<double>(k)/static_cast<double>(GrowSegments);
         Endpoint e{};
-        e.phase = Phase::Grow; e.growIndex = k; e.radiusMm = frozen.radiusMm*t;
+        e.phase = Phase::Grow; e.growIndex = k; e.radiusMm = fixedRadius ? frozen.radiusMm : frozen.radiusMm*t;
         e.feedMmMin = frozen.feedMmMin;
         for (unsigned j = 0U; j < 3U; ++j)
             e.center[j] = expansion || k == GrowSegments ? frozen.end[j] : frozen.start[j] + delta[j]*t;

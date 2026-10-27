@@ -272,14 +272,25 @@ inline Binding BindWorkTimeHeightSpeedDeepMachiningReferenceCurveAndFlushStages(
 // EDM173 freezes the complete native G76 recipe atomically. The legacy
 // incremental visible-flush adapters cannot validate this profile halfway
 // through capture: source3 and the sealed 25-child plan are mandatory here.
+// EDM267 FIX2: keep this NC-owner capture out of each recipe dispatch branch.
+// Retain inline linkage while bounding compiler expansion; no RT callback uses it.
+#if defined(_MSC_VER)
+__declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+__attribute__((noinline))
+#endif
 inline Binding BindG76GapProfile175(const EDMRecipe::Controller& controller,std::uint32_t expectedProfileId,
     const EDM20::ProcessProfile& process,std::uint64_t tuningGeneration,unsigned commissioningProfile,
     unsigned architectureSelector=0U) noexcept
 {
     Binding out{};const auto before=controller.Current();const auto* catalog=controller.GetCatalog();
     const bool expansion=IsG76ExpansionSelector263(architectureSelector);
-    const bool oneMm=IsG76OneMmSelector260(architectureSelector)||(architectureSelector>=265U&&architectureSelector<=268U);
-    const bool polygonB2=architectureSelector==264U||(architectureSelector>=269U&&architectureSelector<=272U);
+    const bool fixedRadius=IsG76FixedRadiusSelector266(architectureSelector);
+    const bool fixedRadiusWork=IsG76FixedRadiusWorkSelector267(architectureSelector);
+    const bool oneMm=IsG76OneMmSelector260(architectureSelector)||(architectureSelector>=265U&&architectureSelector<=268U)||
+        (architectureSelector>=273U&&architectureSelector<=276U)||(architectureSelector>=281U&&architectureSelector<=284U);
+    const bool polygonB2=architectureSelector==264U||(architectureSelector>=269U&&architectureSelector<=272U)||
+        (architectureSelector>=277U&&architectureSelector<=280U)||(architectureSelector>=285U&&architectureSelector<=288U);
     if((polygonB2&&commissioningProfile!=G76B2Profile175)||
         (oneMm&&commissioningProfile!=VisibleFlushProfile173&&commissioningProfile!=G76B3Profile176&&commissioningProfile!=G76B4Profile177)||
         (architectureSelector==250U&&commissioningProfile!=VisibleFlushProfile173)||
@@ -351,7 +362,7 @@ inline Binding BindG76GapProfile175(const EDMRecipe::Controller& controller,std:
         CurveDoubleBits(process.flush.initialSlowMmPerMin)!=CurveDoubleBits(initialBase))
     {out.error=EDM58::BindingError::CaptureChanged;return out;}
     Recipe recipe=base.recipe;
-    recipe.commissioningProfile=static_cast<std::uint16_t>(commissioningProfile);recipe.diagnosticControlSource=3U;recipe.planRows=expansion?26U:25U;recipe.planMovementMask=7U;
+    recipe.commissioningProfile=static_cast<std::uint16_t>(commissioningProfile);recipe.diagnosticControlSource=3U;recipe.planRows=expansion||fixedRadius||fixedRadiusWork?26U:25U;recipe.planMovementMask=7U;
     // Set the explicit selector before full validation, never patch a rejected
     // short-height capture into a nominally valid legacy binding afterwards.
     recipe.flushHoldTest=static_cast<std::uint16_t>(architectureSelector);
@@ -422,6 +433,26 @@ inline Binding BindG76Expansion263(const EDMRecipe::Controller& controller,std::
     if(shape>=4U||!profile){Binding out{};out.error=EDM58::BindingError::InvalidRecipe;return out;}
     return BindG76GapProfile175(controller,expectedProfileId,process,tuningGeneration,profile,
         (bMode==2U?269U:265U)+shape);
+}
+inline Binding BindG76FixedRadius266(const EDMRecipe::Controller& controller,std::uint32_t expectedProfileId,
+    const EDM20::ProcessProfile& process,std::uint64_t tuningGeneration,unsigned modeP,unsigned bMode) noexcept
+{
+    const unsigned shape=modeP==1U?0U:modeP==2U?1U:modeP==3U?2U:modeP==6U?3U:4U;
+    const unsigned profile=bMode==1U?VisibleFlushProfile173:bMode==2U?G76B2Profile175:
+        bMode==3U?G76B3Profile176:bMode==4U?G76B4Profile177:0U;
+    if(shape>=4U||!profile){Binding out{};out.error=EDM58::BindingError::InvalidRecipe;return out;}
+    return BindG76GapProfile175(controller,expectedProfileId,process,tuningGeneration,profile,
+        (bMode==2U?277U:273U)+shape);
+}
+inline Binding BindG76FixedRadiusWork267(const EDMRecipe::Controller& controller,std::uint32_t expectedProfileId,
+    const EDM20::ProcessProfile& process,std::uint64_t tuningGeneration,unsigned modeP,unsigned bMode) noexcept
+{
+    const unsigned shape=modeP==1U?0U:modeP==2U?1U:modeP==3U?2U:modeP==6U?3U:4U;
+    const unsigned profile=bMode==1U?VisibleFlushProfile173:bMode==2U?G76B2Profile175:
+        bMode==3U?G76B3Profile176:bMode==4U?G76B4Profile177:0U;
+    if(shape>=4U||!profile){Binding out{};out.error=EDM58::BindingError::InvalidRecipe;return out;}
+    return BindG76GapProfile175(controller,expectedProfileId,process,tuningGeneration,profile,
+        (bMode==2U?285U:281U)+shape);
 }
 inline Binding BindG76B3Gap176(const EDMRecipe::Controller& controller,std::uint32_t expectedProfileId,
     const EDM20::ProcessProfile& process,std::uint64_t tuningGeneration) noexcept

@@ -7,7 +7,7 @@
 // each NC/Motion lane still admits its own exact modes and process scope.
 namespace NCG76Mode
 {
-enum class Family : std::uint8_t { Invalid, Taper, HoleExpansion };
+enum class Family : std::uint8_t { Invalid, Taper, HoleExpansion, FixedRadius };
 enum class Shape : std::uint8_t { Invalid, Circle, Square, Diamond, Polygon };
 struct Definition
 {
@@ -19,16 +19,20 @@ struct Definition
 };
 inline bool IsHoleExpansion(std::uint32_t modeP) noexcept
 { return modeP==21U || modeP==22U || modeP==23U || modeP==26U; }
+inline bool IsImplementedFixedRadius(std::uint32_t modeP) noexcept
+{ return modeP==1U || modeP==2U || modeP==3U || modeP==6U; }
+inline bool IsFixedRadius(std::uint32_t modeP) noexcept
+{ return IsImplementedFixedRadius(modeP); }
 inline bool IsPolygon(std::uint32_t modeP) noexcept
-{ return modeP==16U || modeP==26U; }
+{ return modeP==6U || modeP==16U || modeP==26U; }
 inline bool IsImplemented(std::uint32_t modeP) noexcept
-{ return modeP==11U || modeP==12U || modeP==13U || modeP==16U || IsHoleExpansion(modeP); }
+{ return modeP==11U || modeP==12U || modeP==13U || modeP==16U || IsHoleExpansion(modeP) || IsImplementedFixedRadius(modeP); }
 inline bool Lookup(std::uint32_t modeP,Definition& out) noexcept
 {
     out=Definition{};
-    if(!((modeP>=11U&&modeP<=17U)||(modeP>=21U&&modeP<=27U)))return false;
+    if(!((modeP>=1U&&modeP<=7U)||(modeP>=11U&&modeP<=17U)||(modeP>=21U&&modeP<=27U)))return false;
     out.modeP=modeP;
-    out.family=modeP<20U?Family::Taper:Family::HoleExpansion;
+    out.family=modeP<10U?Family::FixedRadius:modeP<20U?Family::Taper:Family::HoleExpansion;
     const unsigned index=modeP%10U;
     out.shape=index==1U?Shape::Circle:index==2U||index==4U?Shape::Square:
         index==3U||index==5U?Shape::Diamond:Shape::Polygon;
@@ -38,6 +42,7 @@ inline bool Lookup(std::uint32_t modeP,Definition& out) noexcept
 }
 inline const char* ShapeName(std::uint32_t modeP) noexcept
 {
+    if(IsFixedRadius(modeP))modeP+=10U;
     if(IsHoleExpansion(modeP))modeP-=10U;
     return modeP==11U?"CIRCLE":modeP==12U?"SQUARE":modeP==13U?"DIAMOND":modeP==16U?"POLYGON":"UNIMPLEMENTED";
 }
@@ -70,7 +75,7 @@ inline bool PolygonVertex(unsigned sides,unsigned vertex,double& x,double& y) no
     return true;
 }
 
-// One growing revolution has 24 intervals. P12 R is its circumradius:
+// One revolution has 24 intervals. Square R is its circumradius:
 // K0 square edges are parallel to the local basis, with corners at 0/6/12/18/24.
 // The perimeter is linear on each side, so no trigonometric square projection
 // or unbounded corner curvature is hidden between samples.
@@ -78,7 +83,8 @@ inline bool PolygonVertex(unsigned sides,unsigned vertex,double& x,double& y) no
 // R is its center-to-vertex circumradius, with the same six samples per side.
 inline bool UnitBoundary(std::uint32_t modeP,unsigned sample,double& x,double& y,unsigned polygonSides=0U) noexcept
 {
-    // Expansion changes the center path, not the normalized local contour.
+    // Families change the center/radius path, not the normalized contour.
+    if(IsFixedRadius(modeP))modeP+=10U;
     if(IsHoleExpansion(modeP))modeP-=10U;
     x=y=0.0;
     if(sample>24U||(modeP==16U?!ValidPolygonSides(polygonSides):polygonSides!=0U))return false;

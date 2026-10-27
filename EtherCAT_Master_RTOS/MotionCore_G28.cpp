@@ -445,7 +445,14 @@ bool MotionCore::TryG76MoveTransactionalTail(const NCG76::NativePlan& plan,
         PublishQueueTailTransactionReceipt(receipt,invalid);
         return false;
     };
-    if (!NCG76::ValidNative(plan) || !m_g76OrbitProducer || m_pContexts==nullptr || m_pCoordMgr==nullptr ||
+    // Complete expansion/fixed-radius AIR plans opt into the existing fixed
+    // W translation/yaw frame. Validation still rebuilds all 26 points; older
+    // taper and retained B2 producers keep their original frame gate.
+    const bool allowExpansionWork=NCG76::UsesExpansionAirWorkFrame264(plan.program);
+    const bool allowFixedRadiusWork=NCG76::UsesFixedRadiusAirWorkFrame265(plan.program);
+    const bool allowOrbitWork=allowExpansionWork || allowFixedRadiusWork;
+    if (!NCG76::ValidNative(plan,allowOrbitWork,allowOrbitWork) ||
+        !m_g76OrbitProducer || m_pContexts==nullptr || m_pCoordMgr==nullptr ||
         commandedMCSTail==nullptr || m_pContexts->size()<3U || m_pContexts->size()>MAX_AXES ||
         !std::isfinite(rapidOverride) || rapidOverride<0.0)
         return reject(true,true,MotionRejectReason::INVALID_GEOMETRY,MotionG76AdmissionGate::PLAN_INPUT);
@@ -577,6 +584,21 @@ bool MotionCore::TryG76MoveTransactionalTail(const NCG76::NativePlan& plan,
         command.mem_transformOrigin[0]=0.0;
         command.mem_transformOrigin[1]=1.0;
         command.mem_transformOrigin[2]=2.0;
+        if(allowOrbitWork && plan.translation.workMode==168)
+        {
+            // Disabled-transform storage carries source identity only. It
+            // never reapplies WORK to these already transformed MCS points.
+            for(unsigned row=0U;row<3U;++row)
+                for(unsigned column=0U;column<3U;++column)
+                    command.mem_transformMatrix[row][column]=0.0;
+            command.mem_transformMatrix[0U][0U]=allowFixedRadiusWork?265.0:264.0;
+            command.mem_transformMatrix[0U][1U]=1.0;
+            command.mem_transformMatrix[0U][2U]=static_cast<double>(plan.modeP);
+            command.mem_transformMatrix[1U][0U]=26.0;
+            command.mem_transformMatrix[1U][1U]=static_cast<double>(segment+1U);
+            command.mem_transformMatrix[2U][0U]=(allowFixedRadiusWork?2650000.0:2640000.0)+
+                static_cast<double>(plan.modeP)*100.0+static_cast<double>(segment+1U);
+        }
         for (unsigned axis=0U; axis<MAX_AXES; ++axis) {
             command.mem_startPos[axis]=workspace.stagedPulse[axis];
             command.mem_ratio[axis]=axis<3U?workspace.targetPulse[axis]:workspace.stagedPulse[axis];

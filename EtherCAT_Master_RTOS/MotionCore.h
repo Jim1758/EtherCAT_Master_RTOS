@@ -1387,18 +1387,112 @@ inline double MotionXYZCUVEndMCS(const MotionCommand& command, unsigned slot) no
 
 // EDM171: an explicit finite native LINE/ARC compound may retain its
 // frozen G90/G91, scale and mirror source. Marker 0/1 keep their old gates.
+// EDM264 uses the disabled transform matrix as immutable source provenance
+// only for complete P2 B0 AIR batches carrying an active fixed W frame.
+// Geometry, publication identity and the current frame remain separate gates.
+inline bool IsMotionG76ExpansionAirWorkSource264(const MotionCommand& command) noexcept
+{
+    const auto& m=command.mem_transformMatrix;
+    const double mode=m[0U][2U],ordinal=m[1U][1U];
+    if(m[0U][0U]!=264.0 || m[0U][1U]!=1.0 ||
+        !(mode==21.0 || mode==22.0 || mode==23.0 || mode==26.0) ||
+        m[1U][0U]!=26.0 || !std::isfinite(ordinal) || ordinal<1.0 || ordinal>26.0 ||
+        m[2U][0U]!=2640000.0+mode*100.0+ordinal ||
+        std::floor(ordinal)!=ordinal || !command.pathCoreRetainedTraversal ||
+        command.pathCoreRetainedReverse || command.pathCorePlanarCircle || command.pathCoreFullCircle ||
+        command.edm173G76Gap || command.mem_enableTransform || command.mode!=InterpolationMode::LINEAR ||
+        command.dir!=0 || command.axisCount!=3 || command.axisIndices[0U]!=0 ||
+        command.axisIndices[1U]!=1 || command.axisIndices[2U]!=2 ||
+        command.mem_transformOrigin[0U]!=0.0 || command.mem_transformOrigin[1U]!=1.0 ||
+        command.mem_transformOrigin[2U]!=2.0 || !command.sourceG168Active ||
+        command.sourceWCode<1 || command.sourceWCode>100) return false;
+    const double zeroFields[]={m[1U][2U],m[2U][1U],m[2U][2U]};
+    for(double value:zeroFields) if(value!=0.0 || std::signbit(value))return false;
+    return true;
+}
+
+// EDM265: P0 uses a distinct source marker. These immutable AIR tags never
+// grant GAP authority or broaden the older P2 marker's mode set.
+inline bool IsMotionG76FixedRadiusAirWorkSource265(const MotionCommand& command) noexcept
+{
+    const auto& m=command.mem_transformMatrix;
+    const double mode=m[0U][2U],ordinal=m[1U][1U];
+    if(m[0U][0U]!=265.0 || m[0U][1U]!=1.0 ||
+        !(mode==1.0 || mode==2.0 || mode==3.0 || mode==6.0) ||
+        m[1U][0U]!=26.0 || !std::isfinite(ordinal) || ordinal<1.0 || ordinal>26.0 ||
+        m[2U][0U]!=2650000.0+mode*100.0+ordinal ||
+        std::floor(ordinal)!=ordinal || !command.pathCoreRetainedTraversal ||
+        command.pathCoreRetainedReverse || command.pathCorePlanarCircle || command.pathCoreFullCircle ||
+        command.edm173G76Gap || command.mem_enableTransform || command.mode!=InterpolationMode::LINEAR ||
+        command.dir!=0 || command.axisCount!=3 || command.axisIndices[0U]!=0 ||
+        command.axisIndices[1U]!=1 || command.axisIndices[2U]!=2 ||
+        command.mem_transformOrigin[0U]!=0.0 || command.mem_transformOrigin[1U]!=1.0 ||
+        command.mem_transformOrigin[2U]!=2.0 || !command.sourceG168Active ||
+        command.sourceWCode<1 || command.sourceWCode>100) return false;
+    const double zeroFields[]={m[1U][2U],m[2U][1U],m[2U][2U]};
+    for(double value:zeroFields) if(value!=0.0 || std::signbit(value))return false;
+    return true;
+}
+
+// EDM269: a separate immutable provenance tag for a complete ordinary B2
+// compound in a fixed WORK XY frame. The matrix stays disabled: these are
+// canonical native intervals, never a request to transform their geometry.
+inline bool IsMotionG76MixedAirWorkSource269(const MotionCommand& command) noexcept
+{
+    const auto& m=command.mem_transformMatrix;
+    const double kind=m[0U][2U],count=m[1U][0U],ordinal=m[1U][1U],phase=m[1U][2U];
+    const double mode=m[2U][1U],nominal=m[2U][2U];
+    if(m[0U][0U]!=269.0 || m[0U][1U]!=1.0 ||
+        !(kind==1.0 || kind==2.0 || kind==3.0) ||
+        !std::isfinite(count) || count<3.0 || count>128.0 || std::floor(count)!=count ||
+        !std::isfinite(ordinal) || ordinal<1.0 || ordinal>count || std::floor(ordinal)!=ordinal ||
+        !(phase==0.0 || phase==1.0 || phase==2.0) || std::signbit(phase) ||
+        m[2U][0U]!=2690000000.0+kind*1000000.0+count*1000.0+ordinal ||
+        !command.pathCoreRetainedTraversal || command.mem_transformOrigin[2U]!=2.0 ||
+        command.edm173G76Gap || command.mem_enableTransform || !command.sourceG168Active ||
+        command.sourceWCode<1 || command.sourceWCode>100) return false;
+    double trigger=1.0;
+    if(kind==3.0)
+    {
+        const bool taper=mode==11.0 || mode==12.0 || mode==13.0 || mode==16.0;
+        const bool entry=mode==1.0 || mode==2.0 || mode==3.0 || mode==6.0 ||
+            mode==21.0 || mode==22.0 || mode==23.0 || mode==26.0;
+        if(!(taper || entry) || nominal!=(taper?25.0:26.0)) return false;
+        trigger=taper?12.0:13.0;
+    }
+    else if(mode!=0.0 || std::signbit(mode) || nominal!=1.0) return false;
+    const double reverse=(count-nominal)*0.5;
+    if(reverse<1.0 || std::floor(reverse)!=reverse) return false;
+    const double expectedPhase=ordinal<=trigger || ordinal>trigger+2.0*reverse ? 0.0 :
+        ordinal<=trigger+reverse ? 1.0 : 2.0;
+    const double begin=command.mem_transformOrigin[0U],end=command.mem_transformOrigin[1U];
+    if(phase!=expectedPhase || command.pathCoreRetainedReverse!=(phase==1.0) ||
+        !std::isfinite(begin) || !std::isfinite(end) || begin<0.0 || begin>1.0 || end<0.0 || end>1.0 ||
+        (phase==1.0 ? begin<=end : begin>=end)) return false;
+    const bool arc=command.pathCorePlanarCircle;
+    if(phase==0.0 && arc!=(kind==2.0)) return false;
+    if(arc ? (command.dir!=1 && command.dir!=-1) ||
+            command.mode!=(command.dir==1?InterpolationMode::CIRCULAR_CCW:InterpolationMode::CIRCULAR_CW) :
+        command.dir!=0 || command.mode!=InterpolationMode::LINEAR || command.pathCoreFullCircle) return false;
+    return true;
+}
+
 inline bool IsMotionG76MixedRetainedSourceAllowed(const MotionCommand& command) noexcept
 {
     if (!IsMotionEDMCommissioningMarkerEncodingValid(command)) return false;
-    // Only the explicitly marked EDM173 child may carry fixed XYZ WORK and G17 yaw.
-    // Owner, source tags, retained geometry and runtime scope are still bound.
-    const bool allowFixedWorkTranslation=command.edm173G76Gap;
+    // B0 and ordinary B2 fixed WORK compounds use separate immutable tags;
+    // an untagged legacy mixed/reverse packet still keeps W disabled.
+    const bool orbitAirWork=IsMotionG76ExpansionAirWorkSource264(command) ||
+        IsMotionG76FixedRadiusAirWorkSource265(command);
+    const bool mixedAirWork=IsMotionG76MixedAirWorkSource269(command);
+    if(command.mem_transformMatrix[0U][0U]==269.0 && !mixedAirWork) return false;
+    const bool allowFixedWorkTranslation=command.edm173G76Gap || orbitAirWork || mixedAirWork;
     const auto& frame=command.sourceTranslation;
     if (!command.pathCoreRetainedTraversal || command.mem_transformOrigin[2]!=2.0 ||
         !command.execution.IsAssigned() || command.execution.source!=MotionCommandSource::NC_MEMORY ||
         !command.ownerLease.IsValid() || command.ownerLease.owner!=MotionOwner::AUTO ||
         command.sourceLinePC<0 || command.execution.sourceBlockId!=static_cast<MotionSourceBlockId>(command.sourceLinePC) ||
-        !NCG76::FrameSupported(frame,allowFixedWorkTranslation,command.edm173G76Gap) || command.sourcePlaneMode!=17 || command.sourceToolRadiusMode!=40 ||
+        !NCG76::FrameSupported(frame,allowFixedWorkTranslation,allowFixedWorkTranslation) || command.sourcePlaneMode!=17 || command.sourceToolRadiusMode!=40 ||
         command.sourceG16Active || command.sourceG162Active ||
         (!allowFixedWorkTranslation && (command.sourceG168Active || command.sourceWCode!=0)) ||
         command.sourceIsAbsoluteMode!=(frame.distanceMode==90) ||
@@ -1407,7 +1501,7 @@ inline bool IsMotionG76MixedRetainedSourceAllowed(const MotionCommand& command) 
         command.pathCoreXYZCFeedExactStop || command.pathCoreXYZCUVFeedExactStop || command.pathCoreEccentricCFeedExactStop ||
         command.edm149ZOnlyCommissioning || command.edm150XYZOnlyCommissioning || command.edm154SparseCommissioning ||
         command.replayTerminalAlreadyPublished || command.mem_enableTransform) return false;
-    if (command.edm173G76Gap)
+    if (command.edm173G76Gap || orbitAirWork || mixedAirWork)
     {
         // EDM187: this invocation already validated the complete immutable
         // frame above. Its G17/G40/G15, non-eccentric, exact-stop guards also

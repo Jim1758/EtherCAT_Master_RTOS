@@ -1,4 +1,5 @@
-﻿#include "NCManager.h"
+﻿#include "PositionPidService.h"
+#include "NCManager.h"
 #include "EDMProcessTuningService.h"
 #include "MacroEngine.h"
 #include <memory>
@@ -278,6 +279,7 @@ bool NCManager::AdoptProgramMotionLease(
 NCManager::NCManager(MotionCore& motion) : m_motion(motion), MathParser(MacroSys), Parser(),
 m_pathCoreLiveRetention(AllocatePathCoreLiveOwnerTagStartup())
 {
+    InitializePositionAutoTuneSameThread();
     m_edm173.reset(new EDM173NCState); // Startup only; no RT/lazy allocation.
     // =========================================================
     // G81 HOME Manager Link
@@ -1268,6 +1270,7 @@ void NCManager::Reset()
     m_g76Confirmation = G76Confirmation{}; m_g76Modal = G76ModalState{};
     m_edm149Confirmation = EDM149Confirmation{};
     ForceEDMPLCOutputsOffSameThread("RESET");
+    if (!AdmitPositionAutoTuneResetSameThread()) return; // TUNE01: retire its stop before Reset provenance.
     ResetEDM94SameThread();
     // EDM28 only: retain AUTO authority for bounded physical stop/Disarm
     // before entering the existing Reset safety batch. Never wait here.
@@ -1327,7 +1330,8 @@ void NCManager::Reset()
         ResetContinuationPhase::CLEANUP ||
         m_resetContinuationPhase ==
         ResetContinuationPhase::SETTLE;
-    bool bypassResetStateIdempotence = m_edmZFixture.resetBypass;
+    const bool tuneResetBypass = ConsumePositionAutoTuneResetBypassSameThread();
+    bool bypassResetStateIdempotence = m_edmZFixture.resetBypass || tuneResetBypass;
     m_edmZFixture.resetBypass = false;
 
     if (m_resetContinuationPhase ==
@@ -3652,6 +3656,7 @@ void NCManager::ObserveBootstrapSafetyHandoff() noexcept
 // 🌟 放在 RTOS 迴圈的核心任務
 void NCManager::ProcessTask()
 {
+    ServicePositionAutoTuneSameThread(); // TUNE01: cancellation precedes all early returns.
     // Refresh before service and after every early return (Reset, Alarm, wait).
     struct EDM137PLCExitSync {
         NCManager& nc;
@@ -3667,6 +3672,7 @@ void NCManager::ProcessTask()
         if (m_edmZFixture.resetPending) return;
     }
     ValidateEDMRecipeSelectionSameThread(); // EDM16: fail closed even for direct NC state changes.
+    if (ProcessPositionPidServiceSameThread(*this)) return; // TUNE15: bounded RT PID transaction.
     ProcessEDMProcessTuningServiceSameThread(*this); // One owner, bounded runtime-only updates.
     const EDMGapInput::Snapshot edmGap = ReadEDMGapInputSnapshotSameThread();
     ObserveEDMProcessShadowSameThread(edmGap); // EDM20: 10 ms shadow preview, no Motion/IO writes.
@@ -4957,6 +4963,16 @@ void NCManager::ProcessExecutionEngine()
                 AlarmManager::GetInstance().Trigger(
                     alarmCode,
                     sourceLineNumber);
+                m_state = NCState::ALARM;
+                return;
+            }
+
+            if (!MacroVariableRules::IsWritableIndex(assignment.prefix, assignment.index))
+            {
+                RtPrintf("[TUNE01] event=VARIABLE_WRITE result=REJECT index=%d line=%d reason=READ_ONLY_TUNING_RESULT applied=0\n",
+                    assignment.index, sourceLineNumber);
+                markDispatchFailed(static_cast<std::uint32_t>(AlarmManager::MATH_ERROR));
+                AlarmManager::GetInstance().Trigger(AlarmManager::MATH_ERROR, sourceLineNumber);
                 m_state = NCState::ALARM;
                 return;
             }
@@ -6799,6 +6815,8 @@ WaitConditionFunc NCManager::DispatchSingleGCode(
         return nullptr;
     case 180: // CG: standalone simulated GAP input self-test.
         return StartGapDryRunSameThread(block);
+    case 190: // TUNE01: isolated position-gain measurement, no gain writes.
+        return StartPositionAutoTuneSameThread(block);
     case 178: // CB: arm one Feed Hold excursion on the next original source.
     case 179: // CB: cancel an unused one-shot arm.
         return StartPathCoreHoldSameThread(block);
@@ -6908,6 +6926,9 @@ void NCManager::ExecuteBlock(
     NCBlockDispatchId dispatchId)
 {
     m_waitCallback = nullptr;
+    // TUNE01: reject the full authored row before any EDM/settings/output side effect.
+    if (NCGCodeSemantics::Contains(inputBlock, 190) &&
+        !ValidatePositionAutoTuneBlockSameThread(inputBlock, sourcePC, sourceLineNumber)) return;
     if (!GuardEDM94BlockSameThread(inputBlock, sourcePC, sourceLineNumber)) return;
     NCBlock edm127Geometry{}; bool edm127SettingOnly = false;
     if (!ProcessEDM127BlockSameThread(inputBlock, edm127Geometry, edm127SettingOnly))
@@ -7184,7 +7205,7 @@ void NCManager::ExecuteBlock(
         // 再擷取 Motion Frame Snapshot，最後才派送唯一 Primary Action。
         // A recipe selector changes no geometry or Motion pending frame.
         // Its own exact stopped/authority gate was checked before any setting.
-        if (descriptor.role == NCGCodeRole::PRIMARY_ACTION && gCode != 38 && gCode != 39)
+        if (descriptor.role == NCGCodeRole::PRIMARY_ACTION && gCode != 38 && gCode != 39 && gCode != 190)
         {
             // FIX11: exact EDM94 P85/P86 bracket controls do not prepare
             // geometry. Keep pending-source capture for normal NC provenance.

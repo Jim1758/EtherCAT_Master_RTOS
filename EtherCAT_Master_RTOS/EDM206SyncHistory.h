@@ -7,6 +7,7 @@
 #include <type_traits>
 #include "EDMSixAxisPhysicalGuard.h"
 
+// EDM275 also records the sealed short-flush B1 test; control authority is unchanged.
 // Observation only. One RT writer and one NC reader; no control authority,
 // clock read, allocation, printing, mutex, retry loop or whole-history copy.
 // The ring lives in startup-owned Motion storage, never on the RT stack.
@@ -234,7 +235,7 @@ private:
     enum : unsigned { Idle, Recording, Frozen, Ready, Reading };
     bool Start(std::uint64_t session, unsigned mode) noexcept
     {
-        if (!session || (mode != 3U && mode != 4U) || session == m_lastFrozenSession) return false;
+        if (!session || (mode != 1U && mode != 3U && mode != 4U) || session == m_lastFrozenSession) return false;
         const unsigned state = m_state.load(std::memory_order_acquire);
         if (state != Idle && state != Recording) return false;
         if (state == Idle || m_session != session) {

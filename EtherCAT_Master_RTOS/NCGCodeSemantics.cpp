@@ -127,6 +127,10 @@ namespace NCGCodeSemantics
                 NCGCodeRole::PRIMARY_ACTION, 200, true, true, true);
             return true;
             // BR-END
+        case 190: // TUNE01: standalone callback-owned commissioning cycle.
+            descriptor = MakeDescriptor(code, NCGCodeModalGroup::NONE,
+                NCGCodeRole::PRIMARY_ACTION, 200, true, false, true);
+            return true;
         case 39: // EDM17: controlled live recipe operation, no Motion frame change.
         case 38: // EDM16: standalone shadow table selection; no Motion frame change.
         case 180: // CG: explicit, nonmodal input-only diagnostic barrier.

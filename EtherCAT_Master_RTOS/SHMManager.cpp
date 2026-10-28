@@ -1,4 +1,6 @@
-﻿#include "SHMManager.h"
+﻿#include "PositionPidService.h"
+#include "SHMManager.h"
+#include "PositionAutoTuneJob.h"
 #include "EDMProcessTuningService.h"
 
 #include "EtherCatSmDiagContract.h"
@@ -1695,6 +1697,7 @@ bool SHMManager::Initialize(
 
         InitializeEDMDiagnosticSharedMemory();
         InitializeEDMProcessTuningService();
+        InitializePositionPidService();
         InitializeEDMConditionService((GlobalConfig::GetInstance().BaseDataDir + "Data\\EDM\\").c_str());
 
         return true;
@@ -1789,6 +1792,7 @@ bool SHMManager::Initialize(
 
     InitializeEDMDiagnosticSharedMemory();
     InitializeEDMProcessTuningService();
+        InitializePositionPidService();
     InitializeEDMConditionService((GlobalConfig::GetInstance().BaseDataDir + "Data\\EDM\\").c_str());
 
 
@@ -1798,7 +1802,9 @@ bool SHMManager::Initialize(
 
 void SHMManager::Shutdown()
 {
+    ShutdownPositionPidService();
     ShutdownEDMProcessTuningService();
+    PositionAutoTune::ShutdownJobs(); // TUNE01: join analysis before storage teardown.
     ShutdownEDMConditionService();
     ShutdownEDMDiagnosticSharedMemory();
 

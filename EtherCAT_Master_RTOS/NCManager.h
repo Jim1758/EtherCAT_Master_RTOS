@@ -160,6 +160,7 @@ struct NCMacroAssignmentCommit;
 #include <atomic>
 #include <type_traits>
 class NCManager;
+struct PositionAutoTuneNCState; // TUNE01: NC-only storage, defined out of line.
 
 // 🌟 終極解法：定義一個「檢查條件」的函數指標。
 // 回傳 true 代表條件滿足 (等待結束)，false 代表繼續等
@@ -1951,6 +1952,19 @@ public:
     NCBlock m_g66Block;         // 記住 G66 當下夾帶的所有變數 (A, B, C...)
 
 private:
+    // TUNE01: one callback-owned diagnostic cycle; no live gain changes.
+    std::shared_ptr<PositionAutoTuneNCState> m_positionAutoTune;
+    void InitializePositionAutoTuneSameThread() noexcept;
+    bool ValidatePositionAutoTuneBlockSameThread(const NCBlock&, int, int) noexcept;
+    WaitConditionFunc StartPositionAutoTuneSameThread(const NCBlock&);
+    void ServicePositionAutoTuneSameThread() noexcept;
+    bool AdmitPositionAutoTuneResetSameThread() noexcept;
+    bool ConsumePositionAutoTuneResetBypassSameThread() noexcept;
+    bool CompletePositionAutoTuneSameThread() noexcept;
+    void AbortPositionAutoTuneSameThread(const char* reason, bool raiseAlarm) noexcept;
+    void PublishPositionAutoTuneSameThread() noexcept;
+    static bool WaitPositionAutoTuneCallback(NCManager*) noexcept;
+
     // NC-0.2L.1A2 through L.2A: HMI remains scalar-only. NCManager is
     // heap-owned, so these fixed tail members do not consume RT thread stack.
     NCPathCoreInputHandoffCompactShadow

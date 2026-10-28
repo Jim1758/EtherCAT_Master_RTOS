@@ -30,15 +30,24 @@ constexpr std::uint32_t Version = 1U;
 constexpr std::uint32_t ModeP01 = 1U;
 constexpr std::uint32_t ModeP02 = 2U;
 constexpr std::uint32_t ModeP03 = 3U;
+constexpr std::uint32_t ModeP04 = 4U;
+constexpr std::uint32_t ModeP05 = 5U;
 constexpr std::uint32_t ModeP06 = 6U;
+constexpr std::uint32_t ModeP07 = 7U;
 constexpr std::uint32_t ModeP11 = 11U;
 constexpr std::uint32_t ModeP12 = 12U;
 constexpr std::uint32_t ModeP13 = 13U;
+constexpr std::uint32_t ModeP14 = 14U;
+constexpr std::uint32_t ModeP15 = 15U;
 constexpr std::uint32_t ModeP16 = 16U;
+constexpr std::uint32_t ModeP17 = 17U;
 constexpr std::uint32_t ModeP21 = 21U;
 constexpr std::uint32_t ModeP22 = 22U;
 constexpr std::uint32_t ModeP23 = 23U;
+constexpr std::uint32_t ModeP24 = 24U;
+constexpr std::uint32_t ModeP25 = 25U;
 constexpr std::uint32_t ModeP26 = 26U;
+constexpr std::uint32_t ModeP27 = 27U;
 constexpr unsigned MaximumPoints = 32U;
 constexpr unsigned GrowSegments = 24U;
 constexpr unsigned FlushSample = 12U;
@@ -62,8 +71,9 @@ inline bool AllowsFixedWorkFrame(std::uint32_t modeP,unsigned flushMode) noexcep
 
 // EDM268: noncircular taper B2 uses the target-axis contour and retained proof.
 // The established P11 retained lane remains its legacy G17 contour.
+// EDM273 includes the matching vector identities with the same full contour.
 inline bool IsTaperRetainedMode268(std::uint32_t modeP) noexcept
-{ return modeP==ModeP12 || modeP==ModeP13 || modeP==ModeP16; }
+{ return NCG76Mode::IsTaper(modeP)&&modeP!=ModeP11; }
 
 struct PlanInput
 {
@@ -74,7 +84,7 @@ struct PlanInput
     double heightMm = 0.0;  // Total height above sample-12 center, not an addition.
     double centerReturnFeedMmMin = 0.0; // Physical mm/min; zero inherits F.
     double shapeAngleDeg = 0.0; // K: local orbit orientation; center path is unchanged.
-    unsigned polygonSides = 0U; // Literal Q for P06/P16/P26 only; other modes require zero.
+    unsigned polygonSides = 0U; // Literal Q for polygon modes (P06/07/16/17/26/27); otherwise zero.
     bool targetAxis = false; // Internal sealed-lane opt-in; no additional NC word.
 };
 
@@ -320,7 +330,7 @@ inline bool BuildMode(std::uint32_t modeP,const PlanInput& in, ProgramPlan& out)
     const bool targetAxisRetained = frozen.flushMode==2U &&
         ((expansion || fixedRadius) || (IsTaperRetainedMode268(modeP) && frozen.targetAxis));
     if(!NCG76Mode::IsImplemented(modeP)||(modeP!=ModeP11&&frozen.flushMode!=0U&&!targetAxisRetained)||
-        ((expansion||fixedRadius)&&!frozen.targetAxis)||
+        ((expansion||fixedRadius||NCG76Mode::IsVector(modeP))&&!frozen.targetAxis)||
         (NCG76Mode::IsPolygon(modeP)?!NCG76Mode::ValidPolygonSides(frozen.polygonSides):frozen.polygonSides!=0U))return false;
     Point3 delta{};
     double coordinateScale = 0.0;
@@ -619,7 +629,7 @@ inline bool BuildValidationProgramMode(std::uint32_t modeP,const PlanInput& in, 
     const bool targetAxisRetained = frozen.flushMode==2U &&
         ((expansion || fixedRadius) || (IsTaperRetainedMode268(modeP) && frozen.targetAxis));
     if(!NCG76Mode::IsImplemented(modeP)||(modeP!=ModeP11&&frozen.flushMode!=0U&&!targetAxisRetained)||
-        ((expansion||fixedRadius)&&!frozen.targetAxis)||
+        ((expansion||fixedRadius||NCG76Mode::IsVector(modeP))&&!frozen.targetAxis)||
         (NCG76Mode::IsPolygon(modeP)?!NCG76Mode::ValidPolygonSides(frozen.polygonSides):frozen.polygonSides!=0U))return ClearValidationProgramFalse(out);
     Point3 delta{};
     double coordinateScale = 0.0;

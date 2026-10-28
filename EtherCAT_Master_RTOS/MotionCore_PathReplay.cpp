@@ -627,11 +627,17 @@ bool MotionCore::TryG76MixedMoveTransactionalTail(const NCG76Mixed::Plan& plan,
             // provenance; the native interval is already transformed exactly once.
             const double kind=static_cast<double>(static_cast<unsigned>(input.nominal.kind));
             const double ordinal=static_cast<double>(k+1U);
-            cmd.mem_transformMatrix[0U][0U]=269.0; cmd.mem_transformMatrix[0U][1U]=1.0;
+            NCG76Mode::Definition sourceMode{};
+            const bool vectorMode=input.nominal.kind==NCG76Mixed::Kind::G76 &&
+                NCG76Mode::Lookup(input.nominal.orbit.modeP,sourceMode) && sourceMode.vector;
+            const double mode=vectorMode?static_cast<double>(input.nominal.orbit.modeP):0.0;
+            // EDM273: new vector plans retain the authored P in a version-2
+            // checksum. Established modes keep their version-1 image exactly.
+            cmd.mem_transformMatrix[0U][0U]=269.0; cmd.mem_transformMatrix[0U][1U]=vectorMode?2.0:1.0;
             cmd.mem_transformMatrix[0U][2U]=kind; cmd.mem_transformMatrix[1U][0U]=static_cast<double>(plan.count);
             cmd.mem_transformMatrix[1U][1U]=ordinal;
             cmd.mem_transformMatrix[1U][2U]=static_cast<double>(static_cast<unsigned>(leg.phase));
-            cmd.mem_transformMatrix[2U][0U]=2690000000.0+kind*1000000.0+static_cast<double>(plan.count)*1000.0+ordinal;
+            cmd.mem_transformMatrix[2U][0U]=2690000000.0+kind*1000000.0+static_cast<double>(plan.count)*1000.0+ordinal+mode*10000000.0;
             cmd.mem_transformMatrix[2U][1U]=input.nominal.kind==NCG76Mixed::Kind::G76 ?
                 static_cast<double>(input.nominal.orbit.modeP) : 0.0;
             cmd.mem_transformMatrix[2U][2U]=static_cast<double>(input.nominal.count);

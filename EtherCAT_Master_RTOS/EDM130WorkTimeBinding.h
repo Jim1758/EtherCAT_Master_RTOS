@@ -287,11 +287,14 @@ inline Binding BindG76GapProfile175(const EDMRecipe::Controller& controller,std:
     const bool expansion=IsG76ExpansionSelector263(architectureSelector);
     const bool fixedRadius=IsG76FixedRadiusSelector266(architectureSelector);
     const bool fixedRadiusWork=IsG76FixedRadiusWorkSelector267(architectureSelector);
+    const unsigned sharedMode=G76SharedShortMode274(architectureSelector);
+    const bool sharedShort=sharedMode!=0U;
     const bool oneMm=IsG76OneMmSelector260(architectureSelector)||(architectureSelector>=265U&&architectureSelector<=268U)||
         (architectureSelector>=273U&&architectureSelector<=276U)||(architectureSelector>=281U&&architectureSelector<=284U);
     const bool polygonB2=architectureSelector==264U||(architectureSelector>=269U&&architectureSelector<=272U)||
         (architectureSelector>=277U&&architectureSelector<=280U)||(architectureSelector>=285U&&architectureSelector<=288U);
-    if((polygonB2&&commissioningProfile!=G76B2Profile175)||
+    if((sharedShort&&commissioningProfile!=VisibleFlushProfile173&&commissioningProfile!=G76B3Profile176&&commissioningProfile!=G76B4Profile177)||
+        (polygonB2&&commissioningProfile!=G76B2Profile175)||
         (oneMm&&commissioningProfile!=VisibleFlushProfile173&&commissioningProfile!=G76B3Profile176&&commissioningProfile!=G76B4Profile177)||
         (architectureSelector==250U&&commissioningProfile!=VisibleFlushProfile173)||
         (architectureSelector==251U&&commissioningProfile!=G76B2Profile175)||
@@ -301,7 +304,7 @@ inline Binding BindG76GapProfile175(const EDMRecipe::Controller& controller,std:
         (architectureSelector==256U&&commissioningProfile!=G76B2Profile175)||
         (architectureSelector==257U&&commissioningProfile!=G76B3Profile176)||
         (architectureSelector==258U&&commissioningProfile!=G76B4Profile177)||
-        (!oneMm&&!polygonB2&&architectureSelector!=0U&&architectureSelector!=250U&&architectureSelector!=251U&&architectureSelector!=252U&&architectureSelector!=253U&&architectureSelector!=255U&&architectureSelector!=256U&&architectureSelector!=257U&&architectureSelector!=258U&&((architectureSelector!=233U&&architectureSelector!=239U&&architectureSelector!=240U&&architectureSelector!=241U&&architectureSelector!=242U&&architectureSelector!=243U&&architectureSelector!=244U&&architectureSelector!=245U&&architectureSelector!=246U&&architectureSelector!=247U&&architectureSelector!=248U)||
+        (!sharedShort&&!oneMm&&!polygonB2&&architectureSelector!=0U&&architectureSelector!=250U&&architectureSelector!=251U&&architectureSelector!=252U&&architectureSelector!=253U&&architectureSelector!=255U&&architectureSelector!=256U&&architectureSelector!=257U&&architectureSelector!=258U&&((architectureSelector!=233U&&architectureSelector!=239U&&architectureSelector!=240U&&architectureSelector!=241U&&architectureSelector!=242U&&architectureSelector!=243U&&architectureSelector!=244U&&architectureSelector!=245U&&architectureSelector!=246U&&architectureSelector!=247U&&architectureSelector!=248U)||
         (commissioningProfile!=G76B3Profile176&&commissioningProfile!=G76B4Profile177)||
         (architectureSelector==245U&&commissioningProfile!=G76B3Profile176)||
         (architectureSelector==246U&&commissioningProfile!=G76B4Profile177)||
@@ -326,15 +329,15 @@ inline Binding BindG76GapProfile175(const EDMRecipe::Controller& controller,std:
         base.recipe.tableRevision!=before.tableRevision||base.recipe.eCode!=before.eCode)
     {out.error=EDM58::BindingError::CaptureChanged;return out;}
     const bool validSpeed=ValidG76FlushSpeedPercent(commissioningProfile,base.recipe.jumpSpeedPercentScaled)&&
-        (!(oneMm||polygonB2)||base.recipe.jumpSpeedPercentScaled==100000000ULL);
+        (!(sharedShort||oneMm||polygonB2)||base.recipe.jumpSpeedPercentScaled==100000000ULL);
     if(base.recipe.workTimeUs<VisibleFlushMinimumWorkUs173||base.recipe.workTimeUs>VisibleFlushMaximumWorkUs173||!validSpeed||
-        ((oneMm||polygonB2||architectureSelector==250U||architectureSelector==251U||architectureSelector==252U||architectureSelector==253U||architectureSelector==255U||architectureSelector==256U||architectureSelector==257U||architectureSelector==258U)&&base.recipe.workTimeUs!=500000ULL))
+        ((sharedShort||oneMm||polygonB2||architectureSelector==250U||architectureSelector==251U||architectureSelector==252U||architectureSelector==253U||architectureSelector==255U||architectureSelector==256U||architectureSelector==257U||architectureSelector==258U)&&base.recipe.workTimeUs!=500000ULL))
     {out.error=EDM58::BindingError::EngineeringRange;out.failedFieldId=
         !validSpeed?base.recipe.speedFieldId:base.recipe.fieldId;return out;}
     const char* semantics[]={"JumpHeight","DeepFlushCycleInterval","DeepFlushHeightMultiplier","MachiningServoOverride","GapVoltageSetpoint",
         "FinalApproachSpeed","DecelerationDistance","LargeAreaMachiningSpeed","LargeAreaFlushDistance","ElectrodePolarity"};
     const char* units[]={"mm","cycle","x","%","V","%","mm","%","mm","code"};
-    const EDMRecipe::Value exact[]={oneMm?1000000LL:commissioningProfile==G76B2Profile175?1000LL:2000000LL,
+    const EDMRecipe::Value exact[]={sharedShort?static_cast<EDMRecipe::Value>(G76SharedShortHeightScaled274):oneMm?1000000LL:commissioningProfile==G76B2Profile175?1000LL:2000000LL,
         0LL,1000000LL,40000000LL,55000000LL,10000000LL,100LL,1000000LL,0LL,0LL};
     EDMRecipe::Value values[10]{};std::uint16_t fields[10]{};EDM58::Binding semantic{};
     for(unsigned i=0U;i<10U;++i)
@@ -344,10 +347,11 @@ inline Binding BindG76GapProfile175(const EDMRecipe::Controller& controller,std:
         if(!read){out.error=semantic.error;out.failedFieldId=semantic.failedFieldId;return out;}
         const bool centerHeight=i==0U&&(commissioningProfile==G76B3Profile176||commissioningProfile==G76B4Profile177);
         if(centerHeight?(values[i]<0LL||!ValidG76CenterHeightScaled(static_cast<std::uint64_t>(values[i]))||
+            (sharedShort&&values[i]!=static_cast<EDMRecipe::Value>(G76SharedShortHeightScaled274))||
             (oneMm&&values[i]!=1000000LL)||
             ((architectureSelector==252U||architectureSelector==257U)&&values[i]!=static_cast<EDMRecipe::Value>(G76B3HeightScaled176))||
             ((architectureSelector==253U||architectureSelector==258U)&&values[i]!=static_cast<EDMRecipe::Value>(G76B4HeightScaled177))||
-            (values[i]==static_cast<EDMRecipe::Value>(G76ArchitectureHeightScaled233)&&architectureSelector!=233U&&architectureSelector!=239U&&architectureSelector!=240U&&architectureSelector!=241U&&architectureSelector!=242U&&architectureSelector!=243U&&architectureSelector!=244U&&architectureSelector!=245U&&architectureSelector!=246U&&architectureSelector!=247U&&architectureSelector!=248U)||
+            (values[i]==static_cast<EDMRecipe::Value>(G76ArchitectureHeightScaled233)&&!sharedShort&&architectureSelector!=233U&&architectureSelector!=239U&&architectureSelector!=240U&&architectureSelector!=241U&&architectureSelector!=242U&&architectureSelector!=243U&&architectureSelector!=244U&&architectureSelector!=245U&&architectureSelector!=246U&&architectureSelector!=247U&&architectureSelector!=248U)||
             ((architectureSelector==239U||architectureSelector==240U||architectureSelector==241U||architectureSelector==242U||architectureSelector==243U||architectureSelector==244U||architectureSelector==245U||architectureSelector==246U||architectureSelector==247U||architectureSelector==248U)&&values[i]!=static_cast<EDMRecipe::Value>(G76ArchitectureHeightScaled233))):values[i]!=exact[i])
         {out.error=EDM58::BindingError::EngineeringRange;out.failedFieldId=fields[i];return out;}
     }
@@ -362,7 +366,7 @@ inline Binding BindG76GapProfile175(const EDMRecipe::Controller& controller,std:
         CurveDoubleBits(process.flush.initialSlowMmPerMin)!=CurveDoubleBits(initialBase))
     {out.error=EDM58::BindingError::CaptureChanged;return out;}
     Recipe recipe=base.recipe;
-    recipe.commissioningProfile=static_cast<std::uint16_t>(commissioningProfile);recipe.diagnosticControlSource=3U;recipe.planRows=expansion||fixedRadius||fixedRadiusWork?26U:25U;recipe.planMovementMask=7U;
+    recipe.commissioningProfile=static_cast<std::uint16_t>(commissioningProfile);recipe.diagnosticControlSource=3U;recipe.planRows=expansion||fixedRadius||fixedRadiusWork||(sharedShort&&(sharedMode<10U||sharedMode>=20U))?26U:25U;recipe.planMovementMask=7U;
     // Set the explicit selector before full validation, never patch a rejected
     // short-height capture into a nominally valid legacy binding afterwards.
     recipe.flushHoldTest=static_cast<std::uint16_t>(architectureSelector);

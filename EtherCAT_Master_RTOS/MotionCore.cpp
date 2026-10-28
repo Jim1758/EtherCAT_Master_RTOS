@@ -1,5 +1,6 @@
 ﻿#include "MotionCore.h"
 #include "NCG76StartDiagnostic.h"
+#include "EDM275G76Diagnostic.h"
 #include <algorithm> // for std::abs, std::sqrt, std::max, std::min
 #include <cstring>
 #include <type_traits>
@@ -15,6 +16,9 @@
 #include "MotionEccentricCBinding.h" // BASE79D pre-start binding
 #include "MotionEccentricCConsumer.h" // BASE79F caller-owned heap consumer
 #include "EDMServoPI.h" // EDM93 shared scalar law; no output permission
+#include "PositionPidService.h"
+#include "PositionAutoTuneJob.h"
+#include "PositionAutoTuneCapture.h" // TUNE01 independent positioning observation
 #include "EDM145SourceDiagnostics.h"
 #include "EDM147PhysicalGapEvidence.h"
 #include "EDMExecutionFeedbackChannel.h"
@@ -23,6 +27,13 @@
 
 namespace
 {
+    // EDM275: independent read-only publication. Failure drops diagnostics only.
+    EDM53::Channel<EDM275::Snapshot,768U> g_edm275PhysicalChannel{};
+    std::uint64_t g_edm275PhysicalSession=0ULL,g_edm275PhysicalTick=0ULL;
+    bool E275HistoryRecipe(const EDM130::Recipe& recipe) noexcept
+    { return EDM173::IsCenterRecipe(recipe)||EDM130::IsG76SharedShortB1_274(recipe); }
+    unsigned E275HistoryMode(const EDM130::Recipe& recipe) noexcept
+    { return EDM130::IsG76SharedShortB1_274(recipe)?1U:EDM173::IsB4Recipe(recipe)?4U:3U; }
     // FIX19: one Motion writer; only the existing P50 diagnostic reader prints.
     EDM53::Channel<EDM144::AxesDetail::Snapshot> g_fix19AxesChannel{};
     bool PublishFix19Axes(void*, const EDM144::AxesDetail::Snapshot& snapshot) noexcept
@@ -47,6 +58,13 @@ namespace
             return 0ULL;
         return ticks * 100ULL;
     }
+}
+
+bool EDM275::Read(Snapshot& snapshot, std::uint64_t& publication) noexcept
+{
+    const EDM53::Stamp stamp=g_edm275PhysicalChannel.Read(snapshot);
+    publication=stamp.publication;
+    return stamp.Ready();
 }
 
 bool EDM192Arm::Read(Snapshot& snapshot, std::uint64_t& publication) noexcept
@@ -2267,8 +2285,8 @@ void MotionCore::EndReadEDM206History(std::uint64_t session) noexcept
 void MotionCore::ObserveEDM206HistoryFrame(bool complete) noexcept
 {
     if (!m_edm173 || !m_edm94.Active() || !IsEDM173Profile() ||
-        !EDM173::IsCenterRecipe(m_edm130ArmRecipe)) return;
-    const unsigned mode = EDM173::IsB4Recipe(m_edm130ArmRecipe) ? 4U : 3U;
+        !E275HistoryRecipe(m_edm130ArmRecipe)) return;
+    const unsigned mode = E275HistoryMode(m_edm130ArmRecipe);
     const auto& image = EDM126CommittedImage();
     const bool mapped = m_edm114MappedTick == m_edm94Frame.tick &&
         image.tick == m_edm94Frame.tick && image.nowUs == m_edm94Frame.nowUs;
@@ -2279,11 +2297,11 @@ void MotionCore::ObserveEDM206HistoryFrame(bool complete) noexcept
 void MotionCore::FreezeEDM206History() noexcept
 {
     if (!m_edm173 || !m_edm94.Active() || !m_edm94.Current().faulted ||
-        !IsEDM173Profile() || !EDM173::IsCenterRecipe(m_edm130ArmRecipe)) return;
+        !IsEDM173Profile() || !E275HistoryRecipe(m_edm130ArmRecipe)) return;
     const auto& guard = m_edm94.Current();
     if (guard.firstFault.frameIdentity.session != guard.identity.session) return;
     m_edm173->syncHistory.Freeze(guard.firstFault, guard.rejectedAxis,
-        EDM173::IsB4Recipe(m_edm130ArmRecipe) ? 4U : 3U,
+        E275HistoryMode(m_edm130ArmRecipe),
         static_cast<unsigned>(m_edm128.Evidence().phase), m_edm126Current.authorizedRows);
 }
 // EDM207_CAPTURE_METHOD_BEGIN
@@ -2292,7 +2310,7 @@ bool MotionCore::CaptureEDM207Input(unsigned slot, EDM206::InputSource source,
 {
     out=EDM206::InputCapture{};
     if(!m_edm173 || !m_edm94.Active() || !IsEDM173Profile() ||
-        !EDM173::IsCenterRecipe(m_edm130ArmRecipe) || !m_pContexts || !m_pDrives ||
+        !E275HistoryRecipe(m_edm130ArmRecipe) || !m_pContexts || !m_pDrives ||
         slot>=EDM206::AxisCount || slot>=m_pContexts->size() || slot>=m_pDrives->size())return false;
     const auto& axis=(*m_pContexts)[slot];const auto& drive=(*m_pDrives)[slot];
     out.identity.session=m_edm94.Current().identity.session;
@@ -2356,7 +2374,7 @@ EDM174Comm::MotionObservation MotionCore::GetEDM174CommunicationObservation() co
     return observation;
 }
 std::uint32_t MotionCore::GetEDM173ImplementationRevision() const noexcept
-{ return 70U; }
+{ return 74U; }
 
 bool MotionCore::IsEDM173HandoffCurrent() const noexcept
 {
@@ -3612,7 +3630,8 @@ bool MotionCore::BeginEDM126Segment() noexcept
     const bool tangentFlush=EDM130::IsG76B0Flush192(a.timerRecipe);
     const bool centerFlush=EDM173::IsCenterRecipe(a.timerRecipe);
     const unsigned commissioningProfile=a.timerRecipe.commissioningProfile;
-    const double visibleHeight=centerFlush?EDM173::FrozenHeightMm(a.timerRecipe):EDM94::VisibleFlushHeightMm(commissioningProfile);
+    const double visibleHeight=(centerFlush||EDM130::IsG76SharedShortB1_274(a.timerRecipe))?
+        EDM173::FrozenHeightMm(a.timerRecipe):EDM94::VisibleFlushHeightMm(commissioningProfile);
     if(m_edm94.FrozenConfig().visibleZFlush158!=visible ||
         m_edm94.FrozenConfig().commissioningProfile!=commissioningProfile || (visible&&
         (!E159VisibleHistoryProfileMatches(a.historyFixture,commissioningProfile)||
@@ -3831,7 +3850,7 @@ bool MotionCore::StepEDM126Segment(AxisCommand& command) noexcept
         !decision.faulted && !decision.feedInhibited && !decision.shortActive &&
         decision.state==EDMGapServo::ShortState::Clear;
     const bool flushPause=pauseDemand&&m_edm157Pause.FlushPause();
-    // E217: nominal B2/B3/B4 HOLD stays on its exact retained child.
+    // EDM272: nominal B0-B4 HOLD stays on its exact retained child.
     // Use the paused-path proposal even without a retreat target so neither
     // a due E5 event nor an endpoint can retire that child while paused.
     const bool nominalG76Pause=pauseDemand&&EDM157::IsG76NominalPause(m_edm157Pause.Current().scope);
@@ -4083,8 +4102,11 @@ void MotionCore::ObserveEDM126PhysicalSettle(bool complete,const EDM94::RuntimeD
 {
     if (!m_edm126Profile || !m_edm126Participating) {m_edm126PhysicalSettled=m_edm126PhysicalRange=false;return;}
     const auto& frame=m_edm94Frame; const auto& sent=m_edm94.Current(); const auto& f=EDM126CommittedImage();
-    const bool diagnose=m_edm157Pause.DemandZero()&&
+    const bool pauseDiagnose=m_edm157Pause.DemandZero()&&
         m_edm157Pause.Current().scope.historyFixture==EDM149::G76GapHistoryFixture;
+    const bool observeG76=m_edm173&&m_edm94.Active()&&IsEDM173Profile()&&
+        EDM130::IsG76SharedShort274(m_edm130ArmRecipe);
+    const bool diagnose=pauseDiagnose||observeG76;
     std::uint32_t evaluated=0U,failed=0U,axisMask=0U;
     const auto gate=[&](std::uint32_t bit,bool passed) noexcept {
         if(diagnose){evaluated|=bit;if(!passed)failed|=bit;}return passed;
@@ -4121,8 +4143,64 @@ void MotionCore::ObserveEDM126PhysicalSettle(bool complete,const EDM94::RuntimeD
     }
     m_edm126PhysicalSettled=m_edm126PhysicalRange=valid;m_edm126PhysicalTick=frame.tick;
     if(valid)m_edm126PhysicalReference=f.positionPulse;
-    if(diagnose){m_edm157PhysicalDiagnosticTick=frame.tick;m_edm157PhysicalEvaluated=evaluated;
+    if(pauseDiagnose){m_edm157PhysicalDiagnosticTick=frame.tick;m_edm157PhysicalEvaluated=evaluated;
         m_edm157PhysicalFailures=failed;m_edm157PhysicalAxisMask=axisMask;}
+    // The normal short-test path previously had no physical gate evidence.
+    // Copy at most twice a second. This independent observer never changes
+    // settling, dwell counters, ownership, controller gains or motion output.
+    if(observeG76&&frame.identity.session&&frame.tick&&
+        (g_edm275PhysicalSession!=frame.identity.session||frame.tick<g_edm275PhysicalTick||
+         frame.tick-g_edm275PhysicalTick>=2000ULL)) {
+        EDM275::Snapshot d{};
+        d.session=frame.identity.session;d.epoch=frame.identity.epoch;
+        d.ownerGeneration=frame.identity.ownerGeneration;d.tick=frame.tick;d.nowUs=frame.nowUs;
+        d.physicalTick=m_edm126PhysicalTick;d.mappedTick=m_edm114MappedTick;
+        d.lastSentTick=sent.lastSentTick;d.proofTick=proof.proofTick;
+        const auto& e=m_edm128.Evidence();
+        d.phase=static_cast<std::uint32_t>(e.phase);d.child=m_edm126Current.authorizedRows;
+        d.completedChildren=m_edm126Current.completedRows;
+        d.evaluated=evaluated;d.failed=failed;d.axisMask=axisMask;
+        d.stableCycles=e.stableCycles;d.stableStartUs=e.stableStartUs;d.dwellUs=e.policy.profile.dwellUs;
+        d.localMm=f.localMm;d.lengthMm=f.lengthMm;d.velocityMmSec=f.velocityMmSec;
+        if(valid)d.flags|=EDM275::PhysicalValid;
+        if(m_edm114Current.rowComplete)d.flags|=EDM275::RowComplete;
+        if(f.atCurrentEnd)d.flags|=EDM275::AtCurrentEnd;
+        if(f.awaitingSeam)d.flags|=EDM275::AwaitingSeam;
+        if(f.completeReady)d.flags|=EDM275::CompleteReady;
+        if(m_Group.isActive)d.flags|=EDM275::GroupActive;
+        if(frame.allCommandZero)d.flags|=EDM275::AllCommandZero;
+        if(f.velocityMmSec==0.0&&f.velocityPps==EDM126::Point{})d.flags|=EDM275::MappedVelocityZero;
+        if(m_edm126SameReferencePriorTick)d.flags|=EDM275::PriorSameReference;
+        if(m_edm126PhysicalReference==m_edm114Current.endPulse)d.flags|=EDM275::PhysicalReferenceMatchesEnd;
+        if(EDM128::Zero(m_edm128.Committed()))d.flags|=EDM275::CoordinatorCommittedZero;
+        if(EDM128::Zero(m_edm128.Current()))d.flags|=EDM275::CoordinatorImageZero;
+        if(EDM109::SamePulse(m_edm128.Committed().positionPulse,m_edm128.Current().positionPulse))d.flags|=EDM275::CoordinatorSamePulse;
+        for(unsigned i=0U;i<6U;++i) {
+            const auto& axis=frame.axis[i];const auto& config=m_edm94.FrozenConfig().axis[i];auto& a=d.axis[i];
+            a.commandPulse=axis.commandPulse;a.actualPulse=axis.actualPulse;
+            a.windowPulse=config.followingWindowPulse;a.referencePulse=f.positionPulse[i];
+            const double low=same?(std::min)(m_edm126PhysicalMin[i],axis.actualPulse):axis.actualPulse;
+            const double high=same?(std::max)(m_edm126PhysicalMax[i],axis.actualPulse):axis.actualPulse;
+            a.rangePulse=high-low;
+            if(axis.healthy)a.flags|=EDM275::Healthy;
+            if(axis.writable)a.flags|=EDM275::Writable;
+            if(axis.commandPulse==f.positionPulse[i])a.flags|=EDM275::CommandMatchesReference;
+            const bool finite=std::isfinite(axis.actualPulse)&&std::isfinite(axis.commandPulse)&&
+                std::isfinite(axis.followingErrorPulse)&&std::isfinite(config.followingWindowPulse);
+            if(finite)a.flags|=EDM275::Finite;
+            if(finite&&std::fabs(axis.actualPulse-f.positionPulse[i])<=config.followingWindowPulse)a.flags|=EDM275::ActualInWindow;
+            if(finite&&std::fabs(axis.followingErrorPulse)<=config.followingWindowPulse)a.flags|=EDM275::FollowingInWindow;
+            if(std::isfinite(a.rangePulse)&&a.rangePulse<=EDM94::StopRangeLimitPulse(i,config))a.flags|=EDM275::RangePass;
+            if(m_pContexts&&i<m_pContexts->size()) {
+                const auto& member=(*m_pContexts)[i];
+                a.commandPps=member.currentCmdVel;a.logicalPps=member.logicalCmdVel;a.targetPps=member.targetVelocity;
+                if(member.IsMechanicalCompensationReadyForCompletion())a.flags|=EDM275::CompensationReady;
+            }
+        }
+        // A failed diagnostic publication cannot fault or authorize motion.
+        (void)g_edm275PhysicalChannel.Publish(d);
+        g_edm275PhysicalSession=d.session;g_edm275PhysicalTick=d.tick;
+    }
 }
 
 bool MotionCore::ReadEDM157Feedback(EDM157::Feedback& feedback) const noexcept
@@ -4198,7 +4276,7 @@ EDM157::Scope MotionCore::CurrentEDM157Scope() const noexcept
     scope.ownerGeneration=m_edm126Current.ownerGeneration;scope.historyFixture=m_edm126Current.fixture;
     scope.recipe=m_edm130ArmRecipe;scope.policy=m_edm128Current.rowPolicy;
     if(IsEDM173Profile()&&m_edm173&&m_edm173->sealed&&
-        (EDM130::IsG76B2Flush175(scope.recipe)||EDM173::IsCenterRecipe(scope.recipe))) {
+        EDM130::IsG76Gap173(scope.recipe)) {
         const auto& plan=m_edm173->current.plan;
         scope.compoundFingerprint=plan.fingerprint;scope.compoundArmEpoch=plan.scope.armEpoch;
         scope.compoundLine=plan.scope.line;
@@ -8787,7 +8865,7 @@ void MotionCore::ServiceEDM94MotionPass(bool complete) noexcept
             (EDM130::IsG76SquareB1_250(arm.timerRecipe)||EDM130::IsG76DiamondB1_255(arm.timerRecipe)||
                 EDM130::IsG76OneMmB1_260(arm.timerRecipe)||
                 EDM130::IsG76Expansion263(arm.timerRecipe)||EDM130::IsG76FixedRadius266(arm.timerRecipe)||
-                EDM130::IsG76FixedRadiusWork267(arm.timerRecipe));
+                EDM130::IsG76FixedRadiusWork267(arm.timerRecipe)||EDM130::IsG76SharedShortB1_274(arm.timerRecipe));
         if(g76B2||g76B0)armConfig.maxDurationUs=EDM94::MaximumDurationUs;
         if((arm.ordinarySequenceProgram==247U||arm.ordinarySequenceProgram==248U)&&boundedProgram&&requiredMovementMask==7U&&
             !visibleFlush&&!armConfig.commissioningProfile&&
@@ -10147,6 +10225,42 @@ void MotionCore::ObserveNCSettleRuntimeCycle(
         physicalStamp = m_pEDMPhysicalSourceMaster->ReadGapPhysicalRTShadow(physical);
     m_edm129Physical=physical; m_edm129PhysicalStamp=physicalStamp;
     ObserveEDMZFixtureRuntimeClock(runtimeCycleTick, pdoCycleValid, adjacentToPrevious);
+    // TUNE01: this source hook runs even when an invalid PDO skips Motion.
+    // Start is accepted only here; a mid-pass Start waits for the next source.
+    auto& positionTune = PositionAutoTune::Capture();
+    if (const auto* request = positionTune.RuntimeRequest())
+    {
+        const auto lease = GetMotionOwnerLease();
+        bool layout = m_pContexts != nullptr && m_pDrives != nullptr &&
+            m_pContexts->size() == m_pDrives->size() && m_pContexts->size() <= MAX_AXES &&
+            request->axis >= 0 && static_cast<std::size_t>(request->axis) < m_pContexts->size();
+        if (layout)
+        {
+            for (std::size_t i=0U; i<m_pContexts->size(); ++i)
+            {
+                const auto& member=(*m_pContexts)[i];
+                if (!member.isExist) continue;
+                layout=layout && member.axisIndex==static_cast<int>(i) && !member.homeRuntime.active &&
+                    !member.isFault && !member.isLagAlarm && !member.resetRequest &&
+                    (static_cast<int>(i)==request->axis || member.state==MotionState::MotionState_IDLE);
+            }
+        }
+        PositionAutoTune::CaptureCycle cycle{};
+        cycle.cycle=runtimeCycleTick; cycle.timestampUs=m_edmZMonotonicUs;
+        cycle.owner=static_cast<std::uint32_t>(lease.owner);cycle.ownerGeneration=lease.generation;
+        cycle.epoch=GetCurrentExecutionEpoch();cycle.sourceValid=pdoCycleValid&&adjacentToPrevious;
+        cycle.clockValid=m_edmZClockValid;cycle.layoutGood=layout;
+        cycle.safetyGood=!m_Group.isActive && m_Group.cmdQueue.empty() &&
+            !m_edmZPolicy.Snapshot().capHeld && !m_edm94.Active() &&
+            !HasPendingExecutionEpochChange() && !HasPendingSafetyOrRecoveryRequests() &&
+            !HasUnacknowledgedSafetyMotionRequest() && !AlarmManager::GetInstance().HasAlarm();
+        (void)positionTune.RuntimeBegin(cycle);
+    }
+    if (positionTune.RuntimeNeedsStop())
+    {
+        RequestEmergencyStopAllAxes();
+        positionTune.RuntimeAcknowledgeStop();
+    }
     ServiceEDM96Source();
     ObserveEDMRTShadowRuntimeCycle(runtimeCycleTick, pdoCycleValid, adjacentToPrevious,
         servicePhysical, physical, physicalStamp);
@@ -10173,6 +10287,7 @@ void MotionCore::ObserveNCSettleRuntimeCycle(
         m_pbcResetPreproofTick = 0ULL;
         InvalidateServoOutputImageProof();
         PublishStopSettleEvidence();
+        ServicePositionPidRuntime(false);
     }
 }
 
@@ -18821,6 +18936,38 @@ void MotionCore::WriteServoTargetVelocityCommand(
     if (m_edm94.Active())
         value = static_cast<std::int32_t>(GuardEDM94Velocity(axisIndex, static_cast<double>(value)));
 
+    // TUNE01 final per-axis gate, before the existing owner reservation.
+    // It grants no motion permission and is inert outside a capture session.
+    auto& positionTune = PositionAutoTune::Capture();
+    if (const auto* request=positionTune.RuntimeRequest())
+    {
+        if (axisIndex!=request->axis && positionTune.State()==PositionAutoTune::CaptureState::Running &&
+            m_pContexts && axisIndex>=0 && static_cast<std::size_t>(axisIndex)<m_pContexts->size() &&
+            (*m_pContexts)[axisIndex].isExist && (*m_pContexts)[axisIndex].state!=MotionState::MotionState_IDLE)
+        {
+            (void)positionTune.RuntimeFail(PositionAutoTune::CaptureReason::Interference);
+            value=0;
+        }
+        else if (axisIndex==request->axis)
+        {
+            const bool mapped=m_pContexts && axisIndex>=0 &&
+                static_cast<std::size_t>(axisIndex)<m_pContexts->size();
+            const double sign=mapped && ((*m_pContexts)[axisIndex].isReverse!=
+                (*m_pContexts)[axisIndex].Axis_Reverse) ? -1.0 : 1.0;
+            if (!mapped || !positionTune.RuntimeAllowOutput(axisIndex,static_cast<double>(value)*sign))
+            {
+                if (!mapped) (void)positionTune.RuntimeFail(PositionAutoTune::CaptureReason::Input);
+                value=0;
+            }
+        }
+    }
+    if (positionTune.RuntimeNeedsStop())
+    {
+        RequestEmergencyStopAllAxes();
+        positionTune.RuntimeAcknowledgeStop();
+        value=0;
+    }
+
     const auto writeTarget =
         [&](int32_t exactValue)
     {
@@ -22464,6 +22611,7 @@ void MotionCore::UpdateAllMotion()//更新全部軸狀態 逐步激磁
         FinishEDMZFixtureMotionPass();
         PublishStartupLagArmingEvidence();
         PublishStopSettleEvidence();
+        ServicePositionPidRuntime(false);
         return;
     }
 
@@ -22493,6 +22641,7 @@ void MotionCore::UpdateAllMotion()//更新全部軸狀態 逐步激磁
         FinishEDMZFixtureMotionPass();
         PublishStartupLagArmingEvidence();
         PublishStopSettleEvidence();
+        ServicePositionPidRuntime(false);
         return;
     }
 
@@ -23000,6 +23149,34 @@ void MotionCore::UpdateAllMotion()//更新全部軸狀態 逐步激磁
         imageAuthorized = false;
     }
 
+    // TUNE01: freeze exactly one coherent sample after the local axis/image
+    // checks. A failed guard enters the existing safety path before publishing
+    // this frame; local zero is never reported as physical stop or drive ACK.
+    auto& positionTune=PositionAutoTune::Capture();
+    if (const auto* request=positionTune.RuntimeRequest())
+    {
+        const int selected=request->axis;
+        const auto lease=GetMotionOwnerLease();
+        const bool mapped=selected>=0 && static_cast<std::size_t>(selected)<m_pContexts->size() &&
+            static_cast<std::size_t>(selected)<m_pDrives->size() && (*m_pDrives)[selected].pOutput;
+        double logicalImage=0.0;
+        if (mapped)
+        {
+            const auto& axis=(*m_pContexts)[selected];
+            logicalImage=static_cast<double>((*m_pDrives)[selected].pOutput->TargetVelocity)*
+                (axis.isReverse!=axis.Axis_Reverse ? -1.0 : 1.0);
+        }
+        const bool current=mapped && imageAuthorized && motionInputComplete &&
+            lease.owner==static_cast<MotionOwner>(request->owner) && lease.generation==request->ownerGeneration &&
+            GetCurrentExecutionEpoch()==request->epoch && !HasPendingSafetyOrRecoveryRequests() &&
+            !HasPendingExecutionEpochChange() && !AlarmManager::GetInstance().HasAlarm();
+        if (!positionTune.RuntimeEnd(logicalImage,current)) imageAuthorized=false;
+    }
+    if (positionTune.RuntimeNeedsStop())
+    {
+        RequestEmergencyStopAllAxes();positionTune.RuntimeAcknowledgeStop();imageAuthorized=false;
+    }
+
     if (!imageAuthorized)
     {
         if (ZeroAllServoTargetVelocityForFrame())
@@ -23037,6 +23214,170 @@ void MotionCore::UpdateAllMotion()//更新全部軸狀態 逐步激磁
     // ROTPID_DIAG1: read-only capture after the existing local image guards.
     // This is NOT an acknowledgement of final send or drive consumption.
     CaptureRotaryPidDiagnostics(imageAuthorized);
+    ServicePositionPidRuntime(motionInputComplete);
+}
+
+// TUNE15: RT owner is the only writer of live bank gains and PID history.
+// The NC service sees a separate atomic image and never reads these structs.
+void MotionCore::ServicePositionPidRuntime(bool completedInputPass) noexcept
+{
+    if(!PositionPidRuntimeEnabled())return;
+    PositionPidContext context{};PositionPidValues values{};
+    context.Generation=m_positionPidGeneration;context.RuntimeCycle=m_ncSettleRuntimeCycleTick;
+    PositionPidReason reason=PositionPidReason::Ready;
+    const bool layout=m_pContexts && m_pDrives && m_pContexts->size()==m_pDrives->size() &&
+        !m_pContexts->empty() && m_pContexts->size()<=POSITION_PID_AXIS_COUNT;
+    const bool source=layout && completedInputPass && m_ncSettleRuntimeObserved &&
+        m_ncSettleRuntimeCycleValid && m_ncSettleRuntimeCycleContiguous;
+    const auto owner=GetMotionOwnerLease();
+    const bool adjacent=m_positionPidLastCycle!=0ULL && m_positionPidLastCycle+1ULL==m_ncSettleRuntimeCycleTick;
+    m_positionPidLastCycle=m_ncSettleRuntimeCycleTick;
+    if(!source)reason=PositionPidReason::RuntimeUnavailable;
+    else if(!PositionPidNcIdleNow())reason=PositionPidReason::NcBusy;
+    else if(PositionAutoTune::Capture().Active() || PositionAutoTune::JobBusy())reason=PositionPidReason::TuneBusy;
+    else if(AlarmManager::GetInstance().HasAlarm() || HasPendingSafetyOrRecoveryRequests() ||
+        HasUnacknowledgedSafetyMotionRequest() || HasPendingExecutionEpochChange())reason=PositionPidReason::Safety;
+    else if((owner.owner!=MotionOwner::NONE && owner.owner!=MotionOwner::IDLE_HOLD) ||
+        m_Group.isActive || !m_Group.cmdQueue.empty() || GetAxisCommandMailboxDepth()!=0U ||
+        m_edmZPolicy.Snapshot().capHeld || m_edm94.Active() ||
+        m_pbcXRetainRecoveryRequired.load(std::memory_order_acquire) || HasPbcXUnresolvedActiveOutput())
+        reason=PositionPidReason::MotionBusy;
+    else if(owner.owner==MotionOwner::IDLE_HOLD &&
+        (!m_idlePositionHold.active || m_idlePositionHold.cancelled ||
+        !m_idlePositionHold.lease.Matches(owner) || m_idlePositionHold.runtimeTick!=m_ncSettleRuntimeCycleTick))
+        reason=PositionPidReason::HoldTransition;
+    bool allSettled=source && adjacent;
+    if(layout)
+    {
+        context.AxisCount=static_cast<std::uint32_t>(m_pContexts->size());
+        for(std::size_t i=0U;i<m_pContexts->size();++i)
+        {
+            const auto& axis=(*m_pContexts)[i];
+            const auto copy=[](const PidConfig& p) noexcept -> PositionPidGains
+            {PositionPidGains g{p.Kp,p.Ki,p.Kd,p.Kvff};return g;};
+            values.Axis[i][0]=copy(axis.Pid_G00);values.Axis[i][1]=copy(axis.Pid_IDLE);
+            if(!axis.isExist){m_positionPidSettle[i]=0U;continue;}
+            const std::uint32_t bit=1U<<static_cast<unsigned>(i);context.ActiveAxisMask|=bit;
+            const bool health=source && axis.axisIndex==static_cast<int>(i) && !axis.isVirtualAxis &&
+                axis.isServoOn && (m_servoSourceInputMask&bit)!=0U &&
+                (m_servoSourceStatusWord[i]&0x006fU)==0x0027U && m_servoSourceMode[i]==9 &&
+                !axis.isFault && !axis.isLagAlarm && !axis.resetRequest && !axis.homeRuntime.active &&
+                !axis.hardLimitPositive && !axis.hardLimitNegative &&
+                !axis.positiveTravelBlocked && !axis.negativeTravelBlocked;
+            const bool fixed=health && reason==PositionPidReason::Ready &&
+                axis.state==MotionState::MotionState_IDLE && axis.currentCmdVel==0.0 && axis.logicalCmdVel==0.0 &&
+                std::isfinite(axis.currentCmdPos) && std::isfinite(axis.currentActPos) &&
+                std::isfinite(axis.inPositionWindow_Pulse) && axis.inPositionWindow_Pulse>0.0 &&
+                axis.inPosition && std::fabs(axis.currentCmdPos-axis.currentActPos)<=axis.inPositionWindow_Pulse;
+            if(!fixed || !adjacent || m_positionPidSettle[i]==0U ||
+                axis.currentCmdPos!=m_positionPidCommand[i])
+            {
+                m_positionPidSettle[i]=fixed?1U:0U;m_positionPidCommand[i]=axis.currentCmdPos;
+                m_positionPidActualMin[i]=m_positionPidActualMax[i]=axis.currentActPos;
+            }
+            else
+            {
+                m_positionPidActualMin[i]=(std::min)(m_positionPidActualMin[i],axis.currentActPos);
+                m_positionPidActualMax[i]=(std::max)(m_positionPidActualMax[i],axis.currentActPos);
+                if(m_positionPidActualMax[i]-m_positionPidActualMin[i]>axis.inPositionWindow_Pulse)
+                {m_positionPidSettle[i]=1U;m_positionPidActualMin[i]=m_positionPidActualMax[i]=axis.currentActPos;}
+                else if(m_positionPidSettle[i]<200U)++m_positionPidSettle[i];
+            }
+            allSettled=allSettled && m_positionPidSettle[i]>=200U;
+            if(!health && reason==PositionPidReason::Ready)reason=PositionPidReason::AxisFault;
+        }
+    }
+    if(reason==PositionPidReason::Ready && (!allSettled || !context.ActiveAxisMask))reason=PositionPidReason::NotSettled;
+    if(reason==PositionPidReason::Ready)context.CanApplyMask=context.ActiveAxisMask;
+    context.BlockReason=static_cast<std::uint32_t>(reason);
+
+    PositionPidRequest request{};std::uint64_t queuedCycle=0ULL;
+    const bool requested=PositionPidRuntimeTake(request,queuedCycle);
+    PositionPidStatus status=PositionPidStatus::NotAllowed;
+    PositionPidReason resultReason=reason;
+    if(requested)
+    {
+        if(!PositionPid::Canonical(request))
+        {status=PositionPidStatus::InvalidCommand;resultReason=PositionPidReason::InvalidGain;}
+        else if(request.ExpectedGeneration!=m_positionPidGeneration)
+        {status=PositionPidStatus::Stale;resultReason=PositionPidReason::Conflict;}
+        else if(!PositionPidRuntimeDeadlineCurrent() || !queuedCycle || m_ncSettleRuntimeCycleTick<queuedCycle ||
+            m_ncSettleRuntimeCycleTick-queuedCycle>1000ULL)
+        {status=PositionPidStatus::Stale;resultReason=PositionPidReason::Expired;}
+        else if(!layout || request.Axis>=context.AxisCount || (context.ActiveAxisMask&(1U<<request.Axis))==0U)
+        {status=PositionPidStatus::DomainRejected;resultReason=PositionPidReason::InvalidAxis;}
+        else if(reason==PositionPidReason::Ready && m_positionPidGeneration!=UINT64_MAX)
+        {
+            // Reserve the existing owner and execution publication, which
+            // also fences JOG/MPG/NC admission and safety owner transfer. The
+            // bounded commit contains only scalar assignments; no waits/I/O.
+            AlarmManager& alarms=AlarmManager::GetInstance();
+            AlarmManager::MotionAdmissionReservation admission{};
+            std::uint64_t ownerWord=m_motionOwnerState.load(std::memory_order_acquire);
+            const std::uint64_t baseOwner=ownerWord;
+            std::uint64_t epochWord=m_executionEpochPublication.load(std::memory_order_acquire);
+            const std::uint64_t baseEpoch=epochWord;
+            const bool ownerOkay=(UnpackMotionOwnerState(ownerWord).owner==MotionOwner::NONE ||
+                UnpackMotionOwnerState(ownerWord).owner==MotionOwner::IDLE_HOLD) &&
+                !UnpackMotionOwnerSafetyHandshake(ownerWord) && !UnpackMotionOwnerSafetyActionPending(ownerWord) &&
+                (ownerWord&MOTION_OWNER_ANY_OUTPUT_RESERVATION)==0ULL &&
+                UnpackMotionOwnerSafetyRequestTicket(ownerWord)==m_safetyRequestAcknowledgedTicket.load(std::memory_order_acquire);
+            bool ownerHeld=false,epochHeld=false;
+            if(ownerOkay && (epochWord&(EXECUTION_EPOCH_PUBLICATION_PENDING|EXECUTION_EPOCH_PUBLICATION_COMMIT_RESERVED))==0ULL &&
+                alarms.BeginMotionAdmission(alarms.GetUpdateCount(),admission))
+            {
+                ownerHeld=m_motionOwnerState.compare_exchange_strong(ownerWord,baseOwner|MOTION_OWNER_EPOCH_COMMIT_RESERVED,
+                    std::memory_order_acq_rel,std::memory_order_acquire);
+                if(ownerHeld)epochHeld=m_executionEpochPublication.compare_exchange_strong(epochWord,
+                    baseEpoch|EXECUTION_EPOCH_PUBLICATION_COMMIT_RESERVED,std::memory_order_acq_rel,std::memory_order_acquire);
+                if(epochHeld && PositionPidRuntimeDeadlineCurrent() && PositionPidNcIdleNow() && !PositionAutoTune::Capture().Active() && !PositionAutoTune::JobBusy() &&
+                    alarms.IsMotionAdmissionCurrent(admission) && !alarms.HasAlarm() &&
+                    !HasPendingSafetyOrRecoveryRequests() && !HasUnacknowledgedSafetyMotionRequest() &&
+                    GetAxisCommandMailboxDepth()==0U && m_Group.cmdQueue.empty() &&
+                    m_motionOwnerState.load(std::memory_order_acquire)==(baseOwner|MOTION_OWNER_EPOCH_COMMIT_RESERVED) &&
+                    m_executionEpochPublication.load(std::memory_order_acquire)==(baseEpoch|EXECUTION_EPOCH_PUBLICATION_COMMIT_RESERVED))
+                {
+                    auto& axis=(*m_pContexts)[request.Axis];
+                    auto& bank=request.Bank==0U?axis.Pid_G00:axis.Pid_IDLE;
+                    bank.Kp=request.Values.Kp;bank.Ki=request.Values.Ki;
+                    bank.Kd=request.Values.Kd;bank.Kvff=request.Values.Kvff;
+                    bank.prevError=bank.integralAcc=0.0;
+                    // Never transplant integral/derivative history between
+                    // gain versions. NONE is zero-output; M30 holds are P-only.
+                    axis.pid.prevError=axis.pid.integralAcc=0.0;
+                    if(request.Bank==1U)
+                    {
+                        axis.pid.Kp=bank.Kp;axis.pid.Ki=bank.Ki;axis.pid.Kd=bank.Kd;axis.pid.Kvff=bank.Kvff;
+                        if(UnpackMotionOwnerState(baseOwner).owner==MotionOwner::IDLE_HOLD)
+                            m_idlePositionHold.kp[request.Axis]=bank.Kp;
+                    }
+                    ++m_positionPidGeneration;context.Generation=m_positionPidGeneration;
+                    values.Axis[request.Axis][request.Bank]=request.Values;
+                    m_positionPidSettle[request.Axis]=0U;context.CanApplyMask=0U;
+                    context.BlockReason=static_cast<std::uint32_t>(PositionPidReason::NotSettled);
+                    status=PositionPidStatus::Success;resultReason=PositionPidReason::Ready;
+                }
+                else {status=PositionPidStatus::Busy;resultReason=PositionPidReason::Safety;}
+                if(epochHeld)ReleaseLifecycleCommitReservation(baseEpoch|EXECUTION_EPOCH_PUBLICATION_COMMIT_RESERVED);
+                if(ownerHeld)ReleaseExactResetNCSettleReservation(baseOwner|MOTION_OWNER_EPOCH_COMMIT_RESERVED);
+                (void)alarms.EndMotionAdmission(admission);
+            }
+            else {status=PositionPidStatus::Busy;resultReason=PositionPidReason::Safety;}
+        }
+    }
+    // Every guard runs at 250 us. Only the ~10 ms atomic observation copy is
+    // throttled, with immediate publication for any requested transaction.
+    if(requested || !m_positionPidPublishedCycle || m_ncSettleRuntimeCycleTick-m_positionPidPublishedCycle>=40ULL)
+    {
+        m_positionPidPublishedCycle=m_ncSettleRuntimeCycleTick;
+        PositionPidRuntimePublish(context,values);
+    }
+    if(requested)
+    {
+        PositionPidGains applied{};
+        if(request.Axis<POSITION_PID_AXIS_COUNT && request.Bank<2U)applied=values.Axis[request.Axis][request.Bank];
+        PositionPidRuntimeComplete(request,status,resultReason,m_positionPidGeneration,applied);
+    }
 }
 
 void MotionCore::CaptureRotaryPidDiagnostics(bool imageAuthorized) noexcept
@@ -25104,7 +25445,14 @@ void MotionCore::Calc_Trajectory_Trapezoidal(
     // =========================================================
     // 6. 正方向終點 Clamp
     // =========================================================
-    if (isStopping && dir > 0.0 && nextOutputPosition >= axis.finalTargetPos)
+    // TUNE03 FIX5: clamp only when the filtered output step reaches/crosses
+    // the target. The raw planner can already be at the target while its FIR
+    // tail is still moving; planDistErr==0 then selects dir=+1 even after a
+    // negative move. Using that raw direction would jump the remaining tail
+    // distance in one cycle. This bracket also keeps an already reached
+    // endpoint fixed, without manufacturing a step back from beyond it.
+    if (isStopping && axis.currentCmdPos <= axis.finalTargetPos &&
+        nextOutputPosition >= axis.finalTargetPos)
     {
         stepPos = axis.finalTargetPos - axis.currentCmdPos;
 
@@ -25127,7 +25475,8 @@ void MotionCore::Calc_Trajectory_Trapezoidal(
     // =========================================================
     // 7. 負方向終點 Clamp
     // =========================================================
-    else if (isStopping && dir < 0.0 && nextOutputPosition <= axis.finalTargetPos)
+    else if (isStopping && axis.currentCmdPos >= axis.finalTargetPos &&
+        nextOutputPosition <= axis.finalTargetPos)
     {
         stepPos = axis.finalTargetPos - axis.currentCmdPos;
 
@@ -25294,6 +25643,32 @@ void MotionCore::Calc_Trajectory_Trapezoidal(
     {
         if (isStopping)
         {
+            // TUNE09_STANDALONE_ENDPOINT_INTEGRAL_BEGIN
+            // Ordinary standalone positioning uses the physical trapezoid
+            // planner. A disabled G00 I term must not release its accumulated
+            // position-error history when this exact completion enables IDLE I.
+            // Clear only that previously invisible history, once, before IDLE;
+            // the first IDLE sample still integrates its current error normally.
+            // Group/G1 paths use a virtual planner and keep their transfer policy.
+            // HOME, EDM, flush, stopped/faulted motion and nonzero G00 Ki retain
+            // their existing behavior. No gain, endpoint or output guard changes.
+            const auto endpointOwner = GetMotionOwnerLease();
+            const bool ordinaryStandaloneEndpoint =
+                !axis.isVirtualAxis && axis.isExist && axis.isServoOn &&
+                !axis.homeRuntime.active && !axis.isFault && !axis.isLagAlarm && !axis.resetRequest &&
+                !axis.edmFlushGainSelected && !m_edm94.Active() && !m_edmZPolicy.Snapshot().capHeld &&
+                !m_Group.isActive && !m_safetyControlledStopInProgress &&
+                !HasPendingExecutionEpochChange() && !HasPendingSafetyOrRecoveryRequests() &&
+                !HasUnacknowledgedSafetyMotionRequest() && !AlarmManager::GetInstance().HasAlarm() &&
+                (endpointOwner.owner == MotionOwner::AUTO || endpointOwner.owner == MotionOwner::MDI) &&
+                IsMotionOwnerLeaseCurrent(endpointOwner) &&
+                axis.pid.Kp == axis.Pid_G00.Kp && axis.pid.Ki == 0.0 && axis.Pid_G00.Ki == 0.0 &&
+                axis.pid.Kd == axis.Pid_G00.Kd && axis.pid.Kvff == axis.Pid_G00.Kvff &&
+                std::isfinite(axis.Pid_IDLE.Ki) && axis.Pid_IDLE.Ki > 0.0 &&
+                std::isfinite(axis.pid.integralAcc);
+            if (ordinaryStandaloneEndpoint)
+                axis.pid.integralAcc = 0.0;
+            // TUNE09_STANDALONE_ENDPOINT_INTEGRAL_END
             axis.state = MotionState::MotionState_IDLE;
 
             // Exact Stop is complete only when the whole virtual command state
@@ -26889,6 +27264,7 @@ void MotionCore::Run_Servo_Loop(DriveType& servo, AxisContext& axis, const AxisC
         finalVel = evaluated.velocityPps;
     }
 
+    const double positionTuneProposal=finalVel;
     // FIX2: retain the real selected PI proposal before output guards or a
     // following fault can replace it with zero. Observation only; the wire
     // receipt remains a separately dated complete accepted image.
@@ -26910,10 +27286,10 @@ void MotionCore::Run_Servo_Loop(DriveType& servo, AxisContext& axis, const AxisC
         sample.pTerm = p_term; sample.iTerm = i_term; sample.logicalOutputVelocityPps = finalVel;
         m_edm94.ObserveAxisControlSample(static_cast<unsigned>(axis.axisIndex), sample);
         // EDM206_CONTROL_OBSERVATION_BEGIN: same real PI sample, no new evaluation.
-        if (m_edm173 && IsEDM173Profile() && EDM173::IsCenterRecipe(m_edm130ArmRecipe))
+        if (m_edm173 && IsEDM173Profile() && E275HistoryRecipe(m_edm130ArmRecipe))
             m_edm173->syncHistory.ObserveControl(static_cast<unsigned>(axis.axisIndex), sample,
                 axis.pid.Kd, axis.edmFlushGainSelected,
-                EDM173::IsB4Recipe(m_edm130ArmRecipe) ? 4U : 3U);
+                E275HistoryMode(m_edm130ArmRecipe));
         // EDM206_CONTROL_OBSERVATION_END
     }
 
@@ -27131,6 +27507,50 @@ void MotionCore::Run_Servo_Loop(DriveType& servo, AxisContext& axis, const AxisC
         }
     }
 
+    // TUNE01: capture the actual selected controller before hardware sign.
+    // The later end-of-image hook supplies the guarded local PDO value.
+    auto& positionTune=PositionAutoTune::Capture();
+    if (const auto* request=positionTune.RuntimeRequest())
+    {
+        if (axis.axisIndex==request->axis)
+        {
+            PositionAutoTune::CaptureSample sample{};
+            sample.commandPulse=control.servoCommandPulse;sample.actualPulse=axis.currentActPos;
+            sample.referencePps=control.servoVelocityPPS;sample.actualVelocityPps=axis.currentActVel;
+            sample.proposedLogicalPps=positionTuneProposal;sample.outputLogicalPps=finalVel;
+            sample.pTerm=p_term;sample.iTerm=i_term;sample.feedforwardPps=control.servoVelocityPPS*axis.pid.Kvff;
+            sample.kp=axis.pid.Kp;sample.ki=axis.pid.Ki;sample.kd=axis.pid.Kd;sample.kvff=axis.pid.Kvff;
+            sample.integral=axis.pid.integralAcc;sample.motionState=static_cast<std::uint32_t>(axis.state);
+            sample.gainBank=static_cast<std::uint32_t>(axis.state==MotionState::MotionState_IDLE ?
+                PositionAutoTune::GainBank::Idle : PositionAutoTune::GainBank::Motion);
+            sample.saturated=positionTuneProposal!=finalVel ? 1U : 0U;
+            sample.valid=1U;
+            const bool valid=m_ncSettleRuntimeCycleValid && m_ncSettleRuntimeCycleContiguous &&
+                (m_servoSourceInputMask & (1U<<static_cast<unsigned>(axis.axisIndex)))!=0U &&
+                (input.StatusWord & 0x006FU)==0x0027U && input.ModesOfOperationDisplay==9 &&
+                axis.isServoOn && axis.targetMode==9 && axis.isExist && !axis.isVirtualAxis &&
+                (axis.axisType==AxisType::LINEAR || axis.axisType==AxisType::ROTARY) &&
+                static_cast<std::uint32_t>(axis.axisType)==request->axisType &&
+                axis.fbMode==FeedbackSource::MOTOR_ENCODER &&
+                !axis.homeRuntime.active && !axis.isFault && !axis.isLagAlarm && !axis.resetRequest &&
+                !axis.enablePitch && !axis.enableBacklash && axis.currentCompOffset_unit==0.0 &&
+                !axis.hardLimitPositive && !axis.hardLimitNegative &&
+                !axis.positiveTravelBlocked && !axis.negativeTravelBlocked &&
+                (axis.state==MotionState::MotionState_IDLE || axis.state==MotionState::MotionState_MOVING) &&
+                admissionCorrection==MotionPathCoreAdmissionCorrectionDecision::NOT_APPLICABLE &&
+                servoLoopOwnerLease.owner==static_cast<MotionOwner>(request->owner) &&
+                servoLoopOwnerLease.generation==request->ownerGeneration &&
+                GetCurrentExecutionEpoch()==request->epoch;
+            const double ppu=axis.finalLead>0.0 ? axis.resolution_PPR/axis.finalLead : 0.0;
+            if (!positionTune.RuntimeStage(sample,ppu,valid))
+            {
+                RequestEmergencyStopAllAxes();positionTune.RuntimeAcknowledgeStop();
+                WriteServoTargetVelocityCommand(servo.pOutput,axis.axisIndex,0);
+                return;
+            }
+        }
+    }
+
     // 🌟 輸出給硬體前，根據硬體方向翻轉速度
     if (axis.isReverse)
     {
@@ -27180,10 +27600,10 @@ void MotionCore::Run_Servo_Loop(DriveType& servo, AxisContext& axis, const AxisC
     // EDM206_WRITTEN_OBSERVATION_BEGIN: actual axis PDO memory after the writer;
     // later group guarding/serialization may replace it. This is not a send receipt.
     if (m_edm173 && m_edm94.Active() && IsEDM173Profile() &&
-        EDM173::IsCenterRecipe(m_edm130ArmRecipe) && servo.pOutput != nullptr &&
+        E275HistoryRecipe(m_edm130ArmRecipe) && servo.pOutput != nullptr &&
         axis.axisIndex >= 0 && axis.axisIndex < 3)
         m_edm173->syncHistory.ObserveWritten(static_cast<unsigned>(axis.axisIndex),
-            m_edm94.Current().identity.session, EDM173::IsB4Recipe(m_edm130ArmRecipe) ? 4U : 3U,
+            m_edm94.Current().identity.session, E275HistoryMode(m_edm130ArmRecipe),
             m_ncSettleRuntimeCycleTick, servo.pOutput->TargetVelocity);
     // EDM206_WRITTEN_OBSERVATION_END
     ReceiptPbcXControl(axis, cmd, static_cast<std::int32_t>(finalVel));
@@ -27273,7 +27693,7 @@ void MotionCore::UpdateMotionObserved(
         const auto slot=edm207Capture->config.slot;
         if(slot>=0 && slot<static_cast<std::int32_t>(EDM206::AxisCount))
             m_edm173->syncHistory.ObserveInput(static_cast<unsigned>(slot),*edm207Capture,
-                EDM173::IsB4Recipe(m_edm130ArmRecipe)?4U:3U);
+                E275HistoryMode(m_edm130ArmRecipe));
     }
     // EDM207_DECODED_INPUT_END
     ProcessEDMZFixtureAxis(axis, input);

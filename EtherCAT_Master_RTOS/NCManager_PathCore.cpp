@@ -3717,6 +3717,127 @@ bool NCManager::IsFixedTranslationBlockAllowedSameThread(const NCBlock& block)
         RejectEDMRecipeSelectionSameThread(0, "FIXED_SELECTION_SCOPE");
         return false;
     }
+    // EDM270_M30_BEGIN
+    // A completed ordinary B2 WORK compound can end directly at literal M30.
+    // Reuse its committed parent and every child receipt; the program-end gate
+    // still owns the current 200-cycle settle proof and final owner handoff.
+    if (block.mCount == 1 && block.mCode[0] == 30 &&
+        CoordSys.GetTranslationSnapshot().workMode == 168 && m_g76Orbit->mixed)
+    {
+        const auto completedMixedTerminal = [&]() noexcept {
+            const auto& s = *m_g76Orbit;
+            const auto& r = s.receipt;
+            const auto& plan = m_edm171Air->plan;
+            const auto& input = plan.input;
+            const auto& nominal = input.nominal;
+            const auto& frozen = CoordSys.GetTranslationSnapshot();
+            const int pc = GetActiveDispatchPC();
+            if (s.active || !s.bound || !s.completed || s.mode != 2U ||
+                !(s.sourceG == 1 || s.sourceG == 2 || s.sourceG == 3 || s.sourceG == 76) ||
+                !m_g76PowerInhibited || !IsEDM171AirGrantCurrentSameThread() || m_edm94.latched ||
+                m_state != NCState::RUN || IsFeedHoldActive() || Homing.IsActive() ||
+                !s.run || s.run != m_pathCoreLiveBookkeeping.currentRunToken ||
+                !s.cache || s.cache != GetBaseProgramCache().GetGeneration() || !s.dispatch || !s.commit ||
+                s.pc < 0 || pc != s.pc + 1 || m_currentExecutingBlockDispatchId <= s.dispatch ||
+                plan.status != NCG76Mixed::Status::BUILT || plan.count < 3U || plan.count > NCG76Mixed::MaximumLegs ||
+                plan.count != r.count || nominal.count == 0U || nominal.count > NCG76Mixed::MaximumNominal ||
+                plan.reverseCount == 0U || plan.reverseCount > NCG76Mixed::HistoryCapacity ||
+                plan.count != nominal.count + 2U * plan.reverseCount || nominal.pc != s.pc || nominal.line != s.line ||
+                input.scope.run != s.run || input.scope.cache != s.cache ||
+                input.scope.translationGeneration != frozen.generation || !input.scope.lease.Matches(m_programMotionLease) ||
+                !m_g76Modal.valid || m_g76Modal.mode != 2U || m_g76Modal.run != s.run || m_g76Modal.cache != s.cache ||
+                m_g76Modal.commit != s.commit || !m_g76Modal.lease.Matches(m_programMotionLease) ||
+                !r.valid || !r.commandAccepted || !r.captureBound || !r.tailCommitted ||
+                r.axisMask == 0U || (r.axisMask & ~7U) != 0U || (r.validAxisMask & r.axisMask) != r.axisMask ||
+                !r.tail.IsCommitted() || !r.tail.captureBound || r.tail.axisMask != r.validAxisMask ||
+                !r.tail.ownerLease.Matches(r.ownerLease) || !BQFullIdentity(r.tail.identity, r.identities[r.count - 1U]) ||
+                !m_programMotionLease.IsValid() || m_programMotionLease.owner != MotionOwner::AUTO ||
+                !r.ownerLease.Matches(m_programMotionLease) || !m_motion.IsMotionOwnerLeaseCurrent(m_programMotionLease) ||
+                !CoordSys.IsTranslationRunFrozen() || !IsG76OrbitFrameCurrentSameThread(true, true) ||
+                !IsFixedTranslationTravelCurrentSameThread() || !IsPathCoreLiveNativeConfigCurrentSameThread() ||
+                r.translationGeneration != frozen.generation || !SameNCTranslationSnapshot(input.translation, frozen) ||
+                !m_motion.MatchesNCTranslation(frozen) ||
+                m_pathFeed.pending || m_pathArc.pending || m_pathReplay.pending || m_pathHold.armed || m_pathHold.bound ||
+                m_gapDryRun.active || m_gapPath.active || m_gapWindow.active ||
+                m_cncFeed.selected || m_cncFeed.active || m_cncFeed.count != 0U || m_cutterLine.leadOutRequired ||
+                m_motion.HasPendingSafetyOrRecoveryRequests() || !m_motion.IsGroupDone() || !m_motion.IsGroupNCDrained() ||
+                m_motion.GetCommandIngressSize() != 0U || m_motion.GetCommandReplaySize() != 0U ||
+                m_motion.GetMotionFeedbackOverflowCount() != 0ULL ||
+                m_motion.GetMotionFeedbackProducerNoticeOverflowCount() != 0ULL ||
+                m_motionFeedbackSequenceGapCount != 0ULL) return false;
+            if (s.sourceG == 76 ? nominal.kind != NCG76Mixed::Kind::G76 ||
+                    nominal.count != NCG76Mixed::NominalCountForOrbit(nominal.orbit) || nominal.orbit.modeP != s.program.modeP :
+                nominal.count != 1U || nominal.kind != (s.sourceG == 1 ? NCG76Mixed::Kind::LINE : NCG76Mixed::Kind::ARC)) return false;
+            const auto* authored = GetBaseProgramCache().TryGetLine(pc);
+            NCBlock literal{};
+            if (!authored || authored->parsedBlock.error != NCParseError::NONE ||
+                authored->parsedBlock.duplicateAddressMask != 0U || authored->parsedBlock.dependsOnMacroState ||
+                authored->parsedBlock.controlType != NCParsedControlType::NONE ||
+                !NCPreparedBlockQueueShadow::TryBuildLiteralBlock(authored->parsedBlock, literal)) return false;
+            const auto pureM30 = [](const NCBlock& b) noexcept {
+                if (b.isEmpty || b.isBlockSkip || b.isGoto || b.gotoTarget != -1 ||
+                    b.hasG || b.gCode != -1 || b.gCount != 0 || b.mCount != 1 || b.mCode[0] != 30) return false;
+                for (int code : b.gCodes) if (code != 0) return false;
+                for (unsigned k = 1U; k < NC_MAX_M_CODES_PER_BLOCK; ++k) if (b.mCode[k] != -1) return false;
+                for (char word = 'A'; word <= 'Z'; ++word)
+                    if (b.has(word) ? (word != 'N' || !std::isfinite(b.val(word))) :
+                        PathCoreReturnDoubleBits(b.val(word)) != 0ULL) return false;
+                return true;
+            };
+            if (!pureM30(block) || !pureM30(literal)) return false;
+            for (char word = 'A'; word <= 'Z'; ++word)
+                if (block.has(word) != literal.has(word) ||
+                    PathCoreReturnDoubleBits(block.val(word)) != PathCoreReturnDoubleBits(literal.val(word))) return false;
+            const auto counters = m_blockLifecycleLedger.GetCounters();
+            if (counters.activeBlockOverwrite != 0ULL || counters.activeSegmentIndexOverwrite != 0ULL ||
+                counters.orphanFeedback != 0ULL || counters.duplicateTerminalFeedback != 0ULL ||
+                counters.terminalFeedbackConflict != 0ULL) return false;
+            NCBlockLifecycleSnapshot& ledger = m_edm171Air->ledger;
+            if (!m_blockLifecycleLedger.TryGetSnapshot(s.dispatch, ledger) || ledger.dispatchId != s.dispatch ||
+                !ledger.programCommitted || ledger.ncDispatchFailed || ledger.motionCaptureOverflow || ledger.terminalFailure ||
+                !ledger.programCommit.IsValid() || ledger.programCommit.sequence != s.commit ||
+                ledger.programCommit.scope != NCProgramScope::MEMORY || ledger.programCommit.cacheGeneration != s.cache ||
+                ledger.programCommit.sourcePC != s.pc || ledger.programCommit.frameId != NC_PROGRAM_FRAME_ID_INVALID ||
+                ledger.sourceLineNumber != s.line || ledger.motionSegmentCount != r.count ||
+                ledger.motionCompletedCount != r.count || ledger.motionTerminalCount != r.count || ledger.motionFailedCount != 0U) return false;
+            const auto epoch = m_motion.GetCurrentExecutionEpoch();
+            for (unsigned k = 0U; k < r.count; ++k)
+            {
+                const auto& id = r.identities[k];
+                const auto& child = ledger.motionSegments[k];
+                if (!id.IsAssigned() || id.epoch != epoch || id.source != MotionCommandSource::NC_MEMORY ||
+                    id.sourceBlockId != static_cast<MotionSourceBlockId>(s.pc) ||
+                    !s.accepted[k] || !s.started[k] || !s.done[k] ||
+                    !BQFullIdentity(child.identity, id) || !child.completed || !child.terminal) return false;
+            }
+            NCBlockMotionBoundarySnapshot boundary{};
+            if (!m_blockLifecycleLedger.GetMotionBoundarySnapshot(s.dispatch, boundary) ||
+                boundary.dispatchId != s.dispatch || boundary.state != NCBlockMotionBoundaryState::SUCCEEDED ||
+                boundary.motionSegmentCount != r.count || boundary.motionCompletedCount != r.count ||
+                boundary.motionTerminalCount != r.count || boundary.motionFailedCount != 0U) return false;
+            const auto& tail = plan.legs[plan.count - 1U];
+            for (unsigned axis = 0U; axis < 8U; ++axis)
+            {
+                double end = 0.0;
+                if (!EvaluateNCPathCoreRetainedAxisCanonical(tail.geometry, axis, tail.endU, end) ||
+                    PathCoreReturnDoubleBits(end) != PathCoreReturnDoubleBits(r.endMCS[axis]) ||
+                    PathCoreReturnDoubleBits(CoordSys.commandedMCS[axis]) != PathCoreReturnDoubleBits(r.endMCS[axis]) ||
+                    PathCoreReturnDoubleBits(r.endMCS[axis]) != PathCoreReturnDoubleBits(nominal.geometry[nominal.count - 1U].endMCS[axis])) return false;
+            }
+            return true;
+        };
+        if (!completedMixedTerminal())
+        {
+            RejectG76OrbitSameThread("EDM270_WORK_B2_TERMINAL_SCOPE", AlarmManager::PATH_EXECUTION_NOT_READY);
+            return false;
+        }
+        RtPrintf("[EDM270] event=WORK_B2_AIR_M30_ACCEPTED dispatch=%llu parentDispatch=%llu g=%d P=%u B=2 children=%u evidence=COMPLETED_PARENT_CURRENT_FRAME_AND_DRAIN power=INHIBITED discharge=0\n",
+            static_cast<unsigned long long>(m_currentExecutingBlockDispatchId),
+            static_cast<unsigned long long>(m_g76Orbit->dispatch), m_g76Orbit->sourceG,
+            m_g76Orbit->sourceG == 76 ? m_g76Orbit->program.modeP : 0U, m_g76Orbit->receipt.count);
+        return true;
+    }
+    // EDM270_M30_END
     // EDM264_FIX3_M30_BEGIN
     // P0/P2 B0 may retain a fixed WORK yaw after its last child. A literal M30
     // has no feed geometry; prove that exact completed parent here without

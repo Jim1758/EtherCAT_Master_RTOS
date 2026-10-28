@@ -5,6 +5,9 @@
 
 // Pure G76 mode/shape selection. Recognition is not execution permission;
 // each NC/Motion lane still admits its own exact modes and process scope.
+// EDM273 adds the vector mode identities through the existing complete-contour
+// geometry. Their target-axis/K/Q contract is shared with the corresponding
+// shape; directional clipping and quadrant semantics are not implemented.
 namespace NCG76Mode
 {
 enum class Family : std::uint8_t { Invalid, Taper, HoleExpansion, FixedRadius };
@@ -17,33 +20,60 @@ struct Definition
     bool vector=false;
     bool implemented=false;
 };
+inline bool IsRecognized(std::uint32_t modeP) noexcept
+{ return (modeP>=1U&&modeP<=7U)||(modeP>=11U&&modeP<=17U)||(modeP>=21U&&modeP<=27U); }
+// NC words and provenance markers are doubles. Validate before narrowing so
+// NaN, infinity and out-of-range values cannot become an implemented mode.
+inline bool TryModeFromLiteral(double literal,std::uint32_t& modeP) noexcept
+{
+    modeP=0U;
+    if(!std::isfinite(literal)||literal<1.0||literal>27.0||std::floor(literal)!=literal)return false;
+    const auto candidate=static_cast<std::uint32_t>(literal);
+    if(!IsRecognized(candidate))return false;
+    modeP=candidate;return true;
+}
+inline bool IsVector(std::uint32_t modeP) noexcept
+{ return IsRecognized(modeP)&&(modeP%10U==4U||modeP%10U==5U||modeP%10U==7U); }
 inline bool IsHoleExpansion(std::uint32_t modeP) noexcept
-{ return modeP==21U || modeP==22U || modeP==23U || modeP==26U; }
+{ return modeP>=21U&&modeP<=27U; }
 inline bool IsImplementedFixedRadius(std::uint32_t modeP) noexcept
-{ return modeP==1U || modeP==2U || modeP==3U || modeP==6U; }
+{ return modeP>=1U&&modeP<=7U; }
 inline bool IsFixedRadius(std::uint32_t modeP) noexcept
 { return IsImplementedFixedRadius(modeP); }
+inline bool IsTaper(std::uint32_t modeP) noexcept
+{ return modeP>=11U&&modeP<=17U; }
 inline bool IsPolygon(std::uint32_t modeP) noexcept
-{ return modeP==6U || modeP==16U || modeP==26U; }
+{ return IsRecognized(modeP)&&(modeP%10U==6U||modeP%10U==7U); }
 inline bool IsImplemented(std::uint32_t modeP) noexcept
-{ return modeP==11U || modeP==12U || modeP==13U || modeP==16U || IsHoleExpansion(modeP) || IsImplementedFixedRadius(modeP); }
+{ return IsRecognized(modeP); }
+// Ordinary AIR retains legacy P11's program-XY contour. Every other mode
+// uses the plane normal to the authored XYZ start-to-target vector.
+inline bool IsTargetAxisMode(std::uint32_t modeP) noexcept
+{ return IsImplemented(modeP)&&modeP!=11U; }
+// Only normalized boundary evaluation uses this canonical shape number.
+// ProgramPlan/NativePlan retain the original P identity throughout validation.
+inline std::uint32_t CanonicalContourMode(std::uint32_t modeP) noexcept
+{
+    if(!IsRecognized(modeP))return 0U;
+    const auto index=modeP%10U;
+    return index==1U?11U:index==2U||index==4U?12U:index==3U||index==5U?13U:16U;
+}
 inline bool Lookup(std::uint32_t modeP,Definition& out) noexcept
 {
     out=Definition{};
-    if(!((modeP>=1U&&modeP<=7U)||(modeP>=11U&&modeP<=17U)||(modeP>=21U&&modeP<=27U)))return false;
+    if(!IsRecognized(modeP))return false;
     out.modeP=modeP;
     out.family=modeP<10U?Family::FixedRadius:modeP<20U?Family::Taper:Family::HoleExpansion;
     const unsigned index=modeP%10U;
     out.shape=index==1U?Shape::Circle:index==2U||index==4U?Shape::Square:
         index==3U||index==5U?Shape::Diamond:Shape::Polygon;
-    out.vector=index==4U||index==5U||index==7U;
+    out.vector=IsVector(modeP);
     out.implemented=IsImplemented(modeP);
     return true;
 }
 inline const char* ShapeName(std::uint32_t modeP) noexcept
 {
-    if(IsFixedRadius(modeP))modeP+=10U;
-    if(IsHoleExpansion(modeP))modeP-=10U;
+    modeP=CanonicalContourMode(modeP);
     return modeP==11U?"CIRCLE":modeP==12U?"SQUARE":modeP==13U?"DIAMOND":modeP==16U?"POLYGON":"UNIMPLEMENTED";
 }
 
@@ -84,8 +114,8 @@ inline bool PolygonVertex(unsigned sides,unsigned vertex,double& x,double& y) no
 inline bool UnitBoundary(std::uint32_t modeP,unsigned sample,double& x,double& y,unsigned polygonSides=0U) noexcept
 {
     // Families change the center/radius path, not the normalized contour.
-    if(IsFixedRadius(modeP))modeP+=10U;
-    if(IsHoleExpansion(modeP))modeP-=10U;
+    // EDM273 vector entries currently share this entire closed boundary.
+    modeP=CanonicalContourMode(modeP);
     x=y=0.0;
     if(sample>24U||(modeP==16U?!ValidPolygonSides(polygonSides):polygonSides!=0U))return false;
     if(modeP==16U)

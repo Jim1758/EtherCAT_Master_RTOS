@@ -1076,4 +1076,18 @@
       <Filter>Source Files\EtherCAT_Master</Filter>
     </Text>
   </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="PositionAutoTuneConfig.h" />
+    <ClInclude Include="PositionAutoTuneCapture.h" />
+    <ClInclude Include="PositionAutoTuneAnalysis.h" />
+    <ClInclude Include="PositionAutoTuneJob.h" />
+    <ClInclude Include="PositionPidContract.h" />
+    <ClInclude Include="PositionPidService.h" />
+    <ClCompile Include="PositionAutoTuneConfig.cpp" />
+    <ClCompile Include="PositionAutoTuneCapture.cpp" />
+    <ClCompile Include="PositionAutoTuneAnalysis.cpp" />
+    <ClCompile Include="PositionAutoTuneJob.cpp" />
+    <ClCompile Include="NCManager_PositionAutoTune.cpp" />
+    <ClCompile Include="PositionPidService.cpp" />
+  </ItemGroup>
 </Project>

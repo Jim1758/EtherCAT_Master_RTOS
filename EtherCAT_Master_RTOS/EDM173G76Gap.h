@@ -205,7 +205,7 @@ inline bool RecipeMatchesArm(unsigned p,const EDM130::Recipe& recipe) noexcept
 inline EDM116::Mode ExpectedMode(const EDM130::Recipe& recipe) noexcept
 {return IsB0Recipe(recipe)?EDM116::Mode::B0:IsB4Recipe(recipe)?EDM116::Mode::B4:IsB3Recipe(recipe)?EDM116::Mode::B3:IsB2Recipe(recipe)?EDM116::Mode::B2:EDM130::IsVisibleFlush173(recipe)?EDM116::Mode::B1:EDM116::Mode::Invalid;}
 inline double FrozenHeightMm(const EDM130::Recipe& recipe) noexcept
-{return (IsCenterRecipe(recipe)||EDM130::IsG76OneMmB1_260(recipe)||EDM130::IsG76ExpansionB1_263(recipe)||EDM130::IsG76FixedRadiusB1_266(recipe)||EDM130::IsG76FixedRadiusWorkB1_267(recipe))?EDM130::FrozenJumpHeightMm(recipe):
+{return (IsCenterRecipe(recipe)||EDM130::IsG76OneMmB1_260(recipe)||EDM130::IsG76ExpansionB1_263(recipe)||EDM130::IsG76FixedRadiusB1_266(recipe)||EDM130::IsG76FixedRadiusWorkB1_267(recipe)||EDM130::IsG76SharedShortB1_274(recipe))?EDM130::FrozenJumpHeightMm(recipe):
     IsB0Recipe(recipe)?2.0:IsB2Recipe(recipe)?0.001:EDM130::IsVisibleFlush173(recipe)?2.0:0.0;}
 // EDM193 movement evidence is derived from the frozen compensated endpoints,
 // not the authored word mask or the producer's structural XYZ axis mask.
@@ -380,6 +380,10 @@ inline std::uint64_t Fingerprint(const Scope& s,const NCG76::NativePlan& n,
     if(NCG76Mode::IsFixedRadius(n.modeP))
     {Word(h,0x4737364649583236ULL);Word(h,n.modeP);Word(h,in.polygonSides);} // G76FIX26
     if(EDM130::IsG76FixedRadiusWork267(r))Word(h,0x473736574f524b32ULL); // G76WORK2
+    // Bind the original shared-contour identity and its authored Q, including
+    // P17. Legacy fingerprints retain their complete existing byte stream.
+    if(EDM130::IsG76SharedShort274(r))
+    {Word(h,0x4737365348323734ULL);Word(h,n.modeP);Word(h,in.polygonSides);} // G76SH274
     // A geometrically identical vertical plan must not reuse the old native
     // +Z center-flush contract. Other modes retain their complete old stream.
     if(IsCenterRecipe(r))Word(h,0x4737364146323034ULL); // G76AF204
@@ -406,6 +410,7 @@ inline bool Inputs(const Scope& scope,const NCG76::NativePlan& nominal,
         !NCG76::ValidNative(nominal,true,true,PreservesG90StationaryZ(recipe))||!FrameSupported(nominal.translation)||
         (EDM130::IsG76FixedRadius266(recipe)&&nominal.translation.workMode!=169)||
         (EDM130::IsG76FixedRadiusWork267(recipe)&&nominal.translation.workMode!=168)||
+        (EDM130::IsG76SharedShort274(recipe)&&nominal.translation.workMode!=169)||
         nominal.translation.runToken!=scope.run||nominal.count!=count||nominal.program.count!=count||
         nominal.program.growCount!=24U||nominal.program.input.flushMode!=0U||nominal.program.flushLegCount!=0U||
         nominal.program.input.heightMm!=0.0||nominal.program.input.centerReturnFeedMmMin!=0.0||
@@ -489,7 +494,7 @@ inline bool CenterBoundary(const Plan& plan,unsigned boundary,NCG76::Point8& cen
     centerMCS=n.startMCS;
     // The fixed-radius radial entry has not advanced its center. Preserve
     // the captured native start exactly instead of inverse/forward rounding.
-    if(!boundary||((EDM130::IsG76FixedRadius266(plan.recipe)||EDM130::IsG76FixedRadiusWork267(plan.recipe))&&boundary==1U))return true;
+    if(!boundary||(NCG76Mode::IsFixedRadius(n.modeP)&&boundary==1U))return true;
     double author[8]{},machine[8]{};
     if(n.translation.distanceMode==91)
     {
@@ -693,6 +698,7 @@ inline bool Inputs(const Scope& scope,const NCG76::NativePlan& nominal,
         !NCG76::ValidNative(nominal,scratch,true,true,PreservesG90StationaryZ(recipe))||!FrameSupported(nominal.translation)||
         (EDM130::IsG76FixedRadius266(recipe)&&nominal.translation.workMode!=169)||
         (EDM130::IsG76FixedRadiusWork267(recipe)&&nominal.translation.workMode!=168)||
+        (EDM130::IsG76SharedShort274(recipe)&&nominal.translation.workMode!=169)||
         nominal.translation.runToken!=scope.run||nominal.count!=count||nominal.program.count!=count||
         nominal.program.growCount!=24U||nominal.program.input.flushMode!=0U||nominal.program.flushLegCount!=0U||
         nominal.program.input.heightMm!=0.0||nominal.program.input.centerReturnFeedMmMin!=0.0||

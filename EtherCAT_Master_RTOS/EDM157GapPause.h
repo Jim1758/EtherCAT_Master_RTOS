@@ -10,7 +10,7 @@ constexpr unsigned RequiredStableCycles = 200U;
 // EDM162 uses this same pause transaction for the bounded mainline program.
 // EDM166/167 admit only their existing 2 mm E5 lift, never visible GAP retreat.
 inline bool SupportsArm(unsigned arm) noexcept
-{ return EDM149::IsFlushHoldTestArm(arm) || EDM149::IsPauseTestArm(arm) || arm==294U || arm==296U || arm==298U; }
+{ return EDM149::IsFlushHoldTestArm(arm) || EDM149::IsPauseTestArm(arm) || arm==292U || arm==294U || arm==296U || arm==298U || arm==300U; }
 inline bool SupportsFixture(unsigned history, EDM116::Fixture policy) noexcept
 {
     return (history == EDM149::ProgramHistoryFixture && policy == EDM116::Fixture::ModalProgram156) ||
@@ -79,6 +79,18 @@ inline bool IsG76B2Pause(const Scope& s) noexcept
         s.policy.mode==EDM116::Mode::B2 && EDM130::IsG76B2Flush175(s.recipe) &&
         !s.recipe.holdRetreatMode && s.compoundFingerprint && s.compoundArmEpoch && s.compoundLine>0;
 }
+// EDM272: B0/B1 retain the sealed G76 parent and genuine live child.
+// This admits the existing software-voltage, single-E5 local excursion only;
+// it grants no paused JOG, path retreat, physical AD or discharge permission.
+inline bool IsG76LocalNominalPause(const Scope& s) noexcept
+{
+    return s.historyFixture==EDM149::G76GapHistoryFixture && s.policy.fixture==EDM116::Fixture::ModalG76Gap173 &&
+        ((s.policy.mode==EDM116::Mode::B0 && EDM130::IsG76B0Flush192(s.recipe)) ||
+         (s.policy.mode==EDM116::Mode::B1 && EDM130::IsVisibleFlush173(s.recipe))) &&
+        s.recipe.diagnosticControlSource==3U && !s.recipe.holdRetreatMode &&
+        EDM130::G76EventLimit(s.recipe)==1U &&
+        s.compoundFingerprint && s.compoundArmEpoch && s.compoundLine>0;
+}
 // EDM217: center modes retain the same sealed parent while pausing its
 // nominal GAP child. EDM218-226 admit detached E5 legs and endpoint dwells;
 // EDM227/228 also admit main-path dwell/braking before the E5 anchor capture.
@@ -93,7 +105,7 @@ inline bool IsG76CenterNominalPause(const Scope& s) noexcept
 // Keep the E199 name for callers that identify a sealed compound parent.
 // Actual nominal versus in-flight permission uses the committed coordinator.
 inline bool IsG76NominalPause(const Scope& s) noexcept
-{return IsG76B2Pause(s)||IsG76CenterNominalPause(s);}
+{return IsG76B2Pause(s)||IsG76CenterNominalPause(s)||IsG76LocalNominalPause(s);}
 inline bool SameScope(const Scope& a, const Scope& b) noexcept
 {
     return EDM126::SameSource(a.authorizedSource,b.authorizedSource) && a.ownerGeneration==b.ownerGeneration &&
@@ -149,12 +161,44 @@ inline bool IsG76CenterFlushPause(const Scope& scope,const EDM128::Feedback& e) 
             scope.recipe.deepFlushCycleInterval,EDM130::FrozenDeepMultiplier(scope.recipe),
             EDM130::HasBoundDeep(scope.recipe));
 }
+inline bool ValidMapped(const Scope& scope,const EDM126::Feedback& f) noexcept;
+// Detached local excursions have a spatial target, never B2's path cursor.
+// Every transfer and dwell remains bound to the original captured E5 event.
+inline bool IsG76LocalFlushPause(const Scope& scope,const EDM128::Feedback& e) noexcept
+{
+    if(!IsG76LocalNominalPause(scope)||!ValidScope(scope)||
+        !EDM128::CanPauseTimedFlush(e)||!EDM116::SamePolicy(scope.policy,e.policy)||
+        e.work.workTimeUs!=scope.recipe.workTimeUs||e.eventIndex!=1ULL||
+        e.work.triggeredEvents!=1ULL||e.work.completedEvents||e.eventCount||e.rowEventComplete||
+        !EDM126::SameSource(e.targetSource,EDM126::Source{})||
+        !EDM109::SameDouble(e.targetLocalMm,0.0)||!EDM109::SameDouble(e.targetStationMm,0.0)||
+        !EDM128::ValidHeightProof(e,EDM130::FrozenJumpHeightMm(scope.recipe),
+            scope.recipe.deepFlushCycleInterval,EDM130::FrozenDeepMultiplier(scope.recipe),
+            EDM130::HasBoundDeep(scope.recipe)))return false;
+    for(unsigned mode=0U;mode<EDM116::ModeCount;++mode)if(e.modeEvents[mode])return false;
+    for(unsigned axis=3U;axis<6U;++axis)if(e.tangentPulsePerMm[axis]!=0.0)return false;
+    if(e.phase==EDM128::Phase::Brake||e.phase==EDM128::Phase::AnchorDwell)
+        return !e.detached&&!e.qualifiedDwells&&!e.anchorCaptured&&!e.targetCaptured&&
+            !e.topCaptured&&!e.exactReturn&&G76FlushAnchorBound(scope,e);
+    if(!e.anchorCaptured||!e.targetCaptured||!ValidMapped(scope,e.anchor)||
+        !EDM126::SameSource(e.anchor.authorizedSource,scope.authorizedSource)||
+        !G76FlushSourceBound(e.anchor.cursorSource,scope.authorizedSource))return false;
+    if(e.phase==EDM128::Phase::Outbound||e.phase==EDM128::Phase::TopDwell)
+        return e.qualifiedDwells==1U&&!e.topCaptured&&!e.exactReturn&&
+            (e.detached||(e.phase==EDM128::Phase::Outbound&&
+                e.stableCycles>=EDM126::RequiredSeamStableCycles&&e.stableStartUs));
+    if(e.phase==EDM128::Phase::Returning||e.phase==EDM128::Phase::ReturnDwell)
+        return e.detached&&e.qualifiedDwells==2U&&e.topCaptured&&!e.exactReturn;
+    return e.phase==EDM128::Phase::Resume&&e.detached&&e.qualifiedDwells==3U&&
+        e.topCaptured&&e.exactReturn&&e.stableCycles>=EDM126::RequiredSeamStableCycles&&e.stableStartUs;
+}
 inline bool PauseModeAllowed(const Scope& scope,const EDM128::Feedback& e) noexcept
 {
     if(!ValidScope(scope)||e.faulted||e.stopped||!EDM116::SamePolicy(e.policy,scope.policy))return false;
     if(e.phase==EDM128::Phase::Gap)return (!EDM130::IsOneShotCommissioning(scope.recipe)||IsG76NominalPause(scope))&&
         !e.detached&&e.work.triggeredEvents==e.work.completedEvents&&
-        (!IsG76CenterNominalPause(scope)||e.work.triggeredEvents<=EDM130::G76EventLimit(scope.recipe));
+        (!(IsG76CenterNominalPause(scope)||IsG76LocalNominalPause(scope))||e.work.triggeredEvents<=EDM130::G76EventLimit(scope.recipe));
+    if(IsG76LocalNominalPause(scope))return IsG76LocalFlushPause(scope,e);
     if(IsG76B2Pause(scope))return EDM128::CanPauseTimedFlush(e)&&G76FlushAnchorBound(scope,e)&&
         e.work.workTimeUs==scope.recipe.workTimeUs&&e.eventIndex==1ULL&&
         e.work.triggeredEvents==1ULL&&!e.work.completedEvents&&
@@ -251,7 +295,7 @@ inline bool ValidNominalWorkReceipt(const Feedback& f) noexcept
     return f.nominalWorkCaptured&&!f.flushPause&&IsG76NominalPause(f.scope)&&ValidScope(f.scope)&&
         EDM130::ValidWorkTime(duration)&&w.elapsedUs<=duration&&w.elapsedUs<=w.totalWorkUs&&
         w.triggeredEvents==w.completedEvents&&w.triggeredEvents<=w.totalWorkUs/duration&&
-        (!IsG76CenterNominalPause(f.scope)||w.triggeredEvents<=EDM130::G76EventLimit(f.scope.recipe));
+        (!(IsG76CenterNominalPause(f.scope)||IsG76LocalNominalPause(f.scope))||w.triggeredEvents<=EDM130::G76EventLimit(f.scope.recipe));
 }
 inline bool ValidG76CenterFlushReceipt(const Feedback& f) noexcept
 {
@@ -288,9 +332,33 @@ inline bool ValidG76CenterFlushReceipt(const Feedback& f) noexcept
         !r.targetSegment&&!r.targetOrdinal&&EDM109::SameDouble(r.targetLocalMm,0.0)&&
         EDM109::SameDouble(r.targetStationMm,0.0);
 }
+inline bool ValidG76LocalFlushReceipt(const Feedback& f) noexcept
+{
+    const auto& r=f.flush;
+    if(!f.flushPause||!IsG76LocalNominalPause(f.scope)||!ValidScope(f.scope)||f.flushEventIndex!=1ULL||
+        r.elapsedUs!=f.scope.recipe.workTimeUs||r.totalWorkUs<r.elapsedUs||!r.lastTriggerTick||!r.lastTriggerUs||
+        r.lastTriggerTick>f.tick||r.lastTriggerUs>f.nowUs||r.targetSegment||r.targetOrdinal||
+        !EDM109::SameDouble(r.targetLocalMm,0.0)||!EDM109::SameDouble(r.targetStationMm,0.0))return false;
+    unsigned dwells=0U;bool anchor=false,top=false,returned=false;
+    switch(f.flushPhase){
+    case EDM128::Phase::Brake:case EDM128::Phase::AnchorDwell:break;
+    case EDM128::Phase::Outbound:case EDM128::Phase::TopDwell:dwells=1U;anchor=true;break;
+    case EDM128::Phase::Returning:case EDM128::Phase::ReturnDwell:dwells=2U;anchor=top=true;break;
+    case EDM128::Phase::Resume:dwells=3U;anchor=top=returned=true;break;
+    default:return false;
+    }
+    if(r.qualifiedDwells!=dwells||r.anchorCaptured!=anchor||r.targetCaptured!=anchor||
+        r.topCaptured!=top||r.exactReturn!=returned)return false;
+    if(!anchor)return !r.anchorSegment&&!r.anchorOrdinal&&
+        EDM109::SameDouble(r.anchorLocalMm,0.0)&&EDM109::SameDouble(r.anchorStationMm,0.0);
+    return r.anchorSegment&&r.anchorOrdinal<=f.scope.authorizedSource.ordinal&&
+        std::isfinite(r.anchorLocalMm)&&r.anchorLocalMm>=0.0&&
+        std::isfinite(r.anchorStationMm)&&r.anchorStationMm>=r.anchorLocalMm;
+}
 inline bool ValidG76FlushReceipt(const Feedback& f) noexcept
 {
     if(IsG76CenterNominalPause(f.scope))return ValidG76CenterFlushReceipt(f);
+    if(IsG76LocalNominalPause(f.scope))return ValidG76LocalFlushReceipt(f);
     const auto& r=f.flush;
     if(!f.flushPause||!IsG76B2Pause(f.scope)||!ValidScope(f.scope)||f.flushEventIndex!=1ULL||
         r.elapsedUs!=f.scope.recipe.workTimeUs||r.totalWorkUs<r.elapsedUs||!r.lastTriggerTick||!r.lastTriggerUs||
@@ -346,7 +414,9 @@ inline bool SameFrozenG76Flush(const EDM128::Feedback& a,const EDM128::Feedback&
     for(unsigned i=0U;i<sizeof(a.modeEvents)/sizeof(a.modeEvents[0]);++i)
         if(a.modeEvents[i]!=b.modeEvents[i])return false;
     return EDM116::SamePolicy(a.policy,b.policy)&&a.phase==b.phase&&
-        ((a.phase!=EDM128::Phase::Resume&&(a.phase!=EDM128::Phase::ToCenter||a.detached))||
+        ((a.phase!=EDM128::Phase::Resume&&
+            ((a.phase!=EDM128::Phase::ToCenter&&
+                (a.phase!=EDM128::Phase::Outbound||(a.policy.mode!=EDM116::Mode::B0&&a.policy.mode!=EDM116::Mode::B1)))||a.detached))||
             (a.stableCycles==b.stableCycles&&a.stableStartUs==b.stableStartUs))&&
         EDM130::SameWorkEvidence(a.work,b.work)&&a.eventIndex==b.eventIndex&&
         a.eventCount==b.eventCount&&a.qualifiedDwells==b.qualifiedDwells&&
@@ -483,9 +553,15 @@ public:
             nowUs-committed.nowUs>EDM126::MaximumSourceAgeUs||feedback_.phase==Phase::Rejected)return false;
         // EDM227 has no canonical E5 geometry yet. Capture the live main-path
         // rest pose below, without inventing a center, target or machining anchor.
+        // EDM274 can enter a dwell on the same mapped sample which finishes
+        // braking. Its zero velocity and exact endpoint are already required;
+        // the first paused map must also clear the remaining acceleration.
+        // Completed dwell and backend-transfer proofs keep their strict rest checks.
+        const bool shortDwellEntry=flush&&EDM130::IsG76SharedShort274(scope.recipe)&&
+            flush->stableCycles==0U&&flush->stableStartUs==0ULL;
         if(flush&&IsG76CenterNominalPause(scope)&&flush->phase==EDM128::Phase::AnchorDwell&&
-            (!EDM128::Zero(committed)||committed.accelerationMmSec2!=0.0||
-                committed.accelerationPps2!=EDM126::Point{}))return false;
+            (!EDM128::Zero(committed)||(!shortDwellEntry&&(committed.accelerationMmSec2!=0.0||
+                committed.accelerationPps2!=EDM126::Point{}))))return false;
         // A supported center-mode dwell is stationary at its reconstructed
         // spatial endpoint, never an interior moving-leg pose. For B4 the
         // center endpoint is the shifted diagonal/axial junction in both directions.
@@ -503,12 +579,39 @@ public:
             const bool centerDwell=flush->phase==EDM128::Phase::CenterDwell||
                 flush->phase==EDM128::Phase::CenterReturnDwell;
             const bool atAnchor=flush->phase==EDM128::Phase::ReturnDwell||anchorBoundary;
+            const bool shortCenterDwellEntry=shortDwellEntry&&flush->detached&&
+                (centerDwell||flush->phase==EDM128::Phase::ReturnDwell);
             if(!EDM128::Zero(committed)||!EDM128::CenterAxisGeometry(*flush,geometry)||
-                ((centerDwell||atAnchor)&&(committed.accelerationMmSec2!=0.0||committed.accelerationPps2!=EDM126::Point{}))||
+                ((centerDwell||atAnchor)&&!shortCenterDwellEntry&&
+                    (committed.accelerationMmSec2!=0.0||committed.accelerationPps2!=EDM126::Point{}))||
                 !EDM109::SamePulse(committed.positionPulse,atAnchor?geometry.anchorPulse:
                     centerDwell?geometry.centerPulse:geometry.topPulse)||
                 (anchorBoundary&&(committed.nowUs<flush->stableStartUs||
                     committed.nowUs-flush->stableStartUs<flush->policy.profile.dwellUs)))return false;
+        }
+        if(flush&&IsG76LocalNominalPause(scope)) {
+            const bool initial=flush->phase==EDM128::Phase::AnchorDwell;
+            const bool beforeDetach=flush->phase==EDM128::Phase::Outbound&&!flush->detached;
+            const bool top=flush->phase==EDM128::Phase::TopDwell;
+            const bool returned=flush->phase==EDM128::Phase::ReturnDwell||flush->phase==EDM128::Phase::Resume;
+            if(initial||beforeDetach||top||returned) {
+                EDM126::Point endpoint=initial?committed.positionPulse:flush->anchor.positionPulse;
+                if(top)for(unsigned axis=0U;axis<6U;++axis) {
+                    if(scope.policy.mode==EDM116::Mode::B0&&flush->tangentPulsePerMm[axis]!=0.0)
+                        endpoint[axis]-=EDM130::FrozenJumpHeightMm(scope.recipe)*flush->tangentPulsePerMm[axis];
+                    if(scope.policy.mode==EDM116::Mode::B1&&axis==2U)
+                        endpoint[axis]+=EDM130::FrozenJumpHeightMm(scope.recipe)*flush->heightPulsePerNative[axis];
+                }
+                if(!EDM128::Zero(committed)||!EDM109::SamePulse(committed.positionPulse,endpoint)||
+                    // The first dwell image may retain the last braking
+                    // acceleration at zero velocity. The first paused map
+                    // must clear it; completed transfer proofs are already at rest.
+                    ((beforeDetach||flush->phase==EDM128::Phase::Resume)&&
+                        (committed.accelerationMmSec2!=0.0||committed.accelerationPps2!=EDM126::Point{}))||
+                    ((beforeDetach||flush->phase==EDM128::Phase::Resume)&&
+                        (committed.nowUs<flush->stableStartUs||
+                            committed.nowUs-flush->stableStartUs<flush->policy.profile.dwellUs)))return false;
+            }
         }
         if(PathReturn()&&Holding(feedback_.phase)&&feedback_.anchorCaptured) {
             // A second HOLD stops the excursion and revokes its START. It
@@ -568,6 +671,15 @@ public:
         if(FlushPause()&&IsG76CenterNominalPause(feedback_.scope)&&
             (feedback_.flushPhase==EDM128::Phase::TopDwell||centerDwell||finalDwell||anchorBoundary||initialDwell||settledBrake)&&
             (!zero||!SamePose(mapped)||((centerDwell||finalDwell||anchorBoundary||initialDwell||settledBrake)&&
+                (mapped.accelerationMmSec2!=0.0||mapped.accelerationPps2!=EDM126::Point{})))) {
+            Reject(mapped.tick,mapped.nowUs);return false;
+        }
+        const bool localBoundary=feedback_.flushPhase==EDM128::Phase::Outbound&&!frozenFlush_.detached;
+        if(FlushPause()&&IsG76LocalNominalPause(feedback_.scope)&&
+            (feedback_.flushPhase==EDM128::Phase::TopDwell||finalDwell||initialDwell||settledBrake||localBoundary||
+                feedback_.flushPhase==EDM128::Phase::Resume)&&
+            (!zero||!SamePose(mapped)||((finalDwell||initialDwell||settledBrake||localBoundary||
+                feedback_.flushPhase==EDM128::Phase::Resume)&&
                 (mapped.accelerationMmSec2!=0.0||mapped.accelerationPps2!=EDM126::Point{})))) {
             Reject(mapped.tick,mapped.nowUs);return false;
         }

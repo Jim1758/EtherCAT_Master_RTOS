@@ -171,8 +171,9 @@ bool MacroParser::ExecuteAssignment(const std::string& expression)
     }
 
     const char prefix = clean[0];
+    // TUNE01: return failure to the assignment caller, including computed indices.
     const bool valid =
-        MacroVariableRules::IsValidIndex(prefix, index);
+        MacroVariableRules::IsWritableIndex(prefix, index);
     if (!valid)
     {
         return false;

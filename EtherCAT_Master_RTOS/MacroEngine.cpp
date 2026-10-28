@@ -95,7 +95,8 @@ double MacroEngine::GetVar(char prefix, int index)
 // 寫入變數
 void MacroEngine::SetVar(char prefix, int index, double value)
 {
-    if (!MacroVariableRules::IsValidIndex(prefix, index))
+    // TUNE01: callers report a rejected write; this is the final backstop.
+    if (!MacroVariableRules::IsWritableIndex(prefix, index))
     {
         return;
     }

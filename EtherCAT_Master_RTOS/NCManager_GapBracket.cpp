@@ -1022,11 +1022,11 @@ void NCManager::LogEDM94SameThread(const char* event, const char* reason) const 
 
 bool NCManager::IsEDM199G76PauseScopeCurrentSameThread(const EDM157::Scope& scope) noexcept
 {
-    // A G76 NC row owns 25 RT children. Its retained callback and aggregate
+    // A G76 NC row owns its frozen 25/26 RT children. Its retained callback and aggregate
     // receipt are the parent lifetime fence; s.next is not a child ordinal.
     const auto& s=m_edm94;
     if(!EDM157::ValidScope(scope)||!EDM157::IsG76NominalPause(scope)||
-        (s.gapHistoryArm!=EDM173::B2ArmP&&s.gapHistoryArm!=EDM173::B3ArmP&&s.gapHistoryArm!=EDM173::B4ArmP)||
+        !EDM173::IsArm(s.gapHistoryArm)||
         !EDM173::RecipeMatchesArm(s.gapHistoryArm,scope.recipe)||
         static_cast<unsigned>(scope.policy.mode)!=EDM173::ModeForArm(s.gapHistoryArm)||!m_edm173||!m_g76Orbit||
         !s.program||!s.latched||!s.ready||!s.everArmed||!s.gapWorkTime||
@@ -1130,7 +1130,7 @@ bool NCManager::CaptureEDM157ScopeSameThread(EDM157::Scope& scope) noexcept
     scope = EDM157::Scope{};
     EDM126::MotionFeedback history{}; EDM128::MotionFeedback mode{};
     const auto& s = m_edm94;
-    const bool compound=s.gapHistoryArm==EDM173::B2ArmP||s.gapHistoryArm==EDM173::B3ArmP||s.gapHistoryArm==EDM173::B4ArmP;
+    const bool compound=EDM173::IsArm(s.gapHistoryArm);
     if (!m_motion.ReadEDM126Feedback(history) || !m_motion.ReadEDM130Feedback(mode) ||
         !history.enabled || !history.active || history.faulted || !history.sourceReady ||
         !history.rowActive || history.rowCompleted || history.completedRows + 1U != history.authorizedRows ||
@@ -1167,7 +1167,7 @@ void NCManager::LogEDM157SameThread(const char* event, const char* reason) const
     const auto& p = m_edm157;
     if(EDM157::IsG76NominalPause(p.scope))
     {
-        const char* tag=EDM157::IsG76CenterNominalPause(p.scope)?
+        const char* tag=EDM157::IsG76LocalNominalPause(p.scope)?"EDM272":EDM157::IsG76CenterNominalPause(p.scope)?
             (EDM130::IsG76CenterSecondReturnHold232(p.scope.recipe)?"EDM232":EDM130::IsG76CenterSecondFlushHold231(p.scope.recipe)?"EDM231":
                 (p.feedback.flushPause&&p.feedback.flushPhase==EDM128::Phase::Resume)?"EDM229":
                 EDM130::IsG76CenterBrakeHold228(p.scope.recipe)||
@@ -1192,11 +1192,11 @@ void NCManager::LogEDM157SameThread(const char* event, const char* reason) const
             p.feedback.flushPause||EDM130::IsG76B2FlushHold200(p.scope.recipe)?"EDM200":"EDM199";
         char record[481]{};
         const int length=std::snprintf(record,sizeof(record),
-            "[%s] event=%.24s reason=%.48s session=%llu hold=%llu startFloor=%llu resumeStart=%llu phase=%s stable=%u parentPC=%d dispatch=%llu commit=%llu fingerprint=%llu child=%llu epoch=%llu segment=%llu callbackRetained=1 pausedJog=0 discharge=0\n",
+            "[%s] event=%.24s reason=%.48s session=%llu hold=%llu startFloor=%llu resumeStart=%llu phase=%s stable=%u B=%u parentPC=%d dispatch=%llu commit=%llu fingerprint=%llu child=%llu epoch=%llu segment=%llu callbackRetained=1 pausedJog=0 discharge=0\n",
             tag,event?event:"UNKNOWN",reason?reason:"NONE",static_cast<unsigned long long>(m_edm94.session),
             static_cast<unsigned long long>(p.holdSequence),static_cast<unsigned long long>(p.startFloor),
             static_cast<unsigned long long>(p.resumeStartSequence),EDM157::PhaseName(p.feedback.phase),p.feedback.stableCycles,
-            p.pc,static_cast<unsigned long long>(p.scope.authorizedSource.dispatch),static_cast<unsigned long long>(p.compoundCommit),
+            static_cast<unsigned>(p.scope.policy.mode),p.pc,static_cast<unsigned long long>(p.scope.authorizedSource.dispatch),static_cast<unsigned long long>(p.compoundCommit),
             static_cast<unsigned long long>(p.scope.compoundFingerprint),static_cast<unsigned long long>(p.scope.authorizedSource.ordinal+1ULL),
             static_cast<unsigned long long>(p.scope.authorizedSource.epoch),static_cast<unsigned long long>(p.scope.authorizedSource.segment));
         if(length>0&&length<=480&&static_cast<std::size_t>(length)<sizeof(record))RtPrintf("%s",record);
@@ -1218,17 +1218,17 @@ void NCManager::LogEDM157SameThread(const char* event, const char* reason) const
                 static_cast<unsigned long long>(EDM130::CurveDoubleBits(f.positionPulse[5U])));
             if(poseLength>0&&poseLength<=480&&static_cast<std::size_t>(poseLength)<sizeof(record))RtPrintf("%s",record);
             else RtPrintf("[%s] event=LOG_FORMAT_ERROR part=PAUSE_POSE\n",tag);
-            if(EDM157::IsG76CenterNominalPause(p.scope)&&!f.flushPause)
+            if((EDM157::IsG76CenterNominalPause(p.scope)||EDM157::IsG76LocalNominalPause(p.scope))&&!f.flushPause)
             {
                 const auto& work=f.nominalWork;
                 const int workLength=std::snprintf(record,sizeof(record),
-                    "[EDM217] event=NOMINAL_WORK_RECEIPT result=%.24s hold=%llu tick=%llu captured=%u elapsedUs=%llu totalWorkUs=%llu workTimeUs=%llu triggered=%llu completed=%llu evidence=RT_FROZEN_NOMINAL_GAP authority=NONE\n",
-                    event,static_cast<unsigned long long>(p.holdSequence),static_cast<unsigned long long>(f.tick),
+                    "[%s] event=NOMINAL_WORK_RECEIPT result=%.24s hold=%llu tick=%llu captured=%u elapsedUs=%llu totalWorkUs=%llu workTimeUs=%llu triggered=%llu completed=%llu evidence=RT_FROZEN_NOMINAL_GAP authority=NONE\n",
+                    tag,event,static_cast<unsigned long long>(p.holdSequence),static_cast<unsigned long long>(f.tick),
                     f.nominalWorkCaptured?1U:0U,static_cast<unsigned long long>(work.elapsedUs),
                     static_cast<unsigned long long>(work.totalWorkUs),static_cast<unsigned long long>(p.scope.recipe.workTimeUs),
                     static_cast<unsigned long long>(work.triggeredEvents),static_cast<unsigned long long>(work.completedEvents));
                 if(workLength>0&&workLength<=480&&static_cast<std::size_t>(workLength)<sizeof(record))RtPrintf("%s",record);
-                else RtPrintf("[EDM217] event=LOG_FORMAT_ERROR part=NOMINAL_WORK_RECEIPT\n");
+                else RtPrintf("[%s] event=LOG_FORMAT_ERROR part=NOMINAL_WORK_RECEIPT\n",tag);
             }
             if(f.flushPause)
             {
@@ -1880,12 +1880,12 @@ bool NCManager::ServiceEDM157SameThread(bool feedbackCurrent)
     // TryResume retained the actual Held receipt before queuing START. The
     // Running acknowledgement must retain its stopped pose. SamePauseContext
     // above also requires the same frozen nominal-work or flush receipt.
-    if(EDM157::IsG76CenterNominalPause(p.scope)&&
+    if((EDM157::IsG76CenterNominalPause(p.scope)||EDM157::IsG76LocalNominalPause(p.scope))&&
         (p.startIntentPending||p.feedback.phase==EDM157::Phase::Held||p.feedback.phase==EDM157::Phase::Resuming)&&
         (!E217SameNominalPose(observed,p.feedback)||
             !EDM157::SameNominalWorkReceipt(observed.nominalWork,p.feedback.nominalWork)))
     {LogEDM157SameThread("CANCEL",observed.flushPause?"FLUSH_RECEIPT_CHANGED":"NOMINAL_RECEIPT_CHANGED");
-        CancelEDM94SameThread(observed.flushPause?
+        CancelEDM94SameThread(EDM157::IsG76LocalNominalPause(p.scope)?"EDM272_PAUSE_RECEIPT_CHANGED":observed.flushPause?
             (EDM130::IsG76CenterSecondReturnHold232(p.scope.recipe)?"EDM232_FLUSH_RECEIPT_CHANGED":EDM130::IsG76CenterSecondFlushHold231(p.scope.recipe)?"EDM231_FLUSH_RECEIPT_CHANGED":
                 observed.flushPhase==EDM128::Phase::Resume?"EDM229_FLUSH_RECEIPT_CHANGED":
                 observed.flushPhase==EDM128::Phase::Brake?"EDM228_FLUSH_RECEIPT_CHANGED":
@@ -1898,13 +1898,14 @@ bool NCManager::ServiceEDM157SameThread(bool feedbackCurrent)
                 observed.flushPhase==EDM128::Phase::ToAnchor?"EDM220_FLUSH_RECEIPT_CHANGED":
                 observed.flushPhase==EDM128::Phase::Returning?"EDM219_FLUSH_RECEIPT_CHANGED":"EDM218_FLUSH_RECEIPT_CHANGED"):
             "EDM217_NOMINAL_RECEIPT_CHANGED");return false;}
-    if(observed.phase==EDM157::Phase::Running&&EDM157::IsG76CenterNominalPause(p.scope)&&
+    if(observed.phase==EDM157::Phase::Running&&
+        (EDM157::IsG76CenterNominalPause(p.scope)||EDM157::IsG76LocalNominalPause(p.scope))&&
         ((p.feedback.phase!=EDM157::Phase::Held&&p.feedback.phase!=EDM157::Phase::Resuming)||
             p.feedback.stableCycles<EDM157::RequiredStableCycles||observed.stableCycles<EDM157::RequiredStableCycles||
             !E217SameNominalPose(observed,p.feedback)||
             !EDM157::SameNominalWorkReceipt(observed.nominalWork,p.feedback.nominalWork)))
     {LogEDM157SameThread("CANCEL",observed.flushPause?"FLUSH_RECEIPT_CHANGED":"NOMINAL_RECEIPT_CHANGED");
-        CancelEDM94SameThread(observed.flushPause?
+        CancelEDM94SameThread(EDM157::IsG76LocalNominalPause(p.scope)?"EDM272_PAUSE_RECEIPT_CHANGED":observed.flushPause?
             (EDM130::IsG76CenterSecondReturnHold232(p.scope.recipe)?"EDM232_FLUSH_RECEIPT_CHANGED":EDM130::IsG76CenterSecondFlushHold231(p.scope.recipe)?"EDM231_FLUSH_RECEIPT_CHANGED":
                 observed.flushPhase==EDM128::Phase::Resume?"EDM229_FLUSH_RECEIPT_CHANGED":
                 observed.flushPhase==EDM128::Phase::Brake?"EDM228_FLUSH_RECEIPT_CHANGED":

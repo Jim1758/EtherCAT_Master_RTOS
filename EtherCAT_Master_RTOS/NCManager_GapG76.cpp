@@ -1,7 +1,59 @@
 // EDM267 FIX1: independent NC compilation unit; original function bodies preserved.
 #include "NCManager_GapInternal.h"
+#include "EDM275G76Diagnostic.h"
 
 using namespace NCGapDetail;
+
+namespace
+{
+    const char* E275ObservationState(const EDM275::Snapshot& d) noexcept
+    {
+        if ((d.flags & EDM275::RowComplete) != 0U) return "ROW_END";
+        const bool zero = (d.flags & EDM275::MappedVelocityZero) != 0U;
+        if (zero && (d.flags & EDM275::PhysicalValid) == 0U) return "WAIT_PHYSICAL";
+        const auto phase = static_cast<EDM128::Phase>(d.phase);
+        const bool dwell = phase == EDM128::Phase::AnchorDwell || phase == EDM128::Phase::TopDwell ||
+            phase == EDM128::Phase::ReturnDwell || phase == EDM128::Phase::CenterDwell ||
+            phase == EDM128::Phase::CenterReturnDwell;
+        if (zero && dwell) return "WAIT_DWELL";
+        if (zero && (d.flags & (EDM275::AtCurrentEnd | EDM275::AwaitingSeam | EDM275::CompleteReady)) != 0U)
+            return "ROW_END";
+        return "MOVING";
+    }
+
+    void E275LogObservation(const EDM275::Snapshot& d, std::uint64_t publication) noexcept
+    {
+        // NC is the single diagnostic reader. A new session earns one initial
+        // image; subsequent state and axis rows are limited to one set/second.
+        static std::uint64_t loggedSession = 0ULL, loggedUs = 0ULL, loggedPublication = 0ULL;
+        if (publication == loggedPublication || !d.session || !d.nowUs) return;
+        if (d.session == loggedSession && (d.nowUs <= loggedUs || d.nowUs - loggedUs < 1000000ULL)) return;
+        loggedSession = d.session; loggedUs = d.nowUs; loggedPublication = publication;
+        const std::uint64_t stableElapsed = d.stableStartUs && d.nowUs >= d.stableStartUs ?
+            d.nowUs - d.stableStartUs : 0ULL;
+        PrintNCG76DiagnosticLine("[EDM275] event=OBSERVE pub=%llu session=%llu epoch=%llu gen=%llu tick=%llu phase=%s child=%u done=%u state=%s eval=%04X failed=%04X axes=%02X flags=%04X localMm=%.9g lengthMm=%.9g vMmSec=%.9g stable=%u elapsedUs=%llu dwellUs=%llu authority=NONE\n",
+            static_cast<unsigned long long>(publication), static_cast<unsigned long long>(d.session),
+            static_cast<unsigned long long>(d.epoch), static_cast<unsigned long long>(d.ownerGeneration),
+            static_cast<unsigned long long>(d.tick), EDM128::PhaseName(static_cast<EDM128::Phase>(d.phase)),
+            d.child, d.completedChildren, E275ObservationState(d), d.evaluated, d.failed,
+            d.axisMask, d.flags, d.localMm, d.lengthMm, d.velocityMmSec, d.stableCycles,
+            static_cast<unsigned long long>(stableElapsed), static_cast<unsigned long long>(d.dwellUs));
+        PrintNCG76DiagnosticLine("[EDM275] event=CLOCK session=%llu tick=%llu sourceUs=%llu physicalTick=%llu mappedTick=%llu sentTick=%llu proofTick=%llu gates=FIRST_FAILURE_UNEVALUATED_IS_UNKNOWN range=CANDIDATE authority=NONE\n",
+            static_cast<unsigned long long>(d.session), static_cast<unsigned long long>(d.tick),
+            static_cast<unsigned long long>(d.nowUs), static_cast<unsigned long long>(d.physicalTick),
+            static_cast<unsigned long long>(d.mappedTick), static_cast<unsigned long long>(d.lastSentTick),
+            static_cast<unsigned long long>(d.proofTick));
+        for (unsigned i = 0U; i < 6U; ++i)
+        {
+            const auto& a = d.axis[i];
+            PrintNCG76DiagnosticLine("[EDM275] event=AXIS session=%llu tick=%llu axis=%c cmd=%.12g act=%.12g ref=%.12g lag=%.9g window=%.9g range=%.9g vCmd=%.9g vLogical=%.9g target=%.9g flags=%02X comp=%u unit=PULSE_PPS evidence=RT_SNAPSHOT authority=NONE\n",
+                static_cast<unsigned long long>(d.session), static_cast<unsigned long long>(d.tick), "XYZCUV"[i],
+                a.commandPulse, a.actualPulse, a.referencePulse, a.commandPulse - a.actualPulse,
+                a.windowPulse, a.rangePulse, a.commandPps, a.logicalPps, a.targetPps,
+                a.flags, (a.flags & EDM275::CompensationReady) != 0U ? 1U : 0U);
+        }
+    }
+}
 
 bool NCManager::IsEDM149ConfirmationBlockSameThread(const NCParsedBlock& block, int pc) const noexcept
 {
@@ -160,6 +212,8 @@ bool NCManager::IsEDM173BracketShapeValid(const NCBlock& b) noexcept
     const bool fixedRadiusWork=b.has('L')&&std::isfinite(b.val('L'))&&std::floor(b.val('L'))==b.val('L')&&
         (((b.val('P')==292.0||b.val('P')==296.0||b.val('P')==298.0)&&b.val('L')>=281.0&&b.val('L')<=284.0)||
          (b.val('P')==294.0&&b.val('L')>=285.0&&b.val('L')<=288.0));
+    const bool sharedShort=b.has('L')&&b.val('L')==static_cast<double>(EDM130::G76SharedShortArmTag274)&&
+        (b.val('P')==292.0||b.val('P')==296.0||b.val('P')==298.0);
     const bool autoB2=b.val('P')==294.0&&b.has('L')&&(b.val('L')==3.0||b.val('L')==234.0||b.val('L')==235.0||b.val('L')==236.0||(b.val('L')==237.0||b.val('L')==238.0||b.val('L')==241.0||b.val('L')==242.0||b.val('L')==243.0||b.val('L')==244.0||b.val('L')==245.0||b.val('L')==246.0||b.val('L')==247.0||b.val('L')==248.0));
     const bool rejectBeforeArm=(b.val('P')==296.0||b.val('P')==298.0)&&b.has('L')&&b.val('L')==216.0;
     const bool centerNominalHold=(b.val('P')==296.0||b.val('P')==298.0)&&b.has('L')&&b.val('L')==1.0;
@@ -170,9 +224,16 @@ bool NCManager::IsEDM173BracketShapeValid(const NCBlock& b) noexcept
     const bool centerHistorySequence=b.has('L')&&(((b.val('P')==296.0||b.val('P')==298.0)&&(b.val('L')==239.0||b.val('L')==240.0||b.val('L')==241.0||b.val('L')==242.0||b.val('L')==243.0||b.val('L')==244.0))||(b.val('P')==296.0&&b.val('L')==245.0)||(b.val('P')==298.0&&b.val('L')==246.0)||(b.val('P')==296.0&&b.val('L')==247.0)||(b.val('P')==298.0&&b.val('L')==248.0));
     const bool centerFlushHold=(b.val('P')==296.0||b.val('P')==298.0)&&b.has('L')&&
         (b.val('L')==2.0||b.val('L')==3.0||b.val('L')==4.0||b.val('L')==5.0||b.val('L')==6.0||b.val('L')==7.0||b.val('L')==8.0||b.val('L')==9.0||b.val('L')==10.0||b.val('L')==11.0);
+    if(sharedShort)
+    {
+        if(b.gotoTarget!=-1)return false;
+        for(unsigned i=1U;i<NC_MAX_G_CODES_PER_BLOCK;++i)if(b.gCodes[i]!=0)return false;
+        for(int code:b.mCode)if(code!=-1)return false;
+        for(char word='A';word<='Z';++word)if(!b.has(word)&&!EDM109::SameDouble(b.val(word),0.0))return false;
+    }
     for(char word='A';word<='Z';++word)
         if(b.has(word) && (!std::isfinite(b.val(word)) ||
-            (word!='N' && word!='P' && !(word=='L'&&(autoB2||rejectBeforeArm||centerNominalHold||centerFlushHold||centerRepeat||centerSecondFlushHold||centerSecondReturnHold||parentSequence||centerHistorySequence||squareB1||expansion||fixedRadius||fixedRadiusWork)) &&
+            (word!='N' && word!='P' && !(word=='L'&&(autoB2||rejectBeforeArm||centerNominalHold||centerFlushHold||centerRepeat||centerSecondFlushHold||centerSecondReturnHold||parentSequence||centerHistorySequence||squareB1||expansion||fixedRadius||fixedRadiusWork||sharedShort)) &&
                 (!arm || (word!='Q' && word!='R' && word!='S' && word!='I' && word!='J' && word!='K'))))) return false;
     return !arm || (b.has('Q')&&b.has('R')&&b.has('S')&&b.has('I')&&b.has('J')&&b.has('K')&&
         b.val('Q')==8.0&&b.val('R')==1.0&&b.val('S')==1.0&&b.val('I')==10.0&&b.val('J')==50.0&&b.val('K')==100.0);
@@ -183,12 +244,12 @@ bool NCManager::IsEDM173OrbitBlockShapeValid(const NCBlock& b) noexcept
     if(b.isEmpty||b.isGoto||b.isBlockSkip||!b.hasG||b.gCode!=76||b.gCount!=1||b.gCodes[0]!=76||b.mCount||
         !b.has('P')||(b.val('P')!=11.0&&!((b.val('P')==12.0&&b.has('B')&&(b.val('B')==1.0||b.val('B')==2.0||b.val('B')==3.0||b.val('B')==4.0))||
             (b.val('P')==13.0&&b.has('B')&&(b.val('B')==1.0||b.val('B')==2.0||b.val('B')==3.0||b.val('B')==4.0))||
-            (b.val('P')==16.0&&b.has('B')&&(b.val('B')==1.0||b.val('B')==2.0||b.val('B')==3.0||b.val('B')==4.0)&&E261PolygonOrbitShape(b))||E263ExpansionOrbitShape(b)||E266FixedRadiusOrbitShape(b)))||!b.has('R')||!b.has('F')||b.val('F')!=0.12||
+            (b.val('P')==16.0&&b.has('B')&&(b.val('B')==1.0||b.val('B')==2.0||b.val('B')==3.0||b.val('B')==4.0)&&E261PolygonOrbitShape(b))||E263ExpansionOrbitShape(b)||E266FixedRadiusOrbitShape(b)||E274SharedShortOrbitShape(b)))||!b.has('R')||!b.has('F')||b.val('F')!=0.12||
         E181EffectiveOrbitMode(b)==255U||!(b.has('X')||b.has('Y')||b.has('Z'))) return false;
     // Authored G90 values are coordinates, not travel. The frozen-frame
     // builder proves the actual displacement before any arm publication.
     for(char word='A';word<='Z';++word) if(b.has(word))
-        if(!std::isfinite(b.val(word))||(word!='N'&&word!='P'&&word!='R'&&word!='F'&&word!='B'&&word!='X'&&word!='Y'&&word!='Z'&&word!='K'&&!(word=='Q'&&(b.val('P')==6.0||b.val('P')==16.0||b.val('P')==26.0)))) return false;
+        if(!std::isfinite(b.val(word))||(word!='N'&&word!='P'&&word!='R'&&word!='F'&&word!='B'&&word!='X'&&word!='Y'&&word!='Z'&&word!='K'&&!(word=='Q'&&(b.val('P')==6.0||b.val('P')==16.0||b.val('P')==26.0||b.val('P')==7.0||b.val('P')==17.0||b.val('P')==27.0)))) return false;
     const unsigned mode=E181EffectiveOrbitMode(b);
     const double radiusLimit=mode==3U||mode==4U?EDM173::MaximumCenterRadiusMm:EDM173::MaximumRadiusMm;
     return b.val('R')>0.0&&b.val('R')<=radiusLimit&&
@@ -1493,6 +1554,19 @@ bool NCManager::BindEDM173RecipeSameThread() noexcept
     const bool fixedRadiusWork=E267FixedRadiusWorkArm(arm->parsedBlock,m_edm94.gapHistoryArm);
     if(fixedRadiusWork&&!E267FixedRadiusWorkFrame(CoordSys.GetTranslationSnapshot()))return false;
     if(!E251SquareConfirmationSource(cache,m_edm94.armPC))return false;
+    const bool sharedShort=E274SharedShortArm(arm->parsedBlock,m_edm94.gapHistoryArm);
+    unsigned sharedShortMode=0U;
+    if(sharedShort)
+    {
+        const auto* source=m_edm94.armPC<(std::numeric_limits<int>::max)()?cache.TryGetLine(m_edm94.armPC+1):nullptr;
+        NCBlock authored{};
+        if(CoordSys.GetTranslationSnapshot().workMode!=169||!source||
+            !NCPreparedBlockQueueShadow::TryBuildLiteralBlock(source->parsedBlock,authored)||
+            !IsEDM173OrbitBlockShapeValid(authored)||!E251SquareSourcePair(arm->parsedBlock,authored)||
+            !E180LiteralAngleSourceMatches(source->parsedBlock,m_edm173->authored))return false;
+        sharedShortMode=E274SharedShortMode(authored);
+        if(!sharedShortMode)return false;
+    }
     // EDM233_RECIPE_CONTINUATION_BEGIN
     // A completed first parent retains its immutable recipe/plan. Its exact
     // sequence grant, not the generic idle recipe reader, admits the second
@@ -1533,7 +1607,15 @@ bool NCManager::BindEDM173RecipeSameThread() noexcept
     // every shape; do not duplicate its large inline tree in a conditional result.
     unsigned bindingProfile=EDM130::VisibleFlushProfile173;
     unsigned bindingSelector=0U;
-    if(fixedRadiusWork||fixedRadius||expansion)
+    if(sharedShort)
+    {
+        const unsigned bMode=EDM173::ModeForArm(m_edm94.gapHistoryArm);
+        bindingProfile=bMode==1U?EDM130::VisibleFlushProfile173:bMode==3U?EDM130::G76B3Profile176:
+            bMode==4U?EDM130::G76B4Profile177:0U;
+        bindingSelector=EDM130::G76SharedShortSelector274(sharedShortMode);
+        if(!bindingProfile||!bindingSelector)return false;
+    }
+    else if(fixedRadiusWork||fixedRadius||expansion)
     {
         const unsigned mode=fixedRadiusWork?E267FixedRadiusWorkMode(arm->parsedBlock):
             fixedRadius?E266FixedRadiusMode(arm->parsedBlock):E263ExpansionMode(arm->parsedBlock);
@@ -1579,7 +1661,9 @@ bool NCManager::BindEDM173RecipeSameThread() noexcept
     // EDM267_FIX2_BINDING_DISPATCH_END
     if(!binding.ready) return false;
     auto& recipe=m_edm130.recipe;recipe=binding.recipe;recipe.diagnosticControlSource=3U;recipe.planRows=static_cast<std::uint16_t>(EDM173::CountForRecipe(binding.recipe));recipe.planMovementMask=7U;
-    if((squareB1&&!EDM130::IsG76SquareB1_250(recipe))||(squareB2&&!EDM130::IsG76SquareB2_251(recipe))||
+    if((sharedShort&&(!EDM130::IsG76SharedShort274(recipe)||EDM130::G76PlanMode(recipe)!=sharedShortMode||
+            recipe.flushHoldTest!=EDM130::G76SharedShortSelector274(sharedShortMode)))||
+        (squareB1&&!EDM130::IsG76SquareB1_250(recipe))||(squareB2&&!EDM130::IsG76SquareB2_251(recipe))||
         (squareB3&&!EDM130::IsG76SquareB3_252(recipe))||(squareB4&&!EDM130::IsG76SquareB4_253(recipe))||
         (diamond&&!EDM130::IsG76DiamondB1_255(recipe))||(diamondB2&&!EDM130::IsG76DiamondB2_256(recipe))||
         (diamondB3&&!EDM130::IsG76DiamondB3_257(recipe))||(diamondB4&&!EDM130::IsG76DiamondB4_258(recipe))||
@@ -1588,7 +1672,7 @@ bool NCManager::BindEDM173RecipeSameThread() noexcept
         (expansion&&(!EDM130::IsG76Expansion263(recipe)||EDM130::G76PlanMode(recipe)!=E263ExpansionMode(arm->parsedBlock)))||
         (fixedRadius&&(!EDM130::IsG76FixedRadius266(recipe)||EDM130::G76PlanMode(recipe)!=E266FixedRadiusMode(arm->parsedBlock)))||
         (fixedRadiusWork&&(!EDM130::IsG76FixedRadiusWork267(recipe)||EDM130::G76PlanMode(recipe)!=E267FixedRadiusWorkMode(arm->parsedBlock))))return false;
-    if(arm->parsedBlock.has('L')&&!squareB1&&!squareB2&&!squareB3&&!squareB4&&!diamond&&!diamondB2&&!diamondB3&&!diamondB4&&!oneMm&&!polygonB2&&!expansion&&!fixedRadius&&!fixedRadiusWork&&!E216RejectBeforeArm(arm->parsedBlock,m_edm94.gapHistoryArm))
+    if(arm->parsedBlock.has('L')&&!squareB1&&!squareB2&&!squareB3&&!squareB4&&!diamond&&!diamondB2&&!diamondB3&&!diamondB4&&!oneMm&&!polygonB2&&!expansion&&!fixedRadius&&!fixedRadiusWork&&!sharedShort&&!E216RejectBeforeArm(arm->parsedBlock,m_edm94.gapHistoryArm))
     {
         if(E217CenterNominalHold(arm->parsedBlock,m_edm94.gapHistoryArm))recipe.flushHoldTest=1U;
         else if(E218CenterFlushHold(arm->parsedBlock,m_edm94.gapHistoryArm))recipe.flushHoldTest=2U;
@@ -1633,6 +1717,13 @@ bool NCManager::BindEDM173RecipeSameThread() noexcept
             static_cast<unsigned long long>(summary.generation),static_cast<unsigned long long>(m_edm94.armEpoch),EDM173::ModeForArm(m_edm94.gapHistoryArm));
     }
     m_edm130.bound=true;
+    if(sharedShort)
+        PrintNCG76DiagnosticLine("[EDM274] event=VECTOR_RECIPE_BOUND session=%llu L=%u selector=%u P=%u Q=%u B=%u children=%u E5us=%llu E6microMm=%llu power=INHIBITED discharge=0\n",
+            static_cast<unsigned long long>(m_edm94.session),EDM130::G76SharedShortArmTag274,
+            static_cast<unsigned>(recipe.flushHoldTest),sharedShortMode,
+            NCG76Mode::IsPolygon(sharedShortMode)?static_cast<unsigned>(m_edm173->authored.val('Q')):0U,
+            EDM173::ModeForArm(m_edm94.gapHistoryArm),EDM173::CountForRecipe(recipe),
+            static_cast<unsigned long long>(recipe.workTimeUs),static_cast<unsigned long long>(recipe.jumpHeightScaled));
     if(fixedRadiusWork)
     {
         const auto& frame=CoordSys.GetTranslationSnapshot();
@@ -1780,6 +1871,7 @@ bool NCManager::IsEDM173OrbitAllowedSameThread(const NCBlock& b) noexcept
         m_motion.IsMotionOwnerLeaseCurrent(s.lease)&&!m_motion.HasPendingSafetyOrRecoveryRequests()&&
         !m_g76Orbit->active&&!m_pathFeed.pending&&!m_pathArc.pending&&!m_pathReplay.pending&&!m_pathHold.armed&&!m_pathHold.bound&&
         IsG76OrbitFrameCurrentSameThread(true,true)&&IsPathCoreLiveNativeConfigCurrentSameThread();
+    valid=valid&&(!EDM130::IsG76SharedShort274(m_edm130.recipe)||CoordSys.GetTranslationSnapshot().workMode==169);
     valid=valid&&(!EDM130::IsG76FixedRadiusWork267(m_edm130.recipe)||
         E267FixedRadiusWorkFrame(CoordSys.GetTranslationSnapshot()));
     const auto* authored=GetBaseProgramCache().TryGetLine(pc);
@@ -1953,7 +2045,7 @@ WaitConditionFunc NCManager::StartEDM173SameThread(const NCBlock& b)
     const auto frozen=CoordSys.GetTranslationSnapshot();
     if(!EDM173::BuildOrbitInput(frozen,start,authoredXYZ,authoredMask,w.authored.val('R'),w.authored.val('F'),input,
         w.authored.has('K')?w.authored.val('K'):0.0,EDM173::UsesTargetAxis(m_edm130.recipe),EDM173::IsCenterRecipe(m_edm130.recipe),
-        (w.authored.val('P')==6.0||w.authored.val('P')==16.0||w.authored.val('P')==26.0)?static_cast<unsigned>(w.authored.val('Q')):0U))
+        (w.authored.val('P')==6.0||w.authored.val('P')==16.0||w.authored.val('P')==26.0||w.authored.val('P')==7.0||w.authored.val('P')==17.0||w.authored.val('P')==27.0)?static_cast<unsigned>(w.authored.val('Q')):0U))
     {RejectEDM94SameThread("EDM178_COORDINATE_INPUT",m_gapDryRun.sourceLine);return nullptr;}
     NCG76::ProgramPlan& program=m_g76Orbit->program;
     if(!NCG76::BuildMode(static_cast<std::uint32_t>(w.authored.val('P')),input,program)||!NCG76::BuildNative(program,frozen,start,w.nominal,true,true,EDM173::PreservesG90StationaryZ(m_edm130.recipe))||w.nominal.count!=EDM173::CountForRecipe(m_edm130.recipe))
@@ -2274,6 +2366,14 @@ WaitConditionFunc NCManager::StartEDM173SameThread(const NCBlock& b)
             !SameNCTranslationSnapshot(w.nominal.translation,CoordSys.GetTranslationSnapshot())||
             w.nominal.program.input.polygonSides!=(w.authored.val('P')==6.0?static_cast<unsigned>(w.authored.val('Q')):0U))))
     {RejectEDM94SameThread("EDM267_FIXED_RADIUS_WORK_SOURCE_SCOPE",m_gapDryRun.sourceLine);return nullptr;}
+    const bool sharedShortProgram=b.has('L')&&b.val('L')==static_cast<double>(EDM130::G76SharedShortArmTag274);
+    const auto* sharedShortSource=sharedShortProgram?GetBaseProgramCache().TryGetLine(s.pc[0U]):nullptr;
+    if(sharedShortProgram!=E274SharedShortArm(armSource->parsedBlock,s.gapHistoryArm)||
+        sharedShortProgram!=EDM130::IsG76SharedShort274(m_edm130.recipe)||
+        (sharedShortProgram&&(!sharedShortSource||s.pc[0U]!=s.armPC+1||
+            !E274SharedShortPlanSource(armSource->parsedBlock,sharedShortSource->parsedBlock,w.authored,
+                m_edm130.recipe,w.nominal,CoordSys.GetTranslationSnapshot()))))
+    {RejectEDM94SameThread("EDM274_VECTOR_SOURCE_SCOPE",m_gapDryRun.sourceLine);return nullptr;}
     if(!m_motion.SubmitEDM173Arm(s.session,s.armEpoch,s.lease,s.gapTuning,s.gapFlushParameters,m_edm130.recipe,rejectBeforeArm))
     {RejectEDM94SameThread("EDM173_ARM_PUBLICATION",m_gapDryRun.sourceLine);return nullptr;}
     s.latched=s.armPending=true;
@@ -2441,7 +2541,15 @@ bool NCManager::IsEDM173RuntimeCompleteSameThread() noexcept
     if(EDM130::IsG76FixedRadiusWork267(w.plan.recipe)&&
         (!E267FixedRadiusWorkFrame(w.nominal.translation)||!E267FixedRadiusWorkFrame(CoordSys.GetTranslationSnapshot())||
          !SameNCTranslationSnapshot(w.nominal.translation,CoordSys.GetTranslationSnapshot())))return false;
-    if(NCG76Mode::IsPolygon(EDM130::G76PlanMode(w.plan.recipe))||EDM130::IsG76Expansion263(w.plan.recipe)||EDM130::IsG76FixedRadius266(w.plan.recipe)||EDM130::IsG76FixedRadiusWork267(w.plan.recipe))
+    if(EDM130::IsG76SharedShort274(w.plan.recipe))
+    {
+        const auto* arm=GetBaseProgramCache().TryGetLine(s.armPC);
+        const auto* source=GetBaseProgramCache().TryGetLine(g.pc);
+        if(!arm||!source||g.pc!=s.armPC+1||
+            !E274SharedShortPlanSource(arm->parsedBlock,source->parsedBlock,w.authored,w.plan.recipe,
+                w.nominal,CoordSys.GetTranslationSnapshot()))return false;
+    }
+    if(NCG76Mode::IsPolygon(EDM130::G76PlanMode(w.plan.recipe))||EDM130::IsG76SharedShort274(w.plan.recipe)||EDM130::IsG76Expansion263(w.plan.recipe)||EDM130::IsG76FixedRadius266(w.plan.recipe)||EDM130::IsG76FixedRadiusWork267(w.plan.recipe))
     {
         const auto* source=GetBaseProgramCache().TryGetLine(g.pc);
         if(!source||!E180LiteralAngleSourceMatches(source->parsedBlock,w.authored)||
@@ -2727,6 +2835,11 @@ bool NCManager::IsEDM173RuntimeCompleteSameThread() noexcept
     RtPrintf("[EDM173] event=GAP_E5_VERIFIED session=%llu parentPC=%d children=%u triggered=%u completed=%u B%uevents=%u heightMicroMm=%llu exactReturn=1 discharge=0\n",
         static_cast<unsigned long long>(s.session),g.pc,count,expectedEvents,expectedEvents,mode,expectedEvents,
         static_cast<unsigned long long>(plan.recipe.jumpHeightScaled));
+    if(EDM130::IsG76SharedShort274(plan.recipe))
+        PrintNCG76DiagnosticLine("[EDM274] event=VECTOR_GAP_E5_VERIFIED session=%llu P=%u Q=%u B=%u children=%u E5events=%u dwells=%u settledLegs=%u E6microMm=%llu exactReturn=1 CUVfixed=1 power=INHIBITED discharge=0\n",
+            static_cast<unsigned long long>(s.session),EDM130::G76PlanMode(plan.recipe),
+            plan.nominal.program.input.polygonSides,mode,count,expectedEvents,e.qualifiedDwells,(b3||b4)?4U:0U,
+            static_cast<unsigned long long>(plan.recipe.jumpHeightScaled));
     if(EDM130::IsG76FixedRadiusWork267(plan.recipe))
         PrintNCG76DiagnosticLine("[EDM267] event=FIXED_RADIUS_WORK_E5_VERIFIED session=%llu L=%u modeP=%u Q=%u B=%u children=26 E5events=1 dwells=%u settledLegs=%u E6microMm=%llu exactReturn=1 CUVfixed=1 workMode=G168 W=%d advance=CONSTANT_RADIUS hold=0 discharge=0\n",
             static_cast<unsigned long long>(s.session),static_cast<unsigned>(plan.recipe.flushHoldTest),EDM130::G76PlanMode(plan.recipe),
@@ -2791,6 +2904,17 @@ bool NCManager::IsEDM173RuntimeCompleteSameThread() noexcept
 
 void NCManager::ServiceEDM173SameThread() noexcept
 {
+    // Read the independent bounded image before the phase-only early return.
+    // Never inspect an RT AxisContext from this NC diagnostic path.
+    if (EDM130::IsG76SharedShort274(m_edm130.recipe))
+    {
+        EDM275::Snapshot observation{}; std::uint64_t publication = 0ULL;
+        const auto& identity = m_edm94.feedback.currentIdentity;
+        if (EDM275::Read(observation, publication) && observation.session == m_edm94.session &&
+            observation.ownerGeneration == m_edm94.lease.generation && identity.session == observation.session &&
+            identity.ownerGeneration == observation.ownerGeneration && identity.epoch == observation.epoch)
+            E275LogObservation(observation, publication);
+    }
     auto& w=*m_edm173;EDM128::MotionFeedback f{};
     if(!m_motion.ReadEDM130Feedback(f)||f.session!=m_edm94.session||f.armEpoch!=m_edm94.armEpoch||
         f.ownerGeneration!=m_edm94.lease.generation||!EDM130::SameRecipe(f.timerRecipe,m_edm130.recipe)) return;

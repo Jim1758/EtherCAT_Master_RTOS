@@ -116,7 +116,7 @@ namespace
         observer.lastLiveSample=live.sampleSequence;
         const auto& header=observer.header;
         if(!header.session||!header.count||header.count>EDM206::Capacity||header.capacity!=EDM206::Capacity||
-            (header.mode!=3U&&header.mode!=4U)||!header.faultTick||header.firstTick>header.lastTick||
+            (header.mode!=1U&&header.mode!=3U&&header.mode!=4U)||!header.faultTick||header.firstTick>header.lastTick||
             header.lastTick!=header.faultTick||!header.zeroImageAccepted||header.containmentTick<header.faultTick) {
             EndEDM206History(motion,"HEADER_INVALID");return;
         }

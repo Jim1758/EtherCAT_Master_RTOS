@@ -1103,8 +1103,53 @@ namespace
     {
         return frame.workMode==168&&frame.workWCode>0&&NCG76::FrameSupported(frame,true,true);
     }
+    // EDM274 keeps the authored vector P distinct from its shared contour.
+    // L374 admits only the adjacent literal B1/B3/B4 short-stroke parent.
+    unsigned E274SharedShortMode(const NCBlock& b) noexcept
+    {
+        std::uint32_t mode=0U;
+        return b.has('P')&&NCG76Mode::TryModeFromLiteral(b.val('P'),mode)&&
+            EDM130::IsG76SharedShortMode274(mode)?mode:0U;
+    }
+    bool E274SharedShortArm(const NCParsedBlock& b,unsigned selector) noexcept
+    {
+        if(!((selector==EDM173::ArmP||selector==EDM173::B3ArmP||selector==EDM173::B4ArmP)&&
+            EDM77::Detail::Clean(b)&&!b.isEmpty&&b.gCount==1&&b.mCount==0&&
+            EDM77::Detail::EqualLiteral(b.gExpressions[0],180U)&&
+            EDM77::Detail::OnlyAddresses(b,"NPQRSIJKL")&&b.has('P')&&b.has('L')&&
+            EDM77::Detail::EqualLiteral(b.expression('P'),selector)&&
+            EDM77::Detail::EqualLiteral(b.expression('L'),EDM130::G76SharedShortArmTag274)))return false;
+        const char* const words="QRSIJK";
+        const double expected[]={8.0,1.0,1.0,10.0,50.0,100.0};
+        for(unsigned i=0U;i<6U;++i)
+        {
+            double value=0.0;
+            if(!b.has(words[i])||!E94Number(b.expression(words[i]),value)||value!=expected[i])return false;
+        }
+        if(b.assignment.prefix||!b.assignment.indexExpression.empty()||!b.assignment.valueExpression.empty()||
+            b.gotoStatement.conditional||!b.gotoStatement.conditionExpression.empty()||!b.gotoStatement.targetExpression.empty())return false;
+        for(std::size_t i=1U;i<b.gExpressions.size();++i)if(!b.gExpressions[i].empty())return false;
+        for(const auto& expression:b.mExpressions)if(!expression.empty())return false;
+        for(char word='A';word<='Z';++word)if(!b.has(word)&&!b.expression(word).empty())return false;
+        return true;
+    }
+    bool E274SharedShortOrbitShape(const NCBlock& b) noexcept
+    {
+        const unsigned mode=E274SharedShortMode(b);
+        return mode&&b.has('B')&&(b.val('B')==1.0||b.val('B')==3.0||b.val('B')==4.0)&&
+            (NCG76Mode::IsPolygon(mode)?E261PolygonOrbitShape(b):!b.has('Q'));
+    }
     bool E251SquareSourcePair(const NCParsedBlock& arm,const NCBlock& orbit) noexcept
     {
+        if(arm.has('L')&&EDM77::Detail::EqualLiteral(arm.expression('L'),EDM130::G76SharedShortArmTag274))
+        {
+            unsigned selector=0U;
+            for(unsigned candidate:{EDM173::ArmP,EDM173::B3ArmP,EDM173::B4ArmP})
+                if(E274SharedShortArm(arm,candidate))selector=candidate;
+            return selector&&!orbit.isEmpty&&!orbit.isGoto&&!orbit.isBlockSkip&&orbit.hasG&&
+                orbit.gCode==76&&orbit.gCount==1&&orbit.gCodes[0]==76&&orbit.mCount==0&&
+                E274SharedShortOrbitShape(orbit)&&orbit.val('B')==static_cast<double>(EDM173::ModeForArm(selector));
+        }
         const unsigned fixedRadiusWorkMode=E267FixedRadiusWorkMode(arm);
         if(fixedRadiusWorkMode)
         {
@@ -1189,7 +1234,8 @@ namespace
             EDM77::Detail::EqualLiteral(arm->parsedBlock.expression('L'),256U)||
             EDM77::Detail::EqualLiteral(arm->parsedBlock.expression('L'),257U)||
             EDM77::Detail::EqualLiteral(arm->parsedBlock.expression('L'),258U)||E260OneMmMode(arm->parsedBlock)!=0U||
-            EDM77::Detail::EqualLiteral(arm->parsedBlock.expression('L'),264U)||E263ExpansionMode(arm->parsedBlock)!=0U||E266FixedRadiusMode(arm->parsedBlock)!=0U||E267FixedRadiusWorkMode(arm->parsedBlock)!=0U);
+            EDM77::Detail::EqualLiteral(arm->parsedBlock.expression('L'),264U)||E263ExpansionMode(arm->parsedBlock)!=0U||E266FixedRadiusMode(arm->parsedBlock)!=0U||E267FixedRadiusWorkMode(arm->parsedBlock)!=0U||
+            EDM77::Detail::EqualLiteral(arm->parsedBlock.expression('L'),EDM130::G76SharedShortArmTag274));
         const bool square=source&&source->parsedBlock.has('P')&&(EDM77::Detail::EqualLiteral(source->parsedBlock.expression('P'),12U)||
             EDM77::Detail::EqualLiteral(source->parsedBlock.expression('P'),13U));
         if(!tagged&&!square)return true;
@@ -1208,7 +1254,7 @@ namespace
         const bool centerSecondFlushHold=E231CenterSecondFlushHold(b,selector);
         const bool centerSecondReturnHold=E232CenterSecondReturnHold(b,selector);
         const bool parentSequence=E233CenterParentSequence(b,selector)||E234ArmSequence(b,selector)||E237ArmSequence(b,selector);
-        const bool squareB1=E250SquareB1Arm(b,selector)||E251SquareB2Arm(b,selector)||E252SquareB3Arm(b,selector)||E253SquareB4Arm(b,selector)||E255DiamondB1Arm(b,selector)||E256DiamondB2Arm(b,selector)||E257DiamondB3Arm(b,selector)||E258DiamondB4Arm(b,selector)||E260OneMmArm(b,selector)||E261PolygonB2Arm(b,selector)||E263ExpansionArm(b,selector)||E266FixedRadiusArm(b,selector)||E267FixedRadiusWorkArm(b,selector);
+        const bool squareB1=E250SquareB1Arm(b,selector)||E251SquareB2Arm(b,selector)||E252SquareB3Arm(b,selector)||E253SquareB4Arm(b,selector)||E255DiamondB1Arm(b,selector)||E256DiamondB2Arm(b,selector)||E257DiamondB3Arm(b,selector)||E258DiamondB4Arm(b,selector)||E260OneMmArm(b,selector)||E261PolygonB2Arm(b,selector)||E263ExpansionArm(b,selector)||E266FixedRadiusArm(b,selector)||E267FixedRadiusWorkArm(b,selector)||E274SharedShortArm(b,selector);
         if (b.has('L')&&!rejectBeforeArm&&!centerNominalHold&&!centerFlushHold&&!centerRepeat&&!centerSecondFlushHold&&!centerSecondReturnHold&&!parentSequence&&!squareB1)
         {
             unsigned selection = 0U;
@@ -1895,7 +1941,7 @@ namespace
         if (!E94Matches(parsed,b)) return false;
         const bool explicitB0=b.has('B')&&b.val('B')==0.0;
         if (explicitB0&&!EDM109::SameDouble(b.val('B'),0.0)) return false;
-        if (!explicitB0&&!b.has('K')&&!(b.has('P')&&(b.val('P')==16.0||b.val('P')==21.0||b.val('P')==22.0||b.val('P')==23.0||b.val('P')==26.0)) && (b.gCode!=76 || b.has('B'))) return true;
+        if (!explicitB0&&!b.has('K')&&!(b.gCode==76&&E274SharedShortMode(b))&&!(b.has('P')&&(b.val('P')==16.0||b.val('P')==21.0||b.val('P')==22.0||b.val('P')==23.0||b.val('P')==26.0)) && (b.gCode!=76 || b.has('B'))) return true;
         if (parsed.gCount!=1 || parsed.mCount!=0 || !b.hasG || b.gCode!=76 ||
             b.gCount!=1 || b.gCodes[0]!=76 || b.mCount!=0 || b.gotoTarget!=-1 ||
             parsed.assignment.prefix || !parsed.assignment.indexExpression.empty() ||
@@ -1909,6 +1955,21 @@ namespace
             if (!parsed.has(word) && (!parsed.expression(word).empty() ||
                 !EDM109::SameDouble(b.val(word),0.0))) return false;
         return true;
+    }
+    bool E274SharedShortPlanSource(const NCParsedBlock& arm,const NCParsedBlock& source,
+        const NCBlock& authored,const EDM130::Recipe& recipe,const NCG76::NativePlan& nominal,
+        const NCTranslationSnapshot& current) noexcept
+    {
+        const unsigned mode=E274SharedShortMode(authored);
+        return mode&&EDM130::IsG76SharedShort274(recipe)&&
+            recipe.flushHoldTest==EDM130::G76SharedShortSelector274(mode)&&
+            EDM130::G76PlanMode(recipe)==mode&&nominal.modeP==mode&&nominal.program.modeP==mode&&
+            E181EffectiveOrbitMode(authored)==static_cast<unsigned>(EDM173::ExpectedMode(recipe))&&
+            E251SquareSourcePair(arm,authored)&&E180LiteralAngleSourceMatches(source,authored)&&
+            nominal.count==EDM173::CountForRecipe(recipe)&&
+            nominal.program.input.polygonSides==(NCG76Mode::IsPolygon(mode)?static_cast<unsigned>(authored.val('Q')):0U)&&
+            nominal.translation.workMode==169&&current.workMode==169&&
+            SameNCTranslationSnapshot(nominal.translation,current);
     }
     // Only the newly admitted H setup uses this complete source receipt.
     // Keep ordinary setup rows on their established admission path.

@@ -14,6 +14,14 @@ constexpr int MAX_SYS_VARS = 1000;     // 系統變數 $1~$1000
 
 namespace MacroVariableRules
 {
+    // TUNE17: result, comparison and live telemetry mirrors are published only through SetSysVar.
+    constexpr int TuningResultFirst = 901;
+    constexpr int TuningResultLast = 999;
+    inline bool IsReadOnlySystemIndex(int index) noexcept
+    {
+        return index >= TuningResultFirst && index <= TuningResultLast;
+    }
+
     inline bool IsValidIndex(char prefix, int index) noexcept
     {
         if (prefix == '#')
@@ -29,6 +37,12 @@ namespace MacroVariableRules
             return index >= 1 && index <= MAX_SYS_VARS;
         }
         return false;
+    }
+
+    inline bool IsWritableIndex(char prefix, int index) noexcept
+    {
+        return IsValidIndex(prefix, index) &&
+            !(prefix == '$' && IsReadOnlySystemIndex(index));
     }
 }
 

@@ -223,9 +223,10 @@ inline double ReservedB3VisibleAcceleration(double effectiveMaxSpeedMmSec,double
 }
 inline bool ValidAbsoluteJumpHeightMm(double h,unsigned profile=0U) noexcept
 {return std::isfinite(h)&&profile<=8U&&((profile==6U||profile==7U)?EDM204::ValidCommissioningHeightMm(h):
-    profile?((profile==4U&&h==1.0)||h==CommissioningHeightMm(profile)):(h>=0.0001&&h<=0.005));}
+    profile?((profile==4U&&(h==1.0||h==0.2))||h==CommissioningHeightMm(profile)):(h>=0.0001&&h<=0.005));}
 // This is a geometric configuration check, not recipe or motion authority.
-// The full frozen recipe admits the new one-mm B1 only with L260/L261/L262.
+// The full frozen recipe admits one-mm B1 only with its existing selectors,
+// and 0.2-mm B1 only with EDM274's original-P-bound shared-contour selector.
 // Keep EDM130's generic profile4 helpers and all other fixture shapes intact.
 inline bool ValidHeightConfig260(const Policy& policy,double height,std::uint32_t interval,
     double multiplier,bool bound) noexcept
@@ -233,7 +234,7 @@ inline bool ValidHeightConfig260(const Policy& policy,double height,std::uint32_
     const unsigned profile=VisibleFlushProfile(policy);
     return EDM130::ValidDeepFlushConfig(height,interval,multiplier,bound,profile)||
         (policy.fixture==EDM116::Fixture::ModalG76Gap173&&policy.mode==Mode::B1&&profile==4U&&
-            height==1.0&&interval==0U&&multiplier==1.0&&bound);
+            (height==1.0||height==0.2)&&interval==0U&&multiplier==1.0&&bound);
 }
 inline bool HeightClose(double a,double b) noexcept
 {return std::isfinite(a)&&std::isfinite(b)&&std::fabs(a-b)<=EDM126::Roundoff((std::max)(std::fabs(a),std::fabs(b)));}
@@ -749,11 +750,13 @@ public:
             if(!local_.Step(tick,nowUs,0.0,physicalSettled))return Fail();
             LocalImage();
         }
-        // Held wall time never satisfies an E5 dwell. The two transfer
+        // Held wall time never satisfies an E5 dwell. Completed transfer
         // boundaries already hold a completed dwell proof. Keep it for
         // reattachment, including cancellation of a pending first local step.
         const bool transferBoundary=evidence_.phase==Phase::Resume||
-            (evidence_.phase==Phase::ToCenter&&!evidence_.detached);
+            ((evidence_.phase==Phase::ToCenter||(evidence_.phase==Phase::Outbound&&
+                evidence_.policy.fixture==EDM116::Fixture::ModalG76Gap173&&
+                (evidence_.policy.mode==Mode::B0||evidence_.policy.mode==Mode::B1)))&&!evidence_.detached);
         if(!transferBoundary)ResetDwell();
         evidence_.work.previousEligible=false;image_.completeReady=false;
         CaptureSpeedProof();return Propose();

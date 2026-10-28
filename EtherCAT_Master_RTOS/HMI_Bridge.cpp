@@ -2923,7 +2923,20 @@ namespace HMI_Bridge
         const double variableWriteValue = pShm->varCmd.writeValue;
         if (variableWriteRequested)
         {
-            nc->MacroSys.SetVar(variableWritePrefix, variableWriteIndex, variableWriteValue);
+            if (variableWritePrefix == '$' &&
+                MacroVariableRules::IsReadOnlySystemIndex(variableWriteIndex))
+            {
+                // TUNE01: reject without stopping unrelated machine motion.
+                // The legacy write ABI has no error ACK; expose the reason and
+                // refresh the unchanged authoritative system-variable value.
+                RtPrintf("[TUNE01] event=VARIABLE_WRITE result=REJECT index=%d reason=READ_ONLY_TUNING_RESULT applied=0\n",
+                    variableWriteIndex);
+                pShm->varCmd.refresh_system = true;
+            }
+            else
+            {
+                nc->MacroSys.SetVar(variableWritePrefix, variableWriteIndex, variableWriteValue);
+            }
             pShm->varCmd.writeReq = false;
         }
         // CJ LOAD FIX1: consume the request group before dispatching START.

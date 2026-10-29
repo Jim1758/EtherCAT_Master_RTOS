@@ -31,9 +31,9 @@ namespace
     EDM53::Channel<EDM275::Snapshot,768U> g_edm275PhysicalChannel{};
     std::uint64_t g_edm275PhysicalSession=0ULL,g_edm275PhysicalTick=0ULL;
     bool E275HistoryRecipe(const EDM130::Recipe& recipe) noexcept
-    { return EDM173::IsCenterRecipe(recipe)||EDM130::IsG76SharedShortB1_274(recipe); }
+    { return EDM173::IsCenterRecipe(recipe)||EDM130::IsG76SharedShortB1_274(recipe)||EDM130::IsG76SharedCycleB1_284(recipe); }
     unsigned E275HistoryMode(const EDM130::Recipe& recipe) noexcept
-    { return EDM130::IsG76SharedShortB1_274(recipe)?1U:EDM173::IsB4Recipe(recipe)?4U:3U; }
+    { return (EDM130::IsG76SharedShortB1_274(recipe)||EDM130::IsG76SharedCycleB1_284(recipe))?1U:EDM173::IsB4Recipe(recipe)?4U:3U; }
     // FIX19: one Motion writer; only the existing P50 diagnostic reader prints.
     EDM53::Channel<EDM144::AxesDetail::Snapshot> g_fix19AxesChannel{};
     bool PublishFix19Axes(void*, const EDM144::AxesDetail::Snapshot& snapshot) noexcept
@@ -526,6 +526,7 @@ namespace
     bool IsMotionCommandRetainedGeometryValid(const MotionCommand& command,
         const std::vector<AxisContext>* contexts) noexcept
     {
+        if(!IsMotionG76SphereMarkerClear(command))return false;
         if (!command.pathCoreRetainedTraversal)
             return !command.pathCoreRetainedReverse;
         if (contexts == nullptr || contexts->empty() || contexts->size() > MAX_AXES ||
@@ -1147,6 +1148,12 @@ namespace
         const MotionCommand& command,
         const std::vector<AxisContext>* contexts) noexcept
     {
+        if(!IsMotionEDMCommissioningMarkerEncodingValid(command))return false;
+        if(command.g76SphereAir)return contexts!=nullptr && contexts->size()>=6U &&
+            command.axisCount==6 && command.mode==InterpolationMode::LINEAR &&
+            command.commandPathMode==MotionCommandPathMode::EXACT_STOP;
+        if(!IsMotionPositioningOperationValid(command.positioningOperation)||
+           (command.g80EdgeFind&&command.positioningOperation!=0U))return false;
         // BASE79F: generic probes are structural only. Full packet decode,
         // frozen start binding and reservation belong to the dedicated loader.
         if (command.pathCoreEccentricCFeedExactStop)
@@ -1419,6 +1426,7 @@ namespace
     bool IsMotionCommandHistorySnapshotValid(
         const MotionCommand& command) noexcept
     {
+        if(!IsMotionG76SphereMarkerClear(command))return false;
         const int axisCount = ClampMotionAxisCount(command.axisCount);
         if (command.pathCoreEccentricCFeedExactStop || command.pathCoreRetainedTraversal || command.pathCoreRetainedReverse ||
             axisCount <= 0 ||
@@ -1552,6 +1560,23 @@ namespace
         axis.finalTargetPos = axis.currentCmdPos;
         return true;
     }
+}
+
+bool MotionCore::IsG80IncomingReady(const AxisContext& axis) const noexcept
+{ return IsIncomingPhysicalAxisReadyForGroup(axis); }
+
+bool MotionCore::RetireG80Axes() noexcept
+{
+    auto& v=m_Group.virtualAxis;
+    if(v.isFault || v.isLagAlarm || !std::isfinite(v.currentCmdPos) ||
+        !std::isfinite(v.planningPos) || !std::isfinite(v.finalTargetPos) ||
+        v.currentCmdVel!=0.0 || v.logicalCmdVel!=0.0 || v.targetVelocity!=0.0 || v.targetEndVel!=0.0) return false;
+    for(int slot=0;slot<m_Group.axisCount;++slot)
+        if(!CanCanonicalizeInactivePhysicalAxisCommandState((*m_pContexts)[m_Group.axisIndices[slot]])) return false;
+    for(int slot=0;slot<m_Group.axisCount;++slot)
+        (void)TryCanonicalizeInactivePhysicalAxisCommandState((*m_pContexts)[m_Group.axisIndices[slot]]);
+    v.state=MotionState::MotionState_IDLE;
+    return TryCanonicalizeIdleAxisCommandState(v);
 }
 
 MotionCore::MotionCore()
@@ -2374,7 +2399,7 @@ EDM174Comm::MotionObservation MotionCore::GetEDM174CommunicationObservation() co
     return observation;
 }
 std::uint32_t MotionCore::GetEDM173ImplementationRevision() const noexcept
-{ return 74U; }
+{ return 78U; }
 
 bool MotionCore::IsEDM173HandoffCurrent() const noexcept
 {
@@ -3630,7 +3655,7 @@ bool MotionCore::BeginEDM126Segment() noexcept
     const bool tangentFlush=EDM130::IsG76B0Flush192(a.timerRecipe);
     const bool centerFlush=EDM173::IsCenterRecipe(a.timerRecipe);
     const unsigned commissioningProfile=a.timerRecipe.commissioningProfile;
-    const double visibleHeight=(centerFlush||EDM130::IsG76SharedShortB1_274(a.timerRecipe))?
+    const double visibleHeight=(centerFlush||EDM130::IsG76SharedShortB1_274(a.timerRecipe)||EDM130::IsG76SharedCycleB1_284(a.timerRecipe))?
         EDM173::FrozenHeightMm(a.timerRecipe):EDM94::VisibleFlushHeightMm(commissioningProfile);
     if(m_edm94.FrozenConfig().visibleZFlush158!=visible ||
         m_edm94.FrozenConfig().commissioningProfile!=commissioningProfile || (visible&&
@@ -4105,7 +4130,7 @@ void MotionCore::ObserveEDM126PhysicalSettle(bool complete,const EDM94::RuntimeD
     const bool pauseDiagnose=m_edm157Pause.DemandZero()&&
         m_edm157Pause.Current().scope.historyFixture==EDM149::G76GapHistoryFixture;
     const bool observeG76=m_edm173&&m_edm94.Active()&&IsEDM173Profile()&&
-        EDM130::IsG76SharedShort274(m_edm130ArmRecipe);
+        (EDM130::IsG76SharedShort274(m_edm130ArmRecipe)||EDM130::IsG76SharedCycleShort284(m_edm130ArmRecipe));
     const bool diagnose=pauseDiagnose||observeG76;
     std::uint32_t evaluated=0U,failed=0U,axisMask=0U;
     const auto gate=[&](std::uint32_t bit,bool passed) noexcept {
@@ -5580,6 +5605,15 @@ bool MotionCore::CaptureEDM192TangentEnvelope(const EDM94::Frame& frame,EDM94::T
         m_edm114MappedTick!=frame.tick||frame.tick!=m_ncSettleRuntimeCycleTick||frame.nowUs!=m_edmZMonotonicUs||
         !IsEDM126Current()||!IsEDM126SourceCurrent(frame.nowUs,true))return false;
     const auto& seal=m_edm173->current;const auto& plan=seal.plan;const auto& scope=plan.scope;
+    // EDM283: the RT envelope follows the sealed compound, including its
+    // 26th fixed/expansion child. Count and original P must agree everywhere
+    // before any child identity or endpoint is indexed.
+    const unsigned childCount=EDM173::CountForRecipe(plan.recipe);
+    const unsigned modeP=EDM130::G76PlanMode(plan.recipe);
+    if((childCount!=25U&&childCount!=26U)||!NCG76Mode::IsRecognized(modeP)||
+        EDM173::CountForMode(modeP)!=childCount||plan.nominal.count!=childCount||
+        plan.nominal.program.count!=childCount||plan.nominal.modeP!=modeP||
+        plan.nominal.program.modeP!=modeP)return false;
     const auto& e=m_edm128.Evidence();const auto& f=EDM126CommittedImage();
     const auto& a=e.anchor;const auto& source=a.cursorSource;
     const bool interiorAnchor=!a.atCurrentEnd&&a.localMm>0.0&&a.localMm<a.lengthMm;
@@ -5595,6 +5629,7 @@ bool MotionCore::CaptureEDM192TangentEnvelope(const EDM94::Frame& frame,EDM94::T
         frame.identity.session!=scope.session||frame.identity.ownerGeneration!=scope.owner.generation||
         !EDM116::SamePolicy(e.policy,m_edm128Current.rowPolicy)||
         e.policy.fixture!=EDM116::Fixture::ModalG76Gap173||e.policy.mode!=EDM116::Mode::B0||
+        e.policy.g76Rows!=childCount||
         !e.detached||!e.anchorCaptured||!e.targetCaptured||e.centerCaptured||
         (e.phase!=EDM128::Phase::Outbound&&e.phase!=EDM128::Phase::TopDwell&&
             e.phase!=EDM128::Phase::Returning&&e.phase!=EDM128::Phase::ReturnDwell)||
@@ -5602,12 +5637,12 @@ bool MotionCore::CaptureEDM192TangentEnvelope(const EDM94::Frame& frame,EDM94::T
         e.work.triggeredEvents!=1ULL||e.work.completedEvents!=0ULL||
         !a.active||a.faulted||a.stopRequested||a.stopped||a.awaitingSeam||(!interiorAnchor&&!terminalAnchor)||
         !a.tick||!a.nowUs||a.tick>=frame.tick||a.nowUs>=frame.nowUs||
-        source.ordinal>=25ULL||source.ordinal>a.authorizedSource.ordinal||
+        source.ordinal>=childCount||source.ordinal>a.authorizedSource.ordinal||
         !EDM126::SameSource(a.authorizedSource,f.authorizedSource)||
         !EDM109::SameScope(source.scope,a.authorizedSource.scope))return false;
     const unsigned child=static_cast<unsigned>(source.ordinal);
     const auto sourceFits=[&](const EDM126::Source& value)->bool {
-        if(!EDM126::ValidSource(value)||value.ordinal>=25ULL)return false;
+        if(!EDM126::ValidSource(value)||value.ordinal>=childCount)return false;
         const auto& identity=seal.identities[static_cast<unsigned>(value.ordinal)];
         return value.scope.session==scope.session&&value.scope.run==scope.run&&value.scope.cache==scope.cache&&
             value.scope.ownerGeneration==scope.owner.generation&&
@@ -5638,6 +5673,7 @@ bool MotionCore::CaptureEDM192TangentEnvelope(const EDM94::Frame& frame,EDM94::T
     candidate.liveEpoch=frame.identity.epoch;candidate.run=scope.run;candidate.cache=scope.cache;
     candidate.dispatch=scope.dispatch;candidate.fingerprint=plan.fingerprint;
     candidate.sourceEpoch=source.epoch;candidate.segment=source.segment;candidate.child=child;candidate.sourcePC=scope.sourcePC;
+    candidate.childCount=childCount;
     for(unsigned i=0U;i<6U;++i) {
         tangent[i]/=norm;
         const double budget=64.0*(std::numeric_limits<double>::epsilon)()*(std::max)(1.0,std::fabs(expectedAnchor[i]));
@@ -8865,7 +8901,8 @@ void MotionCore::ServiceEDM94MotionPass(bool complete) noexcept
             (EDM130::IsG76SquareB1_250(arm.timerRecipe)||EDM130::IsG76DiamondB1_255(arm.timerRecipe)||
                 EDM130::IsG76OneMmB1_260(arm.timerRecipe)||
                 EDM130::IsG76Expansion263(arm.timerRecipe)||EDM130::IsG76FixedRadius266(arm.timerRecipe)||
-                EDM130::IsG76FixedRadiusWork267(arm.timerRecipe)||EDM130::IsG76SharedShortB1_274(arm.timerRecipe));
+                EDM130::IsG76FixedRadiusWork267(arm.timerRecipe)||EDM130::IsG76SharedShortB1_274(arm.timerRecipe)||
+                EDM130::IsG76SharedCycleB1_284(arm.timerRecipe));
         if(g76B2||g76B0)armConfig.maxDurationUs=EDM94::MaximumDurationUs;
         if((arm.ordinarySequenceProgram==247U||arm.ordinarySequenceProgram==248U)&&boundedProgram&&requiredMovementMask==7U&&
             !visibleFlush&&!armConfig.commissioningProfile&&
@@ -10225,6 +10262,11 @@ void MotionCore::ObserveNCSettleRuntimeCycle(
         physicalStamp = m_pEDMPhysicalSourceMaster->ReadGapPhysicalRTShadow(physical);
     m_edm129Physical=physical; m_edm129PhysicalStamp=physicalStamp;
     ObserveEDMZFixtureRuntimeClock(runtimeCycleTick, pdoCycleValid, adjacentToPrevious);
+    ObserveCollisionProtectionRuntime(); // Always physical, including HOLD/Reset/invalid-PDO callbacks.
+    ObserveG80RuntimeInput();
+    ObserveG76SphereRuntimeInput();
+    ObserveRotarySpindleRuntimeInput(); // EDM289: includes invalid-PDO cancellation.
+
     // TUNE01: this source hook runs even when an invalid PDO skips Motion.
     // Start is accepted only here; a mid-pass Start waits for the next source.
     auto& positionTune = PositionAutoTune::Capture();
@@ -10899,6 +10941,8 @@ bool MotionCore::SealPbcXHomeProbeSerializedImage(ServoOutputFrameReservation& r
     if (!SealEDM94SerializedImage(reservation, ioMapBase, ioMapSize,
         serializedPayload, payloadSize)) return false;
     if (!SealEDMZFixtureSerializedImage(reservation, ioMapBase, ioMapSize,
+        serializedPayload, payloadSize)) return false;
+    if (!SealRotarySpindleSerializedImage(reservation, ioMapBase, ioMapSize,
         serializedPayload, payloadSize)) return false;
     if (!m_pbcXHomeProbeSendPending) return !reservation.homeProbe.pending;
     const ServoOutputFrameReservation& canonical = m_pbcXHomeProbeCanonicalSend;
@@ -13679,6 +13723,8 @@ bool MotionCore::BeginResetSafetyProvenanceOperation(
     std::uint64_t expectedProvenanceGeneration,
     std::uint64_t& operationProvenanceGeneration) noexcept
 {
+    AdvanceG80ResetScope(expectedProvenanceGeneration,expectedProvenanceGeneration+1ULL);
+    AdvanceG76SphereResetScope(expectedProvenanceGeneration,expectedProvenanceGeneration+1ULL);
     m_executionDrainRevocationPublishersInProgress.fetch_add(
         1U,
         std::memory_order_acq_rel);
@@ -13754,6 +13800,9 @@ void MotionCore::EndResetSafetyOutputHold() noexcept
 
 std::uint64_t MotionCore::MarkResetSafetyOperatorEdge() noexcept
 {
+    const auto g80ResetProvenance=GetSafetyProvenanceGeneration();
+    AdvanceG80ResetScope(g80ResetProvenance,g80ResetProvenance+1ULL);
+    AdvanceG76SphereResetScope(g80ResetProvenance,g80ResetProvenance+1ULL);
     // This short, balanced publisher is the exact linearization point for
     // every explicit Reset edge, including a new edge which reuses an
     // already-active cross-scan output hold after terminal BLOCKED.
@@ -14069,6 +14118,8 @@ MotionCore::ContinueResetSafetyMotionOwnerGeneration(
                     nextTicket,
                     true,
                     false);
+            AdvanceG80ResetScope(result.provenanceGeneration,result.provenanceGeneration,resetSafetyState);
+            AdvanceG76SphereResetScope(result.provenanceGeneration,result.provenanceGeneration,resetSafetyState);
             std::uint64_t expectedBaselineState = baselineState;
             if (m_motionOwnerState.compare_exchange_strong(
                 expectedBaselineState,
@@ -14419,6 +14470,8 @@ bool MotionCore::SubmitAxisCommand(
         *outSequence = MOTION_AXIS_COMMAND_SEQUENCE_INVALID;
     }
 
+    if (IsRotarySpindleSessionClaimed() && command.type != MotionAxisCommandType::STOP_MOVE)
+        return false;
     if (command.axisIndex == 0 &&
         (m_pbcXRetainRecoveryRequired.load(std::memory_order_acquire) || HasPbcXUnresolvedActiveOutput()) &&
         (command.type == MotionAxisCommandType::MOVE_TO_POSITION ||
@@ -14426,6 +14479,10 @@ bool MotionCore::SubmitAxisCommand(
             command.type == MotionAxisCommandType::MPG_MOVE)) return false;
     const MotionOwner expectedOwner =
         ResolveMotionOwnerForSource(command.source);
+    const bool manualMovement=(expectedOwner==MotionOwner::JOG||expectedOwner==MotionOwner::MPG)&&
+        (command.type==MotionAxisCommandType::MOVE_TO_POSITION||
+         command.type==MotionAxisCommandType::VELOCITY_MOVE||command.type==MotionAxisCommandType::MPG_MOVE);
+    if(manualMovement&&IsManualCollisionBlocked(command.ownerLease))return false;
 
     if (command.type == MotionAxisCommandType::NONE ||
         command.axisIndex < 0 ||
@@ -15334,6 +15391,8 @@ MotionCore::RequestExactResetSafetyBatch(
                     childTicket,
                     false,
                     true);
+            AdvanceG80ResetScope(result.provenanceGeneration,result.provenanceGeneration,childState);
+            AdvanceG76SphereResetScope(result.provenanceGeneration,result.provenanceGeneration,childState);
             std::uint64_t expectedParentState = parentState;
             if (!m_motionOwnerState.compare_exchange_strong(
                 expectedParentState,
@@ -15353,6 +15412,8 @@ MotionCore::RequestExactResetSafetyBatch(
                 {
                     result.status =
                         ResetSafetyAuthorityStatus::DEFERRED;
+                    AdvanceG80ResetScope(result.provenanceGeneration,result.provenanceGeneration,parentState);
+                    AdvanceG76SphereResetScope(result.provenanceGeneration,result.provenanceGeneration,parentState);
                 }
                 else
                 {
@@ -15912,6 +15973,12 @@ void MotionCore::ApplyPendingSafetyAndRecoveryRequests() noexcept
         // intentionally fenced; physical standstill is proved later by the
         // existing RESET_ALL settle/rebase gate.
         AbortActiveExecutionForResetSafetyBatch();
+        if(!RetireG80ForResetSafetyBatch(coveredEpoch,currentSafetyLease,coveredTicket,
+            resetSafetyBatchProvenance) || !RetireG76SphereForResetSafetyBatch(coveredEpoch,currentSafetyLease,
+                coveredTicket,resetSafetyBatchProvenance))
+        {
+            EmergencyStopAllAxesImpl(true);
+        }
         if (!FinalizeClaimedResetSafetyBatch(resetSafetyBatch))
         {
             EmergencyStopAllAxesImpl(true);
@@ -16203,6 +16270,16 @@ void MotionCore::DrainAxisCommandMailbox() noexcept
             break;
         }
 
+        if (IsRotarySpindleSessionClaimed())
+        {
+            // An explicit legacy STOP must cancel the spindle, not merely
+            // change an axis trajectory that this dedicated CSV lane bypasses.
+            if (command.type == MotionAxisCommandType::STOP_MOVE)
+                ContainRotarySpindleRuntime(MotionRotarySpindle::Fault::Positioning, true);
+            PublishAxisCommandResult(command, MotionAxisCommandResultType::REJECTED,
+                MotionRejectReason::OWNER_CONFLICT);
+            continue;
+        }
         if (m_edmZPolicy.Snapshot().capHeld && command.type != MotionAxisCommandType::STOP_MOVE)
         {
             StopEDMZFixtureFromRuntime();
@@ -16252,6 +16329,14 @@ void MotionCore::DrainAxisCommandMailbox() noexcept
             continue;
         }
 
+        const bool manualMovement=(expectedOwner==MotionOwner::JOG||expectedOwner==MotionOwner::MPG)&&
+            (command.type==MotionAxisCommandType::MOVE_TO_POSITION||
+             command.type==MotionAxisCommandType::VELOCITY_MOVE||command.type==MotionAxisCommandType::MPG_MOVE);
+        if(manualMovement&&IsManualCollisionBlocked(command.ownerLease)){
+            TripManualCollisionRuntime(command.ownerLease);
+            PublishAxisCommandResult(command,MotionAxisCommandResultType::REJECTED,MotionRejectReason::NOT_READY);
+            continue; // STOP and HOME cleanup retain their original path.
+        }
         bool applied = true;
         bool referenceDeferred = false;
         MotionRejectReason rejectReason = MotionRejectReason::NONE;
@@ -16346,6 +16431,12 @@ void MotionCore::DrainAxisCommandMailbox() noexcept
             break;
         }
 
+        if(applied&&manualMovement){
+            if(!m_collisionManualAxisOwner.Matches(command.ownerLease)){
+                m_collisionManualAxisOwner=command.ownerLease;m_collisionManualAxes=0U;
+            }
+            m_collisionManualAxes|=1U<<static_cast<unsigned>(command.axisIndex);
+        }
         PublishAxisCommandResult(
             command,
             referenceDeferred ? MotionAxisCommandResultType::DEFERRED :
@@ -17647,6 +17738,9 @@ bool MotionCore::IsEccentricCStartBindingCurrent(const MotionCommand& command,
 MotionRejectReason MotionCore::GetCommandAuthorizationFailure(
     const MotionCommand& command, EDM174Leaf::Sample* edm174Trace) const noexcept
 {
+    // EDM289 first live scope is spindle-only: no ordinary group may claim
+    // positioning until exact stop and reference handback release the session.
+    if (IsRotarySpindleSessionClaimed()) return MotionRejectReason::OWNER_CONFLICT;
     // FIX6_AUTH_OBSERVATION_BEGIN: null producer callers access no RT recorder.
     EDM174Leaf::Scope edm174Total(edm174Trace);
     const auto edm174Read128 = [this,edm174Trace](EDM128::MotionFeedback& mode) noexcept {
@@ -17659,6 +17753,8 @@ MotionRejectReason MotionCore::GetCommandAuthorizationFailure(
     };
     // FIX6_AUTH_OBSERVATION_END
     if (!IsMotionEDMCommissioningMarkerEncodingValid(command)) return MotionRejectReason::NOT_READY;
+    if(!IsMotionPositioningOperationValid(command.positioningOperation)||
+       (command.g80EdgeFind&&command.positioningOperation!=0U))return MotionRejectReason::INVALID_GEOMETRY;
     if (m_pbcXRetainRecoveryRequired.load(std::memory_order_acquire) ||
         HasPbcXUnresolvedActiveOutput()) return MotionRejectReason::NOT_READY;
     if (HasUnacknowledgedSafetyMotionRequest())
@@ -17675,6 +17771,13 @@ MotionRejectReason MotionCore::GetCommandAuthorizationFailure(
     {
         return MotionRejectReason::OWNER_CONFLICT;
     }
+
+    if (!command.g76SphereAir && IsG76SphereBarrierBlocking(command)) return MotionRejectReason::NOT_READY;
+    if (command.g76SphereAir)
+        return IsG76SphereCommandAuthorized(command) ? MotionRejectReason::NONE : MotionRejectReason::NOT_READY;
+    if (!command.g80EdgeFind && IsG80BarrierBlocking(command)) return MotionRejectReason::NOT_READY;
+    if (command.g80EdgeFind)
+        return IsG80CommandAuthorized(command) ? MotionRejectReason::NONE : MotionRejectReason::NOT_READY;
 
     // FIX2: this predicate reads only this unchanged const command. Evaluate
     // it lazily at the original first seam, then reuse it only in this call.
@@ -18146,6 +18249,8 @@ void MotionCore::RejectMotionCommand(
 bool MotionCore::TryEnqueueMotionCommand(
     const MotionCommand& command) noexcept
 {
+    if(RejectCollisionPositioningProducer(command,command.execution.epoch,command.execution.source,
+        command.ownerLease)) return false;
     MotionPbcIngressGate::Producer ingress(m_pbcReferenceIngress);
     if (!ingress.Entered()) return false;
     const MotionRejectReason authorizationFailure =
@@ -18380,6 +18485,11 @@ bool MotionCore::TryDequeueNextMotionCommand(
 
         if (authorizationFailure == MotionRejectReason::NONE)
         {
+            if(ContainCollisionPositioningRuntime(command)){
+                RejectMotionCommand(command,MotionRejectReason::NOT_READY,
+                    m_collisionCurrent.valid?AlarmManager::SHORT_CIRCUIT:AlarmManager::SHORT_PROTECTION_INPUT_INVALID);
+                return false;
+            }
             return true;
         }
 
@@ -18421,6 +18531,7 @@ bool MotionCore::TryDequeueNextMotionCommand(
 bool MotionCore::TryRequeueMotionCommandFront(
     const MotionCommand& command) noexcept
 {
+        if(!IsMotionG76SphereMarkerClear(command))return false;
     if (command.pathCoreEccentricCFeedExactStop) return false;
     MotionCommand replayCommand = command;
     replayCommand.replayTerminalAlreadyPublished =
@@ -18662,6 +18773,11 @@ void MotionCore::DiscardStaleQueuedCommands()
         {
             return;
         }
+        // A live G80 frame/configuration rejection belongs to its dedicated
+        // loader, which publishes the G80 result and precise alarm. Genuine
+        // old-epoch/old-owner transports still use normal stale retirement.
+        if ((queuedCommand.g80EdgeFind || queuedCommand.g76SphereAir) && authorizationFailure==MotionRejectReason::NOT_READY &&
+            IsCommandFromCurrentEpoch(queuedCommand) && IsCommandOwnerLeaseCurrent(queuedCommand)) return;
 
         if (HasUnacknowledgedSafetyMotionRequest())
         {
@@ -19440,6 +19556,12 @@ bool MotionCore::ApplyMachineHome(
     const MotionOwnerLease& ownerLease, bool* outDeferred, std::uint64_t homeCaptureToken)
 {
     if (outDeferred != nullptr) *outDeferred = false;
+    // EDM289: legacy direct callers share the same spindle exclusion as mailboxes.
+    if (IsRotarySpindleSessionClaimed())
+    {
+        ContainRotarySpindleRuntime(MotionRotarySpindle::Fault::Positioning, true);
+        return false;
+    }
     if (!axis.isExist ||
         axis.state != MotionState::MotionState_IDLE ||
         !std::isfinite(capturedReferencePulse) ||
@@ -21877,6 +21999,7 @@ bool MotionCore::BeginServoOutputFrameAtSendPoint(
     handoff.sourceStatusWord = proof.sourceStatusWord;
     handoff.sourceMode = proof.sourceMode;
     reservation.handoffPending = true;
+    BeginRotarySpindleSend(reservation);
     reservation.homeProbe = proof.homeProbe;
     if (proof.homeProbe.pending)
     {
@@ -22134,6 +22257,14 @@ bool MotionCore::FinalizeServoOutputFrameAtSendPoint(
     ServoOutputFrameReservation& reservation) noexcept
 {
     if (!FinalizeEDM94Send(reservation)) return false;
+    if (!ValidateRotarySpindleSend(reservation))
+    {
+        // A changed spindle scope can never retain an already-copied nonzero
+        // image. Existing reservations still own the normal release path.
+        reservation.handoff.scrubbed = true;
+        (void)ZeroAllServoTargetVelocityForFrame();
+        reservation.recopyRequired = true;
+    }
     if (reservation.edmZGuardHeld)
     {
         const EDM52::Snapshot stop = m_edmZCancelFence.Read();
@@ -22499,6 +22630,9 @@ void MotionCore::EndServoOutputFrameAfterSend(
     {
         reservation.handoff.attempted = sendAttempted;
         reservation.handoff.apiAccepted = sendAttempted && sendSucceeded;
+        ObserveG80Send(reservation.handoff);
+        ObserveG76SphereSend(reservation.handoff);
+        ObserveRotarySpindleSend(reservation);
         m_servoHandoffMonitor.Observe(reservation.handoff);
         m_pbcXSendAudit.Observe(reservation.pbcX);
         reservation.handoffPending = false;
@@ -23678,6 +23812,12 @@ double MotionCore::CalculateShortestTarget(double currentPos, double targetPos, 
 }
 bool MotionCore::MoveToPosition(AxisContext& axis, double targetPos, double targetVel, double acc_time, double dec_time)
 {
+    // EDM289: legacy direct callers share the same spindle exclusion as mailboxes.
+    if (IsRotarySpindleSessionClaimed())
+    {
+        ContainRotarySpindleRuntime(MotionRotarySpindle::Fault::Positioning, true);
+        return false;
+    }
     if (axis.axisIndex == 0 && (m_pbcXRetainRecoveryRequired.load(std::memory_order_acquire) ||
         HasPbcXUnresolvedActiveOutput())) return false;
 
@@ -23821,6 +23961,12 @@ bool MotionCore::MoveToPosition(AxisContext& axis, double targetPos, double targ
 
 void MotionCore::VelocityMove(AxisContext& axis, double velocity, double acc_time)
 {
+    // EDM289: legacy direct callers share the same spindle exclusion as mailboxes.
+    if (IsRotarySpindleSessionClaimed())
+    {
+        ContainRotarySpindleRuntime(MotionRotarySpindle::Fault::Positioning, true);
+        return;
+    }
     if (axis.axisIndex == 0 && (m_pbcXRetainRecoveryRequired.load(std::memory_order_acquire) ||
         HasPbcXUnresolvedActiveOutput())) return;
 
@@ -23908,6 +24054,12 @@ void MotionCore::MPGMove(
     double acc_time,
     double dec_time)
 {
+    // EDM289: legacy direct callers share the same spindle exclusion as mailboxes.
+    if (IsRotarySpindleSessionClaimed())
+    {
+        ContainRotarySpindleRuntime(MotionRotarySpindle::Fault::Positioning, true);
+        return;
+    }
     if (axis.axisIndex == 0 && (m_pbcXRetainRecoveryRequired.load(std::memory_order_acquire) ||
         HasPbcXUnresolvedActiveOutput())) return;
     // =====================================================
@@ -24103,6 +24255,9 @@ void MotionCore::MPGMove(
 }
 void MotionCore::StopMove(AxisContext& axis, double dec_time)
 {
+    // A direct legacy stop must also cancel a dedicated spindle trajectory.
+    if (IsRotarySpindleSessionClaimed() && !m_rotarySpindle.fault)
+        ContainRotarySpindleRuntime(MotionRotarySpindle::Fault::Positioning, true);
     // =========================================================
     // 1. 已經停止就不需要再次處理
     // =========================================================
@@ -24287,6 +24442,9 @@ void MotionCore::StopMove(AxisContext& axis, double dec_time)
 }
 void MotionCore::EmergencyStop(AxisContext& axis)
 {
+    // EDM289: a direct per-axis E-stop also revokes every active spindle intent.
+    // The global safety path has already latched containment, so this is idempotent.
+    ContainRotarySpindleRuntime(MotionRotarySpindle::Fault::Authority, true);
     // EDM195: a raw servo fault may set ERROR before emergency containment.
     // Preserve that diagnostic state, but always truncate pending targets and
     // buffered velocity, including repeated ERROR/ESTOP containment requests.
@@ -24348,6 +24506,8 @@ void MotionCore::EmergencyStopAllAxesImpl(
     bool forceExecutionInvalidation,
     MotionExecutionEpoch causalExecutionEpoch) noexcept
 {
+    // EDM289: clear saved/pending spindle RPM before global safety retires authority.
+    ContainRotarySpindleRuntime(MotionRotarySpindle::Fault::Authority, false);
     // A real Alarm/E-stop supersedes a benign operator RESET stop before it
     // can be claimed or resumed. The normal Reset flow will later use its
     // explicit zero-output safety batch; it must never resurrect this
@@ -26451,6 +26611,8 @@ void MotionCore::DetermineActiveGainSet(AxisContext& axis, bool* physicalFixture
     }
 
 
+    if (SelectG80Gains(axis)) return;
+
     // EDM165_FLUSH_GAIN_SELECT_BEGIN
     if(edm165Flush)
     {
@@ -27338,6 +27500,26 @@ void MotionCore::Run_Servo_Loop(DriveType& servo, AxisContext& axis, const AxisC
         TripEDM94(EDM94::Reason::Output);
         finalVel = 0.0;
     }
+    const bool g80DerivativeValid=ApplyG80Derivative(axis,error,finalVel);
+    if (m_g80Running && axis.axisIndex>=0 && axis.axisIndex<6 &&
+        (m_g80Frozen.axisMask&(1U<<static_cast<unsigned>(axis.axisIndex)))!=0U &&
+        (!g80DerivativeValid || !std::isfinite(finalVel) || !std::isfinite(axis.pid.integralAcc)))
+    {
+        // A G80 arithmetic fault must never be disguised as maximum speed by
+        // the legacy saturation below. Contain all parent members this pass.
+        FailG80Runtime(3U,true); finalVel=0.0;
+    }
+    if (G80DemandsZero(axis)) { finalVel=0.0; axis.pid.integralAcc=0.0; }
+    // P50 uses the existing PID bank, but a nonfinite result must be contained
+    // before legacy saturation or integer PDO conversion can disguise it.
+    if (m_g76SphereRunning && axis.axisIndex>=0 && axis.axisIndex<6 &&
+        (m_g76SphereFrozen.axisMask&(1U<<static_cast<unsigned>(axis.axisIndex)))!=0U &&
+        (!std::isfinite(finalVel) || !std::isfinite(axis.pid.integralAcc)))
+    {
+        FailG76SphereRuntime(3U,true); finalVel=0.0;
+    }
+    if (G76SphereDemandsZero(axis)) { finalVel=0.0; axis.pid.integralAcc=0.0; }
+
     // 5. [Output Clamp] 輸出限速保護
     // 限制不超過最大速度的 1.2 倍
     double limit = axis.maxVel_PPS * 1.2;
@@ -27697,6 +27879,15 @@ void MotionCore::UpdateMotionObserved(
     }
     // EDM207_DECODED_INPUT_END
     ProcessEDMZFixtureAxis(axis, input);
+    // EDM289: a claimed rotary spindle owns CSV output and its reference tuple.
+    // The adapter validates source, drive, travel and authority before this
+    // writer; positional PID cannot add correction to the authored shaft RPM.
+    std::int32_t spindleHardwarePps = 0;
+    if (ApplyRotarySpindleAxis(axis, input, spindleHardwarePps))
+    {
+        WriteServoTargetVelocityCommand(servo.pOutput, axis.axisIndex, spindleHardwarePps);
+        return;
+    }
 
     // =========================================================
 
@@ -28223,7 +28414,8 @@ bool MotionCore::TryLineMove(
     const NCXYZCFeedLineValue* xyzcGeometry,
     bool pathCoreXYZCUVFeedExactStop,
     const NCXYZCUVFeedLineValue* xyzcuvGeometry,
-    const EDM94FeedAuthorization* edm94Authorization) noexcept
+    const EDM94FeedAuthorization* edm94Authorization,
+    std::uint8_t positioningOperation) noexcept
 {
     if (preparedCommand != nullptr) *preparedCommand = MotionCommand{};
     if (producedIdentity != nullptr)
@@ -28266,6 +28458,7 @@ bool MotionCore::TryLineMove(
     invalidCommand.mode = InterpolationMode::LINEAR;
     invalidCommand.sourceLinePC = m_pendingSourcePC;
     invalidCommand.commandPathMode = commandPathMode;
+    invalidCommand.positioningOperation=positioningOperation;
 
     // Permit only the native XY queue lane under a frozen rotation. A supplied
     // Q compound must also pass full canonical geometry validation below, before
@@ -28424,6 +28617,7 @@ bool MotionCore::TryLineMove(
         axes.empty() ||
         axes.size() > static_cast<std::size_t>(MAX_AXES) ||
         targetPos.size() != axes.size() ||
+        !IsMotionPositioningOperationValid(positioningOperation) ||
         !IsValidMotionCommandPathMode(commandPathMode) ||
         !std::isfinite(targetVel) ||
         !std::isfinite(acc_time) ||
@@ -28479,6 +28673,7 @@ bool MotionCore::TryLineMove(
     // 1. 建立一個全新的任務包裹
     MotionCommand cmd{};
     cmd.mode = InterpolationMode::LINEAR;
+    cmd.positioningOperation=positioningOperation;
     cmd.axisCount = (int)axes.size();
     cmd.commandPathMode = commandPathMode;
     cmd.cncFeedLookahead = cncFeedLookahead;
@@ -28703,6 +28898,9 @@ bool MotionCore::TryLineMove(
             return false;
         }
     }
+
+    if (RejectCollisionPositioningProducer(cmd,commandEpoch,commandSource,commandOwnerLease,
+        producedIdentity,producedOwnerLease)) return false;
 
     if (preparedCommand != nullptr)
     {
@@ -29689,6 +29887,7 @@ void MotionCore::RefreshCncFeedLookahead(bool loading) noexcept
 
 void MotionCore::LoadNextCommand(bool cncBoundaryCrossing)
 {
+    if (m_Group.isActive && (m_Group.currentCmd.g80EdgeFind || m_Group.currentCmd.g76SphereAir)) return;
     // A marked outgoing segment always retires with both authority words
     // reserved. Never complete/clear it through the legacy native handoff.
     if (m_Group.isActive && m_Group.currentCmd.pathCoreEccentricCFeedExactStop) return;
@@ -29747,12 +29946,21 @@ void MotionCore::LoadNextCommand(bool cncBoundaryCrossing)
     }
 
     MotionCommand frontCommand{};
-    if (!TryPeekNextMotionCommand(frontCommand) ||
-        GetCommandAuthorizationFailure(frontCommand) !=
-        MotionRejectReason::NONE)
+    if (!TryPeekNextMotionCommand(frontCommand)) return;
+    if (frontCommand.g76SphereAir)
     {
+        if (!m_Group.isActive && !cncBoundaryCrossing) (void)LoadG76SphereCommand(frontCommand);
         return;
     }
+    if (frontCommand.g80EdgeFind)
+    {
+        // G80 owns rejection as well as start: a missing physical source or
+        // changed frozen frame must produce a terminal, not park the queue.
+        if (!m_Group.isActive && !cncBoundaryCrossing) (void)LoadG80Command(frontCommand);
+        return;
+    }
+    if (GetCommandAuthorizationFailure(frontCommand)!=MotionRejectReason::NONE) return;
+    if(ContainCollisionPositioningRuntime(frontCommand))return;
 
     // BASE79F: a curve packet owns its complete decode/pop/start transaction.
     // Let an outgoing exact-stop group retire through the common endpoint
@@ -33154,6 +33362,7 @@ void MotionCore::Process_Forward_Crossing()
         return;
     }
 
+    if(ContainCollisionPositioningRuntime(frontCommand))return;
     const bool forwardMappingSafe =
         IsMotionCommandConsumerGeometryValid(
             m_Group.currentCmd,
@@ -33653,6 +33862,16 @@ void MotionCore::UpdateInterpolation()
         TryAcknowledgeAppliedSafetyMotionRequests();
     }
 
+    if (m_g76SphereRunning && (!m_Group.isActive || !m_Group.currentCmd.g76SphereAir ||
+        GetCommandAuthorizationFailure(m_g76SphereFrozen.command)!=MotionRejectReason::NONE ||
+        m_safetyControlledStopInProgress))
+        FailG76SphereRuntime(2U,true);
+
+    if (m_g80Running && (!m_Group.isActive || !m_Group.currentCmd.g80EdgeFind ||
+        GetCommandAuthorizationFailure(m_g80Frozen.command)!=MotionRejectReason::NONE ||
+        m_safetyControlledStopInProgress))
+        FailG80Runtime(2U,true);
+
     // Keep competing ordinary motion fenced immediately. The existing J.5
     // settle consumer below must still service P13 PROGRAM HOLD requests.
     if (m_edmZPolicy.Snapshot().capHeld)
@@ -33920,6 +34139,9 @@ void MotionCore::UpdateInterpolation()
 
 
 
+
+    if (m_g76SphereRunning) { (void)StepG76SphereRuntime(); return; }
+    if (m_g80Running) { (void)StepG80Runtime(); return; }
 
     AxisContext& vAxis = m_Group.virtualAxis; // 先取得 vAxis 的引用
     double dt = CYCLE_TIME_SEC;
@@ -34253,6 +34475,7 @@ void MotionCore::UpdateInterpolation()
             // 大腦算完了，且實體馬達也都擠進視窗了，才准拆下一個包裹！
             if (allAxesInPos && !m_Group.cmdQueue.empty()) {
                 LoadNextCommand();
+                if (m_g80Running || m_g76SphereRunning) return;
             }
         }
         if (!m_Group.isActive) return;
@@ -34370,6 +34593,7 @@ void MotionCore::UpdateInterpolation()
                     vCmd.instantCmdVel = outputVelocity;
                 }
                 else LoadNextCommand();
+                if (m_g80Running || m_g76SphereRunning) return;
             }
         }
 
@@ -39476,4 +39700,192 @@ bool MotionCore::RetireEccentricCCommand() noexcept
         CompleteResetControlledStop();
     }
     return true;
+}
+
+
+namespace {
+bool CollisionManualOwner(const MotionOwnerLease& owner) noexcept
+{ return owner.owner==MotionOwner::JOG||owner.owner==MotionOwner::MPG; }
+int CollisionPositioningAlarm(std::uint8_t operation,const EDMShortCircuitProtection::Snapshot& state) noexcept
+{
+    const auto action=EDMShortCircuitProtection::Evaluate(
+        static_cast<EDMShortCircuitProtection::Operation>(operation),state,false);
+    if(action==EDMShortCircuitProtection::Response::EmergencyStopAlarm)return AlarmManager::SHORT_CIRCUIT;
+    if(action==EDMShortCircuitProtection::Response::InvalidSource)return AlarmManager::SHORT_PROTECTION_INPUT_INVALID;
+    return 0;
+}
+bool CollisionSamePhysicalReceipt(const EDM63::Receipt& a,const EDM63::Receipt& b) noexcept
+{
+    const auto& x=a.conversion;const auto& y=b.conversion;
+    return EDM63::SameSample(a.sample,b.sample)&&a.observerGeneration==b.observerGeneration&&
+        a.expectedProfileRevision==b.expectedProfileRevision&&a.expectedCalibrationRevision==b.expectedCalibrationRevision&&
+        x.inputStatus==y.inputStatus&&x.boardVoltageValid==y.boardVoltageValid&&x.zeroClamped==y.zeroClamped&&
+        x.gapInRange==y.gapInRange&&x.boardVoltageMv==y.boardVoltageMv&&x.voltageMv==y.voltageMv;
+}
+}
+
+bool MotionCore::ConfigureCollisionProtection(const EDMGapServo::Profile& profile,bool valid) noexcept
+{
+    CollisionProtectionConfiguration request{};
+    request.valid=valid&&EDMShortCircuitProtection::MakeConfig(profile,request.config);
+    const auto owner=GetMotionOwnerLease();
+    // Valid threshold changes are idle-only and report rejection before the
+    // NC producer commits its candidate. Explicit startup/load failure still
+    // invalidates protection regardless of the current owner.
+    if(valid&&(!request.valid||(owner.owner!=MotionOwner::NONE&&owner.owner!=MotionOwner::IDLE_HOLD)))return false;
+    request.generation=m_collisionNextConfiguration++;
+    if(!request.generation)request.generation=m_collisionNextConfiguration++;
+    const bool published=m_collisionConfiguration.Publish(request);
+    if(published||!valid)m_collisionConfigurationRequested.store(request.generation,std::memory_order_release);
+    return published;
+}
+
+void MotionCore::SetManualShortBypass(bool bypass) noexcept
+{m_collisionManualBypass.store(bypass,std::memory_order_release);}
+
+bool MotionCore::ReadCollisionProtection(EDMShortCircuitProtection::Snapshot& out) const noexcept
+{
+    CollisionProtectionFeedback report{};
+    if(!m_collisionFeedback.Read(report).Ready()){
+        out=EDMShortCircuitProtection::Snapshot{};
+        out.shortActive=m_collisionAcceptedShort.load(std::memory_order_acquire);
+        out.manualStopSequence=m_collisionManualStopSequence.load(std::memory_order_acquire);
+        return false;
+    }
+    out=report.protection;
+    if(!report.configurationGeneration||report.configurationGeneration!=
+        m_collisionConfigurationRequested.load(std::memory_order_acquire)){
+        out.valid=false;out.blocked=true;
+    }
+    return true;
+}
+
+bool MotionCore::IsManualCollisionBlocked(const MotionOwnerLease& owner) const noexcept
+{
+    if(!CollisionManualOwner(owner))return false;
+    const auto tripped=UnpackMotionOwnerState(m_collisionManualBlockedOwnerState.load(std::memory_order_acquire));
+    if(owner.Matches(tripped))return true; // A cleared level/C20 never resurrects this manual lease.
+    EDMShortCircuitProtection::Snapshot current{};
+    if(!ReadCollisionProtection(current)||!current.valid)return true;
+    return current.shortActive&&!m_collisionManualBypass.load(std::memory_order_acquire);
+}
+
+bool MotionCore::RejectCollisionPositioningProducer(MotionCommand command,MotionExecutionEpoch epoch,
+    MotionCommandSource source,const MotionOwnerLease& owner,
+    MotionExecutionIdentity* producedIdentity,MotionOwnerLease* producedOwner) noexcept
+{
+    if(command.g80EdgeFind||!epoch||epoch!=GetCurrentExecutionEpoch()||!IsMotionOwnerLeaseCurrent(owner))return false;
+    EDMShortCircuitProtection::Snapshot protection{};(void)ReadCollisionProtection(protection);
+    const int alarm=CollisionPositioningAlarm(command.positioningOperation,protection);
+    if(!alarm)return false;
+    if(!command.execution.IsAssigned())AssignExecutionIdentity(command,epoch,source,owner);
+    if(producedIdentity)*producedIdentity=command.execution;
+    if(producedOwner)*producedOwner=command.ownerLease;
+    m_lastRejectedSegmentId.store(command.execution.segmentId,std::memory_order_relaxed);
+    TryQueueProducerFeedbackNotice(command,MotionFeedbackType::REJECTED,MotionRejectReason::NOT_READY,
+        static_cast<std::uint32_t>(alarm),0.0);
+    ObserveCommandPathModeProducer(command,false);
+    RecordProgramBlockMotionSubmission(command,false,MotionRejectReason::NOT_READY);
+    AlarmManager::GetInstance().Trigger(alarm,command.sourceLinePC);
+    RequestEmergencyStopAllAxes();
+    return true;
+}
+
+bool MotionCore::ContainCollisionPositioningRuntime(const MotionCommand& command) noexcept
+{
+    if(command.g80EdgeFind||!IsCommandFromCurrentEpoch(command)||!IsCommandOwnerLeaseCurrent(command))return false;
+    const int alarm=CollisionPositioningAlarm(command.positioningOperation,m_collisionCurrent);
+    if(!alarm)return false;
+    if(IsTrackedMotionCommand(command)&&m_feedbackTrackedStarted)
+        FaultTrackedMotionCommand(static_cast<std::uint32_t>(alarm),MotionRejectReason::NOT_READY);
+    AlarmManager::GetInstance().Trigger(alarm,command.sourceLinePC);
+    EmergencyStopAllAxes();
+    return true;
+}
+
+void MotionCore::ObserveCollisionProtectionRuntime() noexcept
+{
+    CollisionProtectionConfiguration configured{};
+    const bool readConfiguration=m_collisionConfiguration.Read(configured).Ready();
+    const auto requested=m_collisionConfigurationRequested.load(std::memory_order_acquire);
+    if(readConfiguration&&configured.generation==requested&&configured.generation!=m_collisionRuntimeConfiguration){
+        m_collisionRuntimeConfiguration=configured.generation;
+        m_collisionConfigurationValid=configured.valid;
+        auto config=configured.config;if(!configured.valid)config.revision=0ULL;
+        m_collisionConfigurationValid=m_collisionDetector.Configure(config)&&configured.valid;
+    }
+    EDMShortCircuitProtection::Input input{};
+    const auto& receipt=m_edm129Physical.input;const auto& sample=receipt.sample;
+    input.sequence=sample.sequence;input.nowUs=m_edmZMonotonicUs;input.capturedAtUs=sample.capturedAtUs;
+    input.voltageV=static_cast<double>(receipt.conversion.voltageMv)/1000.0;
+    const auto route=EDM63::ProducerRoute(sample);
+    if(!m_collisionHaveRoute||!EDM63::SameRoute(m_collisionRoute,route)||
+       m_collisionObserverGeneration!=receipt.observerGeneration){
+        m_collisionRoute=route;m_collisionHaveRoute=true;m_collisionObserverGeneration=receipt.observerGeneration;
+        if(m_collisionSourceIdentity!=(std::numeric_limits<std::uint64_t>::max)())++m_collisionSourceIdentity;
+        else m_collisionConfigurationValid=false; // Identity exhaustion cannot alias a prior source.
+    }
+    input.sourceIdentity=m_collisionSourceIdentity;
+    input.sourceRevision=(static_cast<std::uint64_t>(receipt.expectedProfileRevision)<<32U)|receipt.expectedCalibrationRevision;
+    input.valid=readConfiguration&&requested!=0ULL&&configured.generation==requested&&
+        m_collisionRuntimeConfiguration==requested&&m_collisionConfigurationValid&&
+        m_ncSettleRuntimeCycleValid&&m_ncSettleRuntimeCycleContiguous&&m_edm129PhysicalStamp.Ready()&&
+        MotionG80RuntimeProof::FreshPhysicalInput(receipt,m_edmZMonotonicUs,m_edmZClockFrequency,0ULL,m_edmZClockValid);
+    // One sequence denotes one immutable ADC reading. A repeated sequence
+    // whose timestamp/raw/conversion was mutated is invalid, never a fresh
+    // sample or a reason to retain a clear level. Exact duplicates still age.
+    const bool sameIdentity=m_collisionHaveReceipt&&input.sequence==m_collisionLastSequence&&
+        input.sourceIdentity==m_collisionLastSource&&input.sourceRevision==m_collisionLastRevision;
+    const bool mutatedDuplicate=sameIdentity&&!CollisionSamePhysicalReceipt(m_collisionLastReceipt,receipt);
+    if(mutatedDuplicate)input.valid=false;
+    if(!input.valid||!sameIdentity){
+        m_collisionCurrent=m_collisionDetector.Step(input);
+        if(!sameIdentity){
+            m_collisionLastReceipt=receipt;m_collisionHaveReceipt=true;
+            m_collisionLastSequence=input.sequence;m_collisionLastSource=input.sourceIdentity;m_collisionLastRevision=input.sourceRevision;
+        }
+    }else m_collisionCurrent=m_collisionDetector.Current();
+    m_collisionAcceptedShort.store(m_collisionCurrent.shortActive,std::memory_order_release);
+    const auto owner=GetMotionOwnerLease();
+    if(CollisionManualOwner(owner)&&IsMotionOwnerLeaseCurrent(owner)&&
+       (!m_collisionCurrent.valid||(m_collisionCurrent.shortActive&&
+        !m_collisionManualBypass.load(std::memory_order_acquire))))TripManualCollisionRuntime(owner);
+    if(m_Group.isActive&&!m_Group.currentCmd.g80EdgeFind)
+        (void)ContainCollisionPositioningRuntime(m_Group.currentCmd);
+    m_collisionCurrent.manualStopSequence=m_collisionManualStopSequence.load(std::memory_order_acquire);
+    CollisionProtectionFeedback feedback{};feedback.protection=m_collisionCurrent;
+    feedback.configurationGeneration=m_collisionRuntimeConfiguration;feedback.tick=m_ncSettleRuntimeCycleTick;
+    (void)m_collisionFeedback.Publish(feedback);
+}
+
+
+void MotionCore::TripManualCollisionRuntime(const MotionOwnerLease& owner) noexcept
+{
+    if(!CollisionManualOwner(owner)||!IsMotionOwnerLeaseCurrent(owner))return;
+    if(!m_collisionManualStopOwner.Matches(owner)){
+        m_collisionManualStopOwner=owner;m_collisionManualStoppedAxes=0U;
+        // Retire the entire immutable lease's pending/preempted intent. NC
+        // must release it after neutral+standstill, then acquire a new lease.
+        m_collisionManualBlockedOwnerState.store(PackMotionOwnerState(owner.owner,owner.generation),std::memory_order_release);
+        auto episode=m_collisionManualStopSequence.fetch_add(1ULL,std::memory_order_acq_rel)+1ULL;
+        if(!episode)m_collisionManualStopSequence.fetch_add(1ULL,std::memory_order_acq_rel);
+    }
+    if(m_pContexts==nullptr||m_Group.isActive)return;
+    for(std::size_t i=0;i<m_pContexts->size()&&i<static_cast<std::size_t>(MAX_AXES);++i){
+        auto& axis=(*m_pContexts)[i];const auto bit=1U<<static_cast<unsigned>(i);
+        const bool ownedAxis=(m_collisionManualAxisOwner.Matches(owner)&&(m_collisionManualAxes&bit))||
+            axis.state==MotionState::MotionState_MOVING||axis.state==MotionState::MotionState_VELOCITY||
+            axis.state==MotionState::MotionState_MPG;
+        if(!axis.isExist||!ownedAxis||(m_collisionManualStoppedAxes&bit)||axis.isFault||axis.isLagAlarm||
+           axis.state==MotionState::MotionState_ERROR||axis.state==MotionState::MotionState_ESTOP)continue;
+        if(!std::isfinite(axis.currentCmdPos)||!std::isfinite(axis.planningPos)||
+           !std::isfinite(axis.currentCmdVel)||!std::isfinite(axis.logicalCmdVel)||!std::isfinite(axis.targetVelocity)){
+            TriggerGroupMappingIntegrityEmergencyStop(static_cast<int>(i),true);return; // A hard numeric fault is never bypassed.
+        }
+        if(axis.state!=MotionState::MotionState_IDLE&&axis.state!=MotionState::MotionState_STOPPING){
+            const double dec=std::isfinite(axis.Stop_dec_time)&&axis.Stop_dec_time>=0.001?axis.Stop_dec_time:0.2;
+            StopMove(axis,dec);
+        }
+        m_collisionManualStoppedAxes|=bit;
+    }
 }

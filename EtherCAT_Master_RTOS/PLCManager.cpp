@@ -757,6 +757,8 @@ void PLCManager::Init()
     std::memset(m_O, 0, sizeof(m_O));
     std::memset(m_A, 0, sizeof(m_A));
     m_edmOutputWord.store(0U, std::memory_order_release);
+    PublishAuxiliaryOutputs(-1, -1, 0U);
+    m_auxiliaryFinishLevel.store(0U, std::memory_order_release);
     std::memset(m_S, 0, sizeof(m_S));
     std::memset(m_C, 0, sizeof(m_C));
     std::memset(m_R, 0, sizeof(m_R));
@@ -795,6 +797,8 @@ void PLCManager::Close_PLC()
     std::memset(m_O, 0, sizeof(m_O));
     std::memset(m_A, 0, sizeof(m_A));
     m_edmOutputWord.store(0U, std::memory_order_release);
+    PublishAuxiliaryOutputs(-1, -1, 0U);
+    m_auxiliaryFinishLevel.store(0U, std::memory_order_release);
     std::memset(m_S, 0, sizeof(m_S));
     std::memset(m_C, 0, sizeof(m_C));
     std::memset(m_R, 0, sizeof(m_R));
@@ -966,11 +970,11 @@ double PLCManager::GetOperandAsDouble(const PLCOperand& op) {
     switch (op.region) {
     case 0: return m_I[addr];
     case 1: return m_O[addr];
-    case 2: return m_C[addr];
+    case 2: return Get_C(addr);
     case 3: return Get_S(addr); // V7.4.3: restore S as readable operand.
     case 4: return m_A[addr]; // V7.4.3: restore A as readable operand.
     case 5: return m_T[addr].done ? 1.0 : 0.0;
-    case 6: return m_R[addr];
+    case 6: return GetReg_R(addr);
     case 7: return m_DR[addr];
     case 9: return m_F[addr];
     case 10: return m_L[addr];
@@ -1039,7 +1043,7 @@ void PLCManager::SetOperandFromDouble(const PLCOperand& op, double val) {
 
     const int addr = op.payload.address;
     switch (op.region) {
-    case 6: m_R[addr] = ClampDoubleToInt32(val); break;
+    case 6: SetReg_R(addr, ClampDoubleToInt32(val)); break;
     case 7: m_DR[addr] = ClampDoubleToInt32(val); break;
     case 9: m_F[addr] = ClampDoubleToFloat(val); break;
     case 10:
@@ -1052,7 +1056,7 @@ void PLCManager::SetOperandFromDouble(const PLCOperand& op, double val) {
         }
         break;
     case 1: m_O[addr] = (val != 0); break;
-    case 2: m_C[addr] = (val != 0); break;
+    case 2: Set_C(addr, val != 0); break;
     case 3: Set_S(addr, val != 0); break;
     case 4: m_A[addr] = (val != 0); break;
     case 0:
@@ -2466,8 +2470,16 @@ bool PLCManager::GetBit_I(int index) const { if (index >= 0 && index < MAX_PLC_I
 void PLCManager::SetBit_O(int index, bool value) { if (index >= 0 && index < MAX_PLC_O) m_O[index] = value ? 1 : 0; }
 bool PLCManager::GetBit_O(int index) const { if (index >= 0 && index < MAX_PLC_O) return m_O[index] != 0; return false; }
 
-int32_t PLCManager::GetReg_R(int index) const { if (index >= 0 && index < MAX_PLC_R) return m_R[index]; return 0; }
-void PLCManager::SetReg_R(int index, int32_t value) { if (index >= 0 && index < MAX_PLC_R) m_R[index] = value; }
+int32_t PLCManager::GetReg_R(int index) const {
+    if (index == 1) return m_auxiliaryMCode.load(std::memory_order_acquire);
+    if (index == 2) return m_auxiliaryTCode.load(std::memory_order_acquire);
+    if (index >= 0 && index < MAX_PLC_R) return m_R[index];
+    return 0;
+}
+void PLCManager::SetReg_R(int index, int32_t value) {
+    if (index == 1 || index == 2) return; // EDM282: only NC may publish R1/R2.
+    if (index >= 0 && index < MAX_PLC_R) m_R[index] = value;
+}
 
 int32_t PLCManager::GetReg_DR(int index) const { if (index >= 0 && index < MAX_PLC_DR) return m_DR[index]; return 0; }
 void PLCManager::SetReg_DR(int index, int32_t value) { if (index >= 0 && index < MAX_PLC_DR) m_DR[index] = value; }
@@ -2493,7 +2505,22 @@ void PLCManager::PublishEDMOutputs(unsigned word) noexcept {
     m_edmOutputWord.store(word & EDM137PLC::OutputMask, std::memory_order_release);
 }
 
+void PLCManager::PublishAuxiliaryOutputs(
+    int32_t mCode, int32_t tCode, unsigned requestWord) noexcept
+{
+    requestWord &= 3U;
+    if (requestWord == 3U) requestWord = 0U; // Never expose simultaneous requests.
+    // Retire the request before a RESET changes its data; active publication
+    // writes both code values before releasing the matching request level.
+    if (requestWord == 0U)
+        m_auxiliaryRequestWord.store(0U, std::memory_order_release);
+    m_auxiliaryMCode.store(mCode, std::memory_order_release);
+    m_auxiliaryTCode.store(tCode, std::memory_order_release);
+    m_auxiliaryRequestWord.store(requestWord, std::memory_order_release);
+}
+
 void PLCManager::Set_S(int index, bool value) {
+    if (index == 51 || index == 52) return; // EDM282: NC-owned request levels.
     if (EDM137PLC::ReservedPoint(index)) return;
     if (index >= 0 && index < MAX_PLC_S) {
         m_S[index] = value ? 1 : 0;
@@ -2501,6 +2528,9 @@ void PLCManager::Set_S(int index, bool value) {
 }
 
 bool PLCManager::Get_S(int index) const {
+    if (index == 51 || index == 52)
+        return (m_auxiliaryRequestWord.load(std::memory_order_acquire) &
+            (index == 51 ? 1U : 2U)) != 0U;
     if (EDM137PLC::ReservedPoint(index))
         return (m_edmOutputWord.load(std::memory_order_acquire) & EDM137PLC::PointBit(index)) != 0U;
     if (index >= 0 && index < MAX_PLC_S) {
@@ -2511,6 +2541,11 @@ bool PLCManager::Get_S(int index) const {
 
 void PLCManager::Set_C(int index, bool value)
 {
+    if (index == 10)
+    {
+        m_auxiliaryFinishLevel.store(value ? 1U : 0U, std::memory_order_release);
+        return;
+    }
     if (index >= 0 && index < MAX_PLC_C)
     {
         m_C[index] = value ? 1 : 0;
@@ -2519,6 +2554,8 @@ void PLCManager::Set_C(int index, bool value)
 
 bool PLCManager::Get_C(int index) const
 {
+    if (index == 10)
+        return m_auxiliaryFinishLevel.load(std::memory_order_acquire) != 0U;
     if (index >= 0 && index < MAX_PLC_C)
     {
         return m_C[index] != 0;
@@ -2532,8 +2569,8 @@ double PLCManager::GetMemory(const std::string& prefix, int index) const {
     if (prefix == "O" && index >= 0 && index < MAX_PLC_O) return m_O[index];
     if (prefix == "A" && index >= 0 && index < MAX_PLC_A) return m_A[index]; // 🌟 A 點
     if (prefix == "S" && index >= 0 && index < MAX_PLC_S) return Get_S(index); // 🌟 S 點
-    if (prefix == "C" && index >= 0 && index < MAX_PLC_C) return m_C[index];
-    if (prefix == "R" && index >= 0 && index < MAX_PLC_R) return m_R[index];
+    if (prefix == "C" && index >= 0 && index < MAX_PLC_C) return Get_C(index);
+    if (prefix == "R" && index >= 0 && index < MAX_PLC_R) return GetReg_R(index);
     if (prefix == "DR" && index >= 0 && index < MAX_PLC_DR) return m_DR[index];
     if (prefix == "F" && index >= 0 && index < MAX_PLC_F) return m_F[index];
     if (prefix == "L" && index >= 0 && index < MAX_PLC_L) return m_L[index];
@@ -2547,8 +2584,8 @@ void PLCManager::SetMemory(const std::string& prefix, int index, double value) {
     else if (prefix == "O" && index >= 0 && index < MAX_PLC_O) m_O[index] = (value != 0);
     else if (prefix == "A" && index >= 0 && index < MAX_PLC_A) m_A[index] = (value != 0); // 🌟 A 點
     else if (prefix == "S" && index >= 0 && index < MAX_PLC_S) Set_S(index, value != 0); // 🌟 S 點
-    else if (prefix == "C" && index >= 0 && index < MAX_PLC_C) m_C[index] = (value != 0);
-    else if (prefix == "R" && index >= 0 && index < MAX_PLC_R) m_R[index] = ClampDoubleToInt32(value);
+    else if (prefix == "C" && index >= 0 && index < MAX_PLC_C) Set_C(index, value != 0);
+    else if (prefix == "R" && index >= 0 && index < MAX_PLC_R) SetReg_R(index, ClampDoubleToInt32(value));
     else if (prefix == "DR" && index >= 0 && index < MAX_PLC_DR) m_DR[index] = ClampDoubleToInt32(value);
     else if (prefix == "F" && index >= 0 && index < MAX_PLC_F) m_F[index] = ClampDoubleToFloat(value);
     else if (prefix == "L" && index >= 0 && index < MAX_PLC_L) {
@@ -2674,6 +2711,12 @@ void PLCManager::ExportPLCStatus(SHM_PLC_Status* pStatus) const
     std::memcpy(pStatus->C, m_C, sizeof(m_C));
     std::memcpy(pStatus->R, m_R, sizeof(m_R));
     std::memcpy(pStatus->DR, m_DR, sizeof(m_DR));
+    const unsigned auxiliaryWord = m_auxiliaryRequestWord.load(std::memory_order_acquire);
+    pStatus->S[51] = (auxiliaryWord & 1U) != 0U;
+    pStatus->S[52] = (auxiliaryWord & 2U) != 0U;
+    pStatus->R[1] = GetReg_R(1);
+    pStatus->R[2] = GetReg_R(2);
+    pStatus->C[10] = Get_C(10) ? 1 : 0;
 
     // Timer 因為是 Struct，我們把它拆解放入對應的陣列給人機
     for (int i = 0; i < MAX_PLC_T; i++) {

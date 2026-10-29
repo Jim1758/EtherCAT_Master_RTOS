@@ -14,12 +14,15 @@ constexpr int MAX_SYS_VARS = 1000;     // 系統變數 $1~$1000
 
 namespace MacroVariableRules
 {
+    constexpr int G80ResultFirst = 701;
+    constexpr int G80ResultLast = 899;
     // TUNE17: result, comparison and live telemetry mirrors are published only through SetSysVar.
     constexpr int TuningResultFirst = 901;
     constexpr int TuningResultLast = 999;
     inline bool IsReadOnlySystemIndex(int index) noexcept
     {
-        return index >= TuningResultFirst && index <= TuningResultLast;
+        return (index >= G80ResultFirst && index <= G80ResultLast) ||
+            (index >= TuningResultFirst && index <= TuningResultLast);
     }
 
     inline bool IsValidIndex(char prefix, int index) noexcept

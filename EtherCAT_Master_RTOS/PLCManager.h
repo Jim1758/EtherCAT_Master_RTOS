@@ -290,6 +290,10 @@ public:
     // Read-only snapshot for HMI / Studio comparison.
     PLCLogicVerificationState GetLogicVerificationState() const;
 
+    // EDM286 coherent commanded-output intent; not physical HV feedback.
+    unsigned ReadEDMOutputWord() const noexcept
+    { return m_edmOutputWord.load(std::memory_order_acquire); }
+
     // V7.6.3 Runtime Scan Health.
     // Read-only; no SHM dependency inside PLCManager.
     PLCScanHealth GetScanHealth() const;
@@ -299,6 +303,13 @@ private:
     // Only the NC owner can publish these three reserved S points.
     void PublishEDMOutputs(unsigned word) noexcept;
     std::atomic<unsigned> m_edmOutputWord{0U};
+    // EDM282: NC owns the two auxiliary requests and their latched codes.
+    void PublishAuxiliaryOutputs(int32_t mCode, int32_t tCode, unsigned requestWord) noexcept;
+    std::atomic<int32_t> m_auxiliaryMCode{-1};
+    std::atomic<int32_t> m_auxiliaryTCode{-1};
+    std::atomic<unsigned> m_auxiliaryRequestWord{0U};
+    // C10 remains PLC/HMI writable; NC only observes the atomic FIN level.
+    std::atomic<unsigned> m_auxiliaryFinishLevel{0U};
 
     // 🌟 移除 std::mutex，改用 RTX64 支援的臨界區段
     mutable CRITICAL_SECTION m_logicCS;

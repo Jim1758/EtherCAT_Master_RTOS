@@ -257,6 +257,13 @@ namespace GCodeHandlers
 
         // 6. 下達移動命令！(底層會自動套用 G00 的快速定位 PID 與速度)
 
+        // A literal immediate G80 can own one rapid/seek compound parent.
+        // Declining lookahead leaves the ordinary rapid and next row intact.
+        bool g80Handled=false;
+        if(nc->TryStartG80ApproachSameThread(block,targetMCS,axisProgrammed,
+            rapidOverrideCandidate,g80Handled))return nullptr;
+        if(g80Handled)return [](NCManager*){return true;};
+
         const bool continuousPath =
             block.has('P') && block.val('P') == 1.0;
         const bool readAheadExactStop =

@@ -6,7 +6,26 @@
 #include "AlarmManager.h"
 #include <cstdint>
 #include <cmath>
+#include <cstdarg>
+#include <cstdio>
+#include "EDMShortCircuitProtection.h"
+#include <windows.h> // Explicit Windows SDK types before RTX SDK declarations.
 #include <rtapi.h> // BASE65 START_DIAG1: supervisory diagnostics only.
+
+namespace {
+// NC thread only. RTSS receives one bounded string, no floating-point varargs.
+void PrintCollisionDiagnostic(const char* format, ...) noexcept {
+    char line[481]{};
+    va_list args;va_start(args,format);
+    const int count=std::vsnprintf(line,sizeof(line),format,args);
+    va_end(args);
+    if(count<0 || static_cast<unsigned>(count)>=sizeof(line)) {
+        RtPrintf("%s","[SHORT] build=EDM280 event=LOG_FORMAT_FAILURE dataValid=0\n");
+        return;
+    }
+    RtPrintf("%s",line);
+}
+}
 
 // =========================================================
 // Constructor
@@ -14,6 +33,10 @@
 NCPLCManager::NCPLCManager(NCManager& nc, MotionCore& motion, PLCManager& plc)
     : m_nc(nc), m_motion(motion), m_plc(plc)
 {
+    // Fail-safe startup: PLC C20 defaults OFF; the first scan samples its actual level.
+    m_edmProtectionBypass=false;
+    m_motion.SetManualShortBypass(false);
+    m_plc.Set_S(NCPLC::S::EDM_PROTECTION_BYPASS_ACTIVE,false);
     m_lastMPGCount = static_cast<int32_t>(m_plc.GetMemory("DR", NCPLC::DR::MPG_ENCODER_COUNT)); // MPG DR200 baseline. Avoid a startup jump if DR200 is already non-zero.
 }
 
@@ -36,6 +59,7 @@ bool NCPLCManager::QueueManualStop(
 bool NCPLCManager::QueueManualVelocity(
     int axisIndex, double velocity, double accelerationTime) noexcept
 {
+    if(m_manualShortGateActive)return false; // Producer gate; RT repeats the live source check.
     return m_motion.SubmitAxisVelocityMove(
         axisIndex, velocity, accelerationTime, GetManualCommandSource(),
         m_manualMotionLease);
@@ -45,6 +69,7 @@ bool NCPLCManager::QueueManualMPG(
     int axisIndex, double targetPosition, double maximumVelocity,
     double accelerationTime, double decelerationTime) noexcept
 {
+    if(m_manualShortGateActive)return false; // Producer gate; RT repeats the live source check.
     return m_motion.SubmitAxisMPGMove(
         axisIndex, targetPosition, maximumVelocity, accelerationTime,
         decelerationTime, GetManualCommandSource(), m_manualMotionLease);
@@ -55,6 +80,7 @@ bool NCPLCManager::QueueManualMove(
     double accelerationTime, double decelerationTime,
     bool useShortestPath) noexcept
 {
+    if(m_manualShortGateActive)return false; // Producer gate; RT repeats the live source check.
     return m_motion.SubmitAxisMoveToPosition(
         axisIndex, targetPosition, targetVelocity, accelerationTime,
         decelerationTime, useShortestPath, GetManualCommandSource(),
@@ -92,6 +118,7 @@ void NCPLCManager::Process()
 {
     // Single control-side consumer for RT mailbox results.
     m_motion.ProcessAxisCommandResults();
+    UpdateCollisionProtectionSameThread(); // C20 and physical status stay current on safety early returns.
 
     ProcessSafetyInputs(); // 1. Safety First
 
@@ -289,8 +316,8 @@ void NCPLCManager::ProcessGlobalInputs()
     const bool blockSkip = m_plc.Get_C(NCPLC::C::BLOCK_SKIP); // C18 - Block Skip (Level Signal)
     m_nc.SetBlockSkipEnabled(blockSkip);
 
-    m_edmProtectionBypass = m_plc.Get_C(NCPLC::C::EDM_PROTECTION_BYPASS); // C20 - EDM Protection Bypass: 只保存狀態。不能 bypass: Emergency, Hard Limit, Axis Protection, Servo Fault, Lag Alarm, Safety Chain
 
+    // EDM280 sampled before safety gate: m_edmProtectionBypass = m_plc.Get_C(NCPLC::C::EDM_PROTECTION_BYPASS); // C20 - EDM Protection Bypass: 只保存狀態。不能 bypass: Emergency, Hard Limit, Axis Protection, Servo Fault, Lag Alarm, Safety Chain
     const bool controlledStop = m_plc.Get_C(NCPLC::C::CONTROLLED_STOP); // C4 - Controlled Stop / Feed Hold (Rising Edge)
     if (controlledStop && !m_prevControlledStop)
     {
@@ -477,6 +504,117 @@ void NCPLCManager::ProcessSafetyInputs()
 // =========================================================
 // Manual Inputs
 // =========================================================
+void NCPLCManager::UpdateCollisionProtectionSameThread() noexcept
+{
+    const bool previousValid=m_collisionValid,previousShort=m_collisionShortActive;
+    const bool previousBypass=m_edmProtectionBypass;
+    const auto previousStopSequence=m_collisionManualStopSequence;
+    m_edmProtectionBypass=m_plc.Get_C(NCPLC::C::EDM_PROTECTION_BYPASS);
+    m_motion.SetManualShortBypass(m_edmProtectionBypass);
+    EDMShortCircuitProtection::Snapshot observed{};
+    const bool ready=m_motion.ReadCollisionProtection(observed);
+    m_collisionValid=ready&&observed.valid;
+    if(ready){
+        // The RT snapshot retains its accepted short level through invalid input.
+        m_collisionShortActive=observed.shortActive;
+        m_collisionSequence=observed.sequence;
+        m_collisionManualStopSequence=observed.manualStopSequence;
+    }
+    // A busy/missing read invalidates admission but never clears accepted S207.
+    m_plc.Set_S(NCPLC::S::SHORT_ACTIVE,m_collisionShortActive);
+    m_plc.Set_S(NCPLC::S::EDM_PROTECTION_BYPASS_ACTIVE,m_edmProtectionBypass);
+    if(!m_collisionLogInitialized||previousValid!=m_collisionValid||
+       previousShort!=m_collisionShortActive||previousBypass!=m_edmProtectionBypass||
+       previousStopSequence!=m_collisionManualStopSequence){
+        m_collisionLogInitialized=true;
+        PrintCollisionDiagnostic("[SHORT] build=EDM280 event=SHORT_STATE valid=%u short=%u bypass=%u S207=%u S202=%u sequence=%llu manualStopSequence=%llu source=PHYSICAL\n",
+            m_collisionValid?1U:0U,m_collisionShortActive?1U:0U,m_edmProtectionBypass?1U:0U,
+            m_collisionShortActive?1U:0U,m_edmProtectionBypass?1U:0U,
+            static_cast<unsigned long long>(m_collisionSequence),static_cast<unsigned long long>(m_collisionManualStopSequence));
+    }
+}
+
+bool NCPLCManager::ApplyManualCollisionGateSameThread(bool mpgInputSelected) noexcept
+{
+    const auto currentMPG=static_cast<int32_t>(m_plc.GetMemory("DR",NCPLC::DR::MPG_ENCODER_COUNT));
+    bool directionsReleased=true,stopped=true;
+    const bool ownsManual=m_manualMotionLease.IsValid()&&
+        (m_manualMotionLease.owner==MotionOwner::JOG||m_manualMotionLease.owner==MotionOwner::MPG)&&
+        m_motion.IsMotionOwnerLeaseCurrent(m_manualMotionLease);
+    std::uint32_t activeMask=0U;
+    for(int i=0;i<NCPLC::AXIS_COUNT;++i){
+        if(m_plc.Get_C(NCPLC::C::AxisPoint(NCPLC::C::JOG_POSITIVE_BASE,i))||
+           m_plc.Get_C(NCPLC::C::AxisPoint(NCPLC::C::JOG_NEGATIVE_BASE,i)))directionsReleased=false;
+        const auto& axis=m_motion.GetAxisContext(i);
+        if(axis.state==MotionState::MotionState_IDLE){
+            m_jogActive[i]=false;m_manualShortStopQueued[i]=false;
+        }else if(m_jogActive[i]||(ownsManual&&axis.isExist&&
+            (axis.state==MotionState::MotionState_VELOCITY||axis.state==MotionState::MotionState_MOVING||
+             axis.state==MotionState::MotionState_MPG||axis.state==MotionState::MotionState_STOPPING))){
+            stopped=false;activeMask|=1U<<static_cast<unsigned>(i);
+        }
+    }
+    const bool newStop=m_collisionManualStopSequence!=m_manualObservedStopSequence;
+    m_manualObservedStopSequence=m_collisionManualStopSequence;
+    // C20 only bypasses valid short contact. Invalid physical source is never bypassed.
+    const bool blocked=!m_collisionValid||(m_collisionShortActive&&!m_edmProtectionBypass);
+    const bool previousGate=m_manualShortGateActive;
+    const bool mpgQuiet=!mpgInputSelected||currentMPG==m_lastMPGCount;
+    const auto retireStoppedManualLease=[&]() noexcept {
+        if(!directionsReleased||!mpgQuiet||!stopped)return false;
+        if(m_manualMotionLease.IsValid()){
+            if(m_motion.IsMotionOwnerLeaseCurrent(m_manualMotionLease)&&
+               !m_motion.ReleaseMotionOwner(m_manualMotionLease))return false;
+            m_manualMotionLease=MotionOwnerLease{};
+        }
+        return true;
+    };
+    m_manualShortGateActive=m_manualShortRearm.Update(blocked,newStop,directionsReleased,mpgQuiet,stopped);
+    // RT holds a tripped owner generation even after contact clears/bypass turns ON.
+    // An incident first observed already clear still retires its old manual lease.
+    if(!m_manualShortGateActive&&(newStop||previousGate)&&!retireStoppedManualLease()){
+        m_manualShortRearm.releaseRequired=true;m_manualShortGateActive=true;
+    }
+    if(!m_manualShortGateActive){
+        if(previousGate){
+            for(bool& queued:m_manualShortStopQueued)queued=false;
+            m_manualShortLoggedStopMask=0U;
+            PrintCollisionDiagnostic("[SHORT] build=EDM280 event=MANUAL_SHORT_REARM valid=%u short=%u bypass=%u sequence=%llu manualStopSequence=%llu directionsReleased=1 stopped=1\n",
+                m_collisionValid?1U:0U,m_collisionShortActive?1U:0U,m_edmProtectionBypass?1U:0U,
+                static_cast<unsigned long long>(m_collisionSequence),static_cast<unsigned long long>(m_collisionManualStopSequence));
+        }
+        return false;
+    }
+    m_manualMoveMode=ManualMoveMode::NONE;
+    std::uint32_t queuedMask=0U;
+    for(int i=0;i<NCPLC::AXIS_COUNT;++i){
+        const bool positive=m_plc.Get_C(NCPLC::C::AxisPoint(NCPLC::C::JOG_POSITIVE_BASE,i));
+        const bool negative=m_plc.Get_C(NCPLC::C::AxisPoint(NCPLC::C::JOG_NEGATIVE_BASE,i));
+        m_prevJogPositive[i]=positive;m_prevJogNegative[i]=negative;
+        m_jogPositive[i]=m_jogNegative[i]=false;
+        auto& axis=m_motion.GetAxisContext(i);
+        if(!ownsManual||!axis.isExist||m_manualShortStopQueued[i])continue;
+        if(axis.state==MotionState::MotionState_STOPPING){m_manualShortStopQueued[i]=true;continue;}
+        if(axis.state!=MotionState::MotionState_VELOCITY&&axis.state!=MotionState::MotionState_MOVING&&
+           axis.state!=MotionState::MotionState_MPG)continue;
+        const double deceleration=axis.state==MotionState::MotionState_MOVING?axis.INCH_dec_time:axis.JOG_dec_time;
+        if(QueueManualStop(i,deceleration)){
+            m_manualShortStopQueued[i]=true;m_jogActive[i]=true;
+            queuedMask|=1U<<static_cast<unsigned>(i);
+        }
+    }
+    m_lastMPGCount=currentMPG; // Consume blocked handwheel counts; never replay them after clear/bypass.
+    if(!previousGate||(queuedMask&~m_manualShortLoggedStopMask)!=0U){
+        m_manualShortLoggedStopMask|=queuedMask;
+        PrintCollisionDiagnostic("[SHORT] build=EDM280 event=MANUAL_SHORT_STOP valid=%u short=%u bypass=%u sequence=%llu manualStopSequence=%llu activeMask=%u queuedMask=%u noAlarm=1\n",
+            m_collisionValid?1U:0U,m_collisionShortActive?1U:0U,m_edmProtectionBypass?1U:0U,
+            static_cast<unsigned long long>(m_collisionSequence),static_cast<unsigned long long>(m_collisionManualStopSequence),
+            activeMask,queuedMask);
+    }
+    if(directionsReleased&&mpgQuiet&&stopped)(void)retireStoppedManualLease();
+    return true;
+}
+
 void NCPLCManager::ProcessManualInputs()
 {
     // =========================================================
@@ -518,6 +656,13 @@ void NCPLCManager::ProcessManualInputs()
 
 
 
+    if (m_manualMotionLease.IsValid() &&
+        !m_motion.IsMotionOwnerLeaseCurrent(m_manualMotionLease))
+    {
+        m_manualMotionLease = MotionOwnerLease{};
+    }
+    if(ApplyManualCollisionGateSameThread(mpgMode))return;
+
     MotionOwner requestedManualOwner = MotionOwner::NONE;
     if (m_manualMoveMode == ManualMoveMode::MPG)
     {
@@ -528,11 +673,6 @@ void NCPLCManager::ProcessManualInputs()
         requestedManualOwner = MotionOwner::JOG;
     }
 
-    if (m_manualMotionLease.IsValid() &&
-        !m_motion.IsMotionOwnerLeaseCurrent(m_manualMotionLease))
-    {
-        m_manualMotionLease = MotionOwnerLease{};
-    }
 
     // JOG <-> MPG is a real ownership transfer. Stop the old mode first;
     // release occurs only after every owned axis reaches IDLE.
@@ -1939,5 +2079,8 @@ void NCPLCManager::ProcessAuxiliaryHandshake()
 // =========================================================
 void NCPLCManager::SyncNCStateToPLC()
 {
-
+    // Also executes on the PLC safety early-return path, before NC ProcessTask.
+    m_plc.Set_S(NCPLC::S::G80_ACTIVE,m_nc.IsG80ActiveSameThread());
+    m_plc.Set_S(NCPLC::S::SHORT_ACTIVE,m_collisionShortActive);
+    m_plc.Set_S(NCPLC::S::EDM_PROTECTION_BYPASS_ACTIVE,m_edmProtectionBypass);
 }

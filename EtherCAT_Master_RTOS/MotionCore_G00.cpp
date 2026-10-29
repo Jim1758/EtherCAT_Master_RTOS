@@ -349,6 +349,23 @@ bool MotionCore::TryG00MoveInternal(
         (positioningProfile != 7 && positioningProfile != 161 && !referencePositioning)))
         return rejectWithoutTailMutation(true, true, MotionRejectReason::INVALID_GEOMETRY);
 
+    // EDM280: freeze the submitted operation from this producer's explicit
+    // profile, never from a later NC PC/modal value. Every G00 wrapper, P1 and
+    // read-ahead variant reaches this common admission point. The G80 compound
+    // uses its separate parent producer and cannot enter this ordinary lane.
+    using CollisionOperation = EDMShortCircuitProtection::Operation;
+    CollisionOperation operation = useG53Profile ? CollisionOperation::G53 : CollisionOperation::G00;
+    switch (positioningProfile)
+    {
+    case 7: operation = CollisionOperation::G07; break;
+    case 28: operation = CollisionOperation::G28; break;
+    case 30: operation = CollisionOperation::G30; break;
+    case 32: operation = CollisionOperation::G32; break;
+    case 161: operation = CollisionOperation::G161; break;
+    default: break; // Only the validated ordinary G00/G53 profile zero remains.
+    }
+    const std::uint8_t positioningOperation = static_cast<std::uint8_t>(operation);
+
     // BASE-PLANE-3: a mismatched G17 tag must not downgrade a non-XY
     // frozen source into the legacy rapid lane before source rejection.
     const bool basePlaneLinear = m_pendingPlaneMode != 17 ||
@@ -896,7 +913,10 @@ bool MotionCore::TryG00MoveInternal(
         &producedIdentity,
         &producedOwnerLease,
         plannedTailEpoch,
-        &plannedTailOwnerLease);
+        &plannedTailOwnerLease,
+        false, nullptr, 0.0, false, nullptr,
+        false, nullptr, false, nullptr, false, nullptr, false, nullptr,
+        nullptr, positioningOperation);
 
     if (!accepted)
     {

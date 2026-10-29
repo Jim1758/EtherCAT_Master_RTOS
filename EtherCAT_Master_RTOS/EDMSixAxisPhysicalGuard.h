@@ -676,12 +676,13 @@ namespace EDM94
         unsigned child=0U;
         int sourcePC=-1;
         std::array<double,6U> anchorPulse{},topPulse{},tangentPulsePerMm{},pulsePerNative{};
+        unsigned childCount=25U; // Sealed RT-local compound identity; legacy defaults to 25.
     };
     inline bool SameTangentGeometry(const TangentEnvelope& a,const TangentEnvelope& b) noexcept
     {
         return SameIdentity(a.identity,b.identity)&&a.liveEpoch==b.liveEpoch&&a.run==b.run&&a.cache==b.cache&&
             a.dispatch==b.dispatch&&a.fingerprint==b.fingerprint&&a.sourceEpoch==b.sourceEpoch&&
-            a.segment==b.segment&&a.child==b.child&&a.sourcePC==b.sourcePC&&
+            a.segment==b.segment&&a.child==b.child&&a.childCount==b.childCount&&a.sourcePC==b.sourcePC&&
             a.anchorPulse==b.anchorPulse&&a.topPulse==b.topPulse&&
             a.tangentPulsePerMm==b.tangentPulsePerMm&&a.pulsePerNative==b.pulsePerNative;
     }
@@ -689,7 +690,7 @@ namespace EDM94
     {
         if(c.commissioningProfile!=8U||c.visibleZFlush158||!ValidIdentity(e.identity)||!e.tick||!e.nowUs||
             !e.liveEpoch||!e.run||!e.cache||!e.dispatch||!e.fingerprint||!e.sourceEpoch||!e.segment||
-            e.child>=25U||e.sourcePC<0)return false;
+            (e.childCount!=25U&&e.childCount!=26U)||e.child>=e.childCount||e.sourcePC<0)return false;
         double norm=0.0;
         for(unsigned i=0U;i<6U;++i) {
             const double a=e.anchorPulse[i],t=e.tangentPulsePerMm[i],p=e.pulsePerNative[i];

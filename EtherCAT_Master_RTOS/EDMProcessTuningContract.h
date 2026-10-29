@@ -37,7 +37,10 @@ struct EDMProcessTuningContext
 {
     std::uint64_t Generation;
     std::uint32_t ProfileRevision, MachineProfileId, SchemaVersion, Flags;
-    std::uint32_t ActiveAxisMask, PhysicalApplied; // PhysicalApplied is always 0.
+    // Legacy gain-application flag remains 0: no physical PID/discharge gains.
+    // EDM280 collision thresholds are active RT protection, independently of
+    // this flag. Successful Apply reports that effect in Ack.Detail.
+    std::uint32_t ActiveAxisMask, PhysicalApplied;
     std::uint8_t Reserved[32];
 };
 struct EDMProcessTuningParameters

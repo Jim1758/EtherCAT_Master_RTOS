@@ -1509,6 +1509,10 @@ bool GlobalConfig::InitSystemParameters(EtherCatMaster& master)
         return false;
     }
 
+    // EDM287: independent spindle parameters; startup only, runtime not connected.
+    master.m_NC->LoadRotarySpindleParametersBeforeStart(
+        GlobalConfig::GetInstance().ParameterDir + "RotarySpindleConfig.txt");
+
     // EDM18 selected ADC/simulation input. Missing/invalid configuration disables
     // the new observation channel only; no implicit fallback to simulation.
     {

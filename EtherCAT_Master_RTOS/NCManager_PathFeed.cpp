@@ -3861,6 +3861,9 @@ bool NCManager::NormalizeEDM171AirBlockSameThread(const NCBlock& input,NCBlock& 
 {
     output=input;
     auto& a=*m_edm171Air; a.selected=false; a.bound=false;
+    // P50 has its own exact source/modal-B/frame/one-parent admission. It must
+    // never be normalized into the legacy fixed-size G76 child batch.
+    if(IsG76SphereBlock(input))return true;
     // The existing live EDM/G180 modal-B family owns its unchanged decoder.
     if (m_edm94.latched) return true;
     const bool motion=NCGCodeSemantics::Contains(input,1) || NCGCodeSemantics::Contains(input,2) ||
@@ -4249,7 +4252,18 @@ bool NCManager::IsEDM171AirProgramSameThread(int firstPC) const noexcept
             if (!orbit) {b.hasParam['B'-'A']=false;b.param['B'-'A']=0.0;}
         }
         if (orbit)
-        { if (!IsG76OrbitBlockShapeValid(b,true,CoordSys.isInchMode?20:21)) return false; }
+        {
+            if(IsG76SphereBlock(b)){
+                NCG76SphereSource::Words words{};
+                const auto status=NCG76SphereSource::Decode(parsed,words);
+                // This is literal lookahead only. Unresolved B is syntactically
+                // sound but MUST acquire actual committed provenance at dispatch.
+                // No fake modal receipt is manufactured by the program scanner.
+                if(CoordSys.isInchMode||
+                    (status!=NCG76SphereSource::Status::Ok&&status!=NCG76SphereSource::Status::UnresolvedModalB)||
+                    (b.has('B')&&b.val('B')!=0.0))return false;
+            }else if (!IsG76OrbitBlockShapeValid(b,true,CoordSys.isInchMode?20:21)) return false;
+        }
         else if (b.gCode==1)
         { if (!IsPathCoreFeedBlockShapeValid(b,true,CoordSys.isInchMode?20:21,false,17)) return false; }
         else if (b.gCode==2 || b.gCode==3)

@@ -284,15 +284,26 @@ bool MotionCore::TryReferencePositionPairTransactionalTail(
     const std::uint64_t stagedFingerprint = ReferencePairTailFingerprint(
         stagedPulse, stagedMCS.data(), rapidOverride);
 
+    // EDM280: both private packets retain the ORIGINAL reference operation,
+    // including the intermediate leg. G32's no-short-stop policy must not be
+    // lost by treating its first leg as an ordinary G00.
+    using CollisionOperation = EDMShortCircuitProtection::Operation;
+    const CollisionOperation operation = profileCode == 28 ? CollisionOperation::G28 :
+        profileCode == 30 ? CollisionOperation::G30 : CollisionOperation::G32;
+    const std::uint8_t positioningOperation = static_cast<std::uint8_t>(operation);
     MotionCommand first{}, second{};
     if (!TryLineMove(axes, firstPulse, velocity[0], groupAcc, groupDec,
         BufferMode::ABORTING, MotionCommandPathMode::EXACT_STOP,
         &receipt.identity, &receipt.ownerLease, plannedEpoch, &plannedOwner,
-        false, nullptr, 0.0, false, &first) ||
+        false, nullptr, 0.0, false, &first,
+        false, nullptr, false, nullptr, false, nullptr, false, nullptr,
+        nullptr, positioningOperation) ||
         !TryLineMove(axes, finalPulse, velocity[1], groupAcc, groupDec,
             BufferMode::ABORTING, MotionCommandPathMode::EXACT_STOP,
             &receipt.identity, &receipt.ownerLease, plannedEpoch, &plannedOwner,
-            false, nullptr, 0.0, false, &second))
+            false, nullptr, 0.0, false, &second,
+            false, nullptr, false, nullptr, false, nullptr, false, nullptr,
+            nullptr, positioningOperation))
         return reject(false, false, MotionRejectReason::NOT_READY);
 
     // Both complete packets and every endpoint are private at this boundary.

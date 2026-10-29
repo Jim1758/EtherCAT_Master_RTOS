@@ -1281,6 +1281,50 @@ bool CoordinateManager::CommitWorkCoordinateTransition(
     return true;
 }
 
+bool CoordinateManager::PrepareG80OriginTransition(const G80::Point6& meanMCS,
+    std::uint32_t authoredMask, int action, double lValue,
+    NCTranslationSnapshot& candidate, G80::Point6& meanWCS,
+    G80::Point6& desiredWCS) const noexcept
+{
+    int selectedRow = -1;
+    if (!m_translationFrozen || m_translationResetBypass || toolRadiusMode != 40 ||
+        !IsTranslationRunCurrent() ||
+        m_translationGeneration != m_translationGenerationCounter ||
+        !TryDecodeNCWorkCoordinateCode(m_frozenTranslation.wcsCode, selectedRow) ||
+        selectedRow != currentWCSIndex || selectedRow < 0 ||
+        static_cast<std::size_t>(selectedRow) >= m_WCSTable.size() ||
+        m_WCSTable[static_cast<std::size_t>(selectedRow)].size() != 8U) return false;
+    G80::CoordinateError error = G80::CoordinateError::None;
+    return G80::BuildOriginSnapshot(m_frozenTranslation, meanMCS, authoredMask,
+        action, lValue, candidate, meanWCS, desiredWCS, error);
+}
+
+bool CoordinateManager::CommitG80OriginTransition(const NCTranslationSnapshot& previous,
+    const NCTranslationSnapshot& candidate) noexcept
+{
+    int selectedRow = -1;
+    if (!m_translationFrozen || m_translationResetBypass || toolRadiusMode != 40 ||
+        !IsTranslationRunCurrent() ||
+        m_translationGeneration != m_translationGenerationCounter ||
+        !SameNCTranslationSnapshot(previous, m_frozenTranslation) ||
+        !G80::IsOriginSnapshotTransition(previous, candidate) ||
+        !TryDecodeNCWorkCoordinateCode(previous.wcsCode, selectedRow) ||
+        selectedRow != currentWCSIndex || selectedRow < 0 ||
+        static_cast<std::size_t>(selectedRow) >= m_WCSTable.size() ||
+        m_WCSTable[static_cast<std::size_t>(selectedRow)].size() != 8U) return false;
+    // All checks precede all writes. No allocation, file I/O, native endpoint
+    // change or per-axis setter occurs inside this NC-thread commit. Motion
+    // must have accepted this exact candidate under its lifecycle reservation.
+    auto& row = m_WCSTable[static_cast<std::size_t>(selectedRow)];
+    for (unsigned axis = 0U; axis < 8U; ++axis) row[axis] = candidate.wcsOffsetMM[axis];
+    m_workCenterConfirmation = WorkCenterConfirmation{};
+    m_translationGenerationCounter = candidate.generation;
+    m_translationGeneration = candidate.generation;
+    m_translationRevision = candidate.revision;
+    m_frozenTranslation = candidate;
+    return true;
+}
+
 bool CoordinateManager::PrepareToolLengthTransition(int normalizedMode,
     int normalizedH, NCTranslationSnapshot& candidate) const noexcept
 {

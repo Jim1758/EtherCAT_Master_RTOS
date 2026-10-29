@@ -104,6 +104,30 @@
     <DebuggerFlavor>RtxBaseDm</DebuggerFlavor>
   </PropertyGroup>
   <ItemGroup>
+    <ClInclude Include="G80VoltageSimulator.h" />
+    <ClInclude Include="G80PID.h" />
+    <ClInclude Include="G80Config.h" />
+    <ClInclude Include="G80Coordinates.h" />
+    <ClInclude Include="G80Cycle.h" />
+    <ClInclude Include="MotionCore_G80.h" />
+    <ClInclude Include="NCG80Block.h" />
+    <ClInclude Include="NCG76SpherePlan.h" />
+    <ClInclude Include="NCG76SphereCoordinates.h" />
+    <ClInclude Include="NCG76SphereSource.h" />
+    <ClInclude Include="NCG76SphereHold.h" />
+    <ClInclude Include="NCG76SphereArchitecture.h" />
+    <ClInclude Include="NCG76SphereRuntimeGeometry.h" />
+    <ClInclude Include="NCG76SphereCycle.h" />
+    <ClInclude Include="MotionCore_G76Sphere.h" />
+    <ClInclude Include="RotarySpindleConfig.h" />
+    <ClInclude Include="NCSpindleCodes.h" />
+    <ClInclude Include="NCSpindleSource.h" />
+    <ClInclude Include="NCRotarySpindle.h" />
+    <ClInclude Include="NCSpindleDispatch.h" />
+    <ClInclude Include="MotionCore_RotarySpindle.h" />
+    <ClInclude Include="MotionRotarySpindleProof.h" />
+    <ClInclude Include="NCG80Results.h" />
+    <ClInclude Include="EDM275G76Diagnostic.h" />
     <ClInclude Include="PositionAutoTuneConfig.h" />
     <ClInclude Include="PositionAutoTuneCapture.h" />
     <ClInclude Include="PositionAutoTuneAnalysis.h" />
@@ -112,6 +136,16 @@
     <ClInclude Include="PositionPidService.h" />
   </ItemGroup>
   <ItemGroup>
+    <ClCompile Include="G80Config.cpp" />
+    <ClCompile Include="G80Coordinates.cpp" />
+    <ClCompile Include="G80Cycle.cpp" />
+    <ClCompile Include="MotionCore_G80.cpp" />
+    <ClCompile Include="RotarySpindleConfig.cpp" />
+    <ClCompile Include="NCManager_RotarySpindle.cpp" />
+    <ClCompile Include="NCManager_G76Sphere.cpp" />
+    <ClCompile Include="MotionCore_G76Sphere.cpp" />
+    <ClCompile Include="MotionCore_RotarySpindle.cpp" />
+    <ClCompile Include="NCManager_G80.cpp" />
     <ClCompile Include="PositionAutoTuneConfig.cpp" />
     <ClCompile Include="PositionAutoTuneCapture.cpp" />
     <ClCompile Include="PositionAutoTuneAnalysis.cpp" />

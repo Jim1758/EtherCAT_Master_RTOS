@@ -1162,6 +1162,15 @@ NCPreparedBlockQueueShadow::ClassifyLiteralBlock(
             continue;
         }
 
+        // G80 may commit a new origin, including when its A word is absent.
+        // Never form later endpoints from the pre-contact coordinate frame.
+        if (code == 80)
+        {
+            AddBarrier(result, NCPreparedBarrierKind::TABLE_WRITE,
+                NC_PREPARED_BARRIER_FLAG_TABLE_WRITE);
+            continue;
+        }
+
         if (code == 10 || code == 92 || code == 160)
         {
             AddBarrier(
@@ -1247,7 +1256,8 @@ NCPreparedBlockQueueShadow::ClassifyLiteralBlock(
             NC_PREPARED_BARRIER_FLAG_MODAL);
     }
 
-    if (block.has('T'))
+    if (block.has('T') && !NCGCodeSemantics::Contains(block, 65) &&
+        !NCGCodeSemantics::Contains(block, 66))
     {
         AddBarrier(
             result,
@@ -1291,6 +1301,7 @@ NCPreparedModalSnapshot NCPreparedBlockQueueShadow::ReduceModalSnapshot(
     for (int i = 0; i < count; ++i)
     {
         const int code = StoredGCode(block, i);
+        if(code==80){afterValid=false;after.commandedMCSValid=false;continue;}
         // Coordinate settings depend on the actual table revision. Never
         // predict a new translation from only a G-code or a table index.
         if ((code >= 54 && code <= 959 && IsExtendedWorkCoordinateCode(code)) ||
@@ -1427,9 +1438,16 @@ NCPreparedModalSnapshot NCPreparedBlockQueueShadow::ReduceModalSnapshot(
         }
     }
 
-    if (block.has('T'))
+    if (block.has('T') && !NCGCodeSemantics::Contains(block, 65) &&
+        !NCGCodeSemantics::Contains(block, 66))
     {
-        after.toolCode = static_cast<int>(block.val('T'));
+        const double tool = block.val('T');
+        if (!std::isfinite(tool) || tool < 0.0 ||
+            tool > static_cast<double>((std::numeric_limits<int>::max)()) ||
+            std::floor(tool) != tool)
+            afterValid = false; // Runtime rejects before tool/PLC side effects.
+        else
+            after.toolCode = static_cast<int>(tool);
     }
 
     after.imageValid = afterValid;

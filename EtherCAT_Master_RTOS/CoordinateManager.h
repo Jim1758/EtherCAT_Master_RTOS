@@ -1,6 +1,7 @@
 ﻿#pragma once
 #include "NC_Types.h"
 #include "NCTranslationSnapshot.h"
+#include "G80Coordinates.h"
 #include <vector>
 #include <string>
 
@@ -51,6 +52,15 @@ public:
     // NC-only drained WCS selection; fixed transforms and native tail stay unchanged.
     bool PrepareWorkCoordinateTransition(int wcsCode, NCTranslationSnapshot& candidate) const noexcept;
     bool CommitWorkCoordinateTransition(const NCTranslationSnapshot& candidate) noexcept;
+    // G80 changes one selected WCS row at the captured mean contact, not at
+    // the later retracted position. The caller owns Motion's stopped/drained
+    // epoch/lease transaction; prepare is pure and commit is failure-atomic.
+    bool PrepareG80OriginTransition(const G80::Point6& meanMCS,
+        std::uint32_t authoredMask, int action, double lValue,
+        NCTranslationSnapshot& candidate, G80::Point6& meanWCS,
+        G80::Point6& desiredWCS) const noexcept;
+    bool CommitG80OriginTransition(const NCTranslationSnapshot& previous,
+        const NCTranslationSnapshot& candidate) noexcept;
     // NC-only drained H selection; native geometry and fixed centres remain exact.
     bool PrepareToolLengthTransition(int normalizedMode, int normalizedH,
         NCTranslationSnapshot& candidate) const noexcept;

@@ -553,11 +553,13 @@ public:
             nowUs-committed.nowUs>EDM126::MaximumSourceAgeUs||feedback_.phase==Phase::Rejected)return false;
         // EDM227 has no canonical E5 geometry yet. Capture the live main-path
         // rest pose below, without inventing a center, target or machining anchor.
-        // EDM274 can enter a dwell on the same mapped sample which finishes
-        // braking. Its zero velocity and exact endpoint are already required;
+        // EDM274/284 short flush can enter a dwell on the same mapped sample
+        // which finishes braking. B0/B2 retain their own pause contracts.
+        // Its zero velocity and exact endpoint are already required;
         // the first paused map must also clear the remaining acceleration.
         // Completed dwell and backend-transfer proofs keep their strict rest checks.
-        const bool shortDwellEntry=flush&&EDM130::IsG76SharedShort274(scope.recipe)&&
+        const bool shortDwellEntry=flush&&
+            (EDM130::IsG76SharedShort274(scope.recipe)||EDM130::IsG76SharedCycleShort284(scope.recipe))&&
             flush->stableCycles==0U&&flush->stableStartUs==0ULL;
         if(flush&&IsG76CenterNominalPause(scope)&&flush->phase==EDM128::Phase::AnchorDwell&&
             (!EDM128::Zero(committed)||(!shortDwellEntry&&(committed.accelerationMmSec2!=0.0||

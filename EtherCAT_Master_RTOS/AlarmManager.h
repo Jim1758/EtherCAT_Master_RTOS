@@ -136,7 +136,17 @@ public:
         EDM_CONDITION_STARTUP_RECOVERED = EDM_BASE + 11, // 4011: missing startup COND regenerated
         EDM_CONDITION_CATALOG_INVALID = EDM_BASE + 12, // 4012: COND catalog/startup recovery failed
         EDM_CONDITION_SELECTION_SAVE_FAILED = EDM_BASE + 13, // 4013: last selected COND could not be saved
-        EDM_PROCESS_CONFIG_INVALID = EDM_BASE + 20 // 4020: EDM process profile missing/invalid
+        EDM_PROCESS_CONFIG_INVALID = EDM_BASE + 20, // 4020: EDM process profile missing/invalid
+        SHORT_PROTECTION_INPUT_INVALID = EDM_BASE + 21, // 4021: collision protection GAP input/config unavailable
+        G80_CONFIG_INVALID = EDM_BASE + 30, // 4030: disabled/missing/invalid edge-find configuration
+        G80_SIGNAL_INVALID = EDM_BASE + 31, // 4031: physical GAP receipt/calibration/PDO invalid
+        G80_CONTACT_AT_START = EDM_BASE + 32, // 4032: contact before search or during rapid approach
+        G80_EDGE_NOT_FOUND = EDM_BASE + 33, // 4033: search distance or cycle timeout exceeded
+        G80_CONTACT_NOT_RELEASED = EDM_BASE + 34, // 4034: contact failed to release after retreat
+        G80_REPEAT_ERROR = EDM_BASE + 35, // 4035: slow-touch mean deviation exceeds threshold
+        G80_SETTLE_TIMEOUT = EDM_BASE + 36, // 4036: commanded stop did not physically settle
+        G80_FRAME_CHANGED = EDM_BASE + 37, // 4037: frozen coordinate/run identity no longer matches
+        G80_RUNTIME_FAULT = EDM_BASE + 38 // 4038: invalid G80 runtime/lifecycle or travel limit
     };
 
     // 取得單例

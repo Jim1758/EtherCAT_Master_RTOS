@@ -2736,6 +2736,8 @@ bool NCManager::IsEDMPathXYZTranslationBlockAllowedSameThread(const NCBlock& blo
 
 bool NCManager::PrepareFixedTranslationMotionSameThread(const NCBlock& block, int gCode)
 {
+    if(gCode==76&&IsG76SphereBlock(block))return PrepareG76SphereTranslationSameThread(block);
+    if(gCode==80)return PrepareG80TranslationSameThread(block);
     if (gCode==76 || (m_edm171Air->selected && (gCode==1 || gCode==2 || gCode==3))) return PrepareG76OrbitTranslationSameThread(block);
     // BASE58-BEGIN: repeatable side-effect-free extra-axis XYZ feed policy.
     std::uint32_t xyzFeedPresentMask = 0U;
@@ -2750,6 +2752,13 @@ bool NCManager::PrepareFixedTranslationMotionSameThread(const NCBlock& block, in
         !m_pathReplay.pending && !m_gapDryRun.active && !m_gapPath.active && !m_gapWindow.active &&
         !m_cutterLine.leadOutRequired;
     const bool xyzFeedMemoryBound = m_mode == NCOperationMode::MEMORY && CoordSys.IsTranslationRunBound();
+    // EDM277_FIX1: the first G00 of a literal G00/G80 parent must freeze the
+    // same native XYZCUV frame as G80 before endpoint conversion. The generic
+    // first-motion lane only opens extra axes for feed, so G91 otherwise
+    // rejects here and neutral G90 falls back without ever forming the pair.
+    const bool g80ApproachAllowed = gCode==0 && xyzFeedMemoryBound && xyzFeedRuntimeClear &&
+        xyzFeedPresentMask==NCXYZFeedPresentMask(xyzFeedSource.axisIdentity) &&
+        IsG80ApproachMotionSameThread(block);
     // BASE68 is a separate degree-domain producer. Only its complete
     // neutral, explicit, single-axis shape may replace an XYZ-only rejection.
     const bool rotaryFeedAllowed = xyzFeedMemoryBound && xyzFeedRuntimeClear &&
@@ -2776,7 +2785,7 @@ bool NCManager::PrepareFixedTranslationMotionSameThread(const NCBlock& block, in
     const bool activeEccentricH = xyzFeedMemoryBound && CoordSys.isCAxisOffsetRotationEnabled &&
         (CoordSys.toolLengthMode == 43 || CoordSys.toolLengthMode == 44);
     const bool edmPathXYZAllowed = IsEDMPathXYZTranslationBlockAllowedSameThread(block, xyzFeedSource, xyzFeedPresentMask);
-    NCXYZFeedScopeDecision xyzFeedDecision = (edmPathXYZAllowed || eccentricFeedAllowed || rotaryFeedAllowed || zcFeedAllowed || xyzcFeedAllowed || xyzcuvFeedAllowed) ?
+    NCXYZFeedScopeDecision xyzFeedDecision = (g80ApproachAllowed || edmPathXYZAllowed || eccentricFeedAllowed || rotaryFeedAllowed || zcFeedAllowed || xyzcFeedAllowed || xyzcuvFeedAllowed) ?
         NCXYZFeedScopeDecision::ALLOWED : EvaluateNCXYZFeedScope(
             xyzFeedSource, block, xyzFeedPresentMask, xyzFeedFrozen,
             xyzFeedMemoryBound, xyzFeedRuntimeClear);
@@ -2923,6 +2932,7 @@ bool NCManager::PrepareFixedTranslationMotionSameThread(const NCBlock& block, in
     const bool extraAxisXYZCFeed = gCode == 1 && !xyzFeedFrozen && xyzcFeedAllowed;
     const bool extraAxisXYZCUVFeed = gCode == 1 && !xyzFeedFrozen && xyzcuvFeedAllowed;
     const bool extraAxisEccentricCFeed = gCode == 1 && !xyzFeedFrozen && eccentricFeedAllowed;
+    const bool extraAxisG80Approach = !xyzFeedFrozen && g80ApproachAllowed;
     const bool extraAxisXYZFeed = gCode >= 1 && gCode <= 3 && !xyzFeedFrozen &&
         !extraAxisRotaryFeed && !extraAxisZCFeed && !extraAxisXYZCFeed && !extraAxisXYZCUVFeed &&
         !extraAxisEccentricCFeed && xyzFeedDecision == NCXYZFeedScopeDecision::ALLOWED;
@@ -2935,11 +2945,11 @@ bool NCManager::PrepareFixedTranslationMotionSameThread(const NCBlock& block, in
     {
         const AxisContext& axis = m_motion.GetAxisContext(i);
         if (i < 3 && (!axis.isExist || axis.axisType != AxisType::LINEAR)) scopeValid = false;
-        if (i >= 3 && ((axis.isExist && !extraAxisXYZFeed && !extraAxisRotaryFeed && !extraAxisZCFeed && !extraAxisXYZCFeed && !extraAxisXYZCUVFeed && !extraAxisEccentricCFeed) ||
+        if (i >= 3 && ((axis.isExist && !extraAxisXYZFeed && !extraAxisRotaryFeed && !extraAxisZCFeed && !extraAxisXYZCFeed && !extraAxisXYZCUVFeed && !extraAxisEccentricCFeed && !extraAxisG80Approach) ||
             (m_axisNames[i] != ' ' && block.has(m_axisNames[i]) &&
                 !(extraAxisRotaryFeed && static_cast<unsigned>(i) == rotaryAxis) &&
                 !((extraAxisZCFeed || extraAxisXYZCFeed || extraAxisEccentricCFeed) && i == 3) &&
-                !(extraAxisXYZCUVFeed && i >= 3 && i < 6)))) scopeValid = false;
+                !((extraAxisXYZCUVFeed || extraAxisG80Approach) && i >= 3 && i < 6)))) scopeValid = false;
     }
     if (!scopeValid)
     {
@@ -3572,6 +3582,12 @@ bool NCManager::TransitionFixedTranslationSelectionSameThread(const NCBlock& blo
 
 bool NCManager::IsFixedTranslationBlockAllowedSameThread(const NCBlock& block)
 {
+    if(m_g76Sphere->active){
+        RejectG76SphereSameThread("NEXT_BLOCK_BEFORE_P50_COMPLETION",AlarmManager::PATH_EXECUTION_NOT_READY);
+        return false;
+    }
+    if(IsG76SphereBlock(block))return ValidateG76SphereBlockSameThread(block,GetActiveDispatchPC(),0);
+    if(NCGCodeSemantics::Contains(block,80))return ValidateG80BlockSameThread(block,GetActiveDispatchPC(),0);
     if (m_edm171Air->selected && (NCGCodeSemantics::Contains(block,1) || NCGCodeSemantics::Contains(block,2) || NCGCodeSemantics::Contains(block,3)))
         return IsEDM171AirGrantCurrentSameThread() &&
             IsG76OrbitFrameCurrentSameThread(m_edm171Air->mode==2U,m_edm171Air->mode==2U) &&

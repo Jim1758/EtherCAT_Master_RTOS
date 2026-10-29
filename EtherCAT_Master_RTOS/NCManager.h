@@ -1,5 +1,11 @@
 ﻿#pragma once
 #include "NC_Types.h"
+#include "NCAuxiliaryHandshake.h"
+#include "RotarySpindleConfig.h"
+#include "NCSpindleDispatch.h"
+#include "NCG80Block.h"
+#include "G80Cycle.h"
+#include "G80Coordinates.h"
 #include "EDM127ModalB.h"
 #include "EDM140LocalAssignment.h"
 #include "EDM141MotionWords.h"
@@ -18,6 +24,7 @@
 #include "EDMProcessProfile.h"
 #include "EDMProcessTuningContract.h" // EDM20 owner-thread shadow calculations only.
 class EtherCatMaster;
+namespace NCSpindleSource { struct Words; }
 struct NCMacroAssignmentCommit;
 #include "EDMProcessSimulationTest.h" // EDM01: no physical output or motion.
 #include "EDMFeedRetreatSimulationTest.h" // EDM02: simulated consumer only.
@@ -59,6 +66,8 @@ struct NCMacroAssignmentCommit;
 #include "EDM173G76Gap.h"
 #include "EDM171G76Config.h"
 #include "MotionG76OrbitReceipt.h"
+#include "NCG76SphereArchitecture.h"
+#include "MotionCore_G76Sphere.h"
 #include "EDMSixAxisCurveFixture.h" // EDM112 NC-only curve fixture; no physical arc output.
 #include "EDMSixAxisCurveRuntime.h" // EDM113 independent RT observation receipts; no arc authority.
 #include "EDMSixAxisArcExecution.h"
@@ -315,6 +324,19 @@ static_assert(
 class NCManager {
 public:
     NCManager(MotionCore& motion);
+    // Parameters load once before cyclic workers; execution uses committed MEMORY sessions.
+    void LoadRotarySpindleParametersBeforeStart(const std::string& path) noexcept;
+    bool ValidateRotarySpindleSourceSameThread(const NCBlock& block,int sourcePC,int sourceLineNumber,NCSpindleSource::Words& words) noexcept;
+    bool ValidateRotarySpindleBlockSameThread(const NCBlock& block,int sourcePC,int sourceLineNumber) noexcept;
+    WaitConditionFunc HandleRotarySpindleMCodeSameThread(const NCBlock& block) noexcept;
+    bool ValidateRotarySpindleParsedScopeSameThread(const NCParsedBlock&,int) noexcept;
+    void CommitRotarySpindleCaptureSameThread(NCBlockDispatchId,const MotionProgramBlockCapture&,
+        const NCProgramCommitSnapshot&,bool,bool,const NCBlockLifecycleSnapshot&,int,int) noexcept;
+    void ServiceRotarySpindleSameThread() noexcept;
+    bool TryHoldRotarySpindleSameThread() noexcept;
+    bool TryResumeRotarySpindleSameThread() noexcept;
+    void CancelRotarySpindleSameThread(NCSpindleDispatch::State,const char*) noexcept;
+    static bool WaitForRotarySpindleCallback(NCManager*) noexcept;
     // EDM16: one boot ownership transfer, before NC/RT cyclic threads start.
     bool InstallEDMRecipeCatalogBeforeStart(std::unique_ptr<EDMRecipe::Catalog> catalog) noexcept;
     // One startup logical selection: restore the last COND, always load E1.
@@ -572,6 +594,26 @@ public:
     void PushBlock(const NCBlock& block);
 
     // 4. 核心執行緒 (放在 Main Loop 執行)
+    // G80 owns direction and F-percent words before general modal handling.
+    bool ValidateG80BlockSameThread(const NCBlock& block,int pc,int line,bool report=true);
+    bool PrepareG80TranslationSameThread(const NCBlock& block);
+    WaitConditionFunc StartG80SameThread(const NCBlock& block);
+    bool IsG80ApproachCandidateSameThread(const NCParsedBlock& rapid,int pc) const noexcept;
+    bool IsG80ApproachMotionSameThread(const NCBlock& rapid) const noexcept;
+    bool TryStartG80ApproachSameThread(const NCBlock& rapid,const double* targetMCS,
+        const bool* programmed,double overrideRatio,bool& handled);
+    bool IsG80CompoundContinuationSameThread(const NCBlock& block,int pc,int line) const noexcept;
+    bool PollG80SameThread();
+    void ServiceG80SameThread();
+    void CancelG80SameThread(const char* reason) noexcept;
+    void PublishG80SameThread() noexcept;
+    bool IsG80ActiveSameThread() const noexcept;
+    void SyncG80ActiveToPLCSameThread() noexcept;
+    void LogG80FeedbackSameThread(const MotionG80Feedback& observed) noexcept;
+    void LogG80CompletedCoordinatesSameThread() const noexcept;
+    bool StageG80SameThread(const NCBlock& block,int pc,int line,const G80::Point6* approachEnd=nullptr,
+        double rapidOverride=1.0);
+    static bool WaitG80Callback(NCManager* nc) {return nc->PollG80SameThread();}
     void ProcessTask();
 
     // ======================================================
@@ -596,6 +638,15 @@ public:
     void SetG04TimeMs(double ms) { m_G04_TimeMs = ms; }
     double GetG04TimeMs() const { return m_G04_TimeMs; }
 
+
+    // EDM282: control-thread PLC auxiliary request/finish protocol.
+    bool BeginAuxiliaryHandshakeSameThread(int tCode, int mCode) noexcept;
+    bool PollAuxiliaryHandshakeSameThread() noexcept;
+    void ServiceAuxiliaryHandshakeSameThread(bool allowDispatch) noexcept;
+    void CancelAuxiliaryHandshakeSameThread() noexcept;
+    void ResetAuxiliaryHandshakeSameThread() noexcept;
+    void SyncAuxiliaryHandshakeToPLCSameThread() noexcept;
+    static bool WaitForAuxiliaryHandshakeCallback(NCManager* nc);
 
     int GetSimulatedTicks() const { return m_simulatedTicks; }
     void SetSimulatedTicks(int ticks) { m_simulatedTicks = ticks; }
@@ -1414,6 +1465,7 @@ private:
         WaitConditionFunc mCallback = nullptr;
     };
 
+    NCAuxiliaryHandshake m_auxiliaryHandshake{};
     NCGMBlockTransactionState m_gmBlockTransaction{};
     NCGMBlockTransactionCounters m_gmBlockTransactionCounters{};
     std::uint64_t m_nextGMBlockTransactionSequence = 1ULL;
@@ -1905,6 +1957,33 @@ public:
     // 🌟 替換：捨棄 Enum，改用統一的檢查回呼函式
     WaitConditionFunc m_waitCallback = nullptr;
 
+    struct G80NCSession {
+        NCG80::Program program{};
+        G80::Request request{};
+        G80::Feedback feedback{};
+        G80::Point6 meanWCS{},endpoint{};
+        NCTranslationSnapshot frame{},measurementFrame{},originCandidate{};
+        MotionExecutionIdentity identity{};
+        MotionOwnerLease owner{};
+        MotionExecutionEpoch epoch=MOTION_EXECUTION_EPOCH_INVALID;
+        std::uint64_t run=0ULL,cache=0ULL,session=0ULL,lastPublishedTick=0ULL;
+        int sourcePC=-1,sourceLine=0,approachPC=-1;
+        std::uint32_t machineMask=0U,ncFault=0U,runtimeFault=0U,alarmCode=0U,reportSource=0U,simScenario=0U;
+        std::uint64_t inputSequence=0ULL;
+        double simProjectedDistance=0.0,simPlaneDistance=0.0;
+        double voltage=0.0;
+        // EDM278: NC-only diagnostics; no authority, motion or public result layout.
+        std::uint32_t diagnosticEvents=0U,lastDiagnosticSlowCount=0U,plcDiagnosticEvents=0U;
+        G80::Phase lastDiagnosticPhase=G80::Phase::Idle;
+        unsigned plcDiagnosticState=0U;
+        bool diagnosticInitialized=false,lastDiagnosticHeld=false,junctionLogged=false;
+        bool plcDiagnosticInitialized=false,plcDiagnosticHeld=false,plcTerminalLogged=false;
+        char cancelReason[48]{};
+        bool staged=false,active=false,submitted=false,compound=false,claimed=false;
+        bool endpointCommitted=false,originPrepared=false,originCommitted=false,success=false;
+    } m_g80{};
+    std::uint64_t m_g80NextSession=1ULL,m_g80Publication=0ULL;
+
     int m_simulatedTicks = 0; // (測試用) 模擬馬達跑了多久
     double m_G04_TimeMs = 0.0;
     G04TimerState m_g04Timer{};
@@ -1952,6 +2031,25 @@ public:
     NCBlock m_g66Block;         // 記住 G66 當下夾帶的所有變數 (A, B, C...)
 
 private:
+    // EDM289: startup-loaded parameters and NC-owned committed spindle session.
+    RotarySpindleFile::Settings m_rotarySpindleParameters{};
+    RotarySpindleFile::Error m_rotarySpindleParameterError{};
+    RotarySpindleFile::LoadStatus m_rotarySpindleParameterStatus=RotarySpindleFile::LoadStatus::Invalid;
+    struct RotarySpindleNCState {
+        NCSpindleDispatch::Broker broker{};
+        NCSpindleDispatch::Authority authority{};
+        NCSpindleDispatch::Config config{};
+        NCSpindleDispatch::Row stagedRow{};
+        std::array<std::uint64_t,3> submitted{};
+        std::uint64_t lifecycleSequence=0ULL,waitSequence=0ULL;
+        unsigned waitSpindle=0U;
+        bool active=false,rtBegun=false,waitActive=false,waitComplete=false,servicing=false,resumeReadyPending=false;
+    } m_rotarySpindle{};
+    std::uint64_t m_rotarySpindleParameterGeneration=0ULL;
+    bool BuildRotarySpindleRuntimeSameThread(NCSpindleDispatch::Config&,RotarySpindleFile::Error&) noexcept;
+    bool IsRotarySpindleScopeCurrentSameThread() noexcept;
+    bool PublishRotarySpindleRequestsSameThread() noexcept;
+    void RejectRotarySpindleSameThread(const char*,int,int=0) noexcept;
     // TUNE01: one callback-owned diagnostic cycle; no live gain changes.
     std::shared_ptr<PositionAutoTuneNCState> m_positionAutoTune;
     void InitializePositionAutoTuneSameThread() noexcept;
@@ -2581,6 +2679,44 @@ private:
         unsigned mode=0U; int sourceG=76;
     };
     std::unique_ptr<G76OrbitState> m_g76Orbit{new G76OrbitState{}};
+    // EDM286: one source row / one Motion identity, independent of legacy
+    // 25/26-child G76 batches. Planning scratch stays off the RT stack.
+    struct G76SphereNCState
+    {
+        NCG76SphereArchitecture::Preparation prepared{};
+        NCG76SphereArchitecture::Workspace workspace{};
+        NCG76SphereCycle::Request request{};
+        NCTranslationSnapshot frame{};
+        MotionExecutionIdentity identity{};
+        MotionOwnerLease owner{};
+        MotionExecutionEpoch epoch=MOTION_EXECUTION_EPOCH_INVALID;
+        MotionG76SphereFeedback feedback{};
+        CncFeedValueSnapshot feed{};
+        NCG76SphereCoordinates::Point8 endpoint{};
+        std::uint64_t run=0ULL,cache=0ULL,dispatch=0ULL,commit=0ULL,session=0ULL;
+        std::uint64_t holdSequence=0ULL,startSequence=0ULL;
+        unsigned diagnosticEvents=0U,lastLayer=0U;
+        NCG76SphereCycle::Phase lastPhase=NCG76SphereCycle::Phase::Idle;
+        int pc=-1,line=0;
+        bool staged=false,active=false,submitted=false,bound=false,endpointCommitted=false;
+        bool resumePending=false,completed=false,diagnosticInitialized=false;
+    };
+    std::unique_ptr<G76SphereNCState> m_g76Sphere{new G76SphereNCState{}};
+    std::uint64_t m_g76SphereNextSession=1ULL;
+    static bool IsG76SphereBlock(const NCBlock&) noexcept;
+    bool ValidateG76SphereBlockSameThread(const NCBlock&,int pc,int line=0);
+    bool PrepareG76SphereTranslationSameThread(const NCBlock&);
+    bool IsG76SphereScopeCurrentSameThread();
+    WaitConditionFunc StartG76SphereSameThread(const NCBlock&);
+    void CommitG76SphereCaptureSameThread(NCBlockDispatchId,const MotionProgramBlockCapture&,
+        const NCProgramCommitSnapshot&,bool,bool,const NCBlockLifecycleSnapshot&,int,int);
+    void ServiceG76SphereSameThread();
+    bool PollG76SphereSameThread();
+    bool TryHoldG76SphereSameThread();
+    bool TryResumeG76SphereSameThread();
+    void CancelG76SphereSameThread(const char*);
+    void RejectG76SphereSameThread(const char*,int,int sourceLine=0);
+    NCG76SphereSource::ModalB CaptureG76SphereModalBSameThread() const noexcept;
     struct G76ModalState
     {
         MotionOwnerLease lease{};

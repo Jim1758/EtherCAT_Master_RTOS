@@ -2,6 +2,7 @@
 #include "SHMManager.h"
 #include "GlobalConfig.h" 
 #include "NCManager.h"
+#include "NCG80Results.h"
 #include "AlarmManager.h"
 #include "EtherCatPdoRuntimeInvalidCorrelation.h"
 #include <cstring> 
@@ -26,6 +27,25 @@ namespace HMI_Bridge
 {
     namespace
     {
+        // Same supervisory writer as NCManager::PublishG80SameThread. This
+        // automatic page is independent of the legacy macro refresh request.
+        void PublishG80ResultsSameThread(NCManager& nc,SHM_Data& shared) noexcept
+        {
+            const double* source=nc.MacroSys.GetSysVarsArray();
+            const double sequence=source[801];
+            if(!std::isfinite(sequence)||sequence<=0.0||sequence>9007199254740991.0||
+               source[799]!=sequence||source[899]!=sequence||
+               source[701]!=NCG80::SchemaMagic||source[702]!=NCG80::SchemaVersion)return;
+            auto* target=shared.macroStatus.sysVars;
+            // A stable native publication is immutable. Do not write payload
+            // again under the same sequence, which would weaken the reader gate.
+            if(target[801]==sequence&&target[799]==sequence&&target[899]==sequence&&
+               target[701]==NCG80::SchemaMagic&&target[702]==NCG80::SchemaVersion)return;
+            NCG80::Results image{};
+            std::memcpy(image.data(),source+NCG80::ResultFirst,sizeof(image));
+            NCG80::PublishImage(image,[target](int index,double value) noexcept {target[index]=value;});
+        }
+
         HMI_DIAG_NOINLINE void PublishEDMObservationSameThread(NCManager& nc) noexcept
         {
             SHM_EDM_DiagData* target = GetEDMDiagnosticSharedMemoryData();
@@ -3225,6 +3245,7 @@ namespace HMI_Bridge
         SHM_Data* pShm = SHMManager::GetInstance().GetData();
         if (pShm == nullptr || nc == nullptr) return;
 
+        PublishG80ResultsSameThread(*nc,*pShm);
         ProcessEDMConditionServiceSameThread(*nc);
         PublishEDMObservationSameThread(*nc);
 
@@ -3574,7 +3595,11 @@ namespace HMI_Bridge
 
         if (pShm->varCmd.refresh_system)
         {
-            memcpy(pShm->macroStatus.sysVars, nc->MacroSys.GetSysVarsArray(), sizeof(pShm->macroStatus.sysVars));
+            // EDM277 owns 701..899 with its automatic coherent publisher.
+            // A generic refresh must never overwrite that page under its old seq.
+            const double* source=nc->MacroSys.GetSysVarsArray();
+            std::memcpy(pShm->macroStatus.sysVars,source,sizeof(double)*701U);
+            std::memcpy(pShm->macroStatus.sysVars+900U,source+900U,sizeof(double)*101U);
             pShm->varCmd.refresh_system = false;
         }
 

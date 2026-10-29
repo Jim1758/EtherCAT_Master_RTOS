@@ -161,6 +161,7 @@ inline bool CanonicalizeMotionEccentricCLinearLimits(NCEccentricCRuntimeInput& i
 
 inline bool IsMotionEccentricCFeedSourceAllowed(const MotionCommand& c) noexcept
 {
+    if (!IsMotionG76SphereMarkerClear(c)) return false;
     using namespace MotionEccentricCTransportDetail;
     const auto& s = c.sourceTranslation;
     unsigned role = 8U;

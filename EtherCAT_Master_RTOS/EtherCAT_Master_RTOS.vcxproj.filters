@@ -144,6 +144,36 @@
     </Filter>
   </ItemGroup>
   <ItemGroup>
+    <ClCompile Include="G80Config.cpp">
+      <Filter>Source Files\Motion</Filter>
+    </ClCompile>
+    <ClCompile Include="G80Coordinates.cpp">
+      <Filter>Source Files\NC</Filter>
+    </ClCompile>
+    <ClCompile Include="G80Cycle.cpp">
+      <Filter>Source Files\Motion</Filter>
+    </ClCompile>
+    <ClCompile Include="MotionCore_G80.cpp">
+      <Filter>Source Files\Motion</Filter>
+    </ClCompile>
+    <ClCompile Include="RotarySpindleConfig.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="NCManager_RotarySpindle.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="NCManager_G76Sphere.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="MotionCore_G76Sphere.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="MotionCore_RotarySpindle.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="NCManager_G80.cpp">
+      <Filter>Source Files\NC</Filter>
+    </ClCompile>
     <ClCompile Include="EtherCAT_Master_RTOSDriver.cpp">
       <Filter>Source Files\EtherCAT_Master</Filter>
     </ClCompile>
@@ -515,6 +545,78 @@
     </ClCompile>
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="G80VoltageSimulator.h">
+      <Filter>Header Files\Motion</Filter>
+    </ClInclude>
+    <ClInclude Include="G80PID.h">
+      <Filter>Header Files\Motion</Filter>
+    </ClInclude>
+    <ClInclude Include="G80Config.h">
+      <Filter>Header Files\Motion</Filter>
+    </ClInclude>
+    <ClInclude Include="G80Coordinates.h">
+      <Filter>Header Files\NC</Filter>
+    </ClInclude>
+    <ClInclude Include="G80Cycle.h">
+      <Filter>Header Files\Motion</Filter>
+    </ClInclude>
+    <ClInclude Include="MotionCore_G80.h">
+      <Filter>Header Files\Motion</Filter>
+    </ClInclude>
+    <ClInclude Include="NCG80Block.h">
+      <Filter>Header Files\NC</Filter>
+    </ClInclude>
+    <ClInclude Include="NCG76SpherePlan.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="NCG76SphereCoordinates.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="NCG76SphereSource.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="NCG76SphereHold.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="NCG76SphereArchitecture.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="NCG76SphereRuntimeGeometry.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="NCG76SphereCycle.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="MotionCore_G76Sphere.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="RotarySpindleConfig.h">
+      <Filter>Header Files\NC</Filter>
+    </ClInclude>
+    <ClInclude Include="NCSpindleCodes.h">
+      <Filter>Header Files\NC</Filter>
+    </ClInclude>
+    <ClInclude Include="NCSpindleSource.h">
+      <Filter>Header Files\NC</Filter>
+    </ClInclude>
+    <ClInclude Include="NCRotarySpindle.h">
+      <Filter>Header Files\NC</Filter>
+    </ClInclude>
+    <ClInclude Include="NCSpindleDispatch.h">
+      <Filter>Header Files\NC</Filter>
+    </ClInclude>
+    <ClInclude Include="MotionCore_RotarySpindle.h">
+      <Filter>Header Files\NC</Filter>
+    </ClInclude>
+    <ClInclude Include="MotionRotarySpindleProof.h">
+      <Filter>Header Files\NC</Filter>
+    </ClInclude>
+    <ClInclude Include="NCG80Results.h">
+      <Filter>Header Files\NC</Filter>
+    </ClInclude>
+    <ClInclude Include="EDM275G76Diagnostic.h">
+      <Filter>Header Files\Motion</Filter>
+    </ClInclude>
     <ClInclude Include="NCManager_GapInternal.h">
       <Filter>Source Files\NC\EDM</Filter>
     </ClInclude>

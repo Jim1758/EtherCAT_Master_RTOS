@@ -388,15 +388,72 @@ inline bool IsG76SharedShort274(const Recipe& r) noexcept
 }
 inline bool IsG76SharedShortB1_274(const Recipe& r) noexcept
 {return r.commissioningProfile==VisibleFlushProfile173&&IsG76SharedShort274(r);}
+// EDM283: one shared source tag for the existing tangent B0 and retained B2
+// contracts. The internal selector binds the original P; L383 is never a
+// recipe by itself. Legacy L374 and every old selector retain their meaning.
+constexpr unsigned G76SharedPathArmTag283=383U, G76SharedPathSelectorBase283=28300U;
+inline bool IsG76SharedPathMode283(unsigned modeP) noexcept
+{return (modeP>=1U&&modeP<=7U)||(modeP>=11U&&modeP<=17U)||(modeP>=21U&&modeP<=27U);}
+inline unsigned G76SharedPathSelector283(unsigned modeP) noexcept
+{return IsG76SharedPathMode283(modeP)?G76SharedPathSelectorBase283+modeP:0U;}
+inline unsigned G76SharedPathMode283(unsigned selector) noexcept
+{return selector>G76SharedPathSelectorBase283&&IsG76SharedPathMode283(selector-G76SharedPathSelectorBase283)?
+    selector-G76SharedPathSelectorBase283:0U;}
+inline bool IsG76SharedPathSelector283(unsigned selector) noexcept
+{return G76SharedPathMode283(selector)!=0U;}
+inline bool IsG76SharedPath283(const Recipe& r) noexcept
+{
+    const unsigned mode=G76SharedPathMode283(r.flushHoldTest);
+    const bool b0=r.commissioningProfile==G76B0Profile192;
+    return mode&&(b0||r.commissioningProfile==G76B2Profile175)&&
+        r.workTimeUs==500000ULL&&r.jumpHeightScaled==(b0?G76B0HeightScaled192:G76B2HeightScaled175)&&
+        r.jumpSpeedPercentScaled==100000000ULL&&r.diagnosticControlSource==3U&&
+        r.planRows==((mode<10U||mode>=20U)?26U:25U)&&
+        (r.planMovementMask==3U||r.planMovementMask==7U)&&!r.holdRetreatMode&&
+        !r.deepFlushCycleInterval&&r.deepFlushHeightMultiplierScaled==1000000ULL;
+}
+// EDM284: one sealed source family covers all five existing B behaviors.
+// Its short-height subset is explicit; old L374/L383 identities stay separate.
+constexpr unsigned G76SharedCycleArmTag284=384U, G76SharedCycleSelectorBase284=28400U;
+constexpr std::uint64_t G76SharedCycleShortHeightScaled284=200000ULL;
+inline bool IsG76SharedCycleMode284(unsigned modeP) noexcept
+{return (modeP>=1U&&modeP<=7U)||(modeP>=11U&&modeP<=17U)||(modeP>=21U&&modeP<=27U);}
+inline unsigned G76SharedCycleSelector284(unsigned modeP) noexcept
+{return IsG76SharedCycleMode284(modeP)?G76SharedCycleSelectorBase284+modeP:0U;}
+inline unsigned G76SharedCycleMode284(unsigned selector) noexcept
+{return selector>G76SharedCycleSelectorBase284&&IsG76SharedCycleMode284(selector-G76SharedCycleSelectorBase284)?
+    selector-G76SharedCycleSelectorBase284:0U;}
+inline bool IsG76SharedCycleSelector284(unsigned selector) noexcept
+{return G76SharedCycleMode284(selector)!=0U;}
+inline bool IsG76SharedCycle284(const Recipe& r) noexcept
+{
+    const unsigned mode=G76SharedCycleMode284(r.flushHoldTest);
+    const bool b0=r.commissioningProfile==G76B0Profile192,b2=r.commissioningProfile==G76B2Profile175;
+    const bool shortFlush=r.commissioningProfile==VisibleFlushProfile173||
+        r.commissioningProfile==G76B3Profile176||r.commissioningProfile==G76B4Profile177;
+    return mode&&(b0||b2||shortFlush)&&r.workTimeUs==500000ULL&&
+        r.jumpHeightScaled==(b0?G76B0HeightScaled192:b2?G76B2HeightScaled175:G76SharedCycleShortHeightScaled284)&&
+        r.jumpSpeedPercentScaled==100000000ULL&&r.diagnosticControlSource==3U&&
+        r.planRows==((mode<10U||mode>=20U)?26U:25U)&&
+        (r.planMovementMask==7U||(b0&&r.planMovementMask==3U))&&!r.holdRetreatMode&&
+        !r.deepFlushCycleInterval&&r.deepFlushHeightMultiplierScaled==1000000ULL;
+}
+inline bool IsG76SharedCycleShort284(const Recipe& r) noexcept
+{return (r.commissioningProfile==VisibleFlushProfile173||r.commissioningProfile==G76B3Profile176||
+    r.commissioningProfile==G76B4Profile177)&&IsG76SharedCycle284(r);}
+inline bool IsG76SharedCycleB1_284(const Recipe& r) noexcept
+{return r.commissioningProfile==VisibleFlushProfile173&&IsG76SharedCycle284(r);}
 inline unsigned G76PlanRows(const Recipe& r) noexcept
 {return IsG76Expansion263(r)||IsG76FixedRadius266(r)||IsG76FixedRadiusWork267(r)||
-    (IsG76SharedShort274(r)&&(G76SharedShortMode274(r.flushHoldTest)<10U||G76SharedShortMode274(r.flushHoldTest)>=20U))?26U:25U;}
+    (IsG76SharedShort274(r)&&(G76SharedShortMode274(r.flushHoldTest)<10U||G76SharedShortMode274(r.flushHoldTest)>=20U))||
+    (IsG76SharedPath283(r)&&(G76SharedPathMode283(r.flushHoldTest)<10U||G76SharedPathMode283(r.flushHoldTest)>=20U))||
+    (IsG76SharedCycle284(r)&&(G76SharedCycleMode284(r.flushHoldTest)<10U||G76SharedCycleMode284(r.flushHoldTest)>=20U))?26U:25U;}
 inline bool IsG76NonCircular(const Recipe& r) noexcept
 {return IsG76SquareMode12(r)||IsG76DiamondB1_255(r)||IsG76DiamondB2_256(r)||IsG76DiamondB3_257(r)||IsG76DiamondB4_258(r)||IsG76PolygonB2_261(r);}
 inline bool IsG76CommissioningRecipe(const Recipe& r) noexcept
-{return IsG76NonCircular(r)||IsG76OneMm260(r)||IsG76Expansion263(r)||IsG76FixedRadius266(r)||IsG76FixedRadiusWork267(r)||IsG76SharedShort274(r);}
+{return IsG76NonCircular(r)||IsG76OneMm260(r)||IsG76Expansion263(r)||IsG76FixedRadius266(r)||IsG76FixedRadiusWork267(r)||IsG76SharedShort274(r)||IsG76SharedPath283(r)||IsG76SharedCycle284(r);}
 inline unsigned G76PlanMode(const Recipe& r) noexcept
-{return IsG76SharedShort274(r)?G76SharedShortMode274(r.flushHoldTest):IsG76FixedRadiusWork267(r)?G76FixedRadiusWorkMode267(r.flushHoldTest):IsG76FixedRadius266(r)?G76FixedRadiusMode266(r.flushHoldTest):IsG76Expansion263(r)?G76ExpansionMode263(r.flushHoldTest):IsG76OneMm260(r)?G76OneMmMode260(r.flushHoldTest):
+{return IsG76SharedCycle284(r)?G76SharedCycleMode284(r.flushHoldTest):IsG76SharedPath283(r)?G76SharedPathMode283(r.flushHoldTest):IsG76SharedShort274(r)?G76SharedShortMode274(r.flushHoldTest):IsG76FixedRadiusWork267(r)?G76FixedRadiusWorkMode267(r.flushHoldTest):IsG76FixedRadius266(r)?G76FixedRadiusMode266(r.flushHoldTest):IsG76Expansion263(r)?G76ExpansionMode263(r.flushHoldTest):IsG76OneMm260(r)?G76OneMmMode260(r.flushHoldTest):
     IsG76PolygonB2_261(r)?16U:
     (IsG76DiamondB1_255(r)||IsG76DiamondB2_256(r)||IsG76DiamondB3_257(r)||IsG76DiamondB4_258(r))?13U:IsG76SquareMode12(r)?12U:11U;}
 inline bool IsG76B2Flush175(const Recipe& r) noexcept
@@ -586,6 +643,8 @@ inline bool ValidFlushHoldSelection(unsigned arm,unsigned value) noexcept
     ((arm==292U||arm==296U||arm==298U)&&value>=273U&&value<=276U)||(arm==294U&&value>=277U&&value<=280U)||
     ((arm==292U||arm==296U||arm==298U)&&value>=281U&&value<=284U)||(arm==294U&&value>=285U&&value<=288U)||
     ((arm==292U||arm==296U||arm==298U)&&value==G76SharedShortArmTag274)||
+    ((arm==300U||arm==294U)&&value==G76SharedPathArmTag283)||
+    ((arm==292U||arm==294U||arm==296U||arm==298U||arm==300U)&&value==G76SharedCycleArmTag284)||
     (arm==296U&&value==245U)||(arm==298U&&value==246U)||(arm==296U&&value==247U)||(arm==298U&&value==248U)||
     ((arm==296U||arm==298U)&&(value==2U||value==3U||value==4U||value==5U||value==6U||value==7U||value==8U||value==9U||value==10U||value==11U||value==230U||value==231U||value==232U||value==233U||value==239U||value==240U||value==241U||value==242U||value==243U||value==244U));}
 inline unsigned FlushHoldTargetMode(unsigned selector) noexcept
@@ -751,7 +810,7 @@ inline bool ValidRecipe(const Recipe& r) noexcept
 {
     // Short geometry is not a generic commissioning permission. Only the
     // frozen center architecture selectors can authorize their exact E6.
-    return (r.jumpHeightScaled!=G76ArchitectureHeightScaled233||IsG76SharedShort274(r)||IsG76ParentSequence233(r)||IsG76CenterSequence239(r)||IsG76CenterSequence240(r)||IsG76CenterSequence241(r)||IsG76CenterSequence242(r)||IsG76CenterSequence243(r)||IsG76CenterSequence244(r)||IsG76CenterSequence245(r)||IsG76CenterSequence246(r)||IsG76CenterSequence248(r)||IsG76CenterSequence247(r))&&
+    return (r.jumpHeightScaled!=G76ArchitectureHeightScaled233||(IsG76SharedShort274(r)||IsG76SharedCycleShort284(r))||IsG76ParentSequence233(r)||IsG76CenterSequence239(r)||IsG76CenterSequence240(r)||IsG76CenterSequence241(r)||IsG76CenterSequence242(r)||IsG76CenterSequence243(r)||IsG76CenterSequence244(r)||IsG76CenterSequence245(r)||IsG76CenterSequence246(r)||IsG76CenterSequence248(r)||IsG76CenterSequence247(r))&&
         r.holdRetreatMode<=1U&&(r.flushHoldTest<=3U||IsG76CommissioningRecipe(r)||IsG76CenterAnchorHold220(r)||IsG76CenterStartHold221(r)||IsG76CenterTopDwellHold222(r)||IsG76CenterDwellHold224(r)||IsG76CenterReturnDwellHold225(r)||IsG76CenterFinalDwellHold226(r)||IsG76CenterInitialDwellHold227(r)||IsG76CenterBrakeHold228(r)||IsG76CenterRepeat230(r)||IsG76ParentSequence233(r)||IsG76CenterSequence239(r)||IsG76CenterSequence240(r)||IsG76CenterSequence241(r)||IsG76CenterSequence242(r)||IsG76CenterSequence243(r)||IsG76CenterSequence244(r)||IsG76CenterSequence245(r)||IsG76CenterSequence246(r)||IsG76CenterSequence248(r)||IsG76CenterSequence247(r)||IsG76CenterSecondFlushHold231(r)||IsG76CenterSecondReturnHold232(r))&&
         (r.flushHoldTest<=1U||((!r.commissioningProfile||IsG76CommissioningRecipe(r)||IsG76B2FlushHold200(r)||IsG76CenterAnyFlushHold232(r)||IsG76CenterRepeat230(r)||IsG76ParentSequence233(r)||IsG76CenterSequence239(r)||IsG76CenterSequence240(r)||IsG76CenterSequence241(r)||IsG76CenterSequence242(r)||IsG76CenterSequence243(r)||IsG76CenterSequence244(r)||IsG76CenterSequence245(r)||IsG76CenterSequence246(r)||IsG76CenterSequence248(r)||IsG76CenterSequence247(r))&&r.diagnosticControlSource==3U))&&
         (!r.flushHoldTest||(IsMotionTest(r)&&HasBoundProgramPlan(r)&&
@@ -763,23 +822,23 @@ inline bool ValidRecipe(const Recipe& r) noexcept
         (!IsG76B0Flush192(r)||(HasBoundHeight(r)&&r.jumpHeightScaled==G76B0HeightScaled192&&
             r.workTimeUs>=VisibleFlushMinimumWorkUs173&&r.workTimeUs<=VisibleFlushMaximumWorkUs173&&
             r.jumpSpeedPercentScaled==100000000ULL&&r.diagnosticControlSource==3U&&
-            !r.holdRetreatMode&&!r.flushHoldTest))&&
-        (!IsVisibleFlush173(r)||(HasBoundHeight(r)&&(r.jumpHeightScaled==VisibleFlushHeightScaled173||IsG76OneMmB1_260(r)||IsG76ExpansionB1_263(r)||(IsG76FixedRadiusB1_266(r)||IsG76FixedRadiusWorkB1_267(r)||IsG76SharedShortB1_274(r)))&&
+            !r.holdRetreatMode&&(!r.flushHoldTest||(IsG76SharedPath283(r)||IsG76SharedCycle284(r)))))&&
+        (!IsVisibleFlush173(r)||(HasBoundHeight(r)&&(r.jumpHeightScaled==VisibleFlushHeightScaled173||IsG76OneMmB1_260(r)||IsG76ExpansionB1_263(r)||(IsG76FixedRadiusB1_266(r)||IsG76FixedRadiusWorkB1_267(r)||(IsG76SharedShortB1_274(r)||IsG76SharedCycleB1_284(r))))&&
             r.workTimeUs>=VisibleFlushMinimumWorkUs173&&r.workTimeUs<=VisibleFlushMaximumWorkUs173&&
             r.jumpSpeedPercentScaled==100000000ULL&&r.diagnosticControlSource==3U&&
-            !r.holdRetreatMode&&(!r.flushHoldTest||IsG76SquareB1_250(r)||IsG76DiamondB1_255(r)||IsG76OneMmB1_260(r)||IsG76ExpansionB1_263(r)||(IsG76FixedRadiusB1_266(r)||IsG76FixedRadiusWorkB1_267(r)||IsG76SharedShortB1_274(r)))))&&
+            !r.holdRetreatMode&&(!r.flushHoldTest||IsG76SquareB1_250(r)||IsG76DiamondB1_255(r)||IsG76OneMmB1_260(r)||IsG76ExpansionB1_263(r)||(IsG76FixedRadiusB1_266(r)||IsG76FixedRadiusWorkB1_267(r)||(IsG76SharedShortB1_274(r)||IsG76SharedCycleB1_284(r))))))&&
         (!IsG76B3Flush176(r)||(HasBoundHeight(r)&&ValidG76CenterHeightScaled(r.jumpHeightScaled)&&
             r.workTimeUs>=VisibleFlushMinimumWorkUs173&&r.workTimeUs<=VisibleFlushMaximumWorkUs173&&
             ValidG76FlushSpeedPercent(r.commissioningProfile,r.jumpSpeedPercentScaled)&&r.diagnosticControlSource==3U&&
-            !r.holdRetreatMode&&(!r.flushHoldTest||IsG76SquareB3_252(r)||IsG76DiamondB3_257(r)||IsG76OneMmB3_260(r)||IsG76ExpansionB3_263(r)||(IsG76FixedRadiusB3_266(r)||IsG76FixedRadiusWorkB3_267(r)||IsG76SharedShort274(r))||IsG76CenterHold217(r)||IsG76CenterAnyFlushHold232(r)||IsG76CenterRepeat230(r)||IsG76ParentSequence233(r)||IsG76CenterSequence239(r)||IsG76CenterSequence240(r)||IsG76CenterSequence241(r)||IsG76CenterSequence242(r)||IsG76CenterSequence243(r)||IsG76CenterSequence244(r)||IsG76CenterSequence245(r)||IsG76CenterSequence247(r))))&&
+            !r.holdRetreatMode&&(!r.flushHoldTest||IsG76SquareB3_252(r)||IsG76DiamondB3_257(r)||IsG76OneMmB3_260(r)||IsG76ExpansionB3_263(r)||(IsG76FixedRadiusB3_266(r)||IsG76FixedRadiusWorkB3_267(r)||(IsG76SharedShort274(r)||IsG76SharedCycleShort284(r)))||IsG76CenterHold217(r)||IsG76CenterAnyFlushHold232(r)||IsG76CenterRepeat230(r)||IsG76ParentSequence233(r)||IsG76CenterSequence239(r)||IsG76CenterSequence240(r)||IsG76CenterSequence241(r)||IsG76CenterSequence242(r)||IsG76CenterSequence243(r)||IsG76CenterSequence244(r)||IsG76CenterSequence245(r)||IsG76CenterSequence247(r))))&&
         (!IsG76B4Flush177(r)||(HasBoundHeight(r)&&ValidG76CenterHeightScaled(r.jumpHeightScaled)&&
             r.workTimeUs>=VisibleFlushMinimumWorkUs173&&r.workTimeUs<=VisibleFlushMaximumWorkUs173&&
             ValidG76FlushSpeedPercent(r.commissioningProfile,r.jumpSpeedPercentScaled)&&r.diagnosticControlSource==3U&&
-            !r.holdRetreatMode&&(!r.flushHoldTest||IsG76SquareB4_253(r)||IsG76DiamondB4_258(r)||IsG76OneMmB4_260(r)||IsG76ExpansionB4_263(r)||(IsG76FixedRadiusB4_266(r)||IsG76FixedRadiusWorkB4_267(r)||IsG76SharedShort274(r))||IsG76CenterHold217(r)||IsG76CenterAnyFlushHold232(r)||IsG76CenterRepeat230(r)||IsG76ParentSequence233(r)||IsG76CenterSequence239(r)||IsG76CenterSequence240(r)||IsG76CenterSequence241(r)||IsG76CenterSequence242(r)||IsG76CenterSequence243(r)||IsG76CenterSequence244(r)||IsG76CenterSequence246(r)||IsG76CenterSequence248(r))))&&
+            !r.holdRetreatMode&&(!r.flushHoldTest||IsG76SquareB4_253(r)||IsG76DiamondB4_258(r)||IsG76OneMmB4_260(r)||IsG76ExpansionB4_263(r)||(IsG76FixedRadiusB4_266(r)||IsG76FixedRadiusWorkB4_267(r)||(IsG76SharedShort274(r)||IsG76SharedCycleShort284(r)))||IsG76CenterHold217(r)||IsG76CenterAnyFlushHold232(r)||IsG76CenterRepeat230(r)||IsG76ParentSequence233(r)||IsG76CenterSequence239(r)||IsG76CenterSequence240(r)||IsG76CenterSequence241(r)||IsG76CenterSequence242(r)||IsG76CenterSequence243(r)||IsG76CenterSequence244(r)||IsG76CenterSequence246(r)||IsG76CenterSequence248(r))))&&
         (!IsG76B2Flush175(r)||(HasBoundHeight(r)&&r.jumpHeightScaled==G76B2HeightScaled175&&
             r.workTimeUs>=VisibleFlushMinimumWorkUs173&&r.workTimeUs<=VisibleFlushMaximumWorkUs173&&
             r.jumpSpeedPercentScaled==100000000ULL&&r.diagnosticControlSource==3U&&
-            !r.holdRetreatMode&&(!r.flushHoldTest||IsG76B2FlushHold200(r)||IsG76SquareB2_251(r)||IsG76DiamondB2_256(r)||IsG76PolygonB2_261(r)||IsG76ExpansionB2_263(r)||(IsG76FixedRadiusB2_266(r)||IsG76FixedRadiusWorkB2_267(r)))))&&
+            !r.holdRetreatMode&&(!r.flushHoldTest||IsG76B2FlushHold200(r)||IsG76SquareB2_251(r)||IsG76DiamondB2_256(r)||IsG76PolygonB2_261(r)||IsG76ExpansionB2_263(r)||(IsG76FixedRadiusB2_266(r)||IsG76FixedRadiusWorkB2_267(r)||(IsG76SharedPath283(r)||IsG76SharedCycle284(r))))))&&
         (!IsVisibleFlush(r)||(HasBoundHeight(r)&&r.jumpHeightScaled==VisibleFlushHeightScaled158&&
             r.workTimeUs==VisibleFlushWorkUs158&&r.jumpSpeedPercentScaled==100000000ULL&&
             (!r.diagnosticControlSource||r.diagnosticControlSource==3U)))&&
@@ -796,12 +855,12 @@ inline bool ValidRecipe(const Recipe& r) noexcept
             (r.speedFieldId&&r.speedFieldId!=r.fieldId&&ValidSpeedPercent(r.jumpSpeedPercentScaled)))&&
         ((!r.heightFieldId&&!r.jumpHeightScaled)||
             (r.heightFieldId&&r.heightFieldId!=r.fieldId&&r.heightFieldId!=r.speedFieldId&&
-                HasBoundSpeed(r)&&(ValidJumpHeight(r.jumpHeightScaled,r.commissioningProfile)||IsG76OneMmB1_260(r)||IsG76ExpansionB1_263(r)||(IsG76FixedRadiusB1_266(r)||IsG76FixedRadiusWorkB1_267(r)||IsG76SharedShortB1_274(r)))))&&
+                HasBoundSpeed(r)&&(ValidJumpHeight(r.jumpHeightScaled,r.commissioningProfile)||IsG76OneMmB1_260(r)||IsG76ExpansionB1_263(r)||(IsG76FixedRadiusB1_266(r)||IsG76FixedRadiusWorkB1_267(r)||(IsG76SharedShortB1_274(r)||IsG76SharedCycleB1_284(r))))))&&
         ((!r.intervalFieldId&&!r.multiplierFieldId&&!r.deepFlushCycleInterval&&!r.deepFlushHeightMultiplierScaled)||
             (HasBoundDeep(r)&&HasBoundHeight(r)&&r.intervalFieldId!=r.multiplierFieldId&&
                 r.intervalFieldId!=r.fieldId&&r.intervalFieldId!=r.heightFieldId&&r.intervalFieldId!=r.speedFieldId&&
                 r.multiplierFieldId!=r.fieldId&&r.multiplierFieldId!=r.heightFieldId&&r.multiplierFieldId!=r.speedFieldId&&
-                (ValidDeepFlushValues(r.jumpHeightScaled,r.deepFlushCycleInterval,r.deepFlushHeightMultiplierScaled,r.commissioningProfile)||IsG76OneMmB1_260(r)||IsG76ExpansionB1_263(r)||(IsG76FixedRadiusB1_266(r)||IsG76FixedRadiusWorkB1_267(r)||IsG76SharedShortB1_274(r)))))&&
+                (ValidDeepFlushValues(r.jumpHeightScaled,r.deepFlushCycleInterval,r.deepFlushHeightMultiplierScaled,r.commissioningProfile)||IsG76OneMmB1_260(r)||IsG76ExpansionB1_263(r)||(IsG76FixedRadiusB1_266(r)||IsG76FixedRadiusWorkB1_267(r)||(IsG76SharedShortB1_274(r)||IsG76SharedCycleB1_284(r))))))&&
         ((!r.machiningFieldId&&!r.machiningSpeedPercentScaled)||
             (HasBoundMachiningSpeed(r)&&HasBoundDeep(r)&&ValidMachiningSpeedPercent(r.machiningSpeedPercentScaled)&&
                 r.machiningFieldId!=r.fieldId&&r.machiningFieldId!=r.speedFieldId&&

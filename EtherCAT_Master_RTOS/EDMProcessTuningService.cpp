@@ -158,5 +158,5 @@ void ProcessEDMProcessTuningServiceSameThread(NCManager& nc) noexcept
     }
     const EDMProcessTuningStatus status = nc.ApplyEDMProcessTuningSameThread(request);
     Ack(nc, request, status, status == EDMProcessTuningStatus::Success ?
-        "Applied to runtime shadow profile; disk files unchanged." : "Rejected; active profile unchanged.", true);
+        "Runtime profile applied; collision thresholds active; disk unchanged." : "Rejected; active profile unchanged.", true);
 }

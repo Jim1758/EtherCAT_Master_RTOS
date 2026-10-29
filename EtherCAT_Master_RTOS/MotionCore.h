@@ -18,6 +18,13 @@
 #include "CompensationEngine.h" // 引入剛寫好的標頭檔
 #include "SHM_Types.h"
 #include "MotionExecutionContract.h"
+#include "MotionCore_G80.h"
+#include "MotionCore_RotarySpindle.h"
+#include "MotionRotarySpindleProof.h"
+#include "MotionCore_G76Sphere.h"
+#include "EDMShortCircuitProtection.h"
+#include "G80VoltageSimulator.h"
+#include "G80PID.h"
 
 class NCEccentricCRuntimeValue; // BASE79D read-only pre-start binding
 struct MotionEccentricCConsumerState;
@@ -811,6 +818,11 @@ enum class PathMode// 軌跡的連續模式
     JUMP_TRACKING//跳躍排渣模式
 };
 
+inline bool IsMotionPositioningOperationValid(std::uint8_t operation) noexcept
+{
+    switch(operation){case 0U:case 1U:case 7U:case 28U:case 30U:case 32U:case 53U:case 161U:return true;default:return false;}
+}
+
 struct MotionCommand//運動指令包裹 (使用在塞進佇列)
 {
     // Stage NC-0.1B：命令進入 Motion Queue 前正式取得執行識別。
@@ -923,6 +935,9 @@ struct MotionCommand//運動指令包裹 (使用在塞進佇列)
     bool sourceIsAbsoluteMode = true;
 
     bool sourceG68Active = false;
+    bool g80EdgeFind = false; // G80 parent marker in existing x64 padding.
+    std::uint8_t positioningOperation=0U; // EDM280 immutable G-code provenance, existing padding.
+    bool g76SphereAir=false; // EDM286 sealed P50 AIR parent; existing source-G68 padding.
     double sourceG68Angle = 0.0;
 
     bool sourceG168Active = false;
@@ -949,6 +964,11 @@ struct MotionCommand//運動指令包裹 (使用在塞進佇列)
     // Immutable fixed-translation source; all prior transport offsets stay unchanged.
     NCTranslationSnapshot sourceTranslation{};
 };
+
+// Generic packet families must reject the P50 parent before a typed bool
+// read; malformed marker bytes are rejected here as well as at the RT gate.
+inline bool IsMotionG76SphereMarkerClear(const MotionCommand& command) noexcept
+{ return reinterpret_cast<const unsigned char*>(&command)[offsetof(MotionCommand,g76SphereAir)]==0U; }
 
 inline bool IsMotionFixedTranslationToolSourceAllowed(const MotionCommand& command) noexcept
 {
@@ -1108,6 +1128,7 @@ inline bool IsMotionFixedTranslationCutterSourceAllowed(const MotionCommand& com
 inline bool IsMotionArcPlaneGroupMapping(const MotionCommand& command,
     int groupAxisCount, const int* groupAxes) noexcept
 {
+    if(!IsMotionG76SphereMarkerClear(command))return false;
     if (command.pathCoreEccentricCFeedExactStop) return false;
     NCArcPlaneAxes plane{};
     return groupAxes != nullptr && TryGetNCArcPlaneAxes(command.sourcePlaneMode, plane) &&
@@ -1123,6 +1144,7 @@ inline bool IsMotionArcPlaneGroupMapping(const MotionCommand& command,
 // the cutter source gate independently checks literal-contour payload shape.
 inline bool IsMotionBaseArcPlaneSourceAllowed(const MotionCommand& command) noexcept
 {
+    if(!IsMotionG76SphereMarkerClear(command))return false;
     if (command.pathCoreEccentricCFeedExactStop) return false;
     if (command.sourcePlaneMode == 17) return true;
     NCArcPlaneAxes plane{};
@@ -1151,6 +1173,7 @@ inline bool IsMotionBaseArcPlaneSourceAllowed(const MotionCommand& command) noex
 // This marker never grants rapid, mixed-axis, lookahead, replay or EDM authority.
 inline bool IsMotionRotaryFeedSourceAllowed(const MotionCommand& command) noexcept
 {
+    if(!IsMotionG76SphereMarkerClear(command))return false;
     if (command.pathCoreEccentricCFeedExactStop) return false;
     const NCTranslationSnapshot& source = command.sourceTranslation;
     if (!command.pathCoreRotaryFeedExactStop || command.pathCoreFeedExactStop || command.pathCoreZCFeedExactStop ||
@@ -1181,6 +1204,7 @@ inline bool IsMotionRotaryFeedSourceAllowed(const MotionCommand& command) noexce
 // pulse path transports common progress, never a mixed physical feed metric.
 inline bool IsMotionZCFeedSourceAllowed(const MotionCommand& command) noexcept
 {
+    if(!IsMotionG76SphereMarkerClear(command))return false;
     if (command.pathCoreEccentricCFeedExactStop) return false;
     const NCTranslationSnapshot& source = command.sourceTranslation;
     return command.pathCoreZCFeedExactStop && !command.pathCoreXYZCFeedExactStop &&
@@ -1205,6 +1229,7 @@ inline bool IsMotionZCFeedSourceAllowed(const MotionCommand& command) noexcept
 // BASE75 exact G90/G91 XYZ/C mapping; physical units remain separate.
 inline bool IsMotionXYZCFeedSourceAllowed(const MotionCommand& command) noexcept
 {
+    if(!IsMotionG76SphereMarkerClear(command))return false;
     if (command.pathCoreEccentricCFeedExactStop) return false;
     const NCTranslationSnapshot& source = command.sourceTranslation;
     return command.pathCoreXYZCFeedExactStop && !command.pathCoreXYZCUVFeedExactStop &&
@@ -1271,23 +1296,42 @@ inline bool IsMotionEDMCommissioningMarkerEncodingValid(const MotionCommand& com
 {
     const unsigned char* bytes = reinterpret_cast<const unsigned char*>(&command);
     unsigned selected = 0U;
-    const std::size_t offsets[4U] = { offsetof(MotionCommand, edm149ZOnlyCommissioning),
-        offsetof(MotionCommand, edm150XYZOnlyCommissioning), offsetof(MotionCommand, edm154SparseCommissioning), offsetof(MotionCommand, edm173G76Gap) };
-    for (unsigned index = 0U; index < 4U; ++index)
+    const std::size_t offsets[5U] = { offsetof(MotionCommand, edm149ZOnlyCommissioning),
+        offsetof(MotionCommand, edm150XYZOnlyCommissioning), offsetof(MotionCommand, edm154SparseCommissioning),
+        offsetof(MotionCommand, edm173G76Gap), offsetof(MotionCommand,g76SphereAir) };
+    for (unsigned index = 0U; index < 5U; ++index)
     {
         const unsigned char value = bytes[offsets[index]];
         if (value > 1U) return false;
         selected += value;
     }
-    return selected <= 1U && (bytes[offsetof(MotionCommand, edm173G76Gap)] ?
+    if(selected>1U)return false;
+    if(bytes[offsetof(MotionCommand,g76SphereAir)]!=0U)
+    {
+        // P50 is its own immutable parent, never a relabelled legacy packet.
+        // Source/geometry/current authority are checked by its dedicated lane.
+        const std::size_t incompatible[] = { offsetof(MotionCommand,g80EdgeFind),
+            offsetof(MotionCommand,pathCoreEccentricCFeedExactStop),
+            offsetof(MotionCommand,pathCoreFeedExactStop), offsetof(MotionCommand,pathCoreRotaryFeedExactStop),
+            offsetof(MotionCommand,pathCoreZCFeedExactStop), offsetof(MotionCommand,pathCoreXYZCFeedExactStop),
+            offsetof(MotionCommand,pathCoreXYZCUVFeedExactStop), offsetof(MotionCommand,pathCorePlanarCircle),
+            offsetof(MotionCommand,pathCoreFullCircle), offsetof(MotionCommand,pathCoreRetainedTraversal),
+            offsetof(MotionCommand,pathCoreRetainedReverse), offsetof(MotionCommand,replayTerminalAlreadyPublished),
+            offsetof(MotionCommand,cncFeedLookahead), offsetof(MotionCommand,cncCornerBlend),
+            offsetof(MotionCommand,mem_enableTransform) };
+        for(std::size_t offset:incompatible)if(bytes[offset]!=0U)return false;
+        if(command.positioningOperation!=0U)return false;
+    }
+    return bytes[offsetof(MotionCommand, edm173G76Gap)] ?
         (command.edm173ChildCount==25U || command.edm173ChildCount==26U) &&
         command.edm173ChildOrdinal<command.edm173ChildCount :
-        command.edm173ChildCount==0U && command.edm173ChildOrdinal==0U);
+        command.edm173ChildCount==0U && command.edm173ChildOrdinal==0U;
 }
 
 // BASE74 exact G90/G91 XYZ/C/U/V mapping; physical units remain separate.
 inline bool IsMotionXYZCUVFeedSourceAllowed(const MotionCommand& command) noexcept
 {
+    if(!IsMotionG76SphereMarkerClear(command))return false;
     if (!IsMotionEDMCommissioningMarkerEncodingValid(command) || command.pathCoreEccentricCFeedExactStop) return false;
     const NCTranslationSnapshot& source = command.sourceTranslation;
     return command.pathCoreXYZCUVFeedExactStop && !command.pathCoreXYZCFeedExactStop &&
@@ -1393,6 +1437,7 @@ inline double MotionXYZCUVEndMCS(const MotionCommand& command, unsigned slot) no
 // Geometry, publication identity and the current frame remain separate gates.
 inline bool IsMotionG76ExpansionAirWorkSource264(const MotionCommand& command) noexcept
 {
+    if(!IsMotionG76SphereMarkerClear(command))return false;
     const auto& m=command.mem_transformMatrix;
     const double mode=m[0U][2U],ordinal=m[1U][1U];
     if(m[0U][0U]!=264.0 || m[0U][1U]!=1.0 ||
@@ -1416,6 +1461,7 @@ inline bool IsMotionG76ExpansionAirWorkSource264(const MotionCommand& command) n
 // grant GAP authority or broaden the older P2 marker's mode set.
 inline bool IsMotionG76FixedRadiusAirWorkSource265(const MotionCommand& command) noexcept
 {
+    if(!IsMotionG76SphereMarkerClear(command))return false;
     const auto& m=command.mem_transformMatrix;
     const double mode=m[0U][2U],ordinal=m[1U][1U];
     if(m[0U][0U]!=265.0 || m[0U][1U]!=1.0 ||
@@ -1442,6 +1488,7 @@ inline bool IsMotionG76FixedRadiusAirWorkSource265(const MotionCommand& command)
 // Legacy version 1 excludes vectors and remains byte-for-byte compatible.
 inline bool IsMotionG76MixedAirWorkSource269(const MotionCommand& command) noexcept
 {
+    if(!IsMotionG76SphereMarkerClear(command))return false;
     const auto& m=command.mem_transformMatrix;
     const double kind=m[0U][2U],count=m[1U][0U],ordinal=m[1U][1U],phase=m[1U][2U];
     const double mode=m[2U][1U],nominal=m[2U][2U];
@@ -1486,6 +1533,7 @@ inline bool IsMotionG76MixedAirWorkSource269(const MotionCommand& command) noexc
 
 inline bool IsMotionG76MixedRetainedSourceAllowed(const MotionCommand& command) noexcept
 {
+    if(!IsMotionG76SphereMarkerClear(command))return false;
     if (!IsMotionEDMCommissioningMarkerEncodingValid(command)) return false;
     // B0 and ordinary B2 fixed WORK compounds use separate immutable tags;
     // an untagged legacy mixed/reverse packet still keeps W disabled.
@@ -1547,6 +1595,7 @@ inline bool IsMotionG76MixedRetainedSourceAllowed(const MotionCommand& command) 
 
 inline bool IsMotionFixedTranslationSourceAllowed(const MotionCommand& command) noexcept
 {
+    if(!IsMotionG76SphereMarkerClear(command))return false;
     if(!IsMotionEDMCommissioningMarkerEncodingValid(command))return false;
     if(command.edm173G76Gap)return command.pathCoreRetainedTraversal && !command.pathCoreRetainedReverse && !command.pathCorePlanarCircle && command.mode==InterpolationMode::LINEAR && command.mem_transformOrigin[0]==0.0 && command.mem_transformOrigin[1]==1.0 && IsMotionG76MixedRetainedSourceAllowed(command);
     if (command.pathCoreRetainedTraversal && command.mem_transformOrigin[2]==2.0)
@@ -1594,6 +1643,13 @@ static_assert(
     "Fixed axis/coordinate source proof appends 496 bytes; rebuild every RTSS translation unit.");
 static_assert(offsetof(MotionCommand, sourceTranslation) == 568U,
     "Fixed translation must preserve every pre-existing command offset.");
+static_assert(offsetof(MotionCommand,positioningOperation)==offsetof(MotionCommand,g80EdgeFind)+1U,
+    "EDM280 positioning provenance must use existing command padding.");
+static_assert(offsetof(MotionCommand,g76SphereAir)==offsetof(MotionCommand,positioningOperation)+1U &&
+    offsetof(MotionCommand,g76SphereAir)==516U,
+    "EDM286 P50 marker must use existing command padding and preserve every source offset.");
+static_assert(offsetof(MotionCommand,g80EdgeFind)==offsetof(MotionCommand,sourceG68Active)+1U,
+    "G80 marker must occupy only existing source-G68 padding.");
 static_assert(offsetof(MotionCommand, cncPrefixVelocityPPS) == 560U,
     "DK must preserve every pre-existing MotionCommand offset.");
 static_assert(
@@ -2628,6 +2684,47 @@ class MotionCore
 public:
     MotionCore();
     ~MotionCore();
+    bool TryG80Move(const G80::Request& request, const NCTranslationSnapshot& frame,
+        MotionExecutionEpoch epoch, const MotionOwnerLease& owner, int sourcePC,
+        MotionExecutionIdentity& identity) noexcept;
+    bool ReadG80Feedback(MotionG80Feedback& out) const noexcept;
+    bool BeginRotarySpindleSession(const NCSpindleDispatch::Authority& authority,
+        const NCSpindleDispatch::Config& config) noexcept;
+    bool SubmitRotarySpindlePacket(const NCSpindleDispatch::Packet& packet) noexcept;
+    bool ReadRotarySpindleFeedback(MotionRotarySpindleFeedback& out) const noexcept;
+    bool ReleaseRotarySpindleSession(const NCSpindleDispatch::Authority& authority) noexcept;
+    bool IsRotarySpindleSessionClaimed() const noexcept;
+
+    bool TryG76SphereMove(const NCG76SphereCycle::Request& request,const NCTranslationSnapshot& frame,
+        MotionExecutionEpoch epoch,const MotionOwnerLease& owner,int sourcePC,
+        MotionExecutionIdentity& identity,MotionG76SphereAdmission* admission=nullptr) noexcept;
+    bool ReadG76SphereFeedback(MotionG76SphereFeedback& out) const noexcept;
+    bool BindG76SphereParent(std::uint64_t session,const MotionExecutionIdentity& identity,
+        const MotionOwnerLease& owner,std::uint64_t dispatch,std::uint64_t commit) noexcept;
+    bool RequestG76SphereHold(std::uint64_t session,const MotionExecutionIdentity& identity,
+        const MotionOwnerLease& owner,std::uint64_t holdSequence,std::uint64_t startFloor) noexcept;
+    bool RequestG76SphereResume(std::uint64_t session,const MotionExecutionIdentity& identity,
+        const MotionOwnerLease& owner,std::uint64_t holdSequence,std::uint64_t startSequence) noexcept;
+    bool RequestG76SphereResetCancellation(std::uint64_t session,const MotionExecutionIdentity& identity,
+        const MotionOwnerLease& owner,std::uint64_t resetHoldProvenance) noexcept;
+    bool CommitG76SphereCompletedEndpoint(std::uint64_t session,const MotionExecutionIdentity& identity,
+        const MotionOwnerLease& owner,std::array<double,8U>& endpointMCS) noexcept;
+    bool ReleaseG76SphereBarrier(std::uint64_t session,const MotionExecutionIdentity& identity,
+        const MotionOwnerLease& owner) noexcept;
+
+    bool ConfigureCollisionProtection(const EDMGapServo::Profile& profile,bool valid) noexcept;
+    void SetManualShortBypass(bool bypass) noexcept;
+    bool ReadCollisionProtection(EDMShortCircuitProtection::Snapshot& out) const noexcept;
+    bool RequestG80ResetCancellation(std::uint64_t session,const MotionExecutionIdentity& identity,
+        const MotionOwnerLease& owner,std::uint64_t resetHoldProvenance) noexcept;
+    bool ReleaseG80Barrier(std::uint64_t session,const MotionExecutionIdentity& identity,
+        const MotionOwnerLease& owner) noexcept;
+    bool CommitG80CompletedEndpoint(std::uint64_t session, const MotionExecutionIdentity& identity,
+        const MotionOwnerLease& owner, G80::Point6& endpointMCS) noexcept;
+    MotionNCTranslationTransitionResult TryCommitG80OriginTranslation(
+        const NCTranslationSnapshot& previous, const NCTranslationSnapshot& next,
+        MotionExecutionEpoch epoch, const MotionOwnerLease& owner, std::uint64_t session) noexcept;
+
     // BASE79F: initialize once before any cyclic work; no cyclic allocation.
     bool InitializeEccentricCConsumer() noexcept;
     bool IsEccentricCConsumerReady() const noexcept;
@@ -2699,6 +2796,12 @@ public:
         bool edmZGuardHeld = false;
         bool edmZSerializedExact = false;
         EDM94Serialized::Receipt edm94{};
+        std::uint64_t rotarySpindleRun=0ULL,rotarySpindleTick=0ULL;
+        std::array<std::uint64_t,3> rotarySpindleRequest{};
+        std::array<double,3> rotarySpindleRpm{};
+        std::array<std::int32_t,3> rotarySpindleHardwarePps{};
+        bool rotarySpindleSerializedExact=false;
+
     };
 
     bool BeginServoOutputFrameAtSendPoint(
@@ -5180,7 +5283,8 @@ private:
         const NCXYZCFeedLineValue* xyzcGeometry = nullptr,
         bool pathCoreXYZCUVFeedExactStop = false,
         const NCXYZCUVFeedLineValue* xyzcuvGeometry = nullptr,
-        const EDM94FeedAuthorization* edm94Authorization = nullptr) noexcept;
+        const EDM94FeedAuthorization* edm94Authorization = nullptr,
+        std::uint8_t positioningOperation = 0U) noexcept;
     bool TryG00MoveInternal(
         const std::vector<int>& axes,
         const std::vector<double>& targetPos,
@@ -5258,6 +5362,246 @@ private:
     std::atomic<MotionSegmentId> m_lastDroppedMotionFeedbackSegmentId{ MOTION_SEGMENT_ID_INVALID };
     std::atomic<MotionFeedbackType> m_lastDroppedMotionFeedbackType{ MotionFeedbackType::NONE };
 
+
+    struct CollisionProtectionConfiguration {
+        EDMShortCircuitProtection::Config config{};
+        std::uint64_t generation=0ULL;
+        bool valid=false;
+    };
+    struct CollisionProtectionFeedback {
+        EDMShortCircuitProtection::Snapshot protection{};
+        std::uint64_t configurationGeneration=0ULL,tick=0ULL;
+    };
+    EDM53::Channel<CollisionProtectionConfiguration,128U> m_collisionConfiguration{};
+    EDM53::Channel<CollisionProtectionFeedback,128U> m_collisionFeedback{};
+    std::atomic<std::uint64_t> m_collisionConfigurationRequested{0ULL};
+    std::atomic<std::uint64_t> m_collisionManualStopSequence{0ULL},m_collisionManualBlockedOwnerState{0ULL};
+    std::atomic<bool> m_collisionManualBypass{false},m_collisionAcceptedShort{false};
+    std::uint64_t m_collisionNextConfiguration=1ULL,m_collisionRuntimeConfiguration=0ULL;
+    std::uint64_t m_collisionLastSequence=0ULL,m_collisionLastSource=0ULL,m_collisionLastRevision=0ULL;
+    EDM63::Route m_collisionRoute{};
+    EDM63::Receipt m_collisionLastReceipt{};
+    std::uint64_t m_collisionSourceIdentity=0ULL,m_collisionObserverGeneration=0ULL;
+    bool m_collisionHaveRoute=false,m_collisionHaveReceipt=false;
+    EDMShortCircuitProtection::Detector m_collisionDetector{};
+    EDMShortCircuitProtection::Snapshot m_collisionCurrent{};
+    MotionOwnerLease m_collisionManualAxisOwner{},m_collisionManualStopOwner{};
+    std::uint32_t m_collisionManualAxes=0U,m_collisionManualStoppedAxes=0U;
+    bool m_collisionConfigurationValid=false;
+    void ObserveCollisionProtectionRuntime() noexcept;
+    void TripManualCollisionRuntime(const MotionOwnerLease& owner) noexcept;
+    bool IsManualCollisionBlocked(const MotionOwnerLease& owner) const noexcept;
+    bool RejectCollisionPositioningProducer(MotionCommand command,MotionExecutionEpoch epoch,
+        MotionCommandSource source,const MotionOwnerLease& owner,
+        MotionExecutionIdentity* producedIdentity=nullptr,MotionOwnerLease* producedOwner=nullptr) noexcept;
+    bool ContainCollisionPositioningRuntime(const MotionCommand& command) noexcept;
+
+    struct RotarySpindleBinding
+    {
+        double resolution=0.0,lead=0.0,maxVelocity=0.0,machineOffset=0.0;
+        double lowPulse=0.0,highPulse=0.0;
+        std::array<double,3> travelLow{},travelHigh{};
+        std::uint32_t travelMask=0U;
+        std::uint8_t reverseFlags=0U;
+        std::uint32_t axisType=0U;
+        std::uintptr_t output=0U;
+    };
+    struct RotarySpindleFrozen
+    {
+        NCSpindleDispatch::Authority authority{};
+        NCSpindleDispatch::Config config{};
+        std::array<RotarySpindleBinding,3> binding{};
+        std::array<std::uintptr_t,8> inputMapping{},outputMapping{};
+        std::uint32_t axisMask=0U,slots=0U;
+    };
+    struct RotarySpindleSent
+    {
+        std::uint64_t tick=0ULL,request=0ULL;
+        double commandRpm=0.0;
+        MotionExecutionEpoch epoch=0U;
+        MotionOwnerLease owner{};
+        std::uint32_t safetyTicket=0U;
+        bool exact=false,safetyZero=false;
+    };
+    struct RotarySpindleRuntime
+    {
+        RotarySpindleFrozen frozen{};
+        NCRotarySpindle::Controller controller{};
+        MotionRotarySpindleFeedback feedback{};
+        std::array<NCSpindleDispatch::Packet,3> packet{};
+        std::array<MotionRotarySpindleProof::ReceiptWindow,3> window{};
+        std::array<RotarySpindleSent,3> sent{};
+        std::array<MotionServoInputSnapshot,3> input{};
+        std::array<std::uint32_t,3> previousRaw{};
+        std::array<std::uint64_t,3> rawTick{};
+        std::array<double,3> rawUnwrapped{};
+        std::array<double,3> actualRpm{},actualPulse{},commandRpm{};
+        std::array<std::int32_t,3> hardwarePps{};
+        std::array<unsigned,3> zeroSamples{},outputMissTicks{};
+        std::array<std::uint64_t,3> deadlineSequence{},deadlineTick{},qualifiedSequence{};
+        std::array<bool,3> rawSeen{},sourceValid{},havePacket{};
+        std::uint64_t tick=0ULL,beginTick=0ULL,publication=0ULL,startFloor=0ULL;
+        bool loaded=false,initialized=false,fault=false,handback=false;
+        std::uint32_t faultCode=0U;
+    };
+    EDM53::Channel<RotarySpindleFrozen,2048U> m_rotarySpindleBegin{};
+    std::array<EDM53::Channel<NCSpindleDispatch::Packet,512U>,3> m_rotarySpindleRequest{};
+    EDM53::Channel<MotionRotarySpindleFeedback,4096U> m_rotarySpindleFeedback{};
+    std::atomic<std::uint64_t> m_rotarySpindleClaim{0ULL},m_rotarySpindleRelease{0ULL};
+    std::uint64_t m_rotarySpindleProducerRun=0ULL;
+    std::array<std::uint64_t,3> m_rotarySpindleProducerSequence{};
+    RotarySpindleRuntime m_rotarySpindle{};
+    bool IsRotarySpindleConfigurationCurrent(const RotarySpindleFrozen& frozen) const noexcept;
+    bool IsRotarySpindleAuthorityCurrent(const RotarySpindleFrozen& frozen) const noexcept;
+    void ObserveRotarySpindleRuntimeInput() noexcept;
+    bool ApplyRotarySpindleAxis(AxisContext& axis,const MotionServoInputSnapshot& input,
+        std::int32_t& hardwarePps) noexcept;
+    void ContainRotarySpindleRuntime(MotionRotarySpindle::Fault fault,bool requestSafety) noexcept;
+    void BeginRotarySpindleSend(ServoOutputFrameReservation& reservation) noexcept;
+    bool ValidateRotarySpindleSend(const ServoOutputFrameReservation& reservation) noexcept;
+    bool SealRotarySpindleSerializedImage(ServoOutputFrameReservation& reservation,
+        const std::uint8_t* ioMapBase,std::size_t ioMapSize,
+        const std::uint8_t* payload,std::size_t payloadSize) noexcept;
+    void ObserveRotarySpindleSend(const ServoOutputFrameReservation& reservation) noexcept;
+    void PublishRotarySpindleRuntime() noexcept;
+    bool HandbackRotarySpindleAxes(bool safety) noexcept;
+
+    struct G80AxisBinding
+    {
+        double resolution=0.0,lead=0.0,maxVelocity=0.0,accSeconds=0.0,decSeconds=0.0;
+        double machineOffset=0.0,scaleRatio=0.0,maxDeviation=0.0;
+        std::uintptr_t scalePointer=0U;
+        std::uint32_t feedbackMode=0U;
+        std::uint8_t reverseFlags=0U;
+    };
+    struct G80Frozen
+    {
+        G80::Request request{};
+        MotionCommand command{};
+        G80::Point6 pulsePerNative{};
+        std::array<G80AxisBinding,6U> axis{};
+        std::uint32_t axisMask=0U;
+    };
+    EDM53::Channel<G80Frozen,4096U> m_g80Requests{}; // NC-only publisher
+    EDM53::Channel<MotionG80Feedback,2048U> m_g80Feedback{}; // RT-only publisher
+    std::atomic<std::uint64_t> m_g80Claim{0ULL};
+    std::atomic<std::uint64_t> m_g80EndpointCommitted{0ULL};
+    std::atomic<std::uint64_t> m_g80Barrier{0ULL};
+    struct G80ResetScope {
+        std::uint64_t session=0ULL,previousProvenance=0ULL,expectedProvenance=0ULL,expectedSafetyOwnerState=0ULL,previousSafetyOwnerState=0ULL;
+        MotionExecutionIdentity identity{};
+        MotionOwnerLease owner{};
+    };
+    EDM53::Channel<G80ResetScope,128U> m_g80ResetScope{}; // NC Reset-only intent, never motion authority.
+    std::uint64_t m_g80ProducerHighWater=0ULL;
+    G80Frozen m_g80Frozen{}; // RT-owned after exact ring dequeue
+    G80::Cycle m_g80Cycle{};
+    G80::Input m_g80Input{};
+    std::uint64_t m_g80InputSession=0ULL;
+    MotionExecutionIdentity m_g80InputIdentity{};
+    G80::VoltageSimulator m_g80VoltageSimulator{};
+    std::uint64_t m_g80SimulationSession=0ULL;
+    MotionExecutionIdentity m_g80SimulationIdentity{};
+    bool m_g80SimulationReady=false;
+    MotionG80Feedback m_g80Current{};
+    EDM63::Route m_g80SourceRoute{};
+    std::uint32_t m_g80ProfileRevision=0U,m_g80CalibrationRevision=0U;
+    std::uint64_t m_g80SourceSequence=0ULL,m_g80ZeroSentTick=0ULL;
+    std::uint64_t m_g80AdmissionTick=0ULL,m_g80AdmissionSession=0ULL;
+    std::uint32_t m_g80ZeroSettleTicks=0U,m_g80TerminalWaitTicks=0U;
+    std::array<PidConfig,6U> m_g80SavedPid{};
+    std::array<G80::DerivativeState,6U> m_g80Derivative{};
+    bool m_g80Running=false,m_g80ZeroDemand=false;
+    bool IsG80BarrierBlocking(const MotionCommand& command) const noexcept;
+    bool IsG80IncomingReady(const AxisContext& axis) const noexcept;
+    bool RetireG80Axes() noexcept;
+    bool IsG80CommandAuthorized(const MotionCommand& command) const noexcept;
+    bool LoadG80Command(const MotionCommand& command) noexcept;
+    void ObserveG80RuntimeInput() noexcept;
+    void ObserveG80Send(const MotionServoHandoffSample& sample) noexcept;
+    bool StepG80Runtime() noexcept;
+    bool SelectG80Gains(AxisContext& axis) noexcept;
+    bool ApplyG80Derivative(AxisContext& axis,double error,double& velocity) noexcept;
+    void RestoreG80PidLimits() noexcept;
+    bool G80DemandsZero(const AxisContext& axis) const noexcept;
+    void FailG80Runtime(std::uint32_t fault, bool emergency) noexcept;
+    bool IsG80ResetOutputHeld(bool applyingExactBatch=false) const noexcept;
+    void AdvanceG80ResetScope(std::uint64_t previousProvenance,std::uint64_t nextProvenance,
+        std::uint64_t expectedSafetyOwnerState=0ULL) noexcept;
+    bool RetireG80ForResetSafetyBatch(MotionExecutionEpoch resetEpoch,const MotionOwnerLease& resetOwner,
+        std::uint32_t resetTicket,std::uint64_t resetProvenance) noexcept;
+    void PublishG80Runtime() noexcept;
+    struct G76SphereAxisBinding
+    {
+        double resolution=0.0,lead=0.0,maxVelocity=0.0,accSeconds=0.0,decSeconds=0.0;
+        double machineOffset=0.0,scaleRatio=0.0,maxDeviation=0.0,followingWindow=0.0,stopSeconds=0.0;
+        double rotaryModulo=0.0;
+        std::uintptr_t scalePointer=0U;
+        std::uint32_t feedbackMode=0U;
+        std::uint8_t reverseFlags=0U,axisType=0U,configurationFlags=0U;
+        std::array<double,6U> travelLimits{},compensationParameters{};
+    };
+    struct G76SphereFrozen
+    {
+        NCG76SphereCycle::Request request{};
+        MotionCommand command{};
+        std::array<double,8U> pulsePerNative{};
+        std::array<G76SphereAxisBinding,6U> axis{};
+        std::uint32_t axisMask=0U;
+    };
+    EDM53::Channel<G76SphereFrozen,4096U> m_g76SphereRequests{};
+    EDM53::Channel<MotionG76SphereFeedback,2048U> m_g76SphereFeedback{};
+    std::atomic<std::uint64_t> m_g76SphereClaim{0ULL},m_g76SphereEndpointCommitted{0ULL},m_g76SphereBarrier{0ULL};
+    struct G76SphereControl
+    {
+        std::uint64_t session=0ULL,holdSequence=0ULL,startSequence=0ULL;
+        MotionExecutionIdentity identity{};
+        MotionOwnerLease owner{};
+        bool hold=false;
+    };
+    FixedCapacitySpscRing<G76SphereControl,8U> m_g76SphereControls{};
+    G76SphereControl m_g76SphereProducerControl{},m_g76SphereIncomingControl{};
+    struct G76SphereResetScope
+    {
+        std::uint64_t session=0ULL,previousProvenance=0ULL,expectedProvenance=0ULL;
+        std::uint64_t expectedSafetyOwnerState=0ULL,previousSafetyOwnerState=0ULL;
+        MotionExecutionIdentity identity{};
+        MotionOwnerLease owner{};
+    };
+    EDM53::Channel<G76SphereResetScope,128U> m_g76SphereResetScope{};
+    struct G76SphereParentBinding
+    {
+        std::uint64_t session=0ULL,dispatch=0ULL,commit=0ULL;
+        MotionExecutionIdentity identity{};
+        MotionOwnerLease owner{};
+    };
+    EDM53::Channel<G76SphereParentBinding,128U> m_g76SphereParentBinding{};
+    std::atomic<std::uint64_t> m_g76SphereParentBound{0ULL};
+    std::uint64_t m_g76SphereProducerHighWater=0ULL;
+    G76SphereFrozen m_g76SphereFrozen{};
+    NCG76SphereCycle::Cycle m_g76SphereCycle{};
+    NCG76SphereCycle::Input m_g76SphereInput{};
+    MotionExecutionIdentity m_g76SphereInputIdentity{};
+    std::uint64_t m_g76SphereInputSession=0ULL,m_g76SphereZeroSentTick=0ULL;
+    std::uint64_t m_g76SphereAdmissionTick=0ULL,m_g76SphereAdmissionSession=0ULL;
+    std::uint64_t m_g76SpherePhysicalTick=0ULL;
+    std::array<double,8U> m_g76SpherePhysicalMinimum{},m_g76SpherePhysicalMaximum{},m_g76SpherePhysicalReference{};
+    bool m_g76SpherePhysicalRange=false,m_g76SphereRunning=false,m_g76SphereZeroDemand=false;
+    MotionG76SphereFeedback m_g76SphereCurrent{};
+    bool IsG76SphereBarrierBlocking(const MotionCommand& command) const noexcept;
+    bool IsG76SphereCommandAuthorized(const MotionCommand& command) const noexcept;
+    bool LoadG76SphereCommand(const MotionCommand& command) noexcept;
+    void ObserveG76SphereRuntimeInput() noexcept;
+    void ObserveG76SphereSend(const MotionServoHandoffSample& sample) noexcept;
+    bool StepG76SphereRuntime() noexcept;
+    bool G76SphereDemandsZero(const AxisContext& axis) const noexcept;
+    void FailG76SphereRuntime(std::uint32_t fault,bool emergency) noexcept;
+    bool IsG76SphereResetOutputHeld(bool applyingExactBatch=false) const noexcept;
+    void AdvanceG76SphereResetScope(std::uint64_t previousProvenance,std::uint64_t nextProvenance,
+        std::uint64_t expectedSafetyOwnerState=0ULL) noexcept;
+    bool RetireG76SphereForResetSafetyBatch(MotionExecutionEpoch resetEpoch,const MotionOwnerLease& resetOwner,
+        std::uint32_t resetTicket,std::uint64_t resetProvenance) noexcept;
+    void PublishG76SphereRuntime() noexcept;
     MotionSegmentId AllocateMotionSegmentId() noexcept;
     void AssignExecutionIdentity(
         MotionCommand& command,

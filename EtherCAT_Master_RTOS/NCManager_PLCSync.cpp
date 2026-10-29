@@ -7,15 +7,169 @@
 #include "MotionCore.h"
 #include "PLCManager.h"
 #include "NCPLCMap.h"
+#include "NCSpindleCodes.h"
 #include "EDM149VoltageMotion.h"
 #include "AlarmManager.h"
+#include <windows.h> // Explicit Windows SDK types before RTX SDK declarations.
 #include <rtapi.h>
 
 extern PLCManager* g_PLC; // 引入 PLC 大腦
 
+// EDM282: only the owning NC scan may mutate this transaction.
+bool NCManager::BeginAuxiliaryHandshakeSameThread(int tCode, int mCode) noexcept
+{
+    // EDM288: no direct helper call may bypass spindle ownership through PLC.
+    if(NCSpindleCodes::IsReserved(mCode))return false;
+    return m_auxiliaryHandshake.Begin(tCode, mCode);
+}
+
+bool NCManager::PollAuxiliaryHandshakeSameThread() noexcept
+{
+    return m_auxiliaryHandshake.IsComplete();
+}
+
+void NCManager::ServiceAuxiliaryHandshakeSameThread(bool allowDispatch) noexcept
+{
+    const auto state = m_state.load(std::memory_order_acquire);
+    if (AlarmManager::GetInstance().HasAlarm() || state == NCState::ALARM ||
+        state == NCState::RESET_STATE)
+    {
+        ResetAuxiliaryHandshakeSameThread();
+        return; // Cancellation dominates an ACK sampled in this same scan.
+    }
+    if (state != NCState::RUN && state != NCState::HOLD)
+    {
+        if (m_auxiliaryHandshake.IsPending()) CancelAuxiliaryHandshakeSameThread();
+        return;
+    }
+    // Auxiliary requests obey the same program ownership and safety fence
+    // as motion admission. An existing request may still collect its ACK.
+    allowDispatch = allowDispatch && state == NCState::RUN &&
+        m_motion.IsMotionOwnerLeaseCurrent(m_programMotionLease) &&
+        !m_motion.HasPendingSafetyOrRecoveryRequests();
+    if (g_PLC == nullptr) return; // Missing PLC must never auto-complete a command.
+    const auto beforeKind = m_auxiliaryHandshake.ActiveKind();
+    const int beforeCode = m_auxiliaryHandshake.ActiveCode();
+    const bool fin = g_PLC->Get_C(NCPLC::C::AUX_FIN);
+    m_auxiliaryHandshake.Service(fin, allowDispatch);
+    const bool acceptedFin = beforeKind != NCAuxiliaryHandshake::Kind::None &&
+        fin && !m_auxiliaryHandshake.IsActive();
+    const bool acceptedFinalFin = acceptedFin && m_auxiliaryHandshake.IsComplete();
+    SyncAuxiliaryHandshakeToPLCSameThread();
+    const auto afterKind = m_auxiliaryHandshake.ActiveKind();
+    const auto afterState = m_state.load(std::memory_order_acquire);
+    if (acceptedFinalFin &&
+        m_auxiliaryHandshake.CurrentPhase() == NCAuxiliaryHandshake::Phase::Idle)
+    {
+        // Sync has revoked the final ACK; its pending-only CANCEL log did not run.
+        RtPrintf("[AUX] build=EDM282 event=CANCEL reason=FIN_REVOKED S51=0 S52=0\n");
+    }
+    else if (acceptedFin && afterKind == NCAuxiliaryHandshake::Kind::None &&
+        m_auxiliaryHandshake.CurrentPhase() != NCAuxiliaryHandshake::Phase::Idle &&
+        afterState != NCState::ALARM && afterState != NCState::RESET_STATE &&
+        !AlarmManager::GetInstance().HasAlarm())
+    {
+        RtPrintf("[AUX] build=EDM282 event=FIN kind=%s code=%d C10=1 S51=0 S52=0\n",
+            beforeKind == NCAuxiliaryHandshake::Kind::Tool ? "T" : "M", beforeCode);
+    }
+    else if (beforeKind == NCAuxiliaryHandshake::Kind::None &&
+        afterKind != NCAuxiliaryHandshake::Kind::None)
+    {
+        RtPrintf("[AUX] build=EDM282 event=REQUEST kind=%s code=%d R1=%d R2=%d S51=%u S52=%u C10=0\n",
+            afterKind == NCAuxiliaryHandshake::Kind::Tool ? "T" : "M",
+            m_auxiliaryHandshake.ActiveCode(), m_auxiliaryHandshake.LastM(),
+            m_auxiliaryHandshake.LastT(), m_auxiliaryHandshake.IsMActive() ? 1U : 0U,
+            m_auxiliaryHandshake.IsTActive() ? 1U : 0U);
+    }
+}
+
+void NCManager::CancelAuxiliaryHandshakeSameThread() noexcept
+{
+    const bool pending = m_auxiliaryHandshake.IsPending();
+    m_auxiliaryHandshake.Cancel();
+    SyncAuxiliaryHandshakeToPLCSameThread();
+    if (pending)
+        RtPrintf("[AUX] build=EDM282 event=CANCEL retainCodes=1 S51=0 S52=0\n");
+}
+
+void NCManager::ResetAuxiliaryHandshakeSameThread() noexcept
+{
+    const bool pending = m_auxiliaryHandshake.IsPending();
+    m_auxiliaryHandshake.Reset();
+    SyncAuxiliaryHandshakeToPLCSameThread();
+    if (pending)
+        RtPrintf("[AUX] build=EDM282 event=CANCEL R1=-1 R2=-1 S51=0 S52=0\n");
+}
+
+void NCManager::SyncAuxiliaryHandshakeToPLCSameThread() noexcept
+{
+    // This method also runs on the ProcessTask exit guard: a late alarm or
+    // state change must revoke a request before PLC can use it next scan.
+    const auto state = m_state.load(std::memory_order_acquire);
+    const bool clearCodes = AlarmManager::GetInstance().HasAlarm() ||
+        state == NCState::ALARM || state == NCState::RESET_STATE;
+    const bool cancelPending = state != NCState::RUN && state != NCState::HOLD &&
+        m_auxiliaryHandshake.IsPending();
+    const bool pending = m_auxiliaryHandshake.IsPending();
+    if (clearCodes) m_auxiliaryHandshake.Reset();
+    else if (cancelPending) m_auxiliaryHandshake.Cancel();
+    if (pending && (clearCodes || cancelPending))
+        RtPrintf("[AUX] build=EDM282 event=CANCEL reason=STATE clearCodes=%u S51=0 S52=0\n",
+            clearCodes ? 1U : 0U);
+    if (g_PLC == nullptr) return;
+    const bool mActive = m_auxiliaryHandshake.IsMActive();
+    const bool tActive = m_auxiliaryHandshake.IsTActive();
+    // Release-publish data and request together through the NC-owned PLC view.
+    const unsigned requestWord = (mActive ? 1U : 0U) | (tActive ? 2U : 0U);
+    g_PLC->PublishAuxiliaryOutputs(m_auxiliaryHandshake.LastM(),
+        m_auxiliaryHandshake.LastT(), requestWord);
+    g_PLC->Set_S(NCPLC::S::AUX_REQUEST, mActive || tActive);
+    g_PLC->Set_S(NCPLC::S::AUX_WAIT_FIN, mActive || tActive);
+}
+
+// S206 is an NC-owned level indication, never a motion or discharge permit.
+void NCManager::SyncG80ActiveToPLCSameThread() noexcept
+{
+    if(g_PLC==nullptr)return;
+    auto& s=m_g80;
+    const bool active=IsG80ActiveSameThread();
+    const bool previous=g_PLC->Get_S(NCPLC::S::G80_ACTIVE);
+    g_PLC->Set_S(NCPLC::S::G80_ACTIVE,active);
+    const auto state=m_state.load(std::memory_order_acquire);
+    const unsigned nc=static_cast<unsigned>(state);
+    const bool stateChanged=s.plcDiagnosticInitialized&&
+        (nc!=s.plcDiagnosticState||s.feedback.held!=s.plcDiagnosticHeld);
+    const bool initial=s.session&&!s.plcDiagnosticInitialized&&(active||s.submitted);
+    const bool terminal=previous&&!active&&!s.plcTerminalLogged;
+    const bool report=previous!=active||initial||(s.session&&s.submitted&&stateChanged);
+    s.plcDiagnosticInitialized=true;s.plcDiagnosticState=nc;s.plcDiagnosticHeld=s.feedback.held;
+    if(!report)return;
+    // Bound HOLD/state chatter per session; retain its one final S206 OFF event.
+    if(s.plcDiagnosticEvents>=128U&&!terminal){
+        if(s.plcDiagnosticEvents==128U){
+            ++s.plcDiagnosticEvents;
+            RtPrintf("[G80] build=EDM278 event=PLC_EVENT_LIMIT session=%llu limit=128\n",
+                static_cast<unsigned long long>(s.session));
+        }
+        return;
+    }
+    ++s.plcDiagnosticEvents;if(terminal)s.plcTerminalLogged=true;
+    const char* reason=s.cancelReason[0]?s.cancelReason:
+        (state==NCState::RESET_STATE?"RESET_STATE":
+        (state==NCState::HOLD||s.feedback.held?"HOLD":
+        (s.success?"COMPLETE":
+        (s.ncFault||s.runtimeFault||s.feedback.fault!=G80::Fault::None?"FAULT":
+        (active?(stateChanged?"RESUME_OR_STATE":"ACTIVE"):"INACTIVE")))));
+    RtPrintf("[G80] build=EDM278 event=PLC_ACTIVE S206=%u previous=%u session=%llu reason=%s nc=%u phase=%u held=%u slowCount=%u activeLevel=1 motionPermit=0\n",
+        active?1U:0U,previous?1U:0U,static_cast<unsigned long long>(s.session),reason,nc,
+        static_cast<unsigned>(s.feedback.phase),s.feedback.held?1U:0U,s.feedback.slowCount);
+}
+
 void NCManager::SyncNCStateToPLC()
 {
     if (g_PLC == nullptr) return; // 防呆
+
+    SyncG80ActiveToPLCSameThread(); // Explicit ON/OFF each NC status scan.
 
     // =========================================================
     // 1. 機台綜合狀態 (S0 ~ S5)
@@ -46,18 +200,8 @@ void NCManager::SyncNCStateToPLC()
     // g_PLC->Set_S(25, m_isZAxisLockEnabled);
     // g_PLC->Set_S(26, false); // 預留
 
-    // =========================================================
-    // 4. M/S/T 碼執行狀態 (S30 ~ S34)
-    // =========================================================
-    // 注意：目前 M/S/T 碼由 GCodeHandlers 處理，如果有 M 碼卡住等待 (FIN)，
-    // 我們可以透過檢查 m_waitCallback 是否有值來簡單判斷。
-    // 如果未來您有專門的 M-Code Manager，可以直接讀取它的狀態。
-    bool isWaitingForMCode = (m_waitCallback != nullptr);
-    g_PLC->Set_S(30, isWaitingForMCode); // M 碼等待中
-
-    // (M00, M01 這些狀態需要您在 GCodeHandlers 處理 M00 時設定一個旗標來讀取)
-    // g_PLC->Set_S(33, m_isM00Active);
-    // g_PLC->Set_S(34, m_isM01Active);
+    // EDM282: a G-code callback alone is not an auxiliary request.
+    SyncAuxiliaryHandshakeToPLCSameThread();
 
     // =========================================================
     // 5. G81 HOME 全域執行狀態

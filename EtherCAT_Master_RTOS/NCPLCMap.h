@@ -34,6 +34,7 @@ namespace NCPLC
         constexpr int BLOCK_SKIP = 18;                             // Block Skip
 
         constexpr int JOG_MODE = 19;                               // Normal Continuous JOG
+        // EDM280: C20 OFF protects manual JOG/INCH/MPG; ON bypasses valid SHORT only.
         constexpr int EDM_PROTECTION_BYPASS = 20;                  // EDM 加工保護暫時解除
         constexpr int MPG_MODE = 21;                               // MPG 手輪模式
         constexpr int RESERVED_22 = 22;                            // 保留，Manual Frame 不使用 PLC 點位
@@ -188,6 +189,9 @@ namespace NCPLC
         // --------------------------------------------------------
 
         constexpr int AUX_REQUEST = 30;                            // NC 發出 M/S/T 執行要求
+        // EDM282: dedicated M/T request levels; only one may be ON.
+        constexpr int AUX_M_ACTIVE = 51;
+        constexpr int AUX_T_ACTIVE = 52;
         constexpr int AUX_WAIT_FIN = 31;                           // NC 等待 AUX FIN
 
 
@@ -268,6 +272,7 @@ namespace NCPLC
 
         constexpr int MANUAL_FRAME_ACTIVE = 200;                   // S200 Manual Frame 已啟用
         constexpr int MPG_ACTIVE = 201;                            // S201 MPG Mode Active
+        // EDM280: S202 mirrors C20 for manual short bypass only; never an automatic-motion permit.
         constexpr int EDM_PROTECTION_BYPASS_ACTIVE = 202;          // S202 EDM Protection Bypass Active
 
         // --------------------------------------------------------
@@ -277,6 +282,9 @@ namespace NCPLC
         constexpr int HOME_ACTIVE = 203;                           // S203 HOME Request Active（Running / Hold / Paused 都保持 ON）
         constexpr int HOME_HOLD_DECEL = 204;                       // S204 HOME Feed Hold Controlled Stop 進行中
         constexpr int HOME_PAUSED = 205;                           // S205 HOME 已完全停止，等待 C12 Resume
+
+        constexpr int G80_ACTIVE = 206; // S206: accepted G80/compound RUN or HOLD through endpoint + A + release.
+        constexpr int SHORT_ACTIVE = 207; // S207 qualified PHYSICAL short level; bypass never clears it.
 
         // --------------------------------------------------------
         // Software Travel Limit State
@@ -317,6 +325,9 @@ namespace NCPLC
         // Auxiliary M / S / T
         // --------------------------------------------------------
 
+        // EDM282: NC-owned user-facing auxiliary code registers.
+        constexpr int M_CODE = 1;
+        constexpr int T_CODE = 2;
         constexpr int AUX_M_CODE = 100;                            // R100 M Code
         constexpr int AUX_S_CODE = 101;                            // R101 S Code
         constexpr int AUX_T_CODE = 102;                            // R102 T Code

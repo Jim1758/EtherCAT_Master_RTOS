@@ -82,6 +82,7 @@ namespace NCGCodeSemantics
             // ---------------------------------------------------------
             // Primary motion / machine actions
             // ---------------------------------------------------------
+        case 80: // Native-direction edge finding owns P/J/K/A/L/F.
         case 76: // P11 bounded growing-orbit cycle; no modal-motion inheritance.
             descriptor = MakeDescriptor(code, NCGCodeModalGroup::NONE,
                 NCGCodeRole::PRIMARY_ACTION, 200, true, true, true);
@@ -489,6 +490,10 @@ namespace NCGCodeSemantics
     bool IsBlockBarrier(
         const NCBlock& block) noexcept
     {
+        // EDM282: auxiliary requests cannot overtake preceding buffered motion.
+        // Shared classification keeps prepared/runtime drain decisions equal.
+        if (block.mCount > 0) return true;
+        if (block.has('T') && !Contains(block, 65) && !Contains(block, 66)) return true;
         // Standalone recipe E is a data-selection barrier, never implicit motion.
         // G65/G66 continue owning their E macro argument.
         if (block.has('E') && !Contains(block, 65) && !Contains(block, 66)) return true;

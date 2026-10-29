@@ -40,6 +40,8 @@ private:
     void ProcessAuxiliaryHandshake(); // 處理 M / S / T Auxiliary Handshake
 
     // NC -> PLC 
+    void UpdateCollisionProtectionSameThread() noexcept;
+    bool ApplyManualCollisionGateSameThread(bool mpgInputSelected) noexcept;
     void SyncNCStateToPLC();          // 將 NC / Motion 目前狀態同步回 PLC S Point。
 
     // Stage NC-0.1F manual ownership and mailbox helpers.
@@ -68,6 +70,25 @@ private:
     bool m_startDiagnosticLevel = false;
     bool m_servoReady = false;          // C11 Servo / Machine Ready 狀態
     bool m_edmProtectionBypass = false; // C20 EDM Protection Bypass 狀態
+
+    // EDM280: source status is independent of the manual-only bypass.
+    bool m_collisionValid = false, m_collisionShortActive = false;
+    bool m_collisionLogInitialized = false;
+    std::uint64_t m_collisionSequence = 0ULL, m_collisionManualStopSequence = 0ULL;
+    std::uint64_t m_manualObservedStopSequence = 0ULL;
+    bool m_manualShortGateActive = false;
+    std::uint32_t m_manualShortLoggedStopMask = 0U;
+    bool m_manualShortStopQueued[NCPLC::AXIS_COUNT] = {};
+    struct ManualShortRearm {
+        bool releaseRequired = false;
+        bool Update(bool blocked, bool newStopIncident, bool directionsReleased,
+            bool mpgQuiet, bool stopped) noexcept {
+            if(blocked || newStopIncident) releaseRequired = true;
+            if(releaseRequired && directionsReleased && mpgQuiet && stopped)
+                releaseRequired = false;
+            return blocked || releaseRequired;
+        }
+    } m_manualShortRearm{};
 
     // Global Input Edge Memory (保存上一個 Scan 的狀態，用來判斷 false->true 的 Rising Edge，避免重複執行)
     bool m_prevCycleStart = false;      // C12 Cycle Start 前一 Scan 狀態

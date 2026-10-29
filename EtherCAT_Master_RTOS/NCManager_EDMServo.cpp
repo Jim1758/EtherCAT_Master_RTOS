@@ -10,11 +10,35 @@
 
 // EDM20: NC owner (nominal 10 ms) shadow preview. This translation unit has
 // no Motion submission, axis/PDO/pulse write, allocation or file operation.
+// EDM280 additionally publishes validated short-protection configuration to the
+// independent RT monitor. Shadow preview never supplies its live input state.
 // NC RUN does not imply electrical discharge is active. Both threshold
 // scenarios are observed explicitly; neither authorizes a physical output.
 namespace
 {
     using ShadowReason = NCManager::EDMProcessShadowReason;
+
+
+    bool SameCollisionThresholds(const EDMGapServo::Profile& a,
+        const EDMGapServo::Profile& b) noexcept
+    {
+        return a.shortIdleV == b.shortIdleV &&
+            a.shortHysteresisV == b.shortHysteresisV &&
+            a.shortEnterMs == b.shortEnterMs && a.shortExitMs == b.shortExitMs;
+    }
+
+    void LogCollisionConfiguration(const EDMGapServo::Profile& profile) noexcept
+    {
+        char line[481]{};
+        const int count = std::snprintf(line, sizeof(line),
+            "[EDM280] event=SHORT_CONFIG source=PHYSICAL revision=%u thresholdV=%.9g hysteresisV=%.9g enterMs=%u exitMs=%u S=207 manualBypassC=20 manualBypassS=202 forcedProtection=1 independentG80=1\n",
+            static_cast<unsigned>(profile.revision), profile.shortIdleV,
+            profile.shortHysteresisV, static_cast<unsigned>(profile.shortEnterMs),
+            static_cast<unsigned>(profile.shortExitMs));
+        if (count >= 0 && static_cast<std::size_t>(count) < sizeof(line))
+            RtPrintf("%s", line);
+        else RtPrintf("%s", "[EDM280] event=SHORT_CONFIG_LOG_INVALID\n");
+    }
 
     const char* EDM20ReasonName(ShadowReason value) noexcept
     {
@@ -146,6 +170,9 @@ namespace
 bool NCManager::InstallEDMProcessProfileBeforeStart(const EDM20::ProcessProfile& profile,
     const AxisContext* axes, std::size_t axisCount) noexcept
 {
+    // Startup only: failed/repeated installation cannot leave an old protection
+    // configuration live. An unconfigured RT monitor blocks protected motion.
+    m_motion.ConfigureCollisionProtection(profile.servo, false);
     if (m_edmProcessInstallAttempted)
     {
         m_edmProcessReady = false;
@@ -167,10 +194,12 @@ bool NCManager::InstallEDMProcessProfileBeforeStart(const EDM20::ProcessProfile&
         if (discharge[axis].status != EDM20::GainResolveStatus::Ready ||
             flush[axis].status != EDM20::GainResolveStatus::Ready) return false;
     }
+    if (!m_motion.ConfigureCollisionProtection(profile.servo, true)) return false;
     m_edmProcessProfile = profile;
     m_edmDischargeGains = discharge; m_edmFlushGains = flush;
     m_edmProcessActiveAxisMask = (1U << static_cast<unsigned>(axisCount)) - 1U;
     m_edmProcessTuningGeneration = 1ULL;
+    LogCollisionConfiguration(profile.servo);
     m_edmProcessReady = true;
     return true;
 }
@@ -421,6 +450,15 @@ EDMProcessTuningStatus NCManager::ApplyEDMProcessTuningSameThread(
     EDM20::ProcessProfile candidate{};
     if (!EDMProcessTuning::DecodeSelected(request, m_edmProcessProfile, candidate))
         return EDMProcessTuningStatus::DomainRejected;
+    const bool collisionThresholdsChanged =
+        !SameCollisionThresholds(candidate.servo, m_edmProcessProfile.servo);
+    if (collisionThresholdsChanged) {
+        // Threshold changes apply only between operations. Unrelated live
+        // tuning does not reset the RT detector or invalidate dwell evidence.
+        const MotionOwner owner = m_motion.GetMotionOwnerLease().owner;
+        if (owner != MotionOwner::NONE && owner != MotionOwner::IDLE_HOLD)
+            return EDMProcessTuningStatus::NotAllowed;
+    }
     std::array<EDM20::GainResolution, 8> discharge{}, flush{};
     for (std::size_t axis = 0U; axis < 8U; ++axis) {
         if ((m_edmProcessActiveAxisMask & (1U << axis)) == 0U) continue;
@@ -433,7 +471,13 @@ EDMProcessTuningStatus NCManager::ApplyEDMProcessTuningSameThread(
     // gain, CNC baseline, file, recipe, voltage calibration or mode is changed.
     candidate.revision = m_edmProcessProfile.revision + 1U;
     candidate.servo.revision = candidate.revision;
+    // Publish before committing the NC view. A late owner change or occupied
+    // channel rejects the complete request without leaving HMI and RT apart.
+    if (collisionThresholdsChanged &&
+        !m_motion.ConfigureCollisionProtection(candidate.servo, true))
+        return EDMProcessTuningStatus::NotAllowed;
     m_edmProcessProfile = candidate;
+    if (collisionThresholdsChanged) LogCollisionConfiguration(candidate.servo);
     m_edmDischargeGains = discharge; m_edmFlushGains = flush;
     ++m_edmProcessTuningGeneration;
     m_edmIdleShortDetector.Reset(); m_edmMachiningShortDetector.Reset();

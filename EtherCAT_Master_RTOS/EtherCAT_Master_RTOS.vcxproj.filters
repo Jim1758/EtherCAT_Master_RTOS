@@ -158,6 +158,7 @@
     </ClCompile>
     <ClCompile Include="HoldConfig.cpp"><Filter>Source Files</Filter></ClCompile>
     <ClCompile Include="NCHoldTelemetry.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="NCMachiningTelemetry.cpp"><Filter>Source Files</Filter></ClCompile>
     <ClCompile Include="RotarySpindleConfig.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -607,6 +608,12 @@
     <ClInclude Include="HoldConfig.h"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="NCHoldPolicy.h"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="NCFinishPolicy.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="NCMachiningTime.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="NCMachiningTimePolicy.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="NCG76OrbitContourGeometry.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="NCG76TimedP11Source.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="NCG76SphereMachiningTime.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="NCMachiningTelemetry.h"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="NCG76SphereFinishVerification.h"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="NCG76SphereHoldRecovery.h"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="NCHoldTelemetry.h"><Filter>Header Files</Filter></ClInclude>

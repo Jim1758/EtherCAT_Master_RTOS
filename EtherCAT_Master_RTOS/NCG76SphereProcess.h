@@ -36,6 +36,8 @@ inline bool NominalStage(NCG76SphereCycle::Phase phase,NCG76SpherePath::Stage& s
     using P=NCG76SphereCycle::Phase;using S=NCG76SpherePath::Stage;
     switch(phase){
     case P::InitialDepth:stage=S::InitialDepth;return true;
+    case P::ContourNominal:stage=S::ContourNominal;return true;
+    case P::ContourFinish:stage=S::ContourFinish;return true;
     case P::InitialRetreat:stage=S::InitialRetreat;return true;
     case P::CircleEntry:stage=S::CircleEntry;return true;
     case P::Orbit:stage=S::Orbit;return true;
@@ -131,16 +133,57 @@ inline bool Observe(const NCG76SpherePath::Descriptor& path,
         e.layerDepthMm=path.geometry.kind==NCG76SphereRuntimeGeometry::Kind::Sphere?path.geometry.radiusMm:0.0;
     }else{
         const bool sphere=path.geometry.kind==NCG76SphereRuntimeGeometry::Kind::Sphere;
-        if(!NominalStage(feedback.nominalPhase,stage)||
-           (sphere?feedback.layerIndex>=path.layerCount:
+        const bool contour=path.geometry.kind==NCG76SphereRuntimeGeometry::Kind::OrbitContour;
+        if(!NominalStage(feedback.nominalPhase,stage))return false;
+        const unsigned contourP=contour?NCG76OrbitContour::ModeP(path.geometry):0U;
+        const bool contourStage=stage==S::ContourNominal?
+            feedback.layerIndex<NCG76OrbitContour::NominalLegCount:
+            stage==S::ContourFinish?NCG76OrbitContour::IsFourSideContour(path.geometry)&&
+                feedback.layerIndex<NCG76OrbitContour::FinishLegCount(path.geometry):
+            feedback.layerIndex==0U&&(stage==S::CircleEntry||stage==S::ReturnCenter||
+                (contourP==11U&&stage==S::Orbit));
+        if((sphere?feedback.layerIndex>=path.layerCount:contour?
+               (feedback.completedLayers!=0U||!contourStage):
                (feedback.layerIndex!=0U||stage!=S::InitialDepth||feedback.completedLayers!=0U))||
            !std::isfinite(feedback.nominalProgressMm)||!std::isfinite(feedback.nominalLengthMm)||
            (stationary?feedback.nominalLengthMm!=0.0:feedback.nominalLengthMm<=0.0)||feedback.nominalProgressMm<0.0||
            feedback.nominalProgressMm>feedback.nominalLengthMm)return false;
         const double fraction=stationary?0.0:feedback.nominalProgressMm==feedback.nominalLengthMm?1.0:
             feedback.nominalProgressMm/feedback.nominalLengthMm;
-        if(NCG76SpherePath::MakeCursorByFraction(path,stage,feedback.layerIndex,fraction,cursor)!=
-            NCG76SpherePath::Status::Ok)return false;
+        const auto cursorStatus=NCG76SpherePath::MakeCursorByFraction(path,stage,feedback.layerIndex,fraction,cursor);
+        if(cursorStatus!=NCG76SpherePath::Status::Ok){
+            // A captured nominal stop retains its raw scalar while HOLD/JOG
+            // traverses elsewhere, and on the first restored nominal tick.
+            // Project only this read-only observation under the same admitted
+            // station/arithmetic proof as recovery; do not rewrite feedback,
+            // command, checkpoint or the strict canonical cursor APIs.
+            const bool zeroSpeed=feedback.speedMmS==0.0&&feedback.signedSpeedMmS==0.0;
+            const bool stoppedNominal=zeroSpeed&&!feedback.holdActive&&!feedback.held&&!feedback.flushActive&&
+                (NCG76SphereCycle::Detail::IsNominal(feedback.phase)||feedback.phase==P::Settle);
+            const bool holdPhase=feedback.phase==P::RecoveryBrake||feedback.phase==P::RecoverySettle||
+                feedback.phase==P::RecoveryMove||feedback.phase==P::HeldAtStart||
+                feedback.phase==P::InspectionJog||feedback.phase==P::InspectionJogBrake||
+                feedback.phase==P::InspectionJogReturn;
+            const bool capturedHold=feedback.holdRecoveryEnabled&&feedback.holdActive&&
+                holdPhase&&((feedback.holdRecoveryPhase>=3U&&feedback.holdRecoveryPhase<=8U)||
+                    feedback.holdRecoveryPaused||(feedback.phase==P::RecoverySettle&&zeroSpeed));
+            const bool flushPhase=feedback.phase==P::FlushSettle||feedback.phase==P::FlushHoldBrake||
+                NCG76SphereCycle::Detail::IsFlushMotionPhase(feedback.phase);
+            const bool capturedFlush=feedback.flushActive&&feedback.flushCheckpointSaved&&flushPhase;
+            if(cursorStatus!=NCG76SpherePath::Status::PrecisionLoss||feedback.gapHistoryActive||
+               !std::isfinite(feedback.speedMmS)||!std::isfinite(feedback.signedSpeedMmS)||
+               !(stoppedNominal||capturedHold||capturedFlush))return false;
+            const auto retreatStage=NCG76SphereCycle::RecoveryNominalStage(feedback.nominalPhase);
+            NCG76SphereRetreat::Span span{};NCG76SpherePath::Point8 canonical{},center{};double station=0.0;
+            if(!NCG76SphereRetreat::GetSpan(path.geometry,retreatStage,feedback.layerIndex,span)||
+               !NCG76SphereRetreat::Evaluate(path.geometry,span,fraction,canonical,center)||
+               !NCG76SphereCycle::ResolveStoppedRecoveryStation(path.geometry,retreatStage,
+                   feedback.layerIndex,feedback.nominalProgressMm,feedback.nominalLengthMm,0.0,canonical,station))return false;
+            const double projectedFraction=NCG76SphereRetreat::Fraction(span,station);
+            if(NCG76SpherePath::MakeCursorByFraction(path,stage,feedback.layerIndex,projectedFraction,cursor)!=
+                NCG76SpherePath::Status::Ok)return false;
+        }
+        if(contour&&stage!=S::ContourNominal)e.layerRadiusMm=path.geometry.radiusMm;
         if(sphere){
             NCG76SphereRuntimeGeometry::Layer layer{};
             if(!NCG76SphereRuntimeGeometry::LayerAt(path.geometry,feedback.layerIndex,layer))return false;

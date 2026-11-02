@@ -111,7 +111,9 @@ bool InitializeEDMProcessTuningService() noexcept
     if (g_epoch == 0ULL) g_epoch = 1ULL;
     std::memset(g_data, 0, offsetof(EDMProcessTuningHeader, Sequence));
     std::memset(reinterpret_cast<unsigned char*>(g_data) + 16U, 0, EDM_PROCESS_TUNING_SIZE - 16U);
-    g_data->Header.Magic = EDM_PROCESS_TUNING_MAGIC; g_data->Header.VersionMajor = 1U;
+    g_data->Header.Magic = EDM_PROCESS_TUNING_MAGIC;
+    g_data->Header.VersionMajor = EDM_PROCESS_TUNING_VERSION_MAJOR;
+    g_data->Header.VersionMinor = EDM_PROCESS_TUNING_VERSION_MINOR;
     g_data->Header.StructSize = EDM_PROCESS_TUNING_SIZE; g_data->Header.RuntimeEpoch = g_epoch;
     g_heartbeat = 0U; g_ack = EDMProcessTuningAck{}; g_history.Reset();
     MemoryBarrier(); Exchange(g_data->Header.Sequence, odd + 1U);

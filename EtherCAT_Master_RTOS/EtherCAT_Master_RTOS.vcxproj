@@ -127,6 +127,12 @@
     <ClInclude Include="HoldConfig.h" />
     <ClInclude Include="NCHoldPolicy.h" />
     <ClInclude Include="NCFinishPolicy.h" />
+    <ClInclude Include="NCMachiningTime.h" />
+    <ClInclude Include="NCMachiningTimePolicy.h" />
+    <ClInclude Include="NCG76OrbitContourGeometry.h" />
+    <ClInclude Include="NCG76TimedP11Source.h" />
+    <ClInclude Include="NCG76SphereMachiningTime.h" />
+    <ClInclude Include="NCMachiningTelemetry.h" />
     <ClInclude Include="NCG76SphereFinishVerification.h" />
     <ClInclude Include="NCG76SphereHoldRecovery.h" />
     <ClInclude Include="NCHoldTelemetry.h" />
@@ -154,6 +160,7 @@
     <ClCompile Include="RotarySpindleConfig.cpp" />
     <ClCompile Include="HoldConfig.cpp" />
     <ClCompile Include="NCHoldTelemetry.cpp" />
+    <ClCompile Include="NCMachiningTelemetry.cpp" />
     <ClCompile Include="NCManager_RotarySpindle.cpp" />
     <ClCompile Include="NCManager_G76Sphere.cpp" />
     <ClCompile Include="MotionCore_G76Sphere.cpp" />

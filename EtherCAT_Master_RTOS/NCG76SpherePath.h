@@ -1,6 +1,7 @@
 #pragma once
 
 #include "NCG76SphereRuntimeGeometry.h"
+#include "NCG76SphereRetreat.h"
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -32,7 +33,7 @@ constexpr double MaximumStationErrorMm=1.e-7;
 constexpr unsigned MaximumLayerSearchIterations=13U;
 
 enum class Stage : std::uint8_t
-{ InitialDepth, InitialRetreat, CircleEntry, Orbit, ReturnCenter, AdvanceCenter, Complete };
+{ InitialDepth, InitialRetreat, CircleEntry, Orbit, ReturnCenter, AdvanceCenter, Complete, ContourNominal, ContourFinish };
 enum class Status : std::uint8_t
 { Ok, InvalidGeometry, UnsupportedRadiusLaw, NumericRange, InvalidDescriptor,
   InvalidStage, InvalidLayer, InvalidProgress, InvalidStation, InvalidCursor, PrecisionLoss };
@@ -81,6 +82,15 @@ inline bool Shape(const Descriptor& p) noexcept
 {
     if(!p.valid||p.version!=Version||!p.geometry.valid||
         p.geometry.version!=NCG76SphereRuntimeGeometry::Version)return false;
+    if(p.geometry.kind==NCG76SphereRuntimeGeometry::Kind::OrbitContour){
+        double total=0.0;
+        return NCG76SphereRetreat::ContourTotal(p.geometry,total)&&p.layerCount==0U&&
+            p.geometry.circleLayerCount==0U&&p.geometry.radiusLaw==NCG76Sphere::RadiusLaw::Linear&&
+            Bits(p.initialDepthLengthMm,NCG76OrbitContour::NominalLength(p.geometry))&&
+            p.initialRetreatLengthMm==0.0&&Bits(p.layeredStartMm,p.initialDepthLengthMm)&&
+            Bits(p.totalLengthMm,total)&&Positive(p.stationErrorBoundMm)&&
+            p.stationErrorBoundMm<=MaximumStationErrorMm&&p.totalLengthMm>p.stationErrorBoundMm*64.0;
+    }
     if(p.geometry.kind!=NCG76SphereRuntimeGeometry::Kind::Sphere)
         return (p.geometry.kind==NCG76SphereRuntimeGeometry::Kind::Line||
                 p.geometry.kind==NCG76SphereRuntimeGeometry::Kind::Arc)&&
@@ -110,9 +120,30 @@ inline long double LayerPrefix(const Descriptor& p,unsigned count) noexcept
 }
 inline long double LayerStart(const Descriptor& p,unsigned index) noexcept
 {return static_cast<long double>(p.initialDepthLengthMm)+p.initialRetreatLengthMm+LayerPrefix(p,index);}
+inline NCG76SphereRetreat::Stage ContourRetreatStage(Stage stage) noexcept
+{
+    return stage==Stage::ContourFinish?NCG76SphereRetreat::Stage::ContourFinish:
+        stage==Stage::ContourNominal?NCG76SphereRetreat::Stage::ContourNominal:
+        static_cast<NCG76SphereRetreat::Stage>(static_cast<unsigned>(stage));
+}
+inline Stage ContourPathStage(NCG76SphereRetreat::Stage stage) noexcept
+{
+    return stage==NCG76SphereRetreat::Stage::ContourFinish?Stage::ContourFinish:
+        stage==NCG76SphereRetreat::Stage::ContourNominal?Stage::ContourNominal:
+        static_cast<Stage>(static_cast<unsigned>(stage));
+}
 inline Status SpanUnchecked(const Descriptor& p,Stage stage,unsigned layer,Span& out) noexcept
 {
     out=Span{};out.stage=stage;out.layerIndex=layer;
+    if(p.geometry.kind==NCG76SphereRuntimeGeometry::Kind::OrbitContour){
+        if(stage==Stage::Complete){
+            if(layer!=0U)return Status::InvalidLayer;
+            out.startMm=out.endMm=p.totalLengthMm;return Status::Ok;
+        }
+        NCG76SphereRetreat::Span span{};
+        if(!NCG76SphereRetreat::ContourSpan(p.geometry,ContourRetreatStage(stage),layer,span))return Status::InvalidStage;
+        out.startMm=span.start;out.endMm=span.end;out.lengthMm=span.length;return Status::Ok;
+    }
     // A G01/G02/G03 parent has exactly one nominal analytic leg. It does
     // not acquire a synthetic sphere layer, center-return or retreat stage.
     if(p.geometry.kind!=NCG76SphereRuntimeGeometry::Kind::Sphere){
@@ -186,6 +217,42 @@ inline Status Build(const Geometry& source,Descriptor& output) noexcept
     if(!NCG76SphereRuntimeGeometry::Valid(geometry))return Status::InvalidGeometry;
     if(geometry.radiusLaw!=NCG76Sphere::RadiusLaw::Linear)return Status::UnsupportedRadiusLaw;
     Descriptor p{};p.geometry=geometry;p.layerCount=geometry.circleLayerCount;
+    if(geometry.kind==NCG76SphereRuntimeGeometry::Kind::OrbitContour){
+        p.layerCount=0U;p.initialDepthLengthMm=p.layeredStartMm=NCG76OrbitContour::NominalLength(geometry);
+        if(!NCG76SphereRetreat::ContourTotal(geometry,p.totalLengthMm))return Status::NumericRange;
+        const double ulp=std::nextafter(p.totalLengthMm,std::numeric_limits<double>::infinity())-p.totalLengthMm;
+        p.stationErrorBoundMm=ulp*32.0;
+        if(!Detail::Positive(p.stationErrorBoundMm)||p.stationErrorBoundMm>MaximumStationErrorMm)return Status::PrecisionLoss;
+        double previousEnd=0.0;
+        for(unsigned i=0U;i<25U;++i){
+            Span span{};const auto status=Detail::SpanUnchecked(p,Stage::ContourNominal,i,span);
+            if(status!=Status::Ok)return status;
+            if(!Detail::Bits(span.startMm,previousEnd)||span.lengthMm<=p.stationErrorBoundMm*64.0||
+               std::fabs((span.endMm-span.startMm)-span.lengthMm)>p.stationErrorBoundMm)return Status::PrecisionLoss;
+            previousEnd=span.endMm;
+        }
+        if(NCG76OrbitContour::FinishEnabled(geometry)&&NCG76OrbitContour::IsFourSideContour(geometry)){
+            const unsigned count=NCG76OrbitContour::FinishLegCount(geometry);
+            for(unsigned i=0U;i<count+2U;++i){
+                const Stage stage=i==0U?Stage::CircleEntry:i==count+1U?Stage::ReturnCenter:Stage::ContourFinish;
+                const unsigned side=stage==Stage::ContourFinish?i-1U:0U;
+                Span span{};const auto status=Detail::SpanUnchecked(p,stage,side,span);
+                if(status!=Status::Ok)return status;
+                if(!Detail::Bits(span.startMm,previousEnd)||span.lengthMm<=p.stationErrorBoundMm*64.0||
+                   std::fabs((span.endMm-span.startMm)-span.lengthMm)>p.stationErrorBoundMm)return Status::PrecisionLoss;
+                previousEnd=span.endMm;
+            }
+        }else if(NCG76OrbitContour::FinishEnabled(geometry))for(Stage stage:{Stage::CircleEntry,Stage::Orbit,Stage::ReturnCenter}){
+            Span span{};const auto status=Detail::SpanUnchecked(p,stage,0U,span);
+            if(status!=Status::Ok)return status;
+            if(!Detail::Bits(span.startMm,previousEnd)||span.lengthMm<=p.stationErrorBoundMm*64.0||
+               std::fabs((span.endMm-span.startMm)-span.lengthMm)>p.stationErrorBoundMm)return Status::PrecisionLoss;
+            previousEnd=span.endMm;
+        }
+        if(!Detail::Bits(previousEnd,p.totalLengthMm))return Status::PrecisionLoss;
+        p.version=Version;p.valid=true;if(!Detail::Shape(p))return Status::PrecisionLoss;
+        output=p;return Status::Ok;
+    }
     if(geometry.kind!=NCG76SphereRuntimeGeometry::Kind::Sphere){
         p.initialDepthLengthMm=p.layeredStartMm=p.totalLengthMm=geometry.travelMm;
         const double ulp=std::nextafter(p.totalLengthMm,std::numeric_limits<double>::infinity())-p.totalLengthMm;
@@ -267,6 +334,15 @@ inline Status Locate(const Descriptor& p,double stationMm,Cursor& output) noexce
     output=Cursor{};if(!Detail::Shape(p))return Status::InvalidDescriptor;
     if(!std::isfinite(stationMm)||stationMm<0.0||stationMm>p.totalLengthMm)return Status::InvalidStation;
     if(stationMm==p.totalLengthMm)return MakeCursorByFraction(p,Stage::Complete,p.layerCount,0.0,output);
+    if(p.geometry.kind==NCG76SphereRuntimeGeometry::Kind::OrbitContour){
+        NCG76SphereRetreat::Span span{};
+        if(!NCG76SphereRetreat::ContourLocate(p.geometry,stationMm,false,span))return Status::InvalidStation;
+        Span pathSpan{};const auto status=Detail::SpanUnchecked(p,Detail::ContourPathStage(span.stage),span.layer,pathSpan);
+        if(status!=Status::Ok)return status;
+        const double fraction=stationMm==span.start?0.0:(stationMm-span.start)/(span.end-span.start);
+        const auto result=Detail::CursorUnchecked(p,pathSpan,fraction,output);
+        if(result==Status::Ok)output.stationMm=stationMm;return result;
+    }
     if(p.geometry.kind!=NCG76SphereRuntimeGeometry::Kind::Sphere){
         const auto result=MakeCursorByFraction(p,Stage::InitialDepth,0U,
             stationMm==0.0?0.0:stationMm/p.totalLengthMm,output);
@@ -316,6 +392,43 @@ inline Status Evaluate(const Descriptor& p,const Cursor& cursor,Sample& output) 
         std::fabs(cursor.localProgressMm-expected.localProgressMm)>p.stationErrorBoundMm)return Status::InvalidCursor;
     Sample sample{};sample.cursor=cursor;const auto stage=cursor.span.stage;
     if(stage==Stage::Complete){sample.position=sample.center=p.geometry.endMCS;sample.terminal=true;}
+    else if(p.geometry.kind==NCG76SphereRuntimeGeometry::Kind::OrbitContour){
+        NCG76SphereRetreat::Span span{};const auto mapped=Detail::ContourRetreatStage(stage);
+        if(!NCG76SphereRetreat::GetSpan(p.geometry,mapped,cursor.span.layerIndex,span)||
+           !NCG76SphereRetreat::Evaluate(p.geometry,span,cursor.fraction,sample.position,sample.center))return Status::InvalidGeometry;
+        if(stage==Stage::Orbit){
+            Point8 point{};Point3 curvature{};
+            if(!NCG76SphereRuntimeGeometry::CircleAt(p.geometry,0U,
+                cursor.fraction==1.0?NCG76SphereRuntimeGeometry::TwoPi:cursor.fraction*NCG76SphereRuntimeGeometry::TwoPi,
+                point,sample.tangent,curvature))return Status::InvalidGeometry;
+        }else{
+            Point8 begin{},end{},center{};double length=0.0,prefix=0.0;
+            if(stage==Stage::ContourNominal){
+                if(!NCG76OrbitContour::NominalLegAt(p.geometry,cursor.span.layerIndex,begin,end,center,length,prefix))return Status::InvalidGeometry;
+            }else if(NCG76OrbitContour::IsFourSideContour(p.geometry)){
+                if(stage==Stage::ContourFinish){
+                    if(!NCG76OrbitContour::FinishLegAt(p.geometry,cursor.span.layerIndex,begin,end,center,length,prefix))
+                        return Status::InvalidGeometry;
+                }else{
+                    Point8 vertex{};
+                    if(!NCG76OrbitContour::FinishVertexAt(p.geometry,0U,vertex))return Status::InvalidGeometry;
+                    if(stage==Stage::CircleEntry){begin=p.geometry.endMCS;end=vertex;}
+                    else if(stage==Stage::ReturnCenter){begin=vertex;end=p.geometry.endMCS;}
+                    else return Status::InvalidStage;
+                }
+            }else{
+                Point8 circle{};Point3 tangent{},curvature{};
+                if(!NCG76SphereRuntimeGeometry::CircleAt(p.geometry,0U,0.0,circle,tangent,curvature))return Status::InvalidGeometry;
+                if(stage==Stage::CircleEntry){begin=p.geometry.endMCS;end=circle;}
+                else if(stage==Stage::ReturnCenter){begin=circle;end=p.geometry.endMCS;}
+                else return Status::InvalidStage;
+            }
+            Point3 delta{};for(unsigned a=0U;a<3U;++a)delta[a]=end[a]-begin[a];
+            const double norm=NCG76SphereRuntimeGeometry::Detail::Norm(delta);
+            if(!Detail::Positive(norm))return Status::PrecisionLoss;
+            for(unsigned a=0U;a<3U;++a)sample.tangent[a]=delta[a]/norm;
+        }
+    }
     else if(p.geometry.kind!=NCG76SphereRuntimeGeometry::Kind::Sphere){
         Point3 curvature{};
         if(stage!=Stage::InitialDepth||

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "NCG76SphereCycle.h"
+#include "NCMachiningTime.h"
 #include "NCG76SphereDeepFlush.h"
 #include "EDM130WorkTimer.h"
 #include "EDMCoordinatedGapSource.h"
@@ -48,8 +49,35 @@ struct Config
     // EDM308: explicit Line/Arc parameter-feed contract; the matching Request
     // is independently checked by Motion. False preserves the P50/F contract.
     bool parameterFeeds=false;
+    // EDM339: opt-in P50 machining-role feeds. Ordinary Line/Arc parents keep
+    // these fields canonical zero and retain their original E8 curve.
+    double orbitScaleMmPerVoltMin=0.0,orbitOverridePercent=0.0;
+    bool orbitFeedsEnabled=false;
 };
 inline bool Disabled(const Config& c) noexcept{return !c.enabled;}
+enum class FeedRole : std::uint8_t { Unavailable, Cutting, Orbit };
+inline const char* FeedRoleName(FeedRole role) noexcept
+{return role==FeedRole::Cutting?"CUTTING":role==FeedRole::Orbit?"ORBIT":"UNAVAILABLE";}
+struct FeedSelection
+{
+    double scaleMmPerVoltMin=0.0,overridePercent=0.0;
+    FeedRole role=FeedRole::Unavailable;
+};
+// The RT owner supplies the active leg's role, including a retained history
+// leg. Do not infer this from the saved forward cursor, which intentionally
+// stays unchanged while GAP retreats through an earlier depth/entry leg.
+inline bool ResolveFeedSelection(const Config& c,NCG76SphereCycle::Phase phase,FeedSelection& out) noexcept
+{
+    out=FeedSelection{};
+    using P=NCG76SphereCycle::Phase;
+    if(c.orbitFeedsEnabled&&phase!=P::Idle&&phase!=P::ContourFinish&&
+        (phase<P::InitialDepth||phase>P::AdvanceCenter))return false;
+    const bool orbit=c.orbitFeedsEnabled&&(phase==P::CircleEntry||phase==P::Orbit||phase==P::ContourFinish);
+    out.role=orbit?FeedRole::Orbit:FeedRole::Cutting;
+    out.scaleMmPerVoltMin=orbit?c.orbitScaleMmPerVoltMin:c.curve.cuttingScaleMmPerVoltMin;
+    out.overridePercent=orbit?c.orbitOverridePercent:c.machiningOverridePercent;
+    return true;
+}
 namespace ParameterFeedDetail
 {
 inline bool ProfileCeiling(const Config& c,double& ceiling) noexcept
@@ -71,6 +99,14 @@ inline bool ProfileCeiling(const Config& c,double& ceiling) noexcept
 }
 inline bool Valid(const Config& c) noexcept
 {
+    if(c.orbitFeedsEnabled){
+        if(!c.enabled||!c.signedMotionEnabled||c.parameterFeeds||
+           !std::isfinite(c.orbitScaleMmPerVoltMin)||c.orbitScaleMmPerVoltMin<0.001||
+           !std::isfinite(c.orbitOverridePercent)||c.orbitOverridePercent<=0.0||c.orbitOverridePercent>100.0)return false;
+        auto curve=c.curve;curve.cuttingScaleMmPerVoltMin=c.orbitScaleMmPerVoltMin;
+        if(!EDMGapServo::Evaluate(curve,0.0,c.referenceV,100.0).valid||
+           !EDMGapServo::Evaluate(curve,300.0,c.referenceV,100.0).valid)return false;
+    }else if(c.orbitScaleMmPerVoltMin!=0.0||c.orbitOverridePercent!=0.0)return false;
     if(c.parameterFeeds){
         double ceiling=0.0;
         if(!c.enabled||!c.signedMotionEnabled||
@@ -170,7 +206,9 @@ inline bool EquivalentForContinuation(const Config& a,const Config& b) noexcept
     return a.enabled&&b.enabled&&Valid(a)&&Valid(b)&&
         a.workTimeUs==b.workTimeUs&&a.recipeGeneration==b.recipeGeneration&&a.tuningGeneration==b.tuningGeneration&&
         a.enabled==b.enabled&&a.flushMotionEnabled==b.flushMotionEnabled&&a.signedMotionEnabled==b.signedMotionEnabled&&
-        a.parameterFeeds==b.parameterFeeds&&
+        a.parameterFeeds==b.parameterFeeds&&a.orbitFeedsEnabled==b.orbitFeedsEnabled&&
+        SameDouble(a.orbitScaleMmPerVoltMin,b.orbitScaleMmPerVoltMin)&&
+        SameDouble(a.orbitOverridePercent,b.orbitOverridePercent)&&
         a.independentFeedsEnabled==b.independentFeedsEnabled&&a.finalApproachEnabled==b.finalApproachEnabled&&
         a.initialSlowEnabled==b.initialSlowEnabled&&a.deepFlushEnabled==b.deepFlushEnabled&&
         a.deepFlushCycleInterval==b.deepFlushCycleInterval&&
@@ -271,6 +309,9 @@ inline const char* ReasonName(Reason r) noexcept
 struct Input
 {
     NCG76SphereCycle::Feedback nominal{}; // Coherent PRE-step P50 feedback.
+    // EDM339: POST-step active leg for the next signed-GAP demand. E5 below
+    // still consumes the coherent PRE-step nominal/accepted-send evidence.
+    NCG76SphereCycle::Phase gapFeedPhase=NCG76SphereCycle::Phase::Idle;
     Point8 candidateMCS{}; // Matching PRE-step nominal command; no stop proof.
     std::uint64_t session=0ULL,tick=0ULL,nowUs=0ULL,acceptedSendTick=0ULL;
     // Sticky, independently proved post-Step cycle acknowledgements. The
@@ -279,6 +320,10 @@ struct Input
     // EDM307: RT alone derives this from its frozen, canonically validated
     // zero-length Line. It does not turn malformed moving feedback into rest.
     bool stationaryNominal=false;
+    // EDM340: RT-owned physical endpoint receipt for an active additional
+    // primitive. This marker alone earns nothing; Step checks the whole
+    // matching PRE-step parent and the current positive GAP sample again.
+    bool additionalEndpointQualified=false;
     bool sourceValid=false,powerInhibited=false,suspended=false,terminal=false,cancel=false;
 };
 struct Feedback
@@ -296,7 +341,9 @@ struct Feedback
     EDM88::Reason sourceReason=EDM88::Reason::Disabled;
     SimulationMode simulationMode=SimulationMode::Wave;
     ProbePhase probePhase=ProbePhase::Disabled;
+    FeedRole selectedFeedRole=FeedRole::Unavailable;
     bool enabled=false,valid=false,eligible=false,suspended=false,pending=false,terminal=false;
+    double selectedScaleMmPerVoltMin=0.0,selectedOverridePercent=0.0;
 };
 
 class Observer
@@ -395,9 +442,19 @@ public:
         if(!qualifier_.Observe(frame_,input.nowUs)){
             feedback_.sourceReason=qualifier_.Current().reason;Withdraw(Reason::Source);return feedback_;
         }
-        const auto gap=EDMGapServo::Evaluate(config_.curve,frame_.voltageV,
-            config_.referenceV,config_.machiningOverridePercent);
+        FeedSelection selection{};
+        if(!ResolveFeedSelection(config_,input.gapFeedPhase,selection))
+        {Withdraw(Reason::Input);return feedback_;}
+        auto selectedCurve=config_.curve;
+        selectedCurve.cuttingScaleMmPerVoltMin=selection.scaleMmPerVoltMin;
+        const auto gap=EDMGapServo::Evaluate(selectedCurve,frame_.voltageV,
+            config_.referenceV,selection.overridePercent);
         if(!gap.valid){Withdraw(Reason::Configuration);return feedback_;}
+        if(config_.orbitFeedsEnabled){
+            feedback_.selectedFeedRole=selection.role;
+            feedback_.selectedScaleMmPerVoltMin=selection.scaleMmPerVoltMin;
+            feedback_.selectedOverridePercent=selection.overridePercent;
+        }
         feedback_.sourceSequence=frame_.sequence;feedback_.sourceCapturedAtUs=frame_.capturedAtUs;
         feedback_.voltageV=frame_.voltageV;feedback_.signedGapSpeedMmMin=gap.limitedSpeedMmPerMin;
         bool acknowledged=false;
@@ -406,11 +463,25 @@ public:
         // saved nominal cursor, even when their signed velocity is positive.
         // Neither direction may earn E5 time or a new flush candidate.
         feedback_.suspended=input.suspended||input.nominal.holdActive||input.nominal.held||
-            input.nominal.flushActive||input.nominal.gapHistoryActive||input.nominal.finishActive;
+            input.nominal.flushActive||input.nominal.gapHistoryActive||input.nominal.finishActive||
+            IsTimeLimitStopping(input.nominal);
         const auto& n=input.nominal;
-        const bool eligible=!input.stationaryNominal&&!seed&&!acknowledged&&!feedback_.suspended&&IsWorkPhase(n.phase)&&n.phase==n.nominalPhase&&
+        const bool movingWork=IsWorkPhase(n.phase,n.layerIndex)&&n.phase==n.nominalPhase&&
             n.speedMmS>0.0&&n.nominalProgressMm>0.0&&n.nominalProgressMm<n.nominalLengthMm&&
-            (!n.gapMotionEnabled||(n.gapApplied&&n.signedSpeedMmS>0.0))&&
+            (!n.gapMotionEnabled||(n.gapApplied&&n.signedSpeedMmS>0.0));
+        // A completed endpoint does not ordinarily earn E5. Only the optional
+        // additional phase may discharge there, after fresh physical/zero-send
+        // qualification supplied by the RT adapter. No waiting, saturated,
+        // historical, flush or final-L check can manufacture periodic work.
+        const bool additionalEndpoint=input.additionalEndpointQualified&&
+            n.additionalUs!=0ULL&&n.additionalElapsedUs<n.additionalUs&&
+            n.timePhase==static_cast<std::uint8_t>(NCMachiningTime::TimePhase::Additional)&&
+            n.additionalTimerState==static_cast<std::uint8_t>(NCMachiningTime::TimerState::Running)&&
+            n.phase==NCG76SphereCycle::Phase::Settle&&n.nominalPhase==NCG76SphereCycle::Phase::InitialDepth&&
+            n.nominalLengthMm>0.0&&n.nominalProgressMm==n.nominalLengthMm&&
+            n.speedMmS==0.0&&n.signedSpeedMmS==0.0&&n.gapMotionEnabled;
+        const bool eligible=!input.stationaryNominal&&!seed&&!acknowledged&&!feedback_.suspended&&
+            (movingWork||additionalEndpoint)&&
             input.acceptedSendTick!=0ULL&&input.acceptedSendTick==input.tick-1ULL&&
             gap.limitedSpeedMmPerMin>0.0;
         feedback_.eligible=eligible&&!feedback_.pending;
@@ -509,16 +580,27 @@ private:
     }
     static bool FinitePoint(const Point8& p) noexcept
     {for(double value:p)if(!std::isfinite(value))return false;return true;}
-    static bool IsWorkPhase(NCG76SphereCycle::Phase phase) noexcept
+    static bool IsWorkPhase(NCG76SphereCycle::Phase phase,unsigned layer) noexcept
     {
         using P=NCG76SphereCycle::Phase;
         // Return/advance power policy is intentionally not released by this
         // first simulation stage. HOLD/resume/initial retreat never accrue E5.
-        return phase==P::InitialDepth||phase==P::CircleEntry||phase==P::Orbit;
+        return phase==P::InitialDepth||phase==P::CircleEntry||phase==P::Orbit||
+            (phase==P::ContourNominal&&layer<24U)||(phase==P::ContourFinish&&layer<4U);
+    }
+    static bool IsTimeLimitStopping(const NCG76SphereCycle::Feedback& n) noexcept
+    {
+        using P=NCG76SphereCycle::Phase;
+        return (n.phase==P::TimeLimitBrake||n.phase==P::TimeLimitSettle)&&
+            n.fault==NCG76SphereCycle::Fault::None&&n.totalLimitUs!=0ULL&&
+            n.totalElapsedUs>=n.totalLimitUs&&
+            n.totalTimerState==static_cast<std::uint8_t>(NCMachiningTime::TimerState::Expired)&&
+            n.timePhase==static_cast<std::uint8_t>(NCMachiningTime::TimePhase::TimedOut);
     }
     static bool ValidNominal(const NCG76SphereCycle::Feedback& n,bool stationary) noexcept
     {
         using P=NCG76SphereCycle::Phase;
+        const bool timeLimitStop=IsTimeLimitStopping(n);
         if(stationary){
             if(n.holdRecoveryEnabled&&n.holdActive&&
                (NCG76SphereCycle::Detail::IsRecovery(n.phase)||n.phase==P::HeldAtStart))
@@ -527,16 +609,20 @@ private:
                     std::isfinite(n.signedSpeedMmS)&&n.speedMmS==std::fabs(n.signedSpeedMmS)&&!n.gapApplied&&
                     !n.flushActive&&!n.flushCheckpointSaved&&!n.gapHistoryActive&&n.layerIndex==0U&&n.completedLayers==0U;
             const bool restingPhase=n.phase==P::Settle||n.phase==P::HoldSettle||
-                n.phase==P::HeldAtStart||n.phase==P::Complete;
+                n.phase==P::HeldAtStart||n.phase==P::Complete||timeLimitStop;
             return n.fault==NCG76SphereCycle::Fault::None&&restingPhase&&n.nominalPhase==P::InitialDepth&&
                 n.nominalLengthMm==0.0&&n.nominalProgressMm==0.0&&n.speedMmS==0.0&&n.signedSpeedMmS==0.0&&
                 !n.gapApplied&&!n.flushActive&&!n.flushCheckpointSaved&&!n.gapHistoryActive&&
                 n.layerIndex==0U&&n.completedLayers==0U;
         }
         return n.fault==NCG76SphereCycle::Fault::None&&
-            static_cast<unsigned>(n.phase)<=static_cast<unsigned>(P::InspectionJogReturn)&&
+            (static_cast<unsigned>(n.phase)<=static_cast<unsigned>(P::InspectionJogReturn)||timeLimitStop||
+                (n.phase==P::ContourNominal&&n.layerIndex<25U)||
+                (n.phase==P::ContourFinish&&n.layerIndex<4U))&&
             (!NCG76SphereCycle::Detail::IsRecovery(n.phase)||(n.holdRecoveryEnabled&&n.holdActive))&&
-            n.nominalPhase>=P::InitialDepth&&n.nominalPhase<=P::AdvanceCenter&&
+            ((n.nominalPhase>=P::InitialDepth&&n.nominalPhase<=P::AdvanceCenter)||
+                (n.nominalPhase==P::ContourNominal&&n.layerIndex<25U&&n.completedLayers==0U)||
+                (n.nominalPhase==P::ContourFinish&&n.layerIndex<4U&&n.completedLayers==0U))&&
             std::isfinite(n.speedMmS)&&n.speedMmS>=0.0&&std::isfinite(n.nominalProgressMm)&&
             (!n.gapMotionEnabled||(std::isfinite(n.signedSpeedMmS)&&
                 n.speedMmS==std::fabs(n.signedSpeedMmS)))&&
@@ -549,6 +635,8 @@ private:
             feedback_.probePhase=ProbePhase::Failed;
         active_=false;qualifier_.Cancel();feedback_.valid=feedback_.eligible=feedback_.pending=feedback_.suspended=false;
         feedback_.reason=reason;feedback_.signedGapSpeedMmMin=feedback_.voltageV=0.0;
+        feedback_.selectedFeedRole=FeedRole::Unavailable;
+        feedback_.selectedScaleMmPerVoltMin=feedback_.selectedOverridePercent=0.0;
         feedback_.sourceSequence=feedback_.sourceCapturedAtUs=feedback_.requestSequence=feedback_.requestTick=0ULL;
         feedback_.candidateMCS=Point8{};feedback_.nominalPhase=NCG76SphereCycle::Phase::Idle;
         feedback_.layerIndex=0U;feedback_.nominalProgressMm=feedback_.nominalLengthMm=0.0;
@@ -563,7 +651,7 @@ private:
     bool active_=false,haveClock_=false;
 };
 static_assert(std::is_trivially_copyable<Config>::value,"P50 SIM config is an immutable value");
-static_assert(sizeof(Config)<=400U,"Parameter-feed mode must use existing Config padding");
+static_assert(sizeof(Config)<=432U,"Role-selected P50 feed config remains bounded");
 static_assert(std::is_trivially_copyable<Feedback>::value&&sizeof(Feedback)<=256U,"P50 SIM feedback stays bounded");
 static_assert(!MotionExecutionReleased&&!DischargeExecutionReleased,"P50 SIM observer cannot authorize outputs");
 }

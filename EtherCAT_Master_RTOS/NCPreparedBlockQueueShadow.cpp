@@ -1,5 +1,6 @@
 #include "NCPreparedBlockQueueShadow.h"
 #include "NCWorkCoordinateCode.h"
+#include "NCMachiningTimePolicy.h"
 
 #include <cerrno>
 #include <cmath>
@@ -1273,9 +1274,10 @@ NCPreparedBlockQueueShadow::ClassifyLiteralBlock(
             NC_PREPARED_BARRIER_FLAG_IMPLICIT);
     }
 
-    // H is table-dependent even when no explicit G43/G44 shares the block.
-    // Never pre-resolve a later motion across an unproven tool selection.
-    if (block.has('H'))
+    // H remains table-dependent except for an exact, literal-shape EDM time
+    // owner. Dispatch separately proves authored D/H and the current EDM grant.
+    if (block.has('H') && !(NCMachiningTimePolicy::Requests(block) &&
+        NCMachiningTimePolicy::ResolvedOwner(block)))
     {
         AddBarrier(result, NCPreparedBarrierKind::MODAL_SNAPSHOT,
             NC_PREPARED_BARRIER_FLAG_MODAL);
@@ -1320,7 +1322,8 @@ NCPreparedModalSnapshot NCPreparedBlockQueueShadow::ReduceModalSnapshot(
 {
     NCPreparedModalSnapshot after = before;
     afterValid = before.imageValid;
-    if (block.has('H')) afterValid = false;
+    if (block.has('H') && !(NCMachiningTimePolicy::Requests(block) &&
+        NCMachiningTimePolicy::ResolvedOwner(block))) afterValid = false;
 
     const int count = SafeGCodeCount(block);
     for (int i = 0; i < count; ++i)

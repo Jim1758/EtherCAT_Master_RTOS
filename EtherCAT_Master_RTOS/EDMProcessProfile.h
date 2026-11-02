@@ -3,6 +3,7 @@
 #include "EDMGapServo.h"
 #include "EDMFlushPlan.h"
 #include "EDMAxisGainProfiles.h"
+#include <cmath>
 #include <cstdint>
 
 namespace EDM20
@@ -17,6 +18,9 @@ namespace EDM20
         std::uint32_t machineProfileId = 1U;
         ProcessMode mode = ProcessMode::ShadowOnly;
         EDMGapServo::Profile servo{};
+        // EDM339: selected only by an admitted orbit machining role. Keeping
+        // this separate leaves the ordinary cutting/short-retreat curve intact.
+        double orbitScaleMmPerVoltMin = 0.010;
         FlushProfile flush{};
         AxisGainProfiles axisGains{};
     };
@@ -27,6 +31,7 @@ namespace EDM20
             profile.machineProfileId > 0U && profile.mode == ProcessMode::ShadowOnly &&
             profile.servo.revision == profile.revision &&
             EDMGapServo::ValidateProfile(profile.servo) &&
+            std::isfinite(profile.orbitScaleMmPerVoltMin) && profile.orbitScaleMmPerVoltMin >= 0.001 &&
             ValidateFlushProfile(profile.flush) && ValidateAxisGainProfiles(profile.axisGains);
     }
 }

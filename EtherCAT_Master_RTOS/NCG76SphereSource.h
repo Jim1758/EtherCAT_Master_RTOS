@@ -3,6 +3,7 @@
 #include "NCPreparedBlockQueueShadow.h"
 #include "NCG76SphereCoordinates.h"
 #include "MotionExecutionContract.h"
+#include "NCMachiningTimePolicy.h"
 
 #include <array>
 #include <cerrno>
@@ -125,7 +126,8 @@ inline bool ExactG76(const std::string& expression) noexcept
 inline bool AllowedAddress(char word) noexcept
 {
     return word == 'N' || word == 'P' || word == 'R' || word == 'K' ||
-        word == 'F' || word == 'B' || word == 'X' || word == 'Y' || word == 'Z';
+        word == 'F' || word == 'B' || word == 'X' || word == 'Y' || word == 'Z' ||
+        word == NCMachiningTimePolicy::TotalAddress || word == NCMachiningTimePolicy::AdditionalAddress;
 }
 }
 
@@ -163,6 +165,8 @@ inline Status Decode(const NCParsedBlock& parsed, const ModalB& inherited, Words
         !literal.has('R') || !literal.has('K') || !literal.has('F') ||
         !(literal.has('X') || literal.has('Y') || literal.has('Z')))
         return Status::UnsupportedBlock;
+    NCMachiningTime::Config timing{};
+    if(!NCMachiningTimePolicy::Decode(parsed,literal,timing))return Status::InvalidProcessOption;
     if (!(literal.val('R') > 0.0) || !(literal.val('K') > 0.0) || !(literal.val('F') > 0.0))
         return Status::InvalidScalar;
     if (literal.has('B') && (literal.val('B') < 0.0 || literal.val('B') > 4.0 ||

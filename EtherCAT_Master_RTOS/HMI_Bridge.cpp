@@ -10,6 +10,7 @@
 #include "NCPLCMap.h"
 #include "RotarySpindleTelemetry.h"
 #include "NCHoldTelemetry.h"
+#include "NCMachiningTelemetry.h"
 #include "NCHoldInspectionCommand.h"
 
 #include <cmath>
@@ -3307,6 +3308,9 @@ namespace HMI_Bridge
         NCHoldTelemetry::Image holdImage{};
         nc->ExportHoldRecoveryTelemetrySameThread(holdImage);
         NCHoldTelemetry::Publish(holdImage);
+        NCMachiningTelemetry::Image machiningImage{};
+        nc->ExportMachiningTelemetrySameThread(machiningImage);
+        NCMachiningTelemetry::Publish(machiningImage);
 
 
         // --- 警報檢查 (自帶條件判斷，極快) ---

@@ -104,6 +104,10 @@ struct Binding
     // NC-only capture provenance. A later mutation of the RT config mode
     // cannot change which engineering envelope this binding was captured for.
     bool parameterFeeds=false;
+    // EDM339: source-scoped P50 role selection, separate from Line/Arc feeds.
+    bool orbitFeeds=false;
+    EDMRecipe::Value orbitValue=0LL;
+    std::uint16_t orbitField=0U;
 };
 inline bool SameDouble(double a,double b) noexcept
 {return std::memcmp(&a,&b,sizeof(double))==0;}
@@ -352,15 +356,16 @@ inline bool SameServoProfile(const EDMGapServo::Profile& a,const EDMGapServo::Pr
 }
 
 inline Binding Capture(const EDMRecipe::Controller& controller,const EDM20::ProcessProfile& process,
-    std::uint64_t tuningGeneration,bool processReady,bool parameterFeeds=false) noexcept
+    std::uint64_t tuningGeneration,bool processReady,bool parameterFeeds=false,bool orbitFeeds=false) noexcept
 {
-    Binding out{};out.parameterFeeds=parameterFeeds;
+    Binding out{};out.parameterFeeds=parameterFeeds;out.orbitFeeds=orbitFeeds;
     if(!processReady)return out;
-    if(!tuningGeneration||!EDM20::ValidateProcessProfile(process)){
+    if(!tuningGeneration||!EDM20::ValidateProcessProfile(process)||(parameterFeeds&&orbitFeeds)){
         out.reason=Reason::ProcessInvalid;out.error=EDM58::BindingError::InvalidRecipe;return out;
     }
     const auto before=controller.Current();const auto* catalog=controller.GetCatalog();
     const auto servo=process.servo;const auto flushProfile=process.flush;
+    const double orbitScale=process.orbitScaleMmPerVoltMin;
     const auto revision=process.revision,profile=process.machineProfileId;
     const auto timed=EDM130::BindWorkTime(controller,profile);
     if(!timed.ready){out.reason=Reason::RecipeUnavailable;out.error=timed.error;
@@ -383,9 +388,23 @@ inline Binding Capture(const EDMRecipe::Controller& controller,const EDM20::Proc
             out.failedFieldId=out.fields[i+1U];return out;
         }
     }
+    if(orbitFeeds){
+        EDM58::Binding semantic{};
+        if(!catalog||!EDM58::BindingDetail::Read(controller,*catalog,"OrbitSpeedOverride","%",
+            out.orbitValue,out.orbitField,semantic)){
+            out.reason=Reason::FieldRejected;out.error=semantic.error;out.failedFieldId=semantic.failedFieldId;return out;
+        }
+        // Existing catalogs legitimately store zero. Once this role is
+        // enabled it must reject before motion rather than stall silently.
+        if(out.orbitValue<=0LL||out.orbitValue>100000000LL){
+            out.reason=Reason::EngineeringRange;out.error=EDM58::BindingError::EngineeringRange;
+            out.failedFieldId=out.orbitField;return out;
+        }
+    }
     if(controller.GetCatalog()!=catalog||!EDM58::BindingDetail::SameSelection(before,controller.Current())||
        !EDM20::ValidateProcessProfile(process)||process.revision!=revision||process.machineProfileId!=profile||
-       !SameServoProfile(servo,process.servo)||!SameFlushProfile(flushProfile,process.flush)){
+       !SameServoProfile(servo,process.servo)||!SameFlushProfile(flushProfile,process.flush)||
+       (orbitFeeds&&!SameDouble(orbitScale,process.orbitScaleMmPerVoltMin))){
         out.reason=Reason::CaptureChanged;out.error=EDM58::BindingError::CaptureChanged;return out;
     }
     out.config.curve=servo;out.config.workTimeUs=timed.recipe.workTimeUs;
@@ -396,6 +415,11 @@ inline Binding Capture(const EDMRecipe::Controller& controller,const EDM20::Proc
     out.config.referenceV=static_cast<double>(out.values[4])/EDMRecipe::Scale;
     out.config.enabled=true;out.config.flushMotionEnabled=out.config.jumpHeightMm>0.0;
     out.config.parameterFeeds=parameterFeeds;
+    if(orbitFeeds){
+        out.config.orbitScaleMmPerVoltMin=orbitScale;
+        out.config.orbitOverridePercent=static_cast<double>(out.orbitValue)/EDMRecipe::Scale;
+        out.config.orbitFeedsEnabled=true;
+    }
     // EDM298: this P50 binding releases only the bounded software-simulation
     // feed lane. Actual GAP input and physical discharge remain unreleased.
     out.config.signedMotionEnabled=true;
@@ -414,7 +438,8 @@ inline Binding Capture(const EDMRecipe::Controller& controller,const EDM20::Proc
     }
     if(controller.GetCatalog()!=catalog||!EDM58::BindingDetail::SameSelection(before,controller.Current())||
        !EDM20::ValidateProcessProfile(process)||process.revision!=revision||process.machineProfileId!=profile||
-       !SameServoProfile(servo,process.servo)||!SameFlushProfile(flushProfile,process.flush)){
+       !SameServoProfile(servo,process.servo)||!SameFlushProfile(flushProfile,process.flush)||
+       (orbitFeeds&&!SameDouble(orbitScale,process.orbitScaleMmPerVoltMin))){
         out.config=NCG76SphereGapProcess::Config{};
         out.reason=Reason::CaptureChanged;out.error=EDM58::BindingError::CaptureChanged;return out;
     }
@@ -431,13 +456,19 @@ inline Binding Capture(const EDMRecipe::Controller& controller,const EDM20::Proc
 inline bool IsCurrent(const Binding& b,const EDMRecipe::Controller& controller,
     const EDM20::ProcessProfile& process,std::uint64_t tuningGeneration,bool processReady) noexcept
 {
-    if(!b.ready||!b.config.enabled||!processReady||b.parameterFeeds!=b.config.parameterFeeds||controller.GetCatalog()!=b.catalog||
+    if(!b.ready||!b.config.enabled||!processReady||b.parameterFeeds!=b.config.parameterFeeds||
+       b.orbitFeeds!=b.config.orbitFeedsEnabled||controller.GetCatalog()!=b.catalog||
        tuningGeneration!=b.config.tuningGeneration||process.revision!=b.processRevision||
        process.machineProfileId!=b.machineProfileId||!SameServoProfile(process.servo,b.config.curve)||
        !SameFlushProfile(process.flush,b.config.flushProfile)||
+       (b.orbitFeeds&&!SameDouble(process.orbitScaleMmPerVoltMin,b.config.orbitScaleMmPerVoltMin))||
        !EDM58::BindingDetail::SameSelection(b.selection,controller.Current()))return false;
-    const auto current=Capture(controller,process,tuningGeneration,processReady,b.config.parameterFeeds);
+    const auto current=Capture(controller,process,tuningGeneration,processReady,b.parameterFeeds,b.orbitFeeds);
     return current.ready&&current.parameterFeeds==b.parameterFeeds&&current.config.parameterFeeds==b.config.parameterFeeds&&
+        current.orbitFeeds==b.orbitFeeds&&current.config.orbitFeedsEnabled==b.config.orbitFeedsEnabled&&
+        current.orbitValue==b.orbitValue&&current.orbitField==b.orbitField&&
+        SameDouble(current.config.orbitScaleMmPerVoltMin,b.config.orbitScaleMmPerVoltMin)&&
+        SameDouble(current.config.orbitOverridePercent,b.config.orbitOverridePercent)&&
         current.catalog==b.catalog&&current.fields==b.fields&&current.values==b.values&&
         current.approachValues==b.approachValues&&current.approachFields==b.approachFields&&SameApproachSnapshots(current,b)&&
         current.approachReason==b.approachReason&&current.approachError==b.approachError&&

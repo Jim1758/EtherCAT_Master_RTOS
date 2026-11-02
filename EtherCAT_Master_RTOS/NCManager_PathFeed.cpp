@@ -1,6 +1,8 @@
 // BX / Path Core V2-01. G01 is a distinct feed producer, not a G00 override.
 #include "NCManager.h"
 #include "NCFinishPolicy.h"
+#include "NCMachiningTimePolicy.h"
+#include "NCG76TimedP11Source.h"
 #include "NCG76StartDiagnostic.h"
 #include "NCG76DiagnosticPrint.h"
 #include "AlarmManager.h"
@@ -4281,14 +4283,21 @@ bool NCManager::IsEDM171AirProgramSameThread(int firstPC) const noexcept
         }
         if (b.gCount!=1 || !b.hasG || b.mCount!=0 || b.isGoto ||
             (b.has('Q')&&!(b.gCode==76&&NCG76Mode::IsPolygon(FeedG76ModeValue273(b))))) return false;
-        // EDM335: L is metadata for this literal analytic EDM parent only.
-        // Validate its whole authored count before removing it from a LOCAL
-        // geometric copy; never widen the ordinary CNC address whitelist.
-        if((b.gCode==1||b.gCode==2||b.gCode==3)&&b.has(NCFinishPolicy::CountAddress)){
-            NCBlock geometry{};std::uint32_t finishCount=0U;
-            if(!NCFinishPolicy::StripValidated(parsed,b,geometry,finishCount))return false;
-            b=geometry;
+        // EDM340/335: validate both policies against the complete original
+        // authored row, then remove metadata only from one local geometry.
+        // No parsed/string temporary is created for each lookahead row.
+        const bool timedP11=NCG76TimedP11Source::IsOptIn(b);
+        NCBlock geometry=b;
+        if(NCMachiningTimePolicy::Requests(b)){
+            NCMachiningTime::Config timing{};
+            if(!NCMachiningTimePolicy::StripValidated(parsed,b,geometry,timing))return false;
         }
+        if((b.gCode==1||b.gCode==2||b.gCode==3)&&b.has(NCFinishPolicy::CountAddress)){
+            std::uint32_t finishCount=0U;
+            if(!NCFinishPolicy::Decode(parsed,b,finishCount))return false;
+            geometry.hasParam['L'-'A']=false;geometry.param['L'-'A']=0.0;
+        }
+        b=geometry;
         const bool orbit=b.gCode==76;
         // EDM308: a literal B selector or a parameter-driven (no-F)
         // G01/G02/G03 suffix is explicit EDM intent under this M00 grant.
@@ -4302,7 +4311,13 @@ bool NCManager::IsEDM171AirProgramSameThread(int firstPC) const noexcept
         }
         if (orbit)
         {
-            if(IsG76SphereBlock(b)){
+            if(timedP11){
+                NCG76TimedP11Source::Words words{};
+                const auto status=NCG76TimedP11Source::Decode(parsed,words);
+                if(CoordSys.isInchMode||CoordSys.activePlane!=17||
+                    (status!=NCG76TimedP11Source::Status::Ok&&
+                     status!=NCG76TimedP11Source::Status::UnresolvedModalB))return false;
+            }else if(IsG76SphereBlock(b)){
                 NCG76SphereSource::Words words{};
                 const auto status=NCG76SphereSource::Decode(parsed,words);
                 // This is literal lookahead only. Unresolved B is syntactically

@@ -6,6 +6,11 @@
 // mm/(V*min). The NC owner alone writes Context, Values and Ack. Windows SDK
 // writers serialize with Global\\OSCARMAX_EDM_PROCESS_TUNING_WRITER.
 constexpr std::uint32_t EDM_PROCESS_TUNING_MAGIC = 0x544D4445U;
+// v1.1 consumes one formerly reserved parameter double. Both directions
+// require the exact version so an older peer cannot silently drop orbit edits.
+constexpr std::uint16_t EDM_PROCESS_TUNING_VERSION_MAJOR = 1U;
+constexpr std::uint16_t EDM_PROCESS_TUNING_VERSION_MINOR = 1U;
+constexpr std::uint32_t EDM_PROCESS_TUNING_PARAMETER_VERSION = 1U;
 constexpr std::uint32_t EDM_PROCESS_TUNING_SIZE = 2432U;
 constexpr std::uint32_t EDM_PROCESS_TUNING_PUBLISHED = 1U;
 constexpr std::uint32_t EDM_PROCESS_TUNING_SHUTTING_DOWN = 2U;
@@ -47,7 +52,7 @@ struct EDMProcessTuningParameters
 {
     std::uint32_t SchemaVersion, Revision, MachineProfileId, Mode;
     // bit0 limits confirmed; bit1 idle short enabled; bit2 machining short enabled
-    std::uint32_t Flags, ShortEnterMs, ShortExitMs, Reserved32;
+    std::uint32_t Flags, ShortEnterMs, ShortExitMs, ParameterVersion;
     double PositiveGain[3], NegativeGain[3], PositiveBreakV[2], NegativeBreakV[2];
     double CuttingScaleMmPerVoltMin, MaxFeedMmPerMin, MaxRetreatMmPerMin, DeadbandV;
     double ShortIdleV, ShortMachiningV, ShortHysteresisV, ShortRetreatMmPerMin;
@@ -55,7 +60,8 @@ struct EDMProcessTuningParameters
     double CenterReturnMmPerMin, MainReturnMmPerMin, PathRetractMmPerMin;
     double InitialSlowMmPerMin, ManualReturnMmPerMin;
     double FinalApproachDistanceMm, PathDistanceMm, InitialSlowDistanceMm;
-    std::uint8_t Reserved[120];
+    double OrbitScaleMmPerVoltMin;
+    std::uint8_t Reserved[112];
 };
 struct EDMProcessTuningAxisGain
 {
@@ -93,6 +99,9 @@ struct EDMProcessTuningData
 static_assert(sizeof(EDMProcessTuningHeader) == 64U, "EDM tuning header ABI");
 static_assert(sizeof(EDMProcessTuningContext) == 64U, "EDM tuning context ABI");
 static_assert(sizeof(EDMProcessTuningParameters) == 384U, "EDM tuning parameters ABI");
+static_assert(offsetof(EDMProcessTuningParameters, ParameterVersion) == 28U, "EDM tuning parameter version offset");
+static_assert(offsetof(EDMProcessTuningParameters, OrbitScaleMmPerVoltMin) == 264U, "EDM tuning orbit scale offset");
+static_assert(offsetof(EDMProcessTuningParameters, Reserved) == 272U, "EDM tuning reserved tail offset");
 static_assert(sizeof(EDMProcessTuningAxisGain) == 40U, "EDM tuning axis gain ABI");
 static_assert(sizeof(EDMProcessTuningValues) == 1024U, "EDM tuning values ABI");
 static_assert(sizeof(EDMProcessTuningRequest) == 1088U, "EDM tuning request ABI");

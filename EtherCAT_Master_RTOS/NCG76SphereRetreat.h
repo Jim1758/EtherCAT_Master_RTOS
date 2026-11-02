@@ -11,14 +11,111 @@ using Geometry=NCG76SphereRuntimeGeometry::Geometry;
 using Point8=NCG76SphereRuntimeGeometry::Point8;
 using Point3=NCG76SphereRuntimeGeometry::Point3;
 enum class Stage : std::uint8_t
-{InitialDepth,InitialRetreat,CircleEntry,Orbit,ReturnCenter,AdvanceCenter};
+{InitialDepth,InitialRetreat,CircleEntry,Orbit,ReturnCenter,AdvanceCenter,ContourNominal,ContourFinish};
 struct Span { double start=0.0,end=0.0,length=0.0;Stage stage=Stage::InitialDepth;unsigned layer=0U; };
 inline bool ValidMode(unsigned mode) noexcept {return mode==0U||mode==2U||mode==3U||mode==4U;}
 inline bool ValidMode(const Geometry& geometry,unsigned mode) noexcept
 {
+    if(geometry.kind==NCG76SphereRuntimeGeometry::Kind::OrbitContour)return mode==0U||mode==2U;
     if(geometry.kind==NCG76SphereRuntimeGeometry::Kind::Sphere)return ValidMode(mode);
     if(geometry.kind==NCG76SphereRuntimeGeometry::Kind::Line)return mode<=4U;
     return geometry.kind==NCG76SphereRuntimeGeometry::Kind::Arc&&(mode==0U||mode==1U||mode==2U);
+}
+// EDM341: one procedural 25-leg taper and one canonical terminal H loop.
+// Repeated H loops borrow this same immutable station region, like P50 rings.
+inline bool ContourTotal(const Geometry& g,double& total) noexcept
+{
+    total=0.0;
+    if(g.kind!=NCG76SphereRuntimeGeometry::Kind::OrbitContour||!g.valid||
+       g.version!=NCG76SphereRuntimeGeometry::Version)return false;
+    const double base=NCG76OrbitContour::NominalLength(g);
+    if(!std::isfinite(base)||base<=0.0)return false;
+    total=base;
+    if(NCG76OrbitContour::FinishEnabled(g)&&NCG76OrbitContour::IsFourSideContour(g)){
+        const double radial=NCG76OrbitContour::FinishEntryLength(g);
+        const double entry=base+radial,perimeter=entry+NCG76OrbitContour::FinishLength(g);
+        total=perimeter+radial;
+        if(!std::isfinite(radial)||radial<=0.0||!std::isfinite(entry)||!std::isfinite(perimeter)||
+           !std::isfinite(total)||entry<=base||perimeter<=entry||total<=perimeter)return false;
+    }else if(NCG76OrbitContour::FinishEnabled(g)){
+        const double entry=base+g.radiusMm,orbit=entry+NCG76SphereRuntimeGeometry::TwoPi*g.radiusMm;
+        total=orbit+g.radiusMm;
+        if(!std::isfinite(entry)||!std::isfinite(orbit)||!std::isfinite(total)||
+           entry<=base||orbit<=entry||total<=orbit)return false;
+    }
+    return std::isfinite(total)&&total>0.0;
+}
+inline bool ContourSpan(const Geometry& g,Stage stage,unsigned index,Span& out) noexcept
+{
+    out=Span{};out.stage=stage;out.layer=index;
+    double total=0.0;if(!ContourTotal(g,total))return false;
+    const double base=NCG76OrbitContour::NominalLength(g);
+    if(stage==Stage::ContourNominal){
+        Point8 begin{},end{},center{};double length=0.0,prefix=0.0;
+        if(index>=25U||!NCG76OrbitContour::NominalLegAt(g,index,begin,end,center,length,prefix))return false;
+        out.start=prefix;out.end=index==24U?base:prefix+length;out.length=length;
+    }else if(NCG76OrbitContour::IsFourSideContour(g)){
+        if(!NCG76OrbitContour::FinishEnabled(g))return false;
+        const double radial=NCG76OrbitContour::FinishEntryLength(g),entry=base+radial;
+        const double perimeter=entry+NCG76OrbitContour::FinishLength(g);
+        if(stage==Stage::ContourFinish){
+            Point8 begin{},end{},center{};double length=0.0,prefix=0.0;
+            if(!NCG76OrbitContour::FinishLegAt(g,index,begin,end,center,length,prefix))return false;
+            out.start=entry+prefix;out.end=index+1U==NCG76OrbitContour::FinishLegCount(g)?perimeter:entry+(prefix+length);
+            out.length=length;
+        }else if(index!=0U)return false;
+        else if(stage==Stage::CircleEntry){out.start=base;out.end=entry;out.length=radial;}
+        else if(stage==Stage::ReturnCenter){out.start=perimeter;out.end=total;out.length=radial;}
+        else return false;
+    }else{
+        if(index!=0U||!NCG76OrbitContour::FinishEnabled(g))return false;
+        const double entry=base+g.radiusMm,orbit=entry+NCG76SphereRuntimeGeometry::TwoPi*g.radiusMm;
+        if(stage==Stage::CircleEntry){out.start=base;out.end=entry;out.length=g.radiusMm;}
+        else if(stage==Stage::Orbit){out.start=entry;out.end=orbit;out.length=NCG76SphereRuntimeGeometry::TwoPi*g.radiusMm;}
+        else if(stage==Stage::ReturnCenter){out.start=orbit;out.end=total;out.length=g.radiusMm;}
+        else return false;
+    }
+    return std::isfinite(out.start)&&std::isfinite(out.end)&&std::isfinite(out.length)&&
+        out.start>=0.0&&out.end>out.start&&out.length>0.0&&out.end<=total;
+}
+inline bool ContourLocate(const Geometry& g,double station,bool reverse,Span& out) noexcept
+{
+    double total=0.0;
+    if(!ContourTotal(g,total)||!std::isfinite(station)||station<0.0||station>total)return false;
+    const double probe=reverse&&station>0.0?std::nextafter(station,-std::numeric_limits<double>::infinity()):station;
+    if(probe<NCG76OrbitContour::NominalLength(g)){
+        // Seven prefixes cover groups of four legs; at most three binary
+        // decisions and four candidate legs, with no array materialization.
+        unsigned low=0U,high=7U,iterations=0U;
+        while(low+1U<high){
+            if(++iterations>3U)return false;
+            const unsigned middle=low+(high-low)/2U;
+            if(probe<g.orbit.coarsePrefix[middle])high=middle;else low=middle;
+        }
+        const unsigned limit=(std::min)(25U,low*4U+4U);
+        for(unsigned index=low*4U;index<limit;++index){
+            Span span{};if(!ContourSpan(g,Stage::ContourNominal,index,span))return false;
+            if(probe>=span.start&&probe<span.end){out=span;return station>=span.start&&station<=span.end;}
+        }
+        return false;
+    }
+    if(NCG76OrbitContour::IsFourSideContour(g)){
+        Span span{};
+        if(!ContourSpan(g,Stage::CircleEntry,0U,span))return false;
+        if(probe>=span.start&&probe<span.end){out=span;return station>=span.start&&station<=span.end;}
+        for(unsigned side=0U;side<NCG76OrbitContour::FinishLegCount(g);++side){
+            if(!ContourSpan(g,Stage::ContourFinish,side,span))return false;
+            if(probe>=span.start&&probe<span.end){out=span;return station>=span.start&&station<=span.end;}
+        }
+        if(!ContourSpan(g,Stage::ReturnCenter,0U,span))return false;
+        if(probe>=span.start&&probe<span.end){out=span;return station>=span.start&&station<=span.end;}
+        return false;
+    }
+    for(Stage stage:{Stage::CircleEntry,Stage::Orbit,Stage::ReturnCenter}){
+        Span span{};if(!ContourSpan(g,stage,0U,span))return false;
+        if(probe>=span.start&&probe<span.end){out=span;return station>=span.start&&station<=span.end;}
+    }
+    return false;
 }
 inline long double LayerStart(const Geometry& g,unsigned count) noexcept
 {
@@ -32,6 +129,7 @@ inline bool GetSpan(const Geometry& g,Stage stage,unsigned layer,Span& out) noex
 {
     out=Span{};out.stage=stage;out.layer=layer;
     if(!g.valid)return false;
+    if(g.kind==NCG76SphereRuntimeGeometry::Kind::OrbitContour)return ContourSpan(g,stage,layer,out);
     if(g.kind!=NCG76SphereRuntimeGeometry::Kind::Sphere){
         if((g.kind!=NCG76SphereRuntimeGeometry::Kind::Line&&g.kind!=NCG76SphereRuntimeGeometry::Kind::Arc)||
             g.version!=NCG76SphereRuntimeGeometry::Version||g.circleLayerCount!=0U||
@@ -70,6 +168,16 @@ inline bool Station(const Geometry& g,Stage stage,unsigned layer,double fraction
 inline bool MaximumFlushStation(const Geometry& g,double& station) noexcept
 {
     Span span{};
+    if(g.kind==NCG76SphereRuntimeGeometry::Kind::OrbitContour){
+        if(NCG76OrbitContour::FinishEnabled(g)&&NCG76OrbitContour::IsFourSideContour(g)){
+            const unsigned count=NCG76OrbitContour::FinishLegCount(g);
+            if(!count||!GetSpan(g,Stage::ContourFinish,count-1U,span))return false;
+            station=span.end;return true;
+        }
+        if(!GetSpan(g,NCG76OrbitContour::FinishEnabled(g)?Stage::Orbit:Stage::ContourNominal,
+            NCG76OrbitContour::FinishEnabled(g)?0U:23U,span))return false;
+        station=span.end;return true;
+    }
     const bool single=g.kind!=NCG76SphereRuntimeGeometry::Kind::Sphere;
     if(!GetSpan(g,single?Stage::InitialDepth:Stage::Orbit,single?0U:g.circleLayerCount-1U,span))return false;
     station=span.end;return true;
@@ -77,6 +185,7 @@ inline bool MaximumFlushStation(const Geometry& g,double& station) noexcept
 inline bool Locate(const Geometry& g,double station,bool reverse,Span& out) noexcept
 {
     if(!std::isfinite(station)||station<0.0)return false;
+    if(g.kind==NCG76SphereRuntimeGeometry::Kind::OrbitContour)return ContourLocate(g,station,reverse,out);
     if(g.kind!=NCG76SphereRuntimeGeometry::Kind::Sphere){
         if(g.travelMm==0.0||station>g.travelMm||(!reverse&&station==g.travelMm))return false;
         return GetSpan(g,Stage::InitialDepth,0U,out);
@@ -104,6 +213,42 @@ inline bool Evaluate(const Geometry& g,const Span& span,double fraction,Point8& 
 {
     if(!std::isfinite(fraction)||fraction<0.0||fraction>1.0)return false;
     Point8 begin{},end{};Point3 tangent{},curvature{};
+    if(g.kind==NCG76SphereRuntimeGeometry::Kind::OrbitContour){
+        Span expected{};
+        if(!ContourSpan(g,span.stage,span.layer,expected)||span.start!=expected.start||
+           span.end!=expected.end||span.length!=expected.length)return false;
+        if(span.stage==Stage::ContourNominal){
+            double length=0.0,prefix=0.0;
+            if(!NCG76OrbitContour::NominalLegAt(g,span.layer,begin,end,center,length,prefix)||
+               !NCG76OrbitContour::NominalCenterAt(g,span.layer,fraction,center))return false;
+        }else if(NCG76OrbitContour::IsFourSideContour(g)){
+            center=g.endMCS;
+            if(span.stage==Stage::ContourFinish){
+                double length=0.0,prefix=0.0;
+                if(!NCG76OrbitContour::FinishLegAt(g,span.layer,begin,end,center,length,prefix))return false;
+            }else{
+                Point8 vertex{};
+                if(!NCG76OrbitContour::FinishVertexAt(g,0U,vertex))return false;
+                if(span.stage==Stage::CircleEntry){begin=g.endMCS;end=vertex;}
+                else if(span.stage==Stage::ReturnCenter){begin=vertex;end=g.endMCS;}
+                else return false;
+            }
+        }else{
+            NCG76SphereRuntimeGeometry::Layer layer{};Point8 circle{};
+            if(!NCG76SphereRuntimeGeometry::LayerAt(g,0U,layer)||
+               !NCG76SphereRuntimeGeometry::CircleAt(g,0U,0.0,circle,tangent,curvature))return false;
+            center=layer.center;
+            if(span.stage==Stage::Orbit)return NCG76SphereRuntimeGeometry::CircleAt(g,0U,
+                fraction==1.0?NCG76SphereRuntimeGeometry::TwoPi:fraction*NCG76SphereRuntimeGeometry::TwoPi,
+                point,tangent,curvature);
+            if(span.stage==Stage::CircleEntry){begin=layer.center;end=circle;}
+            else if(span.stage==Stage::ReturnCenter){begin=circle;end=layer.center;}
+            else return false;
+        }
+        point=fraction==0.0?begin:fraction==1.0?end:begin;
+        if(fraction>0.0&&fraction<1.0)for(unsigned a=0U;a<3U;++a)point[a]=begin[a]+(end[a]-begin[a])*fraction;
+        return NCG76SphereRuntimeGeometry::Detail::Finite(point)&&NCG76SphereRuntimeGeometry::Detail::Finite(center);
+    }
     if(g.kind!=NCG76SphereRuntimeGeometry::Kind::Sphere){
         Span expected{};
         if(!GetSpan(g,span.stage,span.layer,expected)||span.start!=expected.start||
@@ -146,7 +291,10 @@ inline bool AxisEnvelope(const Geometry& g,unsigned mode,double height,unsigned 
     // B0 freezes the current forward tangent at its stopped arc checkpoint.
     // Either tangent sign may occur over an arc, so admit the full physical
     // excursion independently of the particular sample that triggers E5.
-    if(mode==1U){
+    if(mode==0U&&g.kind==NCG76SphereRuntimeGeometry::Kind::OrbitContour&&height>0.0&&axis<3U){
+        minimum=std::nextafter(minimum-height,-std::numeric_limits<double>::infinity());
+        maximum=std::nextafter(maximum+height,std::numeric_limits<double>::infinity());
+    }else if(mode==1U){
         if(axis==2U&&height>0.0)
             maximum=std::nextafter(maximum+height,std::numeric_limits<double>::infinity());
     }else if(mode==0U&&g.kind==NCG76SphereRuntimeGeometry::Kind::Arc&&height>0.0&&axis<3U){

@@ -118,6 +118,12 @@ namespace MotionG76SphereParameterFeeds
 inline bool Matches(const NCG76SphereCycle::Request& request,
     const NCG76SphereGapProcess::Config& config) noexcept
 {
+    if(config.orbitFeedsEnabled&&((request.geometry.kind!=NCG76SphereRuntimeGeometry::Kind::Sphere&&
+        request.geometry.kind!=NCG76SphereRuntimeGeometry::Kind::OrbitContour)||
+       request.parameterFeeds||!NCG76SphereGapProcess::Valid(config)))return false;
+    if(request.geometry.kind==NCG76SphereRuntimeGeometry::Kind::OrbitContour&&
+       (!NCG76OrbitContour::ModeP(request.geometry)||!config.enabled||!config.signedMotionEnabled||
+        !config.orbitFeedsEnabled||request.parameterFeeds))return false;
     if(request.parameterFeeds!=config.parameterFeeds)return false;
     if(!request.parameterFeeds)return request.nominalFeedCapMmMin==0.0;
     if((request.geometry.kind!=NCG76SphereRuntimeGeometry::Kind::Line&&
@@ -128,6 +134,29 @@ inline bool Matches(const NCG76SphereCycle::Request& request,
     double ceiling=0.0;
     return NCG76SphereGapProcess::ResolveParameterMotionCeiling(config,ceiling)&&
         request.feedMmMin==ceiling&&request.geometry.feedMmMin==ceiling;
+}
+}
+
+// EDM340: both sidecar and active Request retain exact, nonmodal clock data.
+namespace MotionG76SphereMachiningTime
+{
+inline NCMachiningTime::Config Config(const NCG76SphereCycle::Request& request) noexcept
+{NCMachiningTime::Config value{};value.totalLimitUs=request.totalLimitUs;value.additionalUs=request.additionalUs;return value;}
+inline bool Matches(const NCMachiningTime::Config& value,const NCG76SphereCycle::Request& request) noexcept
+{return NCMachiningTime::ValidConfig(value)&&NCMachiningTime::SameConfig(value,Config(request));}
+inline bool TerminalQualified(const NCG76SphereCycle::Feedback& feedback,const NCG76SphereCycle::Request& request) noexcept
+{
+    using namespace NCMachiningTime;
+    if(feedback.totalLimitUs!=request.totalLimitUs||feedback.additionalUs!=request.additionalUs||
+       feedback.totalElapsedUs>request.totalLimitUs||feedback.additionalElapsedUs>request.additionalUs)return false;
+    if(!request.totalLimitUs&&!request.additionalUs)
+        return feedback.totalElapsedUs==0ULL&&feedback.additionalElapsedUs==0ULL&&
+            feedback.totalTimerState==0U&&feedback.additionalTimerState==0U&&feedback.timePhase==0U;
+    if(feedback.timePhase!=static_cast<std::uint8_t>(TimePhase::Completed))return false;
+    if(request.totalLimitUs?(feedback.totalTimerState!=static_cast<std::uint8_t>(TimerState::Completed)||
+        feedback.totalElapsedUs>=request.totalLimitUs):feedback.totalTimerState!=0U)return false;
+    return request.additionalUs?(feedback.additionalTimerState==static_cast<std::uint8_t>(TimerState::Completed)&&
+        feedback.additionalElapsedUs==request.additionalUs):feedback.additionalTimerState==0U;
 }
 }
 
@@ -251,5 +280,28 @@ struct MotionG76SphereFeedback
     MotionG76SphereInputDiagnostic firstInputFault{};
     std::uint32_t inputValidAxisMask=0U;
     bool accepted=false,started=false,terminal=false,completed=false,endpointCommitted=false;
+    // RT receipt: deadline braking, physical zero settle and group retirement all succeeded.
+    bool timeLimitStopped=false;
 };
 static_assert(sizeof(MotionG76SphereFeedback)<=2048U,"P50 diagnostics must fit the existing bounded feedback channel.");
+
+namespace MotionG76SphereMachiningTime
+{
+inline bool TimeLimitStoppedQualified(const MotionG76SphereFeedback& report,const NCG76SphereCycle::Request& request) noexcept
+{
+    using namespace NCMachiningTime;
+    const auto& f=report.cycle;
+    if(!report.timeLimitStopped||!report.accepted||!report.started||!report.terminal||report.completed||
+       report.endpointCommitted||report.runtimeFault!=10U||!request.session||report.session!=request.session||
+       f.session!=request.session||!f.tick||f.phase!=NCG76SphereCycle::Phase::Fault||
+       f.fault!=NCG76SphereCycle::Fault::TimeLimit||!ValidConfig(Config(request))||!request.totalLimitUs||
+       f.totalLimitUs!=request.totalLimitUs||f.totalElapsedUs!=request.totalLimitUs||
+       f.additionalUs!=request.additionalUs||f.additionalElapsedUs>request.additionalUs||
+       f.totalTimerState!=static_cast<std::uint8_t>(TimerState::Expired)||
+       f.timePhase!=static_cast<std::uint8_t>(TimePhase::TimedOut))return false;
+    for(unsigned i=0U;i<8U;++i)
+        if(!std::isfinite(report.commandMCS[i])||!std::isfinite(report.actualMCS[i])||
+           report.velocityNative[i]!=0.0)return false;
+    return true;
+}
+}

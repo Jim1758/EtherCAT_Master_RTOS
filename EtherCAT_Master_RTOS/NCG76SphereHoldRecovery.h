@@ -3,9 +3,16 @@
 // the immutable history belongs to the current RT parent, never old authority.
 namespace NCG76SphereCycle
 {
+inline NCG76SphereRetreat::Stage RecoveryNominalStage(Phase phase) noexcept
+{
+    return phase==Phase::ContourFinish?NCG76SphereRetreat::Stage::ContourFinish:
+        phase==Phase::ContourNominal?NCG76SphereRetreat::Stage::ContourNominal:
+        static_cast<NCG76SphereRetreat::Stage>(static_cast<unsigned>(phase)-static_cast<unsigned>(Phase::InitialDepth));
+}
 inline bool Cycle::RecoveryTotal(const NCG76SphereCycle::Geometry& g,double& total) const noexcept
 {
     NCG76SphereRetreat::Span span{};
+    if(g.kind==NCG76SphereRuntimeGeometry::Kind::OrbitContour)return NCG76SphereRetreat::ContourTotal(g,total);
     const bool sphere=g.kind==NCG76SphereRuntimeGeometry::Kind::Sphere;
     if(!NCG76SphereRetreat::GetSpan(g,sphere?NCG76SphereRetreat::Stage::AdvanceCenter:
         NCG76SphereRetreat::Stage::InitialDepth,sphere?g.circleLayerCount-1U:0U,span))return false;
@@ -13,13 +20,78 @@ inline bool Cycle::RecoveryTotal(const NCG76SphereCycle::Geometry& g,double& tot
 }
 inline const NCG76SphereCycle::Geometry& Cycle::RecoveryGeometry(unsigned ordinal) const noexcept
 {return ordinal==recovery_.historyCount?request_.geometry:recovery_.history[ordinal];}
+// A stopped interior scalar can round onto a canonical station endpoint.
+// Exact coordinate aliases may retain that endpoint station. A distinct point
+// may use only a proved conservative station floor; the saved leg, scalar
+// progress and physical command remain unchanged in either case.
+inline bool ResolveStoppedRecoveryStation(const Geometry& geometry,NCG76SphereRetreat::Stage stage,
+    unsigned layer,double progress,double length,double speed,const Point8& anchor,double& station) noexcept
+{
+    if(!Detail::Positive(length)||!std::isfinite(progress)||progress<0.0||progress>length||
+       !std::isfinite(speed)||speed!=0.0||!Detail::Finite(anchor))return false;
+    const double fraction=progress/length;
+    if(!(fraction>0.0&&fraction<1.0))return false;
+    NCG76SphereRetreat::Span span{};
+    if(!NCG76SphereRetreat::GetSpan(geometry,stage,layer,span))return false;
+    const double rounded=span.start+(span.end-span.start)*fraction;
+    const bool atStart=rounded==span.start,atEnd=rounded==span.end;
+    if(!atStart&&!atEnd)return false;
+    const double residual=atStart?progress:length-progress;
+    const double endpointStation=atStart?span.start:span.end;
+    const double interiorStation=std::nextafter(endpointStation,atStart?
+        std::numeric_limits<double>::infinity():-std::numeric_limits<double>::infinity());
+    const double stationUlp=std::fabs(interiorStation-endpointStation);
+    const double budget=geometry.arithmeticErrorBoundMm;
+    if(!Detail::Positive(budget)||budget>NCG76SphereRuntimeGeometry::MaximumArithmeticErrorMm||
+       !Detail::Positive(stationUlp)||!std::isfinite(residual)||residual<0.0||
+       residual>(std::min)(budget,stationUlp))return false;
+    Point8 endpoint{},interior{},center{};
+    if(!NCG76SphereRetreat::Evaluate(geometry,span,atStart?0.0:1.0,endpoint,center)||
+       !NCG76SphereRetreat::Evaluate(geometry,span,fraction,interior,center))return false;
+    if(std::memcmp(endpoint.data(),interior.data(),sizeof(Point8))==0&&
+       std::memcmp(endpoint.data(),anchor.data(),sizeof(Point8))==0)
+    {station=endpointStation;return true;}
+    // There is no preceding canonical distance at an aliased start. Only an
+    // end can lend its strictly interior floor to a distinct physical point.
+    if(!atEnd||!(interiorStation>span.start&&interiorStation<span.end))return false;
+    const double infinity=std::numeric_limits<double>::infinity();
+    const double widthUpper=std::nextafter(span.end-span.start,infinity);
+    const double ratioUpper=std::nextafter(residual/length,infinity);
+    const double mappedResidualUpper=std::nextafter(ratioUpper*widthUpper,infinity);
+    if(!Detail::Positive(widthUpper)||!Detail::Positive(ratioUpper)||
+       !Detail::Positive(mappedResidualUpper)||mappedResidualUpper>stationUlp)return false;
+    Point8 projected{};
+    if(!NCG76SphereRetreat::Evaluate(geometry,span,
+        NCG76SphereRetreat::Fraction(span,interiorStation),projected,center))return false;
+    // Scalar ordering is fenced by a station ULP above. Native coordinate
+    // reconstruction has its own already-admitted arithmetic error budget;
+    // a station ULP is not a bound on three separately rounded XYZ axes.
+    const double projectionBudget=budget;
+    double projection=0.0;
+    for(const Point8* candidate:{&endpoint,&interior,&projected}){
+        if(std::memcmp(candidate->data()+3U,anchor.data()+3U,5U*sizeof(double))!=0)return false;
+        Point3 error{};for(unsigned axis=0U;axis<3U;++axis)error[axis]=(*candidate)[axis]-anchor[axis];
+        if(!Detail::Finite(error))return false;
+        const double norm=Detail::Norm(error);
+        const double upper=norm==0.0?0.0:std::nextafter(std::nextafter(norm,infinity),infinity);
+        if(!std::isfinite(upper)||upper>projectionBudget)return false;
+        projection=(std::max)(projection,upper);
+    }
+    const double combinedUpper=std::nextafter(projection+mappedResidualUpper,infinity);
+    if(!std::isfinite(combinedUpper)||combinedUpper>budget)return false;
+    station=interiorStation;return true;
+}
 inline bool Cycle::RecoveryStation(Phase phase,unsigned layer,const Leg& leg,double& station) const noexcept
 {
     if(request_.geometry.kind==NCG76SphereRuntimeGeometry::Kind::Line&&request_.geometry.travelMm==0.0)
     {station=0.0;return true;}
     if(!Detail::IsNominal(phase)||!Detail::Positive(leg.length))return false;
-    const auto stage=static_cast<NCG76SphereRetreat::Stage>(static_cast<unsigned>(phase)-static_cast<unsigned>(Phase::InitialDepth));
-    return NCG76SphereRetreat::Station(request_.geometry,stage,layer,leg.position/leg.length,station);
+    const auto stage=RecoveryNominalStage(phase);
+    if(NCG76SphereRetreat::Station(request_.geometry,stage,layer,leg.position/leg.length,station))return true;
+    if(feedback_.gapHistoryActive)return false;
+    const Point8& anchor=feedback_.flushCheckpointSaved?savedAnchor_:output_.commandMCS;
+    return ResolveStoppedRecoveryStation(request_.geometry,stage,layer,
+        leg.position,leg.length,leg.speed,anchor,station);
 }
 inline bool Cycle::ConfigureHoldRecovery(const NCHoldRecovery::Config& config,std::uint32_t declaredCount,
     const NCG76SphereCycle::Geometry* completedOldestFirst,std::uint32_t completedCount) noexcept
@@ -209,7 +281,7 @@ inline bool Cycle::CaptureRecoveryStop(const Input& input) noexcept
     if(request_.geometry.kind==NCG76SphereRuntimeGeometry::Kind::Line&&request_.geometry.travelMm==0.0)
         recovery_.nominalAnchor=request_.geometry.startMCS;
     else{
-        const auto stage=static_cast<NCG76SphereRetreat::Stage>(static_cast<unsigned>(nominalPhase)-static_cast<unsigned>(Phase::InitialDepth));
+        const auto stage=RecoveryNominalStage(nominalPhase);
         if(!NCG76SphereRetreat::GetSpan(request_.geometry,stage,feedback_.layerIndex,nominalSpan)||
            !NCG76SphereRetreat::Evaluate(request_.geometry,nominalSpan,nominal->position/nominal->length,recovery_.nominalAnchor,center))
         {Fail(Fault::Numeric);return false;}
@@ -221,7 +293,7 @@ inline bool Cycle::CaptureRecoveryStop(const Input& input) noexcept
         if(previousPrimitiveLegActive_){
             recovery_.bridgeStartStation=leg_.position;recovery_.bridgeEndStation=previousPrimitive_.travelMm;
         }else{
-            const auto stage=static_cast<NCG76SphereRetreat::Stage>(static_cast<unsigned>(previousPhase_)-static_cast<unsigned>(Phase::InitialDepth));
+            const auto stage=RecoveryNominalStage(previousPhase_);
             if(!NCG76SphereRetreat::Station(request_.geometry,stage,previousLayer_,leg_.position/leg_.length,recovery_.bridgeStartStation))
             {Fail(Fault::Numeric);return false;}
             recovery_.bridgeEndStation=recovery_.nominalStation;

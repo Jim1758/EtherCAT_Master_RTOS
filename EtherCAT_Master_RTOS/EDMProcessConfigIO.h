@@ -148,6 +148,7 @@ namespace EDMProcessConfigIO
                 AddReal(rules, "Servo.NegativeBreak" + number + "V", profile.servo.negativeBreakV[index], 0.0, true);
             }
             AddReal(rules, "Servo.CuttingScaleMmPerVoltMin", profile.servo.cuttingScaleMmPerVoltMin, 0.001);
+            AddReal(rules, "Servo.OrbitScaleMmPerVoltMin", profile.orbitScaleMmPerVoltMin, 0.001);
             AddReal(rules, "Servo.MaxFeedMmPerMin", profile.servo.maxFeedMmPerMin, 0.0, true);
             AddReal(rules, "Servo.MaxRetreatMmPerMin", profile.servo.maxRetreatMmPerMin, 0.0, true);
             AddBoolean(rules, "Servo.LimitsConfirmed", profile.servo.limitsConfirmed);
@@ -318,7 +319,13 @@ namespace EDMProcessConfigIO
             rule.line = lineNumber;
         }
         for (std::size_t index = 0U; index < rules.size(); ++index)
-            if (!rules[index].found) return Detail::Fail(diagnostic, path, lineNumber + 1U, rules[index].name, "required key is missing");
+            if (!rules[index].found) {
+                // EDM339: an older schema-2 file retains its own cutting
+                // scale as the orbit starting value, never an unrelated default.
+                if (document == Detail::DocumentKind::Process && rules[index].name == "Servo.OrbitScaleMmPerVoltMin")
+                    candidate.orbitScaleMmPerVoltMin = candidate.servo.cuttingScaleMmPerVoltMin;
+                else return Detail::Fail(diagnostic, path, lineNumber + 1U, rules[index].name, "required key is missing");
+            }
         candidate.servo.revision = candidate.revision;
         const char* invalidKey = nullptr;
         if (candidate.servo.positiveBreakV[1] <= candidate.servo.positiveBreakV[0]) invalidKey = "Servo.PositiveBreak2V";

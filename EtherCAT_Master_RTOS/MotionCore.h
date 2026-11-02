@@ -5589,6 +5589,7 @@ private:
         std::uint8_t holdDeclaredPreviousParents=0U;
         bool holdRecoveryEnabled=false;
         std::uint8_t finishRequiredCount=0U;
+        bool orbitFeedsEnabled=false; // EDM339: immutable P50 role-selection marker.
     };
     static_assert(sizeof(G76SphereFrozen)<=4096U,"P50 motion snapshot must fit the existing fixed channel.");
     EDM53::Channel<G76SphereFrozen,4096U> m_g76SphereRequests{};
@@ -5616,6 +5617,7 @@ private:
         std::uint64_t session=0ULL;
         std::uint32_t declaredPreviousParents=0U;
         std::uint32_t finishRequiredCount=0U;
+        NCMachiningTime::Config machiningTime{};
         bool enabled=false;
     };
     static_assert(sizeof(G76SphereHoldFrozen)<=256U,"HOLD settings remain a small independent page");

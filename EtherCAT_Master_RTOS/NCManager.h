@@ -28,6 +28,7 @@
 class EtherCatMaster;
 namespace NCSpindleSource { struct Words; }
 namespace NCHoldTelemetry { struct Image; }
+namespace NCMachiningTelemetry { struct Image; }
 struct NCMacroAssignmentCommit;
 #include "EDMProcessSimulationTest.h" // EDM01: no physical output or motion.
 #include "EDMFeedRetreatSimulationTest.h" // EDM02: simulated consumer only.
@@ -602,6 +603,8 @@ public:
     bool IsHoldRetreatDeclarationActiveSameThread() const noexcept {return m_holdPolicy.declared;}
     const NCHoldRecovery::Config& GetHoldRecoveryConfigSameThread() const noexcept;
     void ExportHoldRecoveryTelemetrySameThread(NCHoldTelemetry::Image&) const noexcept;
+    void ExportMachiningTelemetrySameThread(NCMachiningTelemetry::Image&) const noexcept;
+    void ClearMachiningTimeTelemetrySameThread() noexcept;
     // EDM333 display-only committed parent PC; never grants motion or resume.
     bool TryGetCommittedProcessParentDisplayPCSameThread(int& pc) const noexcept;
     bool TryG76SphereInspectionJogSameThread(int axis,int direction);
@@ -2731,6 +2734,7 @@ private:
         std::uint64_t flushAcceptedLogged=0ULL,flushCompletedLogged=0ULL,flushAbandonedLogged=0ULL;
         unsigned flushDiagnosticEvents=0U;
         unsigned gapDiagnosticEvents=0U;
+        unsigned orbitFeedDiagnosticEvents=0U;
         int gapLastDirection=0;
         bool gapShadowRevoked=false,gapDiagnosticInitialized=false,gapLastValid=false,gapLastSuspended=false;
         NCTranslationSnapshot frame{};
@@ -2745,9 +2749,15 @@ private:
         unsigned diagnosticEvents=0U,lastLayer=0U;
         NCG76SphereCycle::Phase lastPhase=NCG76SphereCycle::Phase::Idle;
         int pc=-1,line=0,sourceG=76;
+        unsigned sourceP=50U; // EDM341: actual G76 source mode; zero for G01/G02/G03.
         NCTranslationSnapshot scopeTranslation{}; // Explicit-output comparison scratch, NC only.
         NCBlock pathSource{}; // EDM307 exact authored G01/G02/G03, never a synthetic P50.
         double processMotionCeiling=0.0; // EDM308 native parameter envelope; never a fabricated modal F.
+        NCMachiningTime::Config machiningTime{};
+        std::uint64_t timeLoggedSecond=0ULL;
+        std::uint8_t timeLoggedPhase=0U,timeLoggedTotalState=0U,timeLoggedAdditionalState=0U;
+        unsigned timeDiagnosticEvents=0U;
+        bool timeLogInitialized=false,timeTelemetryCleared=false;
         std::uint32_t finishRequiredCount=0U,finishLoggedVerified=0U;
         std::uint64_t finishLoggedAttempt=0ULL,finishLoggedCompleted=0ULL,finishLoggedRework=0ULL;
         std::uint8_t finishLoggedPhase=0U;bool finishLogInitialized=false; // EDM335 NC-only diagnostics.
@@ -2764,7 +2774,7 @@ private:
     bool ValidateEDMProcessPathBlockSameThread(const NCBlock&,int pc,int line=0);
     bool PrepareEDMProcessPathTranslationSameThread(const NCBlock&);
     WaitConditionFunc StartEDMProcessPathSameThread(const NCBlock&);
-    bool IsCompletedEDMProcessPathTerminalAllowedSameThread(const NCBlock&);
+    bool IsCompletedEDMProcessPathTerminalAllowedSameThread(const NCBlock&,int expectedM=30);
     static bool IsG76SphereBlock(const NCBlock&) noexcept;
     bool ValidateG76SphereBlockSameThread(const NCBlock&,int pc,int line=0);
     bool PrepareG76SphereTranslationSameThread(const NCBlock&);

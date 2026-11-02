@@ -146,7 +146,8 @@ public:
         G80_REPEAT_ERROR = EDM_BASE + 35, // 4035: slow-touch mean deviation exceeds threshold
         G80_SETTLE_TIMEOUT = EDM_BASE + 36, // 4036: commanded stop did not physically settle
         G80_FRAME_CHANGED = EDM_BASE + 37, // 4037: frozen coordinate/run identity no longer matches
-        G80_RUNTIME_FAULT = EDM_BASE + 38 // 4038: invalid G80 runtime/lifecycle or travel limit
+        G80_RUNTIME_FAULT = EDM_BASE + 38, // 4038: invalid G80 runtime/lifecycle or travel limit
+        EDM_MACHINING_TIME_LIMIT = EDM_BASE + 40 // 4040: configured per-block machining time reached after controlled stop
     };
 
     // 取得單例

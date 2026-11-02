@@ -4,6 +4,9 @@
 #include "NCG76StartDiagnostic.h"
 #include "NCPathCoreRadiusArc.h"
 #include "NCHoldTelemetry.h"
+#include "NCMachiningTelemetry.h"
+#include "NCMachiningTimePolicy.h"
+#include "NCG76TimedP11Source.h"
 #include "NCFinishPolicy.h"
 #include <algorithm>
 #include <cmath>
@@ -37,8 +40,8 @@ bool FinishTerminalQualified(const NCG76SphereCycle::Feedback& cycle,std::uint32
         cycle.finishAttemptCount>=required&&cycle.finishForcedCompletedCount>=required&&
         cycle.finishForcedCompletedCount<=cycle.finishAttemptCount));
 }
-const char* ParentName(int sourceG) noexcept
-{ return sourceG==1?"[G01]":sourceG==2?"[G02]":sourceG==3?"[G03]":"[P50]"; }
+const char* ParentName(int sourceG,unsigned sourceP=50U) noexcept
+{ return sourceG==1?"[G01]":sourceG==2?"[G02]":sourceG==3?"[G03]":sourceP==11U?"[P11]":sourceP==12U?"[P12]":sourceP==13U?"[P13]":sourceP==14U?"[P14]":sourceP==15U?"[P15]":"[P50]"; }
 bool SameLiteral(const NCBlock& a,const NCBlock& b) noexcept
 {
     if(a.hasG!=b.hasG||a.gCode!=b.gCode||a.gCount!=b.gCount||a.mCount!=b.mCount||
@@ -46,6 +49,25 @@ bool SameLiteral(const NCBlock& a,const NCBlock& b) noexcept
     for(char c='A';c<='Z';++c)if(a.has(c)!=b.has(c)||!SameDouble(a.val(c),b.val(c)))return false;
     for(int i=0;i<NC_MAX_G_CODES_PER_BLOCK;++i)if(a.gCodes[i]!=b.gCodes[i])return false;
     for(int i=0;i<NC_MAX_M_CODES_PER_BLOCK;++i)if(a.mCode[i]!=b.mCode[i])return false;
+    return true;
+}
+bool TimedP11SourceMatchesGeometry(const NCG76TimedP11Source::Words& words,
+    const NCMachiningTime::Config& time,const NCG76SphereRuntimeGeometry::Geometry& geometry) noexcept
+{
+    if(!words.valid||geometry.kind!=NCG76SphereRuntimeGeometry::Kind::OrbitContour||
+       !words.authored.has('P')||!NCG76TimedP11Source::SupportedMode(words.authored.val('P'))||
+       NCG76OrbitContour::ModeP(geometry)!=static_cast<unsigned>(words.authored.val('P'))||
+       geometry.orbit.source.targetAxis!=(words.authored.val('P')!=11.0)||
+       !SameDouble(geometry.orbit.source.radiusMm,words.radiusProgramMm)||
+       !SameDouble(geometry.orbit.source.shapeAngleDeg,words.contourAngleDeg)||
+       !SameDouble(geometry.orbit.source.feedMmMin,words.feedMmMin)||
+       !SameDouble(geometry.feedMmMin,words.feedMmMin)||
+       geometry.orbit.finishEnabled!=(time.additionalUs!=0ULL))return false;
+    for(unsigned axis=0U;axis<3U;++axis){
+        const double target=words.targetMask&(1U<<axis)?words.authoredXYZ[axis]:geometry.frame.programStart[axis];
+        if(!SameDouble(geometry.orbit.source.start[axis],geometry.frame.programStart[axis])||
+           !SameDouble(geometry.orbit.source.end[axis],target))return false;
+    }
     return true;
 }
 bool ExactProcessG(const std::string& word,int expected) noexcept
@@ -96,6 +118,8 @@ bool DecodeProcessPath(const NCParsedBlock& parsed,const NCBlock& resolved,int p
         literal.mCount||literal.isEmpty||literal.isGoto||literal.isBlockSkip)return false;
     std::uint32_t finishRequired=0U;
     if(!NCFinishPolicy::Decode(parsed,resolved,finishRequired))return false;
+    NCMachiningTime::Config machiningTime{};
+    if(!NCMachiningTimePolicy::StripValidated(parsed,resolved,literal,machiningTime))return false;
     NCArcPlaneAxes axes{};if(!TryGetNCArcPlaneAxes(plane,axes))return false;
     if(literal.gCode==1&&!(literal.has('X')||literal.has('Y')||literal.has('Z')))return false;
     for(char c='A';c<='Z';++c){
@@ -165,14 +189,19 @@ bool BuildProcessPath(const NCBlock& block,const NCG76SphereCoordinates::FrozenF
     return NCG76SphereRuntimeGeometry::BuildArc(frame,target,center,normal,block.gCode==2?-1:1,feed,fullCircle,output);
 }
 // Formatting stays on the NC thread. RtPrintf receives only a bounded string.
-void PrintParent(int sourceG,const char* format,...) noexcept {
+void PrintParentV(int sourceG,unsigned sourceP,const char* format,va_list args) noexcept {
     char line[481]{};
-    const int prefix=std::snprintf(line,sizeof(line),"%s build=EDM335 ",ParentName(sourceG));
+    const int prefix=std::snprintf(line,sizeof(line),"%s build=%s ",ParentName(sourceG,sourceP),sourceG==76&&sourceP==15U?"EDM345":sourceG==76&&sourceP==14U?"EDM344":sourceG==76&&sourceP==13U?"EDM343":sourceG==76&&sourceP==12U?"EDM342":"EDM341");
     if(prefix<0||static_cast<std::size_t>(prefix)>=sizeof(line))return;
-    va_list args;va_start(args,format);
-    const int n=std::vsnprintf(line+prefix,sizeof(line)-static_cast<std::size_t>(prefix),format,args);va_end(args);
+    const int n=std::vsnprintf(line+prefix,sizeof(line)-static_cast<std::size_t>(prefix),format,args);
     if(n>=0&&static_cast<std::size_t>(n)<sizeof(line)-static_cast<std::size_t>(prefix))RtPrintf("%s",line);
-    else RtPrintf("%s","[EDM308_FIX4] event=DIAGNOSTIC_FORMAT_FAILURE\n");
+    else RtPrintf("%s","[EDM341] event=DIAGNOSTIC_FORMAT_FAILURE\n");
+}
+void PrintParent(int sourceG,const char* format,...) noexcept {
+    va_list args;va_start(args,format);PrintParentV(sourceG,50U,format,args);va_end(args);
+}
+void PrintParent(int sourceG,unsigned sourceP,const char* format,...) noexcept {
+    va_list args;va_start(args,format);PrintParentV(sourceG,sourceP,format,args);va_end(args);
 }
 struct StartupStackPattern
 {
@@ -205,33 +234,33 @@ void ReadStartupStackPattern(const void* slot,const NCTranslationSnapshot& expec
     }
     out.readable=true;
 }
-void PrintSphereApproachRejection(const NCG76SphereGapBinding::Binding& binding,unsigned mode,int sourceG=76) noexcept {
-    PrintParent(sourceG,"event=APPROACH_BINDING_REJECT B=%u reason=%s error=%s field=%u typedInvalid=1 discharge=0\n",
+void PrintSphereApproachRejection(const NCG76SphereGapBinding::Binding& binding,unsigned mode,int sourceG=76,unsigned sourceP=50U) noexcept {
+    PrintParent(sourceG,sourceP,"event=APPROACH_BINDING_REJECT B=%u reason=%s error=%s field=%u typedInvalid=1 discharge=0\n",
         mode,NCG76SphereGapBinding::ApproachReasonName(binding.approachReason),
         EDM58::BindingErrorName(binding.approachError),binding.approachFailedFieldId);
 }
-void PrintSphereInitialSlowRejection(const NCG76SphereGapBinding::Binding& binding,unsigned mode,int sourceG=76) noexcept {
-    PrintParent(sourceG,"event=INITIAL_SLOW_BINDING_REJECT B=%u reason=%s error=%s field=%u typedInvalid=1 discharge=0\n",
+void PrintSphereInitialSlowRejection(const NCG76SphereGapBinding::Binding& binding,unsigned mode,int sourceG=76,unsigned sourceP=50U) noexcept {
+    PrintParent(sourceG,sourceP,"event=INITIAL_SLOW_BINDING_REJECT B=%u reason=%s error=%s field=%u typedInvalid=1 discharge=0\n",
         mode,NCG76SphereGapBinding::ApproachReasonName(binding.initialSlowReason),
         EDM58::BindingErrorName(binding.initialSlowError),binding.initialSlowFailedFieldId);
 }
-void PrintSphereDeepFlushRejection(const NCG76SphereGapBinding::Binding& binding,unsigned mode,int sourceG=76) noexcept {
-    PrintParent(sourceG,"event=DEEP_FLUSH_BINDING_REJECT B=%u reason=%s error=%s field=%u typedInvalid=1 discharge=0\n",
+void PrintSphereDeepFlushRejection(const NCG76SphereGapBinding::Binding& binding,unsigned mode,int sourceG=76,unsigned sourceP=50U) noexcept {
+    PrintParent(sourceG,sourceP,"event=DEEP_FLUSH_BINDING_REJECT B=%u reason=%s error=%s field=%u typedInvalid=1 discharge=0\n",
         mode,NCG76SphereGapBinding::DeepFlushReasonName(binding.deepFlushReason),
         EDM58::BindingErrorName(binding.deepFlushError),binding.deepFlushFailedFieldId);
 }
-const char* RejectTypedBinding(NCG76SphereGapBinding::Binding& binding,unsigned mode,int sourceG) noexcept
+const char* RejectTypedBinding(NCG76SphereGapBinding::Binding& binding,unsigned mode,int sourceG,unsigned sourceP=50U) noexcept
 {
     if(binding.approachReason==NCG76SphereGapBinding::ApproachReason::InvalidField){
-        binding.config=NCG76SphereGapProcess::Config{};PrintSphereApproachRejection(binding,mode,sourceG);
+        binding.config=NCG76SphereGapProcess::Config{};PrintSphereApproachRejection(binding,mode,sourceG,sourceP);
         return "TYPED_APPROACH_FIELD_INVALID";
     }
     if(binding.initialSlowReason==NCG76SphereGapBinding::ApproachReason::InvalidField){
-        binding.config=NCG76SphereGapProcess::Config{};PrintSphereInitialSlowRejection(binding,mode,sourceG);
+        binding.config=NCG76SphereGapProcess::Config{};PrintSphereInitialSlowRejection(binding,mode,sourceG,sourceP);
         return "TYPED_INITIAL_SLOW_FIELD_INVALID";
     }
     if(binding.deepFlushReason==NCG76SphereGapBinding::DeepFlushReason::InvalidField){
-        binding.config=NCG76SphereGapProcess::Config{};PrintSphereDeepFlushRejection(binding,mode,sourceG);
+        binding.config=NCG76SphereGapProcess::Config{};PrintSphereDeepFlushRejection(binding,mode,sourceG,sourceP);
         return "TYPED_DEEP_FLUSH_FIELD_INVALID";
     }
     return nullptr;
@@ -239,7 +268,8 @@ const char* RejectTypedBinding(NCG76SphereGapBinding::Binding& binding,unsigned 
 const char* PhaseName(NCG76SphereCycle::Phase phase,int sourceG=76) noexcept {
     using P=NCG76SphereCycle::Phase;
     switch(phase){
-    case P::Idle:return "IDLE";case P::InitialDepth:return "INITIAL_DEPTH";
+    case P::ContourFinish:return "CONTOUR_FINISH";
+    case P::ContourNominal:return "CONTOUR_NOMINAL";case P::Idle:return "IDLE";case P::InitialDepth:return "INITIAL_DEPTH";
     case P::InitialRetreat:return "INITIAL_RETREAT";case P::CircleEntry:return "CIRCLE_ENTRY";
     case P::Orbit:return "ORBIT";case P::ReturnCenter:return "RETURN_CENTER";
     case P::AdvanceCenter:return "ADVANCE_CENTER";case P::Settle:return "SETTLE";
@@ -249,6 +279,7 @@ const char* PhaseName(NCG76SphereCycle::Phase phase,int sourceG=76) noexcept {
     case P::ResumeToAnchor:return "RESUME_TO_ANCHOR";case P::FaultBrake:return "FAULT_BRAKE";
     case P::FaultSettle:return "FAULT_SETTLE";case P::Complete:return "COMPLETE";case P::Fault:return "FAULT";
     case P::ResumeBrake:return "RESUME_BRAKE";
+    case P::TimeLimitBrake:return "TIME_LIMIT_BRAKE";case P::TimeLimitSettle:return "TIME_LIMIT_SETTLE";
     case P::FlushBrake:return "FLUSH_BRAKE";case P::FlushSettle:return "FLUSH_SETTLE";
     case P::FlushLift:return "FLUSH_LIFT";case P::FlushReturn:return "FLUSH_RETURN";
     case P::FlushHoldBrake:return "FLUSH_HOLD_BRAKE";
@@ -265,7 +296,7 @@ const char* RuntimeFaultName(std::uint32_t fault) noexcept {
     case 0U:return "NONE";case 1U:return "INPUT";case 2U:return "AUTHORITY";
     case 3U:return "CYCLE";case 4U:return "SETTLE";case 5U:return "PARENT_BIND_TIMEOUT";
     case 6U:return "CONTROL_INTENT";case 7U:return "START_POSITION_TIMEOUT";
-    case 8U:return "START_TRAVEL";case 9U:return "FLUSH_PROCESS_SCOPE";default:return "UNKNOWN";}
+    case 8U:return "START_TRAVEL";case 9U:return "FLUSH_PROCESS_SCOPE";case 10U:return "MACHINING_TIME_LIMIT";default:return "UNKNOWN";}
 }
 const char* CycleFaultName(NCG76SphereCycle::Fault fault) noexcept {
     using F=NCG76SphereCycle::Fault;
@@ -277,6 +308,7 @@ const char* CycleFaultName(NCG76SphereCycle::Fault fault) noexcept {
     case F::Numeric:return "NUMERIC";case F::TravelLimit:return "TRAVEL_LIMIT";
     case F::SettleTimeout:return "SETTLE_TIMEOUT";case F::CycleTimeout:return "CYCLE_TIMEOUT";
     case F::RepeatedHold:return "REPEATED_HOLD";case F::Cancelled:return "CANCELLED";
+    case F::TimeLimit:return "MACHINING_TIME_LIMIT";
     default:return "UNKNOWN";}
 }
 bool FailedSphereFeedback(const MotionG76SphereFeedback& report) noexcept {
@@ -286,8 +318,8 @@ bool FailedSphereFeedback(const MotionG76SphereFeedback& report) noexcept {
 // Diagnostic-only readback remains useful after the RT failure revokes its
 // owner/epoch. It never grants motion or releases the NC completion barrier.
 void PrintSphereRuntimeFailure(const MotionG76SphereFeedback& report,
-    const NCG76SphereCycle::Request& request,int line,int sourceG=76) noexcept {
-    PrintParent(sourceG,"event=FAULT session=%llu line=%d tick=%llu phase=%s nominal=%s cycleFault=%u cause=%s runtimeFault=%u gate=%s started=%u discharge=0\n",
+    const NCG76SphereCycle::Request& request,int line,int sourceG=76,unsigned sourceP=50U) noexcept {
+    PrintParent(sourceG,sourceP,"event=FAULT session=%llu line=%d tick=%llu phase=%s nominal=%s cycleFault=%u cause=%s runtimeFault=%u gate=%s started=%u discharge=0\n",
         static_cast<unsigned long long>(report.session),line,static_cast<unsigned long long>(report.inputSequence),
         PhaseName(report.cycle.phase,sourceG),PhaseName(report.cycle.nominalPhase,sourceG),static_cast<unsigned>(report.cycle.fault),
         CycleFaultName(report.cycle.fault),report.runtimeFault,
@@ -297,11 +329,11 @@ void PrintSphereRuntimeFailure(const MotionG76SphereFeedback& report,
         // RT freezes the first violating sample before fault containment.
         // Format it here on the NC owner; later cancellation cannot replace
         // the original clock evidence with a new sample or owner rejection.
-        PrintParent(sourceG,"event=CLOCK_FAULT session=%llu reasonBits=0x%02X previousTick=%llu currentTick=%llu previousPhysical=%llu currentPhysical=%llu discharge=0\n",
+        PrintParent(sourceG,sourceP,"event=CLOCK_FAULT session=%llu reasonBits=0x%02X previousTick=%llu currentTick=%llu previousPhysical=%llu currentPhysical=%llu discharge=0\n",
             static_cast<unsigned long long>(report.session),static_cast<unsigned>(clock.reasonBits),
             static_cast<unsigned long long>(clock.previousTick),static_cast<unsigned long long>(clock.currentTick),
             static_cast<unsigned long long>(clock.previousPhysicalSequence),static_cast<unsigned long long>(clock.currentPhysicalSequence));
-        PrintParent(sourceG,"event=CLOCK_INTERVAL session=%llu previousNowUs=%llu currentNowUs=%llu deltaValid=%u deltaUs=%llu minimumUs=%llu maximumUs=%llu discharge=0\n",
+        PrintParent(sourceG,sourceP,"event=CLOCK_INTERVAL session=%llu previousNowUs=%llu currentNowUs=%llu deltaValid=%u deltaUs=%llu minimumUs=%llu maximumUs=%llu discharge=0\n",
             static_cast<unsigned long long>(report.session),static_cast<unsigned long long>(clock.previousNowUs),
             static_cast<unsigned long long>(clock.currentNowUs),clock.deltaValid?1U:0U,
             static_cast<unsigned long long>(clock.deltaUs),static_cast<unsigned long long>(clock.minimumTickUs),
@@ -312,16 +344,16 @@ void PrintSphereRuntimeFailure(const MotionG76SphereFeedback& report,
         // This is RT's first failing sample, frozen before cancellation. A
         // later ALARM/owner change must not replace its source with a generic
         // NC AIR_GRANT rejection or with a newer physical input snapshot.
-        PrintParent(sourceG,"event=INPUT_FAULT session=%llu tick=%llu stage=%s gate=%s axis=%d flags=0x%08X validAxisMask=0x%02X statusWord=0x%04X mode=%d rawPosition=%d discharge=0\n",
+        PrintParent(sourceG,sourceP,"event=INPUT_FAULT session=%llu tick=%llu stage=%s gate=%s axis=%d flags=0x%08X validAxisMask=0x%02X statusWord=0x%04X mode=%d rawPosition=%d discharge=0\n",
             static_cast<unsigned long long>(report.session),static_cast<unsigned long long>(input.tick),
             MotionG76SphereInputStageName(input.stage),MotionG76SphereInputGateName(input.gate),
             static_cast<int>(input.axis),static_cast<unsigned>(input.flags),static_cast<unsigned>(input.validAxisMask),
             static_cast<unsigned>(input.statusWord),static_cast<int>(input.mode),static_cast<int>(input.rawPosition));
-        PrintParent(sourceG,"event=INPUT_FAULT_CLOCK session=%llu inputTick=%llu physicalSequence=%llu nowUs=%llu clockFrequency=%llu discharge=0\n",
+        PrintParent(sourceG,sourceP,"event=INPUT_FAULT_CLOCK session=%llu inputTick=%llu physicalSequence=%llu nowUs=%llu clockFrequency=%llu discharge=0\n",
             static_cast<unsigned long long>(report.session),static_cast<unsigned long long>(input.inputTick),
             static_cast<unsigned long long>(input.physicalSequence),static_cast<unsigned long long>(input.nowUs),
             static_cast<unsigned long long>(input.clockFrequency));
-        PrintParent(sourceG,"event=INPUT_FAULT_SCOPE session=%llu inputSession=%llu expectedSession=%llu inputEpoch=%llu expectedEpoch=%llu inputSegment=%llu expectedSegment=%llu inputSource=%u expectedSource=%u inputBlock=%d expectedBlock=%d discharge=0\n",
+        PrintParent(sourceG,sourceP,"event=INPUT_FAULT_SCOPE session=%llu inputSession=%llu expectedSession=%llu inputEpoch=%llu expectedEpoch=%llu inputSegment=%llu expectedSegment=%llu inputSource=%u expectedSource=%u inputBlock=%d expectedBlock=%d discharge=0\n",
             static_cast<unsigned long long>(report.session),static_cast<unsigned long long>(input.inputSession),
             static_cast<unsigned long long>(input.expectedSession),static_cast<unsigned long long>(input.inputIdentity.epoch),
             static_cast<unsigned long long>(report.identity.epoch),static_cast<unsigned long long>(input.inputIdentity.segmentId),
@@ -336,13 +368,13 @@ void PrintSphereRuntimeFailure(const MotionG76SphereFeedback& report,
         const double tolerance=axis<3U?report.positionToleranceMm:report.rotaryToleranceDeg;
         const bool sampleValid=(report.inputValidAxisMask&(1U<<axis))!=0U;
         if(!sampleValid){
-            PrintParent(sourceG,"event=FAULT_AXIS session=%llu axis=%u actual=UNAVAILABLE target=%.12f error=UNAVAILABLE tolerance=%.12f unit=%s inWindow=UNKNOWN sampleValid=0 fallbackActual=%.12g discharge=0\n",
+            PrintParent(sourceG,sourceP,"event=FAULT_AXIS session=%llu axis=%u actual=UNAVAILABLE target=%.12f error=UNAVAILABLE tolerance=%.12f unit=%s inWindow=UNKNOWN sampleValid=0 fallbackActual=%.12g discharge=0\n",
                 static_cast<unsigned long long>(report.session),axis,target[axis],tolerance,
                 axis<3U?"mm":"deg",report.actualMCS[axis]);
             continue;
         }
         const double error=report.actualMCS[axis]-target[axis];
-        PrintParent(sourceG,"event=FAULT_AXIS session=%llu axis=%u actual=%.12f target=%.12f error=%.12f tolerance=%.12f unit=%s inWindow=%u sampleValid=1 discharge=0\n",
+        PrintParent(sourceG,sourceP,"event=FAULT_AXIS session=%llu axis=%u actual=%.12f target=%.12f error=%.12f tolerance=%.12f unit=%s inWindow=%u sampleValid=1 discharge=0\n",
             static_cast<unsigned long long>(report.session),axis,report.actualMCS[axis],target[axis],
             error,tolerance,axis<3U?"mm":"deg",std::isfinite(tolerance)&&tolerance>0.0&&
                 std::isfinite(error)&&std::fabs(error)<=tolerance?1U:0U);
@@ -351,7 +383,12 @@ void PrintSphereRuntimeFailure(const MotionG76SphereFeedback& report,
 }
 
 bool NCManager::IsG76SphereBlock(const NCBlock& block) noexcept
-{ return NCGCodeSemantics::Contains(block,76)&&block.has('P')&&block.val('P')==50.0; }
+{
+    // EDM345: only an authored D/H word opts P11/P12/P13/P14/P15 into the common parent.
+    // The complete source/shape proof follows before any publication.
+    return (NCGCodeSemantics::Contains(block,76)&&block.has('P')&&block.val('P')==50.0)||
+        NCG76TimedP11Source::IsOptIn(block);
+}
 
 bool NCManager::IsEDMProcessPathCandidateSameThread(const NCBlock& block) const noexcept
 {
@@ -419,6 +456,109 @@ void NCManager::ExportHoldRecoveryTelemetrySameThread(NCHoldTelemetry::Image& im
         image.effectiveSegments=image.availableSegments=0U;
         image.inspectionAxisMask=0U;image.retreatAnchorValid=image.processPointValid=false;
         image.phase=Phase::Unavailable;
+    }
+}
+
+void NCManager::ClearMachiningTimeTelemetrySameThread() noexcept
+{
+    if(m_g76Sphere)m_g76Sphere->timeTelemetryCleared=true;
+}
+
+void NCManager::ExportMachiningTelemetrySameThread(NCMachiningTelemetry::Image& image) const noexcept
+{
+    namespace T=NCMachiningTelemetry;
+    image=T::Image{};image.phase=T::Phase::Idle;
+    image.capabilities=T::TotalLimit|T::AdditionalMachining|T::HoldPause|T::P50FullSweep;
+    if(!m_g76Sphere||m_g76Sphere->timeTelemetryCleared)return;
+    const auto& s=*m_g76Sphere;
+    if(!s.bound||!s.session)return;
+    MotionG76SphereFeedback report{};
+    if(!m_motion.ReadG76SphereFeedback(report)||report.session!=s.session||
+       !SameIdentity(report.identity,s.identity)||!report.owner.Matches(s.owner)||
+       report.cycle.session!=s.session||!report.cycle.tick){
+        if(s.active)image.phase=T::Phase::Unavailable;
+        return;
+    }
+    const auto& f=report.cycle;
+    const bool timeLimit=f.fault==NCG76SphereCycle::Fault::TimeLimit||
+        (f.totalLimitUs&&f.totalTimerState==static_cast<std::uint8_t>(NCMachiningTime::TimerState::Expired));
+    const bool fault=report.runtimeFault||f.fault!=NCG76SphereCycle::Fault::None;
+    const bool completed=report.terminal&&report.completed&&!fault;
+    // A completed prior row must not present its budget as the next row's
+    // clock. Keep only the final program result or an explicit alarm receipt.
+    if(!s.active&&!timeLimit&&!(completed&&GetState()==NCState::P_END)&&
+       !(fault&&GetState()==NCState::ALARM))return;
+    if(f.totalLimitUs!=s.request.totalLimitUs||f.additionalUs!=s.request.additionalUs||
+       f.totalElapsedUs>f.totalLimitUs||f.additionalElapsedUs>f.additionalUs){
+        image.phase=T::Phase::Unavailable;return;
+    }
+    const bool fourSideContourSource=s.sourceG==76&&(s.sourceP==12U||s.sourceP==13U||s.sourceP==14U||s.sourceP==15U);
+    if(s.sourceG==76&&(!s.pathSource.has('P')||s.pathSource.val('P')!=static_cast<double>(s.sourceP)||
+       ((s.sourceP==11U||fourSideContourSource)?(s.request.geometry.kind!=NCG76SphereRuntimeGeometry::Kind::OrbitContour||
+           NCG76OrbitContour::ModeP(s.request.geometry)!=s.sourceP||
+           report.nominalKind!=NCG76SphereRuntimeGeometry::Kind::OrbitContour||f.completedLayers!=0U||
+           f.layerIndex>=NCG76OrbitContour::NominalLegCount||
+           (fourSideContourSource&&f.nominalPhase==NCG76SphereCycle::Phase::ContourFinish?
+                f.layerIndex>=NCG76OrbitContour::FinishLegCount(s.request.geometry):
+                (f.nominalPhase!=NCG76SphereCycle::Phase::ContourNominal&&f.layerIndex!=0U))||
+           (s.sourceP==11U&&f.nominalPhase==NCG76SphereCycle::Phase::ContourFinish)||
+           (fourSideContourSource&&f.nominalPhase!=NCG76SphereCycle::Phase::ContourNominal&&
+                f.nominalPhase!=NCG76SphereCycle::Phase::ContourFinish&&
+                f.nominalPhase!=NCG76SphereCycle::Phase::CircleEntry&&
+                f.nominalPhase!=NCG76SphereCycle::Phase::ReturnCenter&&
+                f.nominalPhase!=NCG76SphereCycle::Phase::Idle)):
+        s.sourceP==50U?(s.request.geometry.kind!=NCG76SphereRuntimeGeometry::Kind::Sphere||
+           report.nominalKind!=NCG76SphereRuntimeGeometry::Kind::Sphere):true))){
+        image.phase=T::Phase::Unavailable;return;
+    }
+    image.parentSession=s.session;image.sampleTick=f.tick;
+    image.currentSourceG=static_cast<std::uint32_t>(s.sourceG);
+    image.currentSourceP=s.sourceG==76?s.sourceP:0U;
+    image.currentSourceLine=s.line>0?static_cast<std::uint32_t>(s.line):0U;
+    if(s.pathSource.has('N')){
+        const double n=s.pathSource.val('N');
+        if(std::isfinite(n)&&n>=0.0&&n<=2147483647.0&&std::floor(n)==n)
+            image.currentSequenceN=static_cast<std::int32_t>(n);
+    }
+    image.parentValid=image.runtimeSupported=true;image.active=s.active&&!report.terminal;
+    if(s.sourceG==76&&s.sourceP==50U){image.layerIndex=f.layerIndex;image.layerCount=s.request.geometry.circleLayerCount;}
+    const auto pause=[&](std::uint8_t value) noexcept {
+        using P=NCMachiningTime::PauseReason;
+        switch(static_cast<P>(value)){
+        case P::None:return T::PauseReason::None;
+        case P::Hold:return f.inspectionJogActive?T::PauseReason::InspectionJog:T::PauseReason::Held;
+        case P::Flush:return T::PauseReason::Flush;
+        case P::Gap:return T::PauseReason::GapRetreat;
+        case P::Returning:return T::PauseReason::Returning;
+        case P::Fault:return T::PauseReason::Terminated;
+        case P::Qualification:return T::PauseReason::EndpointQualification;
+        case P::Waiting:return T::PauseReason::NotStarted;
+        default:return T::PauseReason::Terminated;
+        }
+    };
+    image.total.configuredUs=f.totalLimitUs;image.total.elapsedUs=f.totalElapsedUs;
+    image.total.remainingUs=f.totalLimitUs-f.totalElapsedUs;
+    image.total.state=static_cast<T::TimerState>(f.totalTimerState);image.total.pauseReason=pause(f.totalPauseReason);
+    image.additional.configuredUs=f.additionalUs;image.additional.elapsedUs=f.additionalElapsedUs;
+    image.additional.remainingUs=f.additionalUs-f.additionalElapsedUs;
+    image.additional.state=static_cast<T::TimerState>(f.additionalTimerState);image.additional.pauseReason=pause(f.additionalPauseReason);
+    if(timeLimit){image.phase=T::Phase::TimeLimit;image.endReason=T::EndReason::TimeLimit;}
+    else if(fault){image.phase=T::Phase::Fault;image.endReason=f.fault==NCG76SphereCycle::Fault::Cancelled?T::EndReason::Cancelled:T::EndReason::Fault;}
+    else if(completed){image.phase=T::Phase::Complete;image.endReason=T::EndReason::Completed;}
+    else if(f.holdActive){
+        image.phase=f.holdRecoveryPhase>=6U&&f.holdRecoveryPhase<=8U?T::Phase::Returning:T::Phase::Held;
+    }else{
+        using P=NCMachiningTime::TimePhase;
+        switch(static_cast<P>(f.timePhase)){
+        case P::Additional:image.phase=T::Phase::AdditionalMachining;break;
+        case P::Finishing:image.phase=T::Phase::AdditionalFinishing;break;
+        case P::Verification:image.phase=T::Phase::FinishVerification;break;
+        default:image.phase=T::Phase::Machining;break;
+        }
+    }
+    if(!T::Valid(image)){
+        image=T::Image{};image.phase=T::Phase::Unavailable;
+        image.capabilities=T::TotalLimit|T::AdditionalMachining|T::HoldPause|T::P50FullSweep;
     }
 }
 
@@ -501,11 +641,21 @@ bool NCManager::PrepareEDMProcessPathTranslationSameThread(const NCBlock& block)
 WaitConditionFunc NCManager::StartEDMProcessPathSameThread(const NCBlock& block)
 { return StartG76SphereSameThread(block); }
 
-bool NCManager::IsCompletedEDMProcessPathTerminalAllowedSameThread(const NCBlock& block)
+bool NCManager::IsCompletedEDMProcessPathTerminalAllowedSameThread(const NCBlock& block,int expectedM)
 {
     const auto& s=*m_g76Sphere;const int pc=GetActiveDispatchPC();
     const auto* row=GetBaseProgramCache().TryGetLine(pc);NCBlock literal{};
-    if((s.sourceG!=1&&s.sourceG!=2&&s.sourceG!=3)||!s.completed||!s.bound||!s.endpointCommitted||
+    // EDM340 FIX3: M00 is a nonpositioning checkpoint after this exact
+    // completed parent. The original M30 lane keeps its analytic-only policy.
+    const bool analytic=s.sourceG==1||s.sourceG==2||s.sourceG==3;
+    const bool sphereCheckpoint=expectedM==0&&s.sourceG==76&&s.pathSource.has('P')&&
+        s.pathSource.val('P')==50.0&&s.request.geometry.kind==NCG76SphereRuntimeGeometry::Kind::Sphere;
+    const bool timedContour=s.sourceG==76&&(s.sourceP==11U||s.sourceP==12U||s.sourceP==13U||s.sourceP==14U||s.sourceP==15U)&&
+        s.pathSource.has('P')&&s.pathSource.val('P')==static_cast<double>(s.sourceP)&&
+        NCG76OrbitContour::ModeP(s.request.geometry)==s.sourceP&&NCG76TimedP11Source::IsOptIn(s.pathSource)&&
+        s.request.geometry.kind==NCG76SphereRuntimeGeometry::Kind::OrbitContour&&
+        (s.request.retreatMode==0U||s.request.retreatMode==2U);
+    if((expectedM!=0&&expectedM!=30)||(!analytic&&!sphereCheckpoint&&!timedContour)||!s.completed||!s.bound||!s.endpointCommitted||
         s.active||s.staged||s.submitted||!s.session||!s.commit||!s.identity.IsAssigned()||pc<=s.pc||
         !s.feedback.terminal||!s.feedback.completed||s.feedback.runtimeFault||
         s.feedback.cycle.phase!=NCG76SphereCycle::Phase::Complete||s.feedback.cycle.fault!=NCG76SphereCycle::Fault::None||
@@ -516,8 +666,43 @@ bool NCManager::IsCompletedEDMProcessPathTerminalAllowedSameThread(const NCBlock
         !row->parsedBlock.assignment.valueExpression.empty()||row->parsedBlock.gotoStatement.conditional||
         !row->parsedBlock.gotoStatement.conditionExpression.empty()||!row->parsedBlock.gotoStatement.targetExpression.empty()||
         !NCPreparedBlockQueueShadow::TryBuildLiteralBlock(row->parsedBlock,literal)||!SameLiteral(literal,block)||
-        literal.hasG||literal.gCount||literal.mCount!=1||literal.mCode[0]!=30||literal.isGoto||
-        !ExactProcessG(row->parsedBlock.mExpressions[0],30))return false;
+        literal.hasG||literal.gCount||literal.mCount!=1||literal.mCode[0]!=expectedM||literal.isGoto||
+        !ExactProcessG(row->parsedBlock.mExpressions[0],expectedM))return false;
+    if((expectedM==0||timedContour)&&(!s.request.geometry.valid||!s.feedback.accepted||!s.feedback.started||
+        s.identity.source!=MotionCommandSource::NC_MEMORY||s.identity.epoch!=s.epoch||
+        s.identity.sourceBlockId!=static_cast<MotionSourceBlockId>(s.pc)||s.feedback.session!=s.session||
+        s.feedback.cycle.session!=s.session||!s.feedback.cycle.tick||s.feedback.cycle.holdActive||s.feedback.cycle.held||
+        !SameIdentity(s.feedback.identity,s.identity)||!s.feedback.owner.Matches(s.owner)||
+        s.feedback.nominalKind!=s.request.geometry.kind||
+        (s.sourceG==1&&s.request.geometry.kind!=NCG76SphereRuntimeGeometry::Kind::Line)||
+        ((s.sourceG==2||s.sourceG==3)&&s.request.geometry.kind!=NCG76SphereRuntimeGeometry::Kind::Arc)||
+        (sphereCheckpoint&&(!s.request.geometry.circleLayerCount||
+            s.feedback.cycle.completedLayers!=s.request.geometry.circleLayerCount))||
+        !FinishTerminalQualified(s.feedback.cycle,s.finishRequiredCount)||
+        !MotionG76SphereMachiningTime::TerminalQualified(s.feedback.cycle,s.request)))return false;
+    if(timedContour){
+        const auto* parent=GetBaseProgramCache().TryGetLine(s.pc);
+        NCG76TimedP11Source::Words words{};NCMachiningTime::Config time{};
+        if(!parent||parent->sourceLineNumber!=s.line||s.timeTelemetryCleared||
+           !SameNCTranslationSnapshot(s.frame,s.request.geometry.frame.translation)||
+           !NCG76SphereRuntimeGeometry::Valid(s.request.geometry)||
+           NCG76TimedP11Source::Decode(parent->parsedBlock,s.pathSource,s.prepared.inheritedBSource,words)!=
+                NCG76TimedP11Source::Status::Ok||words.requestedB!=s.request.retreatMode||
+           s.prepared.requestedB!=s.request.retreatMode||
+           !NCMachiningTimePolicy::Decode(parent->parsedBlock,s.pathSource,time)||
+           !NCMachiningTime::SameConfig(time,s.machiningTime)||
+           !MotionG76SphereMachiningTime::Matches(time,s.request)||
+           !TimedP11SourceMatchesGeometry(words,time,s.request.geometry)||
+           s.feedback.cycle.completedLayers!=0U||
+           s.feedback.cycle.layerIndex!=(time.additionalUs?0U:24U)||
+           s.feedback.cycle.nominalPhase!=(time.additionalUs?NCG76SphereCycle::Phase::ReturnCenter:
+                NCG76SphereCycle::Phase::ContourNominal)||
+           words.explicitB!=s.prepared.explicitB||words.inheritedB!=s.prepared.inheritedB||
+           (words.inheritedB&&(words.inheritedBSource.committed.run!=s.run||
+            words.inheritedBSource.committed.cache!=s.cache||
+            !words.inheritedBSource.committed.lease.Matches(s.owner)||
+            words.inheritedBSource.commit>=s.commit)))return false;
+    }
     for(const auto& word:row->parsedBlock.gExpressions)if(!word.empty())return false;
     for(std::size_t i=1U;i<row->parsedBlock.mExpressions.size();++i)
         if(!row->parsedBlock.mExpressions[i].empty())return false;
@@ -566,14 +751,36 @@ void NCManager::RejectG76SphereSameThread(const char* reason,int alarm,int sourc
     m_g76Sphere->gapShadowRevoked=true;m_g76Sphere->gapBinding.ready=false;
     m_g76Sphere->active=m_g76Sphere->staged=m_g76Sphere->resumePending=false;
     AlarmManager::GetInstance().Trigger(alarm,line);ChangeState(NCState::ALARM);
-    if(submitted)m_motion.RequestEmergencyStopAllAxes();
-    PrintParent(m_g76Sphere->sourceG,"event=REJECT session=%llu line=%d reason=%s discharge=0\n",
+    MotionG76SphereFeedback stopped{};
+    const bool deadlineAlreadyStopped=submitted&&m_g76Sphere->bound&&
+        alarm==AlarmManager::EDM_MACHINING_TIME_LIMIT&&m_motion.ReadG76SphereFeedback(stopped)&&
+        SameIdentity(stopped.identity,m_g76Sphere->identity)&&stopped.owner.Matches(m_g76Sphere->owner)&&
+        stopped.translationGeneration==m_g76Sphere->request.geometry.frame.translation.generation&&
+        MotionG76SphereMachiningTime::TimeLimitStoppedQualified(stopped,m_g76Sphere->request);
+    if(submitted&&!deadlineAlreadyStopped)m_motion.RequestEmergencyStopAllAxes();
+    PrintParent(m_g76Sphere->sourceG,m_g76Sphere->sourceP,"event=REJECT session=%llu line=%d reason=%s discharge=0\n",
         static_cast<unsigned long long>(session),line,reason?reason:"UNSPECIFIED");
 }
 
 bool NCManager::ValidateG76SphereBlockSameThread(const NCBlock& block,int pc,int line)
 {
     const auto* source=GetBaseProgramCache().TryGetLine(pc);
+    if(NCG76TimedP11Source::IsOptIn(block)){
+        NCG76TimedP11Source::Words words{};
+        const auto status=source?NCG76TimedP11Source::Decode(source->parsedBlock,block,
+            CaptureG76SphereModalBSameThread(),words):NCG76TimedP11Source::Status::InvalidSource;
+        if(!source||(line&&source->sourceLineNumber!=line)||status!=NCG76TimedP11Source::Status::Ok||
+           !SameLiteral(block,words.authored)||!m_macroStack.empty()||m_isG66Active||
+           CoordSys.isInchMode||CoordSys.activePlane!=17){
+            RejectG76SphereSameThread(status==NCG76TimedP11Source::Status::UnresolvedModalB?
+                (block.val('P')==15.0?"P15_B_REQUIRES_COMMITTED_SOURCE":block.val('P')==14.0?"P14_B_REQUIRES_COMMITTED_SOURCE":block.val('P')==13.0?"P13_B_REQUIRES_COMMITTED_SOURCE":block.val('P')==12.0?"P12_B_REQUIRES_COMMITTED_SOURCE":"P11_B_REQUIRES_COMMITTED_SOURCE"):
+                (block.val('P')==15.0?"P15_EXACT_LITERAL_SOURCE_G17_G21":block.val('P')==14.0?"P14_EXACT_LITERAL_SOURCE_G17_G21":block.val('P')==13.0?"P13_EXACT_LITERAL_SOURCE_G17_G21":block.val('P')==12.0?"P12_EXACT_LITERAL_SOURCE_G17_G21":"P11_EXACT_LITERAL_SOURCE_G17_G21"),
+                AlarmManager::G_Code_Invalid_parameter,source?source->sourceLineNumber:line);return false;
+        }
+        if(m_g76Sphere->active){RejectG76SphereSameThread(block.val('P')==15.0?"P15_PARENT_STILL_ACTIVE":block.val('P')==14.0?"P14_PARENT_STILL_ACTIVE":block.val('P')==13.0?"P13_PARENT_STILL_ACTIVE":block.val('P')==12.0?"P12_PARENT_STILL_ACTIVE":"P11_PARENT_STILL_ACTIVE",
+            AlarmManager::PATH_EXECUTION_NOT_READY,source->sourceLineNumber);return false;}
+        return true;
+    }
     NCG76SphereSource::Words words{};
     const auto status=source?NCG76SphereSource::Decode(source->parsedBlock,CaptureG76SphereModalBSameThread(),words):
         NCG76SphereSource::Status::InvalidSource;
@@ -601,15 +808,20 @@ bool NCManager::PrepareG76SphereTranslationSameThread(const NCBlock& block)
 {
     const int pc=GetActiveDispatchPC();const auto* source=GetBaseProgramCache().TryGetLine(pc);
     const bool processPath=block.gCode==1||block.gCode==2||block.gCode==3;
-    if(!processPath)PrintSphereMemoryStage("NC_PREPARE_ENTER",pc);
+    const bool timedContour=NCG76TimedP11Source::IsOptIn(block);
+    if(!processPath&&!timedContour)PrintSphereMemoryStage("NC_PREPARE_ENTER",pc);
     if(processPath?!ValidateEDMProcessPathBlockSameThread(block,pc,source?source->sourceLineNumber:0):
         !ValidateG76SphereBlockSameThread(block,pc,source?source->sourceLineNumber:0))return false;
     // Allocate NC-only preparation storage once per parent; no large temporary
     // session is constructed on the NC stack or on any servo callback.
     m_g76Sphere.reset(new G76SphereNCState{});auto& s=*m_g76Sphere;
     s.pc=pc;s.line=source->sourceLineNumber;s.dispatch=m_currentExecutingBlockDispatchId;
-    s.sourceG=processPath?block.gCode:76;s.pathSource=block;
+    s.sourceG=processPath?block.gCode:76;
+    s.sourceP=processPath?0U:timedContour?static_cast<unsigned>(block.val('P')):50U;s.pathSource=block;
     const auto reject=[this](const char* reason,int alarm){RejectG76SphereSameThread(reason,alarm);return false;};
+    if(!NCMachiningTimePolicy::Decode(source->parsedBlock,block,s.machiningTime))
+        return reject("MACHINING_TIME_LITERAL",AlarmManager::G_Code_Invalid_parameter);
+    s.request.totalLimitUs=s.machiningTime.totalLimitUs;s.request.additionalUs=s.machiningTime.additionalUs;
     if(processPath&&!NCFinishPolicy::Decode(source->parsedBlock,block,s.finishRequiredCount))
         return reject("FINISH_PARAMETER_LITERAL",AlarmManager::G_Code_Invalid_parameter);
     if(m_mode!=NCOperationMode::MEMORY||m_state!=NCState::RUN||!IsEDM171AirGrantCurrentSameThread(processPath)||
@@ -645,10 +857,10 @@ bool NCManager::PrepareG76SphereTranslationSameThread(const NCBlock& block)
         // nominal machining speed; an omitted F never reads modal F.
         s.gapBinding=NCG76SphereGapBinding::Capture(m_recipe,m_edmProcessProfile,
             m_edmProcessTuningGeneration,m_edmProcessReady&&!m_recipeRecoveryDisplayOnly,true);
-        if(const char* typed=RejectTypedBinding(s.gapBinding,mode,s.sourceG))return reject(typed,AlarmManager::G_Code_Invalid_parameter);
+        if(const char* typed=RejectTypedBinding(s.gapBinding,mode,s.sourceG,s.sourceP))return reject(typed,AlarmManager::G_Code_Invalid_parameter);
         if(!s.gapBinding.ready||!s.gapBinding.config.enabled||!s.gapBinding.config.signedMotionEnabled||
             !NCG76SphereGapProcess::ResolveParameterMotionCeiling(s.gapBinding.config,s.processMotionCeiling)){
-            PrintParent(s.sourceG,"event=PARAMETER_BINDING_REJECT reason=%s error=%s field=%u discharge=0\n",
+            PrintParent(s.sourceG,s.sourceP,"event=PARAMETER_BINDING_REJECT reason=%s error=%s field=%u discharge=0\n",
                 NCG76SphereGapBinding::ReasonName(s.gapBinding.reason),EDM58::BindingErrorName(s.gapBinding.error),s.gapBinding.failedFieldId);
             return reject("PROCESS_PATH_REQUIRES_FROZEN_GAP_RECIPE",AlarmManager::G_Code_Invalid_parameter);
         }
@@ -661,6 +873,34 @@ bool NCManager::PrepareG76SphereTranslationSameThread(const NCBlock& block)
         // descriptor is fabricated for a real line or circular source.
         s.prepared.requestedB=mode;s.prepared.explicitB=block.has('B');s.prepared.inheritedB=!block.has('B')&&modal.valid;
         if(s.prepared.inheritedB)s.prepared.inheritedBSource=modal;
+    }else if(timedContour){
+        NCG76TimedP11Source::Words words{};
+        NCG76SphereCoordinates::FrozenFrame pathFrame{};
+        if(NCG76TimedP11Source::Decode(source->parsedBlock,block,CaptureG76SphereModalBSameThread(),words)!=
+                NCG76TimedP11Source::Status::Ok||
+           NCG76SphereCoordinates::BuildFrame(s.frame,start,pathFrame)!=NCG76SphereCoordinates::Status::Ok||
+           !CaptureCncFeedValueSameThread(block,s.feed)||!s.feed.programmed||
+           !SameDouble(s.feed.feedMMMin,words.feedMmMin))
+            return reject(s.sourceP==15U?"P15_SOURCE_GEOMETRY_OR_CURRENT_F":s.sourceP==14U?"P14_SOURCE_GEOMETRY_OR_CURRENT_F":s.sourceP==13U?"P13_SOURCE_GEOMETRY_OR_CURRENT_F":s.sourceP==12U?"P12_SOURCE_GEOMETRY_OR_CURRENT_F":"P11_SOURCE_GEOMETRY_OR_CURRENT_F",AlarmManager::G_Code_Invalid_parameter);
+        NCG76SphereCoordinates::Point3 target{{pathFrame.programStart[0],pathFrame.programStart[1],pathFrame.programStart[2]}};
+        for(unsigned axis=0U;axis<3U;++axis)if(words.targetMask&(1U<<axis))target[axis]=words.authoredXYZ[axis];
+        const bool geometryBuilt=s.sourceP==15U?
+            NCG76OrbitContour::BuildTimedP15(pathFrame,target,words.radiusProgramMm,
+                words.contourAngleDeg,words.feedMmMin,s.machiningTime.additionalUs!=0ULL,s.request.geometry):s.sourceP==14U?
+            NCG76OrbitContour::BuildTimedP14(pathFrame,target,words.radiusProgramMm,
+                words.contourAngleDeg,words.feedMmMin,s.machiningTime.additionalUs!=0ULL,s.request.geometry):s.sourceP==13U?
+            NCG76OrbitContour::BuildTimedP13(pathFrame,target,words.radiusProgramMm,
+                words.contourAngleDeg,words.feedMmMin,s.machiningTime.additionalUs!=0ULL,s.request.geometry):s.sourceP==12U?
+            NCG76OrbitContour::BuildTimedP12(pathFrame,target,words.radiusProgramMm,
+                words.contourAngleDeg,words.feedMmMin,s.machiningTime.additionalUs!=0ULL,s.request.geometry):
+            NCG76OrbitContour::BuildTimedP11(pathFrame,target,words.radiusProgramMm,
+                words.contourAngleDeg,words.feedMmMin,s.machiningTime.additionalUs!=0ULL,s.request.geometry);
+        if(!geometryBuilt||!TimedP11SourceMatchesGeometry(words,s.machiningTime,s.request.geometry))
+            return reject(s.sourceP==15U?"P15_NATIVE_ENVELOPE":s.sourceP==14U?"P14_NATIVE_ENVELOPE":s.sourceP==13U?"P13_NATIVE_ENVELOPE":s.sourceP==12U?"P12_NATIVE_ENVELOPE":"P11_NATIVE_ENVELOPE",AlarmManager::G_Code_Invalid_parameter);
+        // Contours share provenance and one parent, never a fabricated sphere
+        // descriptor, layer step, radius law or prepared native receipt.
+        s.prepared.requestedB=words.requestedB;s.prepared.explicitB=words.explicitB;
+        s.prepared.inheritedB=words.inheritedB;s.prepared.inheritedBSource=words.inheritedBSource;
     }else{
         PrintSphereMemoryStage("NC_SOURCE_PREPARE_BEGIN",pc);
         const auto prepared=NCG76SphereArchitecture::Prepare(source->parsedBlock,s.frame,start,NCG76Sphere::Limits{},
@@ -680,35 +920,41 @@ bool NCManager::PrepareG76SphereTranslationSameThread(const NCBlock& block)
             s.feed.feedMMMin!=s.prepared.native.descriptor.input.feedMmMin)
             return reject("SOURCE_GEOMETRY_OR_FEED",AlarmManager::G_Code_Invalid_parameter);
     }
-    // Build the independent nominal station once on NC. B0 may retain AIR
-    // motion without process metadata. B2/B3/B4 require a valid same-parent
-    // checkpoint below; no cursor grants motion or discharge authority.
-    if(!processPath)PrintSphereMemoryStage("NC_PATH_BUILD_BEGIN",pc);
+    // Build the independent nominal station once on NC. Every P50 now
+    // requires the frozen SIM process binding below. Nonzero B routes also
+    // require this checkpoint; no cursor grants motion or discharge authority.
+    if(!processPath&&!timedContour)PrintSphereMemoryStage("NC_PATH_BUILD_BEGIN",pc);
     (void)NCG76SpherePath::Build(s.request.geometry,s.path);
-    if(!processPath)PrintSphereMemoryStage("NC_PATH_BUILD_END",pc);
-    // Capture the selected COND/E once. Missing fields leave B0 AIR available;
-    // a selected B2/B3/B4 route requires the complete SIM binding below.
+    if(!processPath&&!timedContour)PrintSphereMemoryStage("NC_PATH_BUILD_END",pc);
+    // EDM339: P50 always freezes both machining roles. An invalid/missing
+    // orbit field rejects before publication, including B0; no AIR fallback.
     if(!processPath)s.gapBinding=NCG76SphereGapBinding::Capture(m_recipe,m_edmProcessProfile,
-        m_edmProcessTuningGeneration,m_edmProcessReady&&!m_recipeRecoveryDisplayOnly);
+        m_edmProcessTuningGeneration,m_edmProcessReady&&!m_recipeRecoveryDisplayOnly,false,true);
     s.request.retreatMode=s.prepared.requestedB;
+    if(!processPath&&(!s.gapBinding.ready||!s.gapBinding.config.orbitFeedsEnabled)){
+        PrintParent(s.sourceG,s.sourceP,"event=ORBIT_BINDING_REJECT reason=%s error=%s field=%u discharge=0\n",
+            NCG76SphereGapBinding::ReasonName(s.gapBinding.reason),
+            EDM58::BindingErrorName(s.gapBinding.error),s.gapBinding.failedFieldId);
+        return reject("G76_ORBIT_REQUIRES_FROZEN_GAP_RECIPE",AlarmManager::G_Code_Invalid_parameter);
+    }
     // A confirmed typed error is different from unavailable/unconfirmed
     // optional fields. It rejects B0 too, before frame freeze or submission.
     if(s.gapBinding.approachReason==NCG76SphereGapBinding::ApproachReason::InvalidField){
         s.gapBinding.config=NCG76SphereGapProcess::Config{};
-        PrintSphereApproachRejection(s.gapBinding,s.request.retreatMode,s.sourceG);
+        PrintSphereApproachRejection(s.gapBinding,s.request.retreatMode,s.sourceG,s.sourceP);
         return reject("TYPED_APPROACH_FIELD_INVALID",AlarmManager::G_Code_Invalid_parameter);
     }
     if(s.gapBinding.initialSlowReason==NCG76SphereGapBinding::ApproachReason::InvalidField){
         s.gapBinding.config=NCG76SphereGapProcess::Config{};
-        PrintSphereInitialSlowRejection(s.gapBinding,s.request.retreatMode,s.sourceG);
+        PrintSphereInitialSlowRejection(s.gapBinding,s.request.retreatMode,s.sourceG,s.sourceP);
         return reject("TYPED_INITIAL_SLOW_FIELD_INVALID",AlarmManager::G_Code_Invalid_parameter);
     }
     if(s.gapBinding.deepFlushReason==NCG76SphereGapBinding::DeepFlushReason::InvalidField){
         s.gapBinding.config=NCG76SphereGapProcess::Config{};
-        PrintSphereDeepFlushRejection(s.gapBinding,s.request.retreatMode,s.sourceG);
+        PrintSphereDeepFlushRejection(s.gapBinding,s.request.retreatMode,s.sourceG,s.sourceP);
         return reject("TYPED_DEEP_FLUSH_FIELD_INVALID",AlarmManager::G_Code_Invalid_parameter);
     }
-    if(processPath&&(!s.path.valid||!s.gapBinding.ready||!s.gapBinding.config.enabled||
+    if((processPath||timedContour)&&(!s.path.valid||!s.gapBinding.ready||!s.gapBinding.config.enabled||
         !s.gapBinding.config.signedMotionEnabled))
         return reject("PROCESS_PATH_REQUIRES_FROZEN_GAP_RECIPE",AlarmManager::G_Code_Invalid_parameter);
     // B2 needs a canonical same-parent station. B3/B4 also retain this
@@ -716,7 +962,7 @@ bool NCManager::PrepareG76SphereTranslationSameThread(const NCBlock& block)
     if(s.request.retreatMode!=0U&&(!s.path.valid||!s.gapBinding.ready||
         !s.gapBinding.config.enabled||(!s.gapBinding.config.flushMotionEnabled&&!StationaryProcessLine(s.sourceG,s.request.geometry))||
         !s.gapBinding.config.signedMotionEnabled)){
-        PrintParent(s.sourceG,"event=B_MODE_BINDING_REJECT B=%u reason=%s error=%s field=%u approachReason=%s approachError=%s approachField=%u discharge=0\n",
+        PrintParent(s.sourceG,s.sourceP,"event=B_MODE_BINDING_REJECT B=%u reason=%s error=%s field=%u approachReason=%s approachError=%s approachField=%u discharge=0\n",
             s.request.retreatMode,NCG76SphereGapBinding::ReasonName(s.gapBinding.reason),
             EDM58::BindingErrorName(s.gapBinding.error),s.gapBinding.failedFieldId,
             NCG76SphereGapBinding::ApproachReasonName(s.gapBinding.approachReason),
@@ -777,9 +1023,9 @@ bool NCManager::PrepareG76SphereTranslationSameThread(const NCBlock& block)
     if(!m_g76SphereNextSession||m_g76SphereNextSession==(std::numeric_limits<std::uint64_t>::max)())
         return reject("SESSION_EXHAUSTED",AlarmManager::MOTION_GROUP_MAPPING_INTEGRITY);
     s.session=m_g76SphereNextSession++;s.request.session=s.session;
-    if(!processPath)PrintSphereMemoryStage("NC_REQUEST_VALIDATE_BEGIN",pc);
+    if(!processPath&&!timedContour)PrintSphereMemoryStage("NC_REQUEST_VALIDATE_BEGIN",pc);
     const bool requestValid=NCG76SphereCycle::ValidateRequest(s.request);
-    if(!processPath)PrintSphereMemoryStage("NC_REQUEST_VALIDATE_END",pc);
+    if(!processPath&&!timedContour)PrintSphereMemoryStage("NC_REQUEST_VALIDATE_END",pc);
     if(!requestValid)return reject("CYCLE_REQUEST",AlarmManager::G_Code_Invalid_parameter);
     // E6 is already a physical millimetre distance. The frozen native cut
     // axis supplies its direction; never scale or rotate the height again.
@@ -819,7 +1065,7 @@ bool NCManager::IsG76SphereScopeCurrentSameThread()
 {
     auto& s=*m_g76Sphere;
     const auto reject=[&](const char* gate,int axis=-1){
-        PrintParent(s.sourceG,"event=SCOPE_REJECT session=%llu line=%d gate=%s axis=%d expectedEpoch=%llu actualEpoch=%llu discharge=0\n",
+        PrintParent(s.sourceG,s.sourceP,"event=SCOPE_REJECT session=%llu line=%d gate=%s axis=%d expectedEpoch=%llu actualEpoch=%llu discharge=0\n",
             static_cast<unsigned long long>(s.session),s.line,gate,axis,
             static_cast<unsigned long long>(s.epoch),static_cast<unsigned long long>(m_motion.GetCurrentExecutionEpoch()));
         return false;
@@ -863,9 +1109,10 @@ WaitConditionFunc NCManager::StartG76SphereSameThread(const NCBlock& block)
     TraceG76SphereStartupSameThread(40U,"START_ENTER");
     auto& s=*m_g76Sphere;
     const bool processPath=s.sourceG!=76;
+    const bool timedContour=s.sourceG==76&&(s.sourceP==11U||s.sourceP==12U||s.sourceP==13U||s.sourceP==14U||s.sourceP==15U);
     const auto currentModal=CaptureG76SphereModalBSameThread();
     const auto& inherited=s.prepared.inheritedBSource;
-    const bool processModalCurrent=!processPath||s.prepared.explicitB||
+    const bool processModalCurrent=(!processPath&&!timedContour)||s.prepared.explicitB||
         (s.prepared.inheritedB?(NCG76SphereSource::ValidModalB(currentModal)&&
             currentModal.value==inherited.value&&currentModal.commit==inherited.commit&&
             NCG76SphereSource::SameModalBScope(currentModal.committed,inherited.committed)):
@@ -874,14 +1121,29 @@ WaitConditionFunc NCManager::StartG76SphereSameThread(const NCBlock& block)
     const bool finishCurrent=processPath?(finishSource&&
         NCFinishPolicy::Decode(finishSource->parsedBlock,block,finishCount)&&finishCount==s.finishRequiredCount):
         s.finishRequiredCount==0U;
+    NCMachiningTime::Config currentTime{};
+    const bool timeCurrent=finishSource&&NCMachiningTimePolicy::Decode(finishSource->parsedBlock,block,currentTime)&&
+        NCMachiningTime::SameConfig(currentTime,s.machiningTime)&&
+        MotionG76SphereMachiningTime::Matches(currentTime,s.request);
     const bool processFeedCurrent=!processPath||(s.request.parameterFeeds&&
         SameDouble(s.request.feedMmMin,s.processMotionCeiling)&&
         SameDouble(s.request.geometry.feedMmMin,s.processMotionCeiling)&&
         (s.pathSource.has('F')?(s.feed.valid&&s.feed.programmed&&IsCncFeedValueCurrentSameThread(s.feed)&&
             SameDouble(s.request.nominalFeedCapMmMin,s.feed.feedMMMin)):
             (!s.feed.valid&&!s.feed.programmed&&s.feed.feedMMMin==0.0&&s.request.nominalFeedCapMmMin==0.0)));
+    NCG76TimedP11Source::Words currentContour{};
+    const bool contourCurrent=!timedContour||(finishSource&&NCG76TimedP11Source::IsOptIn(block)&&
+        NCG76TimedP11Source::Decode(finishSource->parsedBlock,block,currentModal,currentContour)==
+            NCG76TimedP11Source::Status::Ok&&SameLiteral(s.pathSource,block)&&
+        SameNCTranslationSnapshot(s.frame,s.request.geometry.frame.translation)&&
+        TimedP11SourceMatchesGeometry(currentContour,currentTime,s.request.geometry)&&
+        !s.request.parameterFeeds&&s.feed.valid&&s.feed.programmed&&IsCncFeedValueCurrentSameThread(s.feed)&&
+        SameDouble(s.feed.feedMMMin,s.request.feedMmMin)&&
+        SameDouble(s.request.feedMmMin,s.request.geometry.feedMmMin)&&s.request.nominalFeedCapMmMin==0.0&&
+        s.request.geometry.kind==NCG76SphereRuntimeGeometry::Kind::OrbitContour);
     if(s.pc!=GetActiveDispatchPC()||s.dispatch!=m_currentExecutingBlockDispatchId||
-        !processModalCurrent||!processFeedCurrent||!finishCurrent||s.sourceG!=block.gCode||s.request.retreatMode!=s.prepared.requestedB||
+        !processModalCurrent||!processFeedCurrent||!contourCurrent||!finishCurrent||!timeCurrent||s.sourceG!=block.gCode||
+        s.sourceP!=(processPath?0U:static_cast<unsigned>(block.val('P')))||s.request.retreatMode!=s.prepared.requestedB||
         (processPath?(!SameLiteral(s.pathSource,block)||!ValidateEDMProcessPathBlockSameThread(block,s.pc,s.line)):
             !ValidateG76SphereBlockSameThread(block,s.pc,s.line))){
         RejectG76SphereSameThread("SUBMIT_SCOPE",AlarmManager::MOTION_GROUP_MAPPING_INTEGRITY);return nullptr;
@@ -896,37 +1158,37 @@ WaitConditionFunc NCManager::StartG76SphereSameThread(const NCBlock& block)
     TraceG76SphereStartupSameThread(43U,"POWER_OFF_DONE");
     if(s.gapBinding.approachReason==NCG76SphereGapBinding::ApproachReason::InvalidField){
         s.gapBinding.config=NCG76SphereGapProcess::Config{};
-        PrintSphereApproachRejection(s.gapBinding,s.request.retreatMode,s.sourceG);
+        PrintSphereApproachRejection(s.gapBinding,s.request.retreatMode,s.sourceG,s.sourceP);
         RejectG76SphereSameThread("TYPED_APPROACH_FIELD_INVALID",AlarmManager::G_Code_Invalid_parameter);return nullptr;
     }
     if(s.gapBinding.initialSlowReason==NCG76SphereGapBinding::ApproachReason::InvalidField){
         s.gapBinding.config=NCG76SphereGapProcess::Config{};
-        PrintSphereInitialSlowRejection(s.gapBinding,s.request.retreatMode,s.sourceG);
+        PrintSphereInitialSlowRejection(s.gapBinding,s.request.retreatMode,s.sourceG,s.sourceP);
         RejectG76SphereSameThread("TYPED_INITIAL_SLOW_FIELD_INVALID",AlarmManager::G_Code_Invalid_parameter);return nullptr;
     }
     if(s.gapBinding.deepFlushReason==NCG76SphereGapBinding::DeepFlushReason::InvalidField){
         s.gapBinding.config=NCG76SphereGapProcess::Config{};
-        PrintSphereDeepFlushRejection(s.gapBinding,s.request.retreatMode,s.sourceG);
+        PrintSphereDeepFlushRejection(s.gapBinding,s.request.retreatMode,s.sourceG,s.sourceP);
         RejectG76SphereSameThread("TYPED_DEEP_FLUSH_FIELD_INVALID",AlarmManager::G_Code_Invalid_parameter);return nullptr;
     }
     // NC-only recapture also detects a typed error introduced after Prepare.
     // Never infer its state from the old ready bit or old approach reason.
     const auto currentApproach=NCG76SphereGapBinding::Capture(m_recipe,m_edmProcessProfile,
-        m_edmProcessTuningGeneration,m_edmProcessReady&&!m_recipeRecoveryDisplayOnly,processPath);
+        m_edmProcessTuningGeneration,m_edmProcessReady&&!m_recipeRecoveryDisplayOnly,processPath,!processPath);
     TraceG76SphereStartupSameThread(44U,"RECIPE_CAPTURE_DONE");
     if(currentApproach.approachReason==NCG76SphereGapBinding::ApproachReason::InvalidField){
         s.gapBinding=currentApproach;s.gapBinding.config=NCG76SphereGapProcess::Config{};
-        PrintSphereApproachRejection(s.gapBinding,s.request.retreatMode,s.sourceG);
+        PrintSphereApproachRejection(s.gapBinding,s.request.retreatMode,s.sourceG,s.sourceP);
         RejectG76SphereSameThread("TYPED_APPROACH_FIELD_INVALID",AlarmManager::G_Code_Invalid_parameter);return nullptr;
     }
     if(currentApproach.initialSlowReason==NCG76SphereGapBinding::ApproachReason::InvalidField){
         s.gapBinding=currentApproach;s.gapBinding.config=NCG76SphereGapProcess::Config{};
-        PrintSphereInitialSlowRejection(s.gapBinding,s.request.retreatMode,s.sourceG);
+        PrintSphereInitialSlowRejection(s.gapBinding,s.request.retreatMode,s.sourceG,s.sourceP);
         RejectG76SphereSameThread("TYPED_INITIAL_SLOW_FIELD_INVALID",AlarmManager::G_Code_Invalid_parameter);return nullptr;
     }
     if(currentApproach.deepFlushReason==NCG76SphereGapBinding::DeepFlushReason::InvalidField){
         s.gapBinding=currentApproach;s.gapBinding.config=NCG76SphereGapProcess::Config{};
-        PrintSphereDeepFlushRejection(s.gapBinding,s.request.retreatMode,s.sourceG);
+        PrintSphereDeepFlushRejection(s.gapBinding,s.request.retreatMode,s.sourceG,s.sourceP);
         RejectG76SphereSameThread("TYPED_DEEP_FLUSH_FIELD_INVALID",AlarmManager::G_Code_Invalid_parameter);return nullptr;
     }
     if(s.gapBinding.ready&&!NCG76SphereGapBinding::IsCurrent(s.gapBinding,m_recipe,
@@ -936,6 +1198,10 @@ WaitConditionFunc NCManager::StartG76SphereSameThread(const NCBlock& block)
         s.gapBinding.error=EDM58::BindingError::CaptureChanged;s.gapShadowRevoked=true;
     }
     TraceG76SphereStartupSameThread(45U,"RECIPE_CURRENT_DONE");
+    if(!processPath&&(!s.gapBinding.ready||!s.gapBinding.config.orbitFeedsEnabled||
+       !currentApproach.ready||!currentApproach.config.orbitFeedsEnabled)){
+        RejectG76SphereSameThread("G76_ORBIT_RECIPE_CHANGED",AlarmManager::G_Code_Invalid_parameter);return nullptr;
+    }
     if(processPath&&(!s.gapBinding.ready||!s.gapBinding.config.enabled||!s.gapBinding.config.signedMotionEnabled)){
         RejectG76SphereSameThread("PROCESS_PATH_GAP_RECIPE_CHANGED",AlarmManager::G_Code_Invalid_parameter);return nullptr;
     }
@@ -958,100 +1224,148 @@ WaitConditionFunc NCManager::StartG76SphereSameThread(const NCBlock& block)
         &admission,&s.gapBinding.config,&holdConfig,GetHoldRetreatSegmentsSameThread(),s.finishRequiredCount);
     TraceG76SphereStartupSameThread(47U,"AFTER_MOTION_ADMISSION");
     if(!admitted){
-        PrintParent(s.sourceG,"event=ADMISSION_REJECT session=%llu line=%d gate=%s axis=%d discharge=0\n",
+        PrintParent(s.sourceG,s.sourceP,"event=ADMISSION_REJECT session=%llu line=%d gate=%s axis=%d discharge=0\n",
             static_cast<unsigned long long>(s.session),s.line,MotionG76SphereAdmissionGateName(admission.gate),admission.axis);
         RejectG76SphereSameThread("MOTION_ADMISSION",AlarmManager::PATH_MOTION_NOT_ADMITTED);return nullptr;
     }
     s.active=s.submitted=true;s.staged=false;
-    if(processPath)PrintParent(s.sourceG,"event=FINISH_CONFIG session=%llu required=%u scope=THIS_PARENT rework=RESIDUAL_GAP_PATH periodicE5=INDEPENDENT forcedHeight=NORMAL_E6 discharge=0\n",
+    if(processPath)PrintParent(s.sourceG,s.sourceP,"event=FINISH_CONFIG session=%llu required=%u scope=THIS_PARENT rework=RESIDUAL_GAP_PATH periodicE5=INDEPENDENT forcedHeight=NORMAL_E6 discharge=0\n",
         static_cast<unsigned long long>(s.session),s.finishRequiredCount);
     if(processPath){
         const unsigned requested=s.prepared.explicitB?static_cast<unsigned>(s.pathSource.val('B')):
             s.prepared.inheritedB?s.prepared.inheritedBSource.value:0U;
-        PrintParent(s.sourceG,"event=BEGIN session=%llu pc=%d g=%d geometry=%s Fmode=%s nominalFcapMmMin=%.9f motionCeilingMmMin=%.9f B=%u inheritedB=%u parents=1 layers=0 discharge=0\n",
+        PrintParent(s.sourceG,s.sourceP,"event=BEGIN session=%llu pc=%d g=%d geometry=%s Fmode=%s nominalFcapMmMin=%.9f motionCeilingMmMin=%.9f B=%u inheritedB=%u parents=1 layers=0 discharge=0\n",
             static_cast<unsigned long long>(s.session),s.pc,s.sourceG,s.sourceG==1?"ANALYTIC_LINE":"ANALYTIC_ARC",
             s.pathSource.has('F')?"CURRENT_BLOCK_CAP":"PARAMETER_ONLY",s.request.nominalFeedCapMmMin,
             s.processMotionCeiling,s.request.retreatMode,s.prepared.inheritedB?1U:0U);
-        PrintParent(s.sourceG,"event=B_RESOLUTION session=%llu g=%d authoredB=%d requestedB=%u effectiveB=%u forced=%u policy=%s origin=%s discharge=0\n",
+        PrintParent(s.sourceG,s.sourceP,"event=B_RESOLUTION session=%llu g=%d authoredB=%d requestedB=%u effectiveB=%u forced=%u policy=%s origin=%s discharge=0\n",
             static_cast<unsigned long long>(s.session),s.sourceG,s.prepared.explicitB?static_cast<int>(requested):-1,
             requested,s.request.retreatMode,s.sourceG!=1&&requested!=2U?1U:0U,
             s.sourceG==1?"SOURCE_MODAL":"ARC_ALWAYS_B2",s.prepared.explicitB?"EXPLICIT":
                 s.prepared.inheritedB?"COMMITTED":"DEFAULT_B0");
-        PrintParent(s.sourceG,"event=FEED_POLICY session=%llu source=PARAMETERS optionalF=%u nominalFcapMmMin=%.9f modalFRead=0 flushIndependent=1 internalCeilingMmMin=%.9f discharge=0\n",
+        PrintParent(s.sourceG,s.sourceP,"event=FEED_POLICY session=%llu source=PARAMETERS optionalF=%u nominalFcapMmMin=%.9f modalFRead=0 flushIndependent=1 internalCeilingMmMin=%.9f discharge=0\n",
             static_cast<unsigned long long>(s.session),s.pathSource.has('F')?1U:0U,
             s.request.nominalFeedCapMmMin,s.processMotionCeiling);
-        PrintParent(s.sourceG,"event=PROCESS_PATH session=%llu valid=%u pathMm=%.9f nominalScope=THIS_PARENT previousParentPolicy=RELEASED_ONE_B2 discharge=0\n",
+        PrintParent(s.sourceG,s.sourceP,"event=PROCESS_PATH session=%llu valid=%u pathMm=%.9f nominalScope=THIS_PARENT previousParentPolicy=RELEASED_ONE_B2 discharge=0\n",
             static_cast<unsigned long long>(s.session),s.path.valid?1U:0U,s.path.totalLengthMm);
         // Observe the admitted native geometry on NC, after the immutable
         // frame has been checked. Never apply a second coordinate transform.
-        PrintParent(s.sourceG,"event=FRAME_MAPPING session=%llu distance=%d plane=%d rotation=%d angleDeg=%.9f wcs=%d Hmode=%d H=%d work=%d discharge=0\n",
+        PrintParent(s.sourceG,s.sourceP,"event=FRAME_MAPPING session=%llu distance=%d plane=%d rotation=%d angleDeg=%.9f wcs=%d Hmode=%d H=%d work=%d discharge=0\n",
             static_cast<unsigned long long>(s.session),s.frame.distanceMode,s.frame.rotationPlane,
             s.frame.rotationMode,s.frame.rotationAngleDeg,s.frame.wcsCode,s.frame.toolLengthMode,
             s.frame.toolHCode,s.frame.workMode);
-        PrintParent(s.sourceG,"event=NATIVE_PATH session=%llu startX=%.9f startY=%.9f startZ=%.9f endX=%.9f endY=%.9f endZ=%.9f discharge=0\n",
+        PrintParent(s.sourceG,s.sourceP,"event=NATIVE_PATH session=%llu startX=%.9f startY=%.9f startZ=%.9f endX=%.9f endY=%.9f endZ=%.9f discharge=0\n",
             static_cast<unsigned long long>(s.session),s.request.geometry.startMCS[0],
             s.request.geometry.startMCS[1],s.request.geometry.startMCS[2],s.request.geometry.endMCS[0],
             s.request.geometry.endMCS[1],s.request.geometry.endMCS[2]);
-        PrintParent(s.sourceG,"event=PROGRAM_SOURCE session=%llu startX=%.9f startY=%.9f startZ=%.9f Xword=%.9f Yword=%.9f Zword=%.9f axisMask=%u centerU=%.9f centerV=%.9f discharge=0\n",
+        PrintParent(s.sourceG,s.sourceP,"event=PROGRAM_SOURCE session=%llu startX=%.9f startY=%.9f startZ=%.9f Xword=%.9f Yword=%.9f Zword=%.9f axisMask=%u centerU=%.9f centerV=%.9f discharge=0\n",
             static_cast<unsigned long long>(s.session),s.request.geometry.frame.programStart[0],
             s.request.geometry.frame.programStart[1],s.request.geometry.frame.programStart[2],
             s.pathSource.val('X'),s.pathSource.val('Y'),s.pathSource.val('Z'),
             (s.pathSource.has('X')?1U:0U)|(s.pathSource.has('Y')?2U:0U)|(s.pathSource.has('Z')?4U:0U),
             s.frame.rotationCenterMM[0],s.frame.rotationCenterMM[1]);
-        PrintParent(s.sourceG,"event=FRAME_OFFSETS session=%llu extX=%.9f extY=%.9f extZ=%.9f wcsX=%.9f wcsY=%.9f wcsZ=%.9f discharge=0\n",
+        PrintParent(s.sourceG,s.sourceP,"event=FRAME_OFFSETS session=%llu extX=%.9f extY=%.9f extZ=%.9f wcsX=%.9f wcsY=%.9f wcsZ=%.9f discharge=0\n",
             static_cast<unsigned long long>(s.session),s.frame.extOffsetMM[0],s.frame.extOffsetMM[1],
             s.frame.extOffsetMM[2],s.frame.wcsOffsetMM[0],s.frame.wcsOffsetMM[1],s.frame.wcsOffsetMM[2]);
-        PrintParent(s.sourceG,"event=TOOL_OFFSETS session=%llu Hmode=%d H=%d rawX=%.9f rawY=%.9f rawZ=%.9f effectiveX=%.9f effectiveY=%.9f effectiveZ=%.9f eccentricFrozen=%u discharge=0\n",
+        PrintParent(s.sourceG,s.sourceP,"event=TOOL_OFFSETS session=%llu Hmode=%d H=%d rawX=%.9f rawY=%.9f rawZ=%.9f effectiveX=%.9f effectiveY=%.9f effectiveZ=%.9f eccentricFrozen=%u discharge=0\n",
             static_cast<unsigned long long>(s.session),s.frame.toolLengthMode,s.frame.toolHCode,
             s.frame.toolOffsetMM[0],s.frame.toolOffsetMM[1],s.frame.toolOffsetMM[2],
             s.request.geometry.frame.fixedEccentric?s.request.geometry.frame.signedEccentricOffset[0]:NCTranslationToolOffsetMM(s.frame,0U),
             s.request.geometry.frame.fixedEccentric?s.request.geometry.frame.signedEccentricOffset[1]:NCTranslationToolOffsetMM(s.frame,1U),
             s.request.geometry.frame.fixedEccentric?s.request.geometry.frame.signedEccentricOffset[2]:NCTranslationToolOffsetMM(s.frame,2U),
             s.request.geometry.frame.fixedEccentric?1U:0U);
-        PrintParent(s.sourceG,"event=WORK_OFFSETS session=%llu mode=%d W=%d X=%.9f Y=%.9f Z=%.9f yawDeg=%.9f pitchDeg=%.9f rollDeg=%.9f centerU=%.9f centerV=%.9f discharge=0\n",
+        PrintParent(s.sourceG,s.sourceP,"event=WORK_OFFSETS session=%llu mode=%d W=%d X=%.9f Y=%.9f Z=%.9f yawDeg=%.9f pitchDeg=%.9f rollDeg=%.9f centerU=%.9f centerV=%.9f discharge=0\n",
             static_cast<unsigned long long>(s.session),s.frame.workMode,s.frame.workWCode,
             s.frame.workOffset[0],s.frame.workOffset[1],s.frame.workOffset[2],
             s.frame.workOffset[3],s.frame.workOffset[4],s.frame.workOffset[5],
             s.frame.workRotationCenterMM[0],s.frame.workRotationCenterMM[1]);
-        PrintParent(s.sourceG,"event=SCALE_FRAME session=%llu mode=%d factor=%.9f centerX=%.9f centerY=%.9f centerZ=%.9f discharge=0\n",
+        PrintParent(s.sourceG,s.sourceP,"event=SCALE_FRAME session=%llu mode=%d factor=%.9f centerX=%.9f centerY=%.9f centerZ=%.9f discharge=0\n",
             static_cast<unsigned long long>(s.session),s.frame.scalingMode,s.frame.scalingFactor,
             s.frame.scalingCenterMM[0],s.frame.scalingCenterMM[1],s.frame.scalingCenterMM[2]);
-        PrintParent(s.sourceG,"event=MIRROR_FRAME session=%llu mask=%u centerX=%.9f centerY=%.9f centerZ=%.9f discharge=0\n",
+        PrintParent(s.sourceG,s.sourceP,"event=MIRROR_FRAME session=%llu mask=%u centerX=%.9f centerY=%.9f centerZ=%.9f discharge=0\n",
             static_cast<unsigned long long>(s.session),static_cast<unsigned>(s.frame.mirrorMask),
             s.frame.mirrorCenterMM[0],s.frame.mirrorCenterMM[1],s.frame.mirrorCenterMM[2]);
+    }else if(timedContour){
+        if(s.sourceP==15U)PrintParent(s.sourceG,s.sourceP,"event=BEGIN session=%llu pc=%d P=15 geometry=ORBIT_CONTOUR nativeR=%.9f contourAngleDeg=%.9f F=%.9f B=%u inheritedB=%u nominalLegs=25 additional=TERMINAL_VECTOR_DIAMOND sideLegs=4 corner=EXACT_STOP plane=TARGET_NORMAL vector=COMPLETE_CONTOUR directionalClipping=0 depthGrowReplay=0 discharge=0\n",
+            static_cast<unsigned long long>(s.session),s.pc,s.request.geometry.radiusMm,
+            s.pathSource.has('K')?s.pathSource.val('K'):0.0,s.request.feedMmMin,
+            s.request.retreatMode,s.prepared.inheritedB?1U:0U);
+        else if(s.sourceP==14U)PrintParent(s.sourceG,s.sourceP,"event=BEGIN session=%llu pc=%d P=14 geometry=ORBIT_CONTOUR nativeR=%.9f contourAngleDeg=%.9f F=%.9f B=%u inheritedB=%u nominalLegs=25 additional=TERMINAL_VECTOR_SQUARE sideLegs=4 corner=EXACT_STOP plane=TARGET_NORMAL vector=COMPLETE_CONTOUR directionalClipping=0 depthGrowReplay=0 discharge=0\n",
+            static_cast<unsigned long long>(s.session),s.pc,s.request.geometry.radiusMm,
+            s.pathSource.has('K')?s.pathSource.val('K'):0.0,s.request.feedMmMin,
+            s.request.retreatMode,s.prepared.inheritedB?1U:0U);
+        else if(s.sourceP==13U)PrintParent(s.sourceG,s.sourceP,"event=BEGIN session=%llu pc=%d P=13 geometry=ORBIT_CONTOUR nativeR=%.9f contourAngleDeg=%.9f F=%.9f B=%u inheritedB=%u nominalLegs=25 additional=TERMINAL_DIAMOND sideLegs=4 corner=EXACT_STOP plane=TARGET_NORMAL depthGrowReplay=0 discharge=0\n",
+            static_cast<unsigned long long>(s.session),s.pc,s.request.geometry.radiusMm,
+            s.pathSource.has('K')?s.pathSource.val('K'):0.0,s.request.feedMmMin,
+            s.request.retreatMode,s.prepared.inheritedB?1U:0U);
+        else if(s.sourceP==12U)PrintParent(s.sourceG,s.sourceP,"event=BEGIN session=%llu pc=%d P=12 geometry=ORBIT_CONTOUR nativeR=%.9f contourAngleDeg=%.9f F=%.9f B=%u inheritedB=%u nominalLegs=25 additional=TERMINAL_SQUARE sideLegs=4 corner=EXACT_STOP plane=TARGET_NORMAL depthGrowReplay=0 discharge=0\n",
+            static_cast<unsigned long long>(s.session),s.pc,s.request.geometry.radiusMm,
+            s.pathSource.has('K')?s.pathSource.val('K'):0.0,s.request.feedMmMin,
+            s.request.retreatMode,s.prepared.inheritedB?1U:0U);
+        else
+        PrintParent(s.sourceG,s.sourceP,"event=BEGIN session=%llu pc=%d P=11 geometry=ORBIT_CONTOUR nativeR=%.9f contourAngleDeg=%.9f F=%.9f B=%u inheritedB=%u nominalLegs=25 additional=TERMINAL_ANALYTIC_CIRCLE depthGrowReplay=0 discharge=0\n",
+            static_cast<unsigned long long>(s.session),s.pc,s.request.geometry.radiusMm,
+            s.pathSource.has('K')?s.pathSource.val('K'):0.0,s.request.feedMmMin,
+            s.request.retreatMode,s.prepared.inheritedB?1U:0U);
+        PrintParent(s.sourceG,s.sourceP,"event=PROCESS_PATH session=%llu valid=%u pathMm=%.9f kind=ORBIT_CONTOUR gap=0 discharge=0\n",
+            static_cast<unsigned long long>(s.session),s.path.valid?1U:0U,s.path.totalLengthMm);
     }else{
-        PrintParent(s.sourceG,"event=BEGIN session=%llu pc=%d layers=%u R=%.9f K=%.9f F=%.9f B=%u inheritedB=%u radiusLaw=R_MINUS_DEPTH contour=ANALYTIC_CIRCLE discharge=0\n",
+        PrintParent(s.sourceG,s.sourceP,"event=BEGIN session=%llu pc=%d layers=%u R=%.9f K=%.9f F=%.9f B=%u inheritedB=%u radiusLaw=R_MINUS_DEPTH contour=ANALYTIC_CIRCLE discharge=0\n",
             static_cast<unsigned long long>(s.session),s.pc,s.request.geometry.circleLayerCount,
             s.request.geometry.radiusMm,s.request.geometry.layerStepMm,s.request.feedMmMin,s.request.retreatMode,s.prepared.inheritedB?1U:0U);
-        PrintParent(s.sourceG,"event=PROCESS_PATH session=%llu valid=%u pathMm=%.9f nativeR=%.9f nativeK=%.9f gap=0 discharge=0\n",
+        PrintParent(s.sourceG,s.sourceP,"event=PROCESS_PATH session=%llu valid=%u pathMm=%.9f nativeR=%.9f nativeK=%.9f gap=0 discharge=0\n",
             static_cast<unsigned long long>(s.session),s.path.valid?1U:0U,s.path.totalLengthMm,
             s.request.geometry.radiusMm,s.request.geometry.layerStepMm);
     }
     TraceG76SphereStartupSameThread(48U,"SOURCE_LOGS_DONE");
     const auto& binding=s.gapBinding;const auto& config=binding.config;
-    PrintParent(s.sourceG,"event=GAP_BINDING session=%llu enabled=%u reason=%s error=%s field=%u recipe=%llu tuning=%llu E5us=%llu E6mm=%.6f E7pct=%.3f E8pct=%.3f E9V=%.3f source=SOFTWARE_SIMULATION AD=0 motionApplied=0 discharge=0\n",
+    if(NCMachiningTime::Enabled(s.machiningTime))
+        PrintParent(s.sourceG,s.sourceP,"event=TIME_CONFIG session=%llu totalLimitUs=%llu additionalUs=%llu scope=THIS_PARENT H=VALID_PROCESS_TIME HOLD=PAUSED timeLimit=CONTROLLED_STOP alarm=4040 discharge=0\n",
+            static_cast<unsigned long long>(s.session),static_cast<unsigned long long>(s.request.totalLimitUs),
+            static_cast<unsigned long long>(s.request.additionalUs));
+    if(config.orbitFeedsEnabled&&s.sourceG==76&&s.sourceP==15U)
+        PrintParent(s.sourceG,s.sourceP,"event=ORBIT_FEED_CONFIG session=%llu cuttingScale=%.9f machiningPct=%.6f orbitScale=%.9f orbitPct=%.6f FcapMmMin=%.6f grow=ORBIT entry=ORBIT vectorDiamondSides=ORBIT return=RETURN multiplier=ONCE source=SOFTWARE_SIMULATION discharge=0\n",
+            static_cast<unsigned long long>(s.session),config.curve.cuttingScaleMmPerVoltMin,
+            config.machiningOverridePercent,config.orbitScaleMmPerVoltMin,config.orbitOverridePercent,s.request.feedMmMin);
+    else if(config.orbitFeedsEnabled&&s.sourceG==76&&s.sourceP==14U)
+        PrintParent(s.sourceG,s.sourceP,"event=ORBIT_FEED_CONFIG session=%llu cuttingScale=%.9f machiningPct=%.6f orbitScale=%.9f orbitPct=%.6f FcapMmMin=%.6f grow=ORBIT entry=ORBIT vectorSquareSides=ORBIT return=RETURN multiplier=ONCE source=SOFTWARE_SIMULATION discharge=0\n",
+            static_cast<unsigned long long>(s.session),config.curve.cuttingScaleMmPerVoltMin,
+            config.machiningOverridePercent,config.orbitScaleMmPerVoltMin,config.orbitOverridePercent,s.request.feedMmMin);
+    else if(config.orbitFeedsEnabled&&s.sourceG==76&&s.sourceP==13U)
+        PrintParent(s.sourceG,s.sourceP,"event=ORBIT_FEED_CONFIG session=%llu cuttingScale=%.9f machiningPct=%.6f orbitScale=%.9f orbitPct=%.6f FcapMmMin=%.6f grow=ORBIT entry=ORBIT diamondSides=ORBIT return=RETURN multiplier=ONCE source=SOFTWARE_SIMULATION discharge=0\n",
+            static_cast<unsigned long long>(s.session),config.curve.cuttingScaleMmPerVoltMin,
+            config.machiningOverridePercent,config.orbitScaleMmPerVoltMin,config.orbitOverridePercent,s.request.feedMmMin);
+    else if(config.orbitFeedsEnabled&&s.sourceG==76&&s.sourceP==12U)
+        PrintParent(s.sourceG,s.sourceP,"event=ORBIT_FEED_CONFIG session=%llu cuttingScale=%.9f machiningPct=%.6f orbitScale=%.9f orbitPct=%.6f FcapMmMin=%.6f grow=ORBIT entry=ORBIT squareSides=ORBIT return=RETURN multiplier=ONCE source=SOFTWARE_SIMULATION discharge=0\n",
+            static_cast<unsigned long long>(s.session),config.curve.cuttingScaleMmPerVoltMin,
+            config.machiningOverridePercent,config.orbitScaleMmPerVoltMin,config.orbitOverridePercent,s.request.feedMmMin);
+    else if(config.orbitFeedsEnabled)
+        PrintParent(s.sourceG,s.sourceP,"event=ORBIT_FEED_CONFIG session=%llu cuttingScale=%.9f machiningPct=%.6f orbitScale=%.9f orbitPct=%.6f FcapMmMin=%.6f depth=CUTTING entry=ORBIT circle=ORBIT multiplier=ONCE source=SOFTWARE_SIMULATION discharge=0\n",
+            static_cast<unsigned long long>(s.session),config.curve.cuttingScaleMmPerVoltMin,
+            config.machiningOverridePercent,config.orbitScaleMmPerVoltMin,config.orbitOverridePercent,s.request.feedMmMin);
+    PrintParent(s.sourceG,s.sourceP,"event=GAP_BINDING session=%llu enabled=%u reason=%s error=%s field=%u recipe=%llu tuning=%llu E5us=%llu E6mm=%.6f E7pct=%.3f E8pct=%.3f E9V=%.3f source=SOFTWARE_SIMULATION AD=0 motionApplied=0 discharge=0\n",
         static_cast<unsigned long long>(s.session),binding.ready?1U:0U,NCG76SphereGapBinding::ReasonName(binding.reason),
         EDM58::BindingErrorName(binding.error),binding.failedFieldId,static_cast<unsigned long long>(config.recipeGeneration),
         static_cast<unsigned long long>(config.tuningGeneration),static_cast<unsigned long long>(config.workTimeUs),
         config.jumpHeightMm,config.jumpSpeedPercent,config.machiningOverridePercent,config.referenceV);
-    PrintParent(s.sourceG,"event=SIM_MOTION_CONFIG session=%llu enabled=%u domain=%s historyCapacity=%u nominalParentOnly=1 work=%s E5=NOMINAL_FORWARD_ONLY source=SOFTWARE_SIMULATION AD=0 discharge=0\n",
+    PrintParent(s.sourceG,s.sourceP,"event=SIM_MOTION_CONFIG session=%llu enabled=%u domain=%s historyCapacity=%u nominalParentOnly=1 work=%s E5=NOMINAL_FORWARD_ONLY source=SOFTWARE_SIMULATION AD=0 discharge=0\n",
         static_cast<unsigned long long>(s.session),binding.ready&&config.signedMotionEnabled?1U:0U,
         processPath?"SOURCE_AND_RELEASED_PREDECESSOR_B2":"PREVIOUS_COMPLETED_LEG",1U,
-        processPath?"SOURCE_FORWARD":"INITIAL_DEPTH_CIRCLE_ENTRY_ORBIT");
+        processPath?"SOURCE_FORWARD":timedContour?(s.sourceP==15U?"P15_25_EXACT_STOP_LEGS":s.sourceP==14U?"P14_25_EXACT_STOP_LEGS":s.sourceP==13U?"P13_25_EXACT_STOP_LEGS":s.sourceP==12U?"P12_25_EXACT_STOP_LEGS":"P11_25_EXACT_STOP_LEGS"):"INITIAL_DEPTH_CIRCLE_ENTRY_ORBIT");
     TraceG76SphereStartupSameThread(49U,"RECIPE_LOGS_DONE");
     NCG76SphereCycle::FlushConfig flush{};
     const bool flushReady=NCG76SphereGapProcess::BuildFlushConfig(config,s.request.feedMmMin,flush)&&flush.enabled;
     const char* route=s.request.retreatMode==2U?"SAME_PARENT_PATH":s.request.retreatMode==3U?
         (processPath?"CENTERLINE_AXIS_COALESCED":"CENTER_THEN_AXIS"):s.request.retreatMode==4U?
         (processPath?"CENTERLINE_DIAGONAL_COALESCED":"DIAGONAL_CENTER_THEN_AXIS"):s.request.retreatMode==1U?
-        "MACHINE_POSITIVE_Z":processPath?"OPPOSITE_STOPPED_TANGENT":"OPPOSITE_NATIVE_CUT_AXIS";
-    PrintParent(s.sourceG,"event=FLUSH_CONFIG session=%llu enabled=%u B=%u route=%s heightMm=%.6f feedMmMin=%.6f zeroSamples=%u historyShort=DEFER source=SOFTWARE_SIMULATION discharge=0\n",
+        "MACHINE_POSITIVE_Z":(processPath||s.sourceP==12U||s.sourceP==13U||s.sourceP==14U||s.sourceP==15U)?"OPPOSITE_STOPPED_TANGENT":"OPPOSITE_NATIVE_CUT_AXIS";
+    PrintParent(s.sourceG,s.sourceP,"event=FLUSH_CONFIG session=%llu enabled=%u B=%u route=%s heightMm=%.6f feedMmMin=%.6f zeroSamples=%u historyShort=DEFER source=SOFTWARE_SIMULATION discharge=0\n",
         static_cast<unsigned long long>(s.session),flushReady?1U:0U,s.request.retreatMode,route,
         flushReady?flush.heightMm:0.0,flushReady?flush.feedMmMin:0.0,s.request.settleSamples);
     TraceG76SphereStartupSameThread(50U,"FLUSH_LOG_DONE");
     // Cooked native feeds are frozen once with this parent. A disabled E11/E13
     // approach is explicit metadata; it never rewrites a stored raw recipe.
-    PrintParent(s.sourceG,"event=FLUSH_SPEED_CONFIG session=%llu independent=%u Pump1=%.6f Pump2=%.6f Pump3=%.6f Pump4=%.6f Pump5=%.6f approachEnabled=%u reason=%s field=%u E11pct=%.3f E13mm=%.6f nativeBase=%.6g final=%.6f unit=mm/min source=SOFTWARE_SIMULATION discharge=0\n",
+    PrintParent(s.sourceG,s.sourceP,"event=FLUSH_SPEED_CONFIG session=%llu independent=%u Pump1=%.6f Pump2=%.6f Pump3=%.6f Pump4=%.6f Pump5=%.6f approachEnabled=%u reason=%s field=%u E11pct=%.3f E13mm=%.6f nativeBase=%.6g final=%.6f unit=mm/min source=SOFTWARE_SIMULATION discharge=0\n",
         static_cast<unsigned long long>(s.session),flushReady&&flush.independentFeedsEnabled?1U:0U,
         flush.centerRetreatFeedMmMin,flush.axisRetreatFeedMmMin,flush.centerReturnFeedMmMin,
         flush.axisReturnFeedMmMin,flush.pathRetreatFeedMmMin,flushReady&&flush.finalApproachEnabled?1U:0U,
@@ -1069,25 +1383,25 @@ WaitConditionFunc NCManager::StartG76SphereSameThread(const NCBlock& block)
             ((binding.resolvedE11Percent/100.0)*(config.jumpSpeedPercent/100.0));
         if(std::isfinite(scaled)&&scaled>0.0)resolvedApproachCap=(std::min)(s.request.feedMmMin,scaled);
     }
-    PrintParent(s.sourceG,"event=E11_PERCENT_CONFIG session=%llu E11pct=%.6g unit=%% source=%s basis=NATIVE_PUMP_STG_AND_E7 nativeBase=%.6g E7pct=%.6g resolvedCapMmMin=%.6g approachEnabled=%u distanceZeroSentinel=%u discharge=0\n",
+    PrintParent(s.sourceG,s.sourceP,"event=E11_PERCENT_CONFIG session=%llu E11pct=%.6g unit=%% source=%s basis=NATIVE_PUMP_STG_AND_E7 nativeBase=%.6g E7pct=%.6g resolvedCapMmMin=%.6g approachEnabled=%u distanceZeroSentinel=%u discharge=0\n",
         static_cast<unsigned long long>(s.session),binding.resolvedE11Percent,
         NCG76SphereGapBinding::E11UnitSourceName(binding.e11UnitSource),config.flushProfile.finalApproachMmPerMin,
         config.jumpSpeedPercent,resolvedApproachCap,flushReady&&flush.finalApproachEnabled?1U:0U,
         binding.distanceZeroSentinel?1U:0U);
     TraceG76SphereStartupSameThread(52U,"E11_LOG_DONE");
-    PrintParent(s.sourceG,"event=APPROACH_CONFIG session=%llu status=%s reason=%s error=%s field=%u E11field=%u E13field=%u rawE11=%lld rawE13=%lld rawOnlyWhenDisabled=1 discharge=0\n",
+    PrintParent(s.sourceG,s.sourceP,"event=APPROACH_CONFIG session=%llu status=%s reason=%s error=%s field=%u E11field=%u E13field=%u rawE11=%lld rawE13=%lld rawOnlyWhenDisabled=1 discharge=0\n",
         static_cast<unsigned long long>(s.session),flushReady&&flush.finalApproachEnabled?"APPROACH_ENABLED":"APPROACH_DISABLED",
         NCG76SphereGapBinding::ApproachReasonName(binding.approachReason),EDM58::BindingErrorName(binding.approachError),
         binding.approachFailedFieldId,binding.approachFields[0],binding.approachFields[1],
         static_cast<long long>(binding.approachValues[0]),static_cast<long long>(binding.approachValues[1]));
-    PrintParent(s.sourceG,"event=INITIAL_SLOW_CONFIG session=%llu enabled=%u reason=%s error=%s field=%u E19field=%u E20field=%u rawE19=%lld rawE20=%lld activeE19pct=%.6g activeE20mm=%.6g nativeBase=%.6g capMmMin=%.6g unit=mm/min discharge=0\n",
+    PrintParent(s.sourceG,s.sourceP,"event=INITIAL_SLOW_CONFIG session=%llu enabled=%u reason=%s error=%s field=%u E19field=%u E20field=%u rawE19=%lld rawE20=%lld activeE19pct=%.6g activeE20mm=%.6g nativeBase=%.6g capMmMin=%.6g unit=mm/min discharge=0\n",
         static_cast<unsigned long long>(s.session),flushReady&&flush.initialSlowEnabled?1U:0U,
         NCG76SphereGapBinding::ApproachReasonName(binding.initialSlowReason),EDM58::BindingErrorName(binding.initialSlowError),
         binding.initialSlowFailedFieldId,binding.initialSlowFields[0],binding.initialSlowFields[1],
         static_cast<long long>(binding.initialSlowValues[0]),static_cast<long long>(binding.initialSlowValues[1]),
         config.initialSlowPercent,config.initialSlowDistanceMm,config.flushProfile.initialSlowMmPerMin,
         flush.initialSlowFeedMmMin);
-    PrintParent(s.sourceG,"event=DEEP_FLUSH_CONFIG session=%llu enabled=%u reason=%s error=%s field=%u E21field=%u E22field=%u rawE21=%lld rawE22=%lld activePeriod=%u activeFactor=%.6g baseHeightMm=%.12f deepHeightMm=%.12f scope=%s count=SUCCESS_ONLY discharge=0\n",
+    PrintParent(s.sourceG,s.sourceP,"event=DEEP_FLUSH_CONFIG session=%llu enabled=%u reason=%s error=%s field=%u E21field=%u E22field=%u rawE21=%lld rawE22=%lld activePeriod=%u activeFactor=%.6g baseHeightMm=%.12f deepHeightMm=%.12f scope=%s count=SUCCESS_ONLY discharge=0\n",
         static_cast<unsigned long long>(s.session),flushReady&&flush.deepFlushEnabled?1U:0U,
         NCG76SphereGapBinding::DeepFlushReasonName(binding.deepFlushReason),EDM58::BindingErrorName(binding.deepFlushError),
         binding.deepFlushFailedFieldId,binding.deepFlushFields[0],binding.deepFlushFields[1],
@@ -1122,7 +1436,7 @@ bool NCManager::ValidateG76SphereWaitCallbackSameThread(WaitConditionFunc callba
     const WaitConditionFunc target=WaitForG76SphereCallback;
     static_assert(sizeof(callback)<=sizeof(actual),"Callback diagnostic requires a bounded x64 pointer.");
     std::memcpy(&actual,&callback,sizeof(callback));std::memcpy(&expected,&target,sizeof(target));
-    PrintParent(s.sourceG,"event=WAIT_CALLBACK_REJECT session=%llu pc=%d callback=0x%llx expected=0x%llx invoked=0 discharge=0\n",
+    PrintParent(s.sourceG,s.sourceP,"event=WAIT_CALLBACK_REJECT session=%llu pc=%d callback=0x%llx expected=0x%llx invoked=0 discharge=0\n",
         static_cast<unsigned long long>(s.session),s.pc,static_cast<unsigned long long>(actual),
         static_cast<unsigned long long>(expected));
     // Clear the saved pointer before rejection retires active state. A later
@@ -1161,13 +1475,13 @@ void NCManager::TraceG76SphereReturnProbeSameThread(NCReturnProbe& probe,const c
             if(mismatch)ReadStartupStackPattern(probe.slot,s.frame,pattern);
             probe.loggedSession=context;
             if(mismatch)probe.mismatchLoggedSession=context;
-            PrintParent(s.sourceG,"event=RETURN_PROBE session=%llu pc=%d frame=%.16s stage=%u available=%u status=%s slot=0x%llx expected=0x%llx actual=0x%llx readBytes=%u action=OBSERVE_ONLY discharge=0\n",
+            PrintParent(s.sourceG,s.sourceP,"event=RETURN_PROBE session=%llu pc=%d frame=%.16s stage=%u available=%u status=%s slot=0x%llx expected=0x%llx actual=0x%llx readBytes=%u action=OBSERVE_ONLY discharge=0\n",
                 static_cast<unsigned long long>(s.session),s.pc,frame,stage,read?1U:0U,
                 !read?"UNAVAILABLE":mismatch?"MISMATCH":"MATCH",
                 static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(probe.slot)),
                 static_cast<unsigned long long>(probe.expected),static_cast<unsigned long long>(actual),
                 read?static_cast<unsigned>(sizeof(actual)):0U);
-            if(mismatch)PrintParent(s.sourceG,"event=RETURN_PATTERN session=%llu frame=%.16s stage=%u readable=%u bytes=%u matched=%u exactSnapshot=%u q0=0x%llx q1=0x%llx q2=0x%llx q3=0x%llx expectedRun=%llu action=OBSERVE_ONLY discharge=0\n",
+            if(mismatch)PrintParent(s.sourceG,s.sourceP,"event=RETURN_PATTERN session=%llu frame=%.16s stage=%u readable=%u bytes=%u matched=%u exactSnapshot=%u q0=0x%llx q1=0x%llx q2=0x%llx q3=0x%llx expectedRun=%llu action=OBSERVE_ONLY discharge=0\n",
                 static_cast<unsigned long long>(s.session),frame,stage,pattern.readable?1U:0U,
                 pattern.readable?static_cast<unsigned>(sizeof(s.frame)):0U,pattern.matchedBytes,
                 pattern.readable&&pattern.matchedBytes==sizeof(s.frame)?1U:0U,
@@ -1204,7 +1518,7 @@ void NCManager::TraceG76SphereStartupSameThread(unsigned stage,const char* name)
     // This helper is reached only by NC. At most 64 stage records per parent,
     // plus at most two return-probe records for each of the two NC frames.
     // No RT printing, allocation, stack query, or timing-guard modification.
-    PrintParent(s.sourceG,"event=STARTUP_STAGE session=%llu pc=%d stage=%u name=%.32s callback=0x%llx expected=0x%llx match=%u sizeNC=%llu sizeSnapshot=%llu sizeFeedback=%llu discharge=0\n",
+    PrintParent(s.sourceG,s.sourceP,"event=STARTUP_STAGE session=%llu pc=%d stage=%u name=%.32s callback=0x%llx expected=0x%llx match=%u sizeNC=%llu sizeSnapshot=%llu sizeFeedback=%llu discharge=0\n",
         static_cast<unsigned long long>(s.session),s.pc,stage,name,
         static_cast<unsigned long long>(actual),static_cast<unsigned long long>(expected),callback==target?1U:0U,
         static_cast<unsigned long long>(sizeof(NCManager)),static_cast<unsigned long long>(sizeof(NCTranslationSnapshot)),
@@ -1242,7 +1556,7 @@ void NCManager::CommitG76SphereCaptureSameThread(NCBlockDispatchId dispatch,cons
     m_edm171Air->history.Clear();ClearPathCoreReplayHistorySameThread();InvalidatePathCoreReturnCursorSameThread();
     m_g76Modal.lease=s.owner;m_g76Modal.run=s.run;m_g76Modal.cache=s.cache;m_g76Modal.commit=s.commit;
     m_g76Modal.mode=s.prepared.requestedB;m_g76Modal.valid=true;
-    PrintParent(s.sourceG,"event=BOUND session=%llu dispatch=%llu commit=%llu children=1 discharge=0\n",
+    PrintParent(s.sourceG,s.sourceP,"event=BOUND session=%llu dispatch=%llu commit=%llu children=1 discharge=0\n",
         static_cast<unsigned long long>(s.session),static_cast<unsigned long long>(s.dispatch),static_cast<unsigned long long>(s.commit));
 }
 
@@ -1261,7 +1575,14 @@ void NCManager::ServiceG76SphereSameThread()
     TraceG76SphereStartupSameThread(G76SphereStartupFeedbackReadEnd,"FEEDBACK_READ_END");
     // Preserve the original RT failure before a resulting alarm/epoch change
     // invalidates the NC scope. All original scope checks still run below.
-    if(matching&&FailedSphereFeedback(observed))PrintSphereRuntimeFailure(observed,s.request,s.line,s.sourceG);
+    if(matching&&FailedSphereFeedback(observed))PrintSphereRuntimeFailure(observed,s.request,s.line,s.sourceG,s.sourceP);
+    if(matching&&MotionG76SphereMachiningTime::TimeLimitStoppedQualified(observed,s.request)){
+        s.feedback=observed;
+        PrintParent(s.sourceG,s.sourceP,"event=TIME_LIMIT session=%llu tick=%llu totalElapsedUs=%llu totalLimitUs=%llu endpointCommitted=0 alarm=4040 discharge=0\n",
+            static_cast<unsigned long long>(s.session),static_cast<unsigned long long>(observed.cycle.tick),
+            static_cast<unsigned long long>(observed.cycle.totalElapsedUs),static_cast<unsigned long long>(observed.cycle.totalLimitUs));
+        RejectG76SphereSameThread("MACHINING_TIME_LIMIT",AlarmManager::EDM_MACHINING_TIME_LIMIT);return;
+    }
     TraceG76SphereStartupSameThread(G76SphereStartupScopeCheckBegin,"SCOPE_CHECK_BEGIN");
     const bool scopeCurrent=IsG76SphereScopeCurrentSameThread();
     TraceG76SphereStartupSameThread(G76SphereStartupScopeCheckEnd,"SCOPE_CHECK_END");
@@ -1275,7 +1596,7 @@ void NCManager::ServiceG76SphereSameThread()
     if(recipeChanged){
         s.gapShadowRevoked=true;s.gapBinding.ready=false;
         (void)m_motion.RevokeG76SphereProcessShadow(s.session,s.identity,s.owner);
-        PrintParent(s.sourceG,"event=SIM_GAP_WITHDRAWN session=%llu reason=RECIPE_OR_TUNING_CHANGED rearm=NEXT_PARENT motionApplied=0 discharge=0\n",
+        PrintParent(s.sourceG,s.sourceP,"event=SIM_GAP_WITHDRAWN session=%llu reason=RECIPE_OR_TUNING_CHANGED rearm=NEXT_PARENT motionApplied=0 discharge=0\n",
             static_cast<unsigned long long>(s.session));
     }
     if(!matching){
@@ -1284,6 +1605,7 @@ void NCManager::ServiceG76SphereSameThread()
     const bool flushLegChanged=s.feedback.cycle.flushLegSequence!=observed.cycle.flushLegSequence;
     const bool approachChanged=s.feedback.cycle.flushApproachActive!=observed.cycle.flushApproachActive;
     const bool initialSlowChanged=s.feedback.cycle.flushInitialSlowActive!=observed.cycle.flushInitialSlowActive;
+    const bool feedSelectionChanged=s.feedback.processShadow.selectedFeedRole!=observed.processShadow.selectedFeedRole;
     const bool probeChanged=s.feedback.processShadow.probePhase!=observed.processShadow.probePhase||
         s.feedback.processShadow.valid!=observed.processShadow.valid;
     s.feedback=observed;
@@ -1299,6 +1621,19 @@ void NCManager::ServiceG76SphereSameThread()
     if(FailedSphereFeedback(observed)){
         RejectG76SphereSameThread("RUNTIME_FAULT",AlarmManager::PATH_EXECUTION_NOT_READY);return;
     }
+    if(observed.started&&observed.cycle.session==s.session&&NCMachiningTime::Enabled(s.machiningTime)){
+        const auto& f=observed.cycle;const auto second=f.totalElapsedUs/1000000ULL;
+        if(!s.timeLogInitialized||s.timeLoggedPhase!=f.timePhase||s.timeLoggedTotalState!=f.totalTimerState||
+           s.timeLoggedAdditionalState!=f.additionalTimerState||s.timeLoggedSecond!=second){
+            s.timeLogInitialized=true;s.timeLoggedPhase=f.timePhase;s.timeLoggedTotalState=f.totalTimerState;
+            s.timeLoggedAdditionalState=f.additionalTimerState;s.timeLoggedSecond=second;
+            if(s.timeDiagnosticEvents++<192U)PrintParent(s.sourceG,s.sourceP,"event=TIME_STATE session=%llu tick=%llu phase=%u totalState=%u totalElapsedUs=%llu totalRemainingUs=%llu additionalState=%u additionalElapsedUs=%llu additionalRemainingUs=%llu totalPause=%u additionalPause=%u discharge=0\n",
+                static_cast<unsigned long long>(s.session),static_cast<unsigned long long>(f.tick),static_cast<unsigned>(f.timePhase),static_cast<unsigned>(f.totalTimerState),
+                static_cast<unsigned long long>(f.totalElapsedUs),static_cast<unsigned long long>(f.totalLimitUs-f.totalElapsedUs),
+                static_cast<unsigned>(f.additionalTimerState),static_cast<unsigned long long>(f.additionalElapsedUs),static_cast<unsigned long long>(f.additionalUs-f.additionalElapsedUs),
+                static_cast<unsigned>(f.totalPauseReason),static_cast<unsigned>(f.additionalPauseReason));
+        }
+    }
     if(s.finishRequiredCount&&observed.started&&observed.cycle.session==s.session){
         const auto& f=observed.cycle;
         if(!s.finishLogInitialized||s.finishLoggedPhase!=f.finishPhase||s.finishLoggedVerified!=f.finishVerifiedCount||
@@ -1307,7 +1642,7 @@ void NCManager::ServiceG76SphereSameThread()
             s.finishLogInitialized=true;s.finishLoggedPhase=f.finishPhase;s.finishLoggedVerified=f.finishVerifiedCount;
             s.finishLoggedAttempt=f.finishAttemptCount;s.finishLoggedCompleted=f.finishForcedCompletedCount;
             s.finishLoggedRework=f.finishReworkCount;
-            PrintParent(s.sourceG,"event=FINISH_VERIFY session=%llu tick=%llu required=%u verified=%u phase=%u active=%u attempts=%llu forcedCompleted=%llu reworks=%llu origin=%u E5=SUSPENDED_DURING_FINISH discharge=0\n",
+            PrintParent(s.sourceG,s.sourceP,"event=FINISH_VERIFY session=%llu tick=%llu required=%u verified=%u phase=%u active=%u attempts=%llu forcedCompleted=%llu reworks=%llu origin=%u E5=SUSPENDED_DURING_FINISH discharge=0\n",
                 static_cast<unsigned long long>(s.session),static_cast<unsigned long long>(f.tick),s.finishRequiredCount,
                 f.finishVerifiedCount,static_cast<unsigned>(f.finishPhase),f.finishActive?1U:0U,
                 static_cast<unsigned long long>(f.finishAttemptCount),static_cast<unsigned long long>(f.finishForcedCompletedCount),
@@ -1316,12 +1651,12 @@ void NCManager::ServiceG76SphereSameThread()
     }
     if(s.sourceG!=76&&observed.started&&observed.cycle.session==s.session&&!s.processSeedLogged){
         s.processSeedLogged=true;
-        PrintParent(s.sourceG,"event=CHAIN_SEED session=%llu initialIntervalWorkUs=%llu completedFlushOffset=%llu previousParentReady=%u previousSession=%llu previousPC=%d historyCapacity=1 E5=NOMINAL_FORWARD_ONLY ordinal=SUCCESS_ONLY discharge=0\n",
+        PrintParent(s.sourceG,s.sourceP,"event=CHAIN_SEED session=%llu initialIntervalWorkUs=%llu completedFlushOffset=%llu previousParentReady=%u previousSession=%llu previousPC=%d historyCapacity=1 E5=NOMINAL_FORWARD_ONLY ordinal=SUCCESS_ONLY discharge=0\n",
             static_cast<unsigned long long>(s.session),static_cast<unsigned long long>(observed.initialIntervalWorkUs),
             static_cast<unsigned long long>(observed.completedFlushOffset),
             observed.cycle.previousParentHistoryReady?1U:0U,
             static_cast<unsigned long long>(observed.previousParentSession),observed.previousParentPC);
-        PrintParent(s.sourceG,"event=SIM_TEST_POLICY session=%llu mode=%s probe=%s targetMaxMm=%.6f source=SOFTWARE_SIMULATION motionAuthority=UNCHANGED discharge=0\n",
+        PrintParent(s.sourceG,s.sourceP,"event=SIM_TEST_POLICY session=%llu mode=%s probe=%s targetMaxMm=%.6f source=SOFTWARE_SIMULATION motionAuthority=UNCHANGED discharge=0\n",
             static_cast<unsigned long long>(s.session),
             NCG76SphereGapProcess::SimulationModeName(observed.processShadow.simulationMode),
             NCG76SphereGapProcess::ProbePhaseName(observed.processShadow.probePhase),
@@ -1335,7 +1670,7 @@ void NCManager::ServiceG76SphereSameThread()
        probe.enabled&&probe.session==s.session&&probe.tick==cycle.tick&&
        probe.simulationMode==NCG76SphereGapProcess::SimulationMode::PreviousParentProbe&&
        probeChanged){
-        PrintParent(s.sourceG,"event=SIM_PROBE session=%llu phase=%s tick=%llu ready=%u entered=%llu returned=%llu previousProgressMm=%.9f previousLengthMm=%.9f commandX=%.9f commandY=%.9f commandZ=%.9f actualX=%.9f actualY=%.9f actualZ=%.9f source=SOFTWARE_SIMULATION discharge=0\n",
+        PrintParent(s.sourceG,s.sourceP,"event=SIM_PROBE session=%llu phase=%s tick=%llu ready=%u entered=%llu returned=%llu previousProgressMm=%.9f previousLengthMm=%.9f commandX=%.9f commandY=%.9f commandZ=%.9f actualX=%.9f actualY=%.9f actualZ=%.9f source=SOFTWARE_SIMULATION discharge=0\n",
             static_cast<unsigned long long>(s.session),NCG76SphereGapProcess::ProbePhaseName(probe.probePhase),
             static_cast<unsigned long long>(cycle.tick),cycle.previousParentHistoryReady?1U:0U,
             static_cast<unsigned long long>(cycle.historyBoundarySequence),
@@ -1347,7 +1682,7 @@ void NCManager::ServiceG76SphereSameThread()
     if(observed.started&&cycle.session==s.session){
         const auto printEvent=[&](const char* event,std::uint64_t sequence){
             if(s.flushDiagnosticEvents++<192U)
-                PrintParent(s.sourceG,"event=%s session=%llu request=%llu tick=%llu phase=%s completed=%llu checkpoint=%u B=%u leg=%llu selectionRequest=%llu selectionCurrent=%u ordinal=%llu heightMm=%.12f deep=%u source=SOFTWARE_SIMULATION discharge=0\n",
+                PrintParent(s.sourceG,s.sourceP,"event=%s session=%llu request=%llu tick=%llu phase=%s completed=%llu checkpoint=%u B=%u leg=%llu selectionRequest=%llu selectionCurrent=%u ordinal=%llu heightMm=%.12f deep=%u source=SOFTWARE_SIMULATION discharge=0\n",
                     event,static_cast<unsigned long long>(s.session),static_cast<unsigned long long>(sequence),
                     static_cast<unsigned long long>(cycle.tick),PhaseName(cycle.phase,s.sourceG),
                     static_cast<unsigned long long>(cycle.flushCount),cycle.flushCheckpointSaved?1U:0U,s.request.retreatMode,
@@ -1375,13 +1710,19 @@ void NCManager::ServiceG76SphereSameThread()
         const bool gapApplied=valid&&s.gapBinding.config.signedMotionEnabled&&
             cycle.session==s.session&&cycle.gapMotionEnabled&&cycle.gapApplied;
         if(valid)s.gapShadow=shadow;
+        if(valid&&s.gapBinding.config.orbitFeedsEnabled&&feedSelectionChanged&&s.orbitFeedDiagnosticEvents++<96U)
+            PrintParent(s.sourceG,s.sourceP,"event=FEED_SELECTION session=%llu tick=%llu nextGapRole=%s scale=%.9f overridePct=%.6f nextSignedTargetMmMin=%.6f phase=%s layer=%u history=%u flush=%u hold=%u discharge=0\n",
+                static_cast<unsigned long long>(s.session),static_cast<unsigned long long>(shadow.tick),
+                NCG76SphereGapProcess::FeedRoleName(shadow.selectedFeedRole),shadow.selectedScaleMmPerVoltMin,
+                shadow.selectedOverridePercent,shadow.signedGapSpeedMmMin,PhaseName(cycle.phase,s.sourceG),cycle.layerIndex,
+                cycle.gapHistoryActive?1U:0U,cycle.flushActive?1U:0U,cycle.holdActive?1U:0U);
         const int direction=valid?(shadow.signedGapSpeedMmMin>0.0?1:shadow.signedGapSpeedMmMin<0.0?-1:0):0;
         if(coherent&&(!s.gapDiagnosticInitialized||phaseChanged||s.gapLastDirection!=direction||
             s.gapLastValid!=valid||s.gapLastSuspended!=shadow.suspended)){
             s.gapDiagnosticInitialized=true;s.gapLastDirection=direction;s.gapLastValid=valid;
             s.gapLastSuspended=shadow.suspended;
             if(s.gapDiagnosticEvents++<64U)
-                PrintParent(s.sourceG,"event=SIM_GAP session=%llu tick=%llu valid=%u phase=%s layer=%u voltageV=%.3f signedTargetMmMin=%.6f eligible=%u suspended=%u simulatedWorkUs=%llu pending=%u reason=%s source=SOFTWARE_SIMULATION motionApplied=%u actualSignedMmMin=%.6f discharge=0\n",
+                PrintParent(s.sourceG,s.sourceP,"event=SIM_GAP session=%llu tick=%llu valid=%u phase=%s layer=%u voltageV=%.3f signedTargetMmMin=%.6f eligible=%u suspended=%u simulatedWorkUs=%llu pending=%u reason=%s source=SOFTWARE_SIMULATION motionApplied=%u actualSignedMmMin=%.6f discharge=0\n",
                     static_cast<unsigned long long>(s.session),static_cast<unsigned long long>(shadow.tick),valid?1U:0U,
                     PhaseName(observed.cycle.phase,s.sourceG),observed.cycle.layerIndex,valid?shadow.voltageV:0.0,
                     valid?shadow.signedGapSpeedMmMin:0.0,valid&&shadow.eligible?1U:0U,shadow.suspended?1U:0U,
@@ -1391,7 +1732,7 @@ void NCManager::ServiceG76SphereSameThread()
         }
         if(valid&&shadow.pending&&shadow.requestSequence>s.gapRequestLogged){
             s.gapRequestLogged=shadow.requestSequence;
-            PrintParent(s.sourceG,"event=FLUSH_REQUEST session=%llu request=%llu tick=%llu workUs=%llu phase=%s layer=%u candidateX=%.9f candidateY=%.9f candidateZ=%.9f time=SIMULATED_WORK candidateOnly=1 stoppedProof=0 motionApplied=0 discharge=0\n",
+            PrintParent(s.sourceG,s.sourceP,"event=FLUSH_REQUEST session=%llu request=%llu tick=%llu workUs=%llu phase=%s layer=%u candidateX=%.9f candidateY=%.9f candidateZ=%.9f time=SIMULATED_WORK candidateOnly=1 stoppedProof=0 motionApplied=0 discharge=0\n",
                 static_cast<unsigned long long>(s.session),static_cast<unsigned long long>(shadow.requestSequence),
                 static_cast<unsigned long long>(shadow.requestTick),static_cast<unsigned long long>(shadow.simulatedWorkUs),
                 PhaseName(shadow.nominalPhase,s.sourceG),shadow.layerIndex,shadow.candidateMCS[0],shadow.candidateMCS[1],shadow.candidateMCS[2]);
@@ -1410,7 +1751,7 @@ void NCManager::ServiceG76SphereSameThread()
         (cycle.phase==NCG76SphereCycle::Phase::HoldSettle||cycle.phase==NCG76SphereCycle::Phase::RecoverySettle||
          cycle.phase==NCG76SphereCycle::Phase::HeldAtStart)){
         s.resumePending=false;
-        PrintParent(s.sourceG,"event=START_CONSUMED session=%llu start=%llu reason=POSITION_REQUALIFICATION freshStartRequired=1 discharge=0\n",
+        PrintParent(s.sourceG,s.sourceP,"event=START_CONSUMED session=%llu start=%llu reason=POSITION_REQUALIFICATION freshStartRequired=1 discharge=0\n",
             static_cast<unsigned long long>(s.session),static_cast<unsigned long long>(s.startSequence));
     }
     if(s.resumePending&&m_state==NCState::HOLD&&observed.started&&!observed.terminal&&
@@ -1424,7 +1765,7 @@ void NCManager::ServiceG76SphereSameThread()
         // or inspection protection pauses it. Retire that admitted START at
         // the proved stopped boundary, without discarding its saved route.
         s.resumePending=false;
-        PrintParent(s.sourceG,"event=START_CONSUMED session=%llu start=%llu reason=RECOVERY_PAUSED freshStartRequired=1 discharge=0\n",
+        PrintParent(s.sourceG,s.sourceP,"event=START_CONSUMED session=%llu start=%llu reason=RECOVERY_PAUSED freshStartRequired=1 discharge=0\n",
             static_cast<unsigned long long>(s.session),static_cast<unsigned long long>(s.startSequence));
     }
     if(s.resumePending&&observed.session==s.session&&cycle.session==s.session&&
@@ -1433,7 +1774,7 @@ void NCManager::ServiceG76SphereSameThread()
         observed.cycle.resumeSequence==s.startSequence&&!observed.cycle.holdActive&&
         !observed.cycle.held&&observed.cycle.phase!=NCG76SphereCycle::Phase::HeldAtStart){
         s.resumePending=false;m_state=NCState::RUN;
-        PrintParent(s.sourceG,"event=RESUMED session=%llu hold=%llu start=%llu tick=%llu nominalProgressMm=%.9f commandX=%.9f commandY=%.9f commandZ=%.9f actualX=%.9f actualY=%.9f actualZ=%.9f discharge=0\n",
+        PrintParent(s.sourceG,s.sourceP,"event=RESUMED session=%llu hold=%llu start=%llu tick=%llu nominalProgressMm=%.9f commandX=%.9f commandY=%.9f commandZ=%.9f actualX=%.9f actualY=%.9f actualZ=%.9f discharge=0\n",
             static_cast<unsigned long long>(s.session),static_cast<unsigned long long>(s.holdSequence),
             static_cast<unsigned long long>(s.startSequence),static_cast<unsigned long long>(cycle.tick),
             cycle.nominalProgressMm,observed.commandMCS[0],observed.commandMCS[1],observed.commandMCS[2],
@@ -1444,28 +1785,28 @@ void NCManager::ServiceG76SphereSameThread()
         // EDM311: distinguish an accepted HOLD request from the RT's proved
         // stopped state. This observes feedback only and grants no resume.
         if((s.sourceG!=76||cycle.holdRecoveryEnabled)&&cycle.held&&cycle.phase==NCG76SphereCycle::Phase::HeldAtStart)
-            PrintParent(s.sourceG,"event=HELD session=%llu hold=%llu tick=%llu nominalProgressMm=%.9f commandX=%.9f commandY=%.9f commandZ=%.9f actualX=%.9f actualY=%.9f actualZ=%.9f path=%s freshStartRequired=1 discharge=0\n",
+            PrintParent(s.sourceG,s.sourceP,"event=HELD session=%llu hold=%llu tick=%llu nominalProgressMm=%.9f commandX=%.9f commandY=%.9f commandZ=%.9f actualX=%.9f actualY=%.9f actualZ=%.9f path=%s freshStartRequired=1 discharge=0\n",
                 static_cast<unsigned long long>(s.session),static_cast<unsigned long long>(cycle.holdSequence),
                 static_cast<unsigned long long>(cycle.tick),cycle.nominalProgressMm,
                 observed.commandMCS[0],observed.commandMCS[1],observed.commandMCS[2],
                 observed.actualMCS[0],observed.actualMCS[1],observed.actualMCS[2],
                 cycle.holdRecoveryEnabled?"RETAINED_PROCESS_PATH":"IN_PLACE");
         if(s.diagnosticEvents++<512U||observed.terminal||observed.cycle.held){
-            PrintParent(s.sourceG,"event=STATE session=%llu tick=%llu phase=%s layer=%u finishedLayers=%u progress=%.9f held=%u heldRequal=%llu xyzTol=%.9f rotaryTol=%.9f flushActive=%u request=%llu flushes=%llu discharge=0\n",
+            PrintParent(s.sourceG,s.sourceP,"event=STATE session=%llu tick=%llu phase=%s layer=%u finishedLayers=%u progress=%.9f held=%u heldRequal=%llu xyzTol=%.9f rotaryTol=%.9f flushActive=%u request=%llu flushes=%llu discharge=0\n",
                 static_cast<unsigned long long>(s.session),static_cast<unsigned long long>(observed.cycle.tick),
                 PhaseName(observed.cycle.phase,s.sourceG),observed.cycle.layerIndex,observed.cycle.completedLayers,
                 observed.cycle.nominalProgressMm,observed.cycle.held?1U:0U,
                 static_cast<unsigned long long>(cycle.heldRequalificationSequence),observed.positionToleranceMm,observed.rotaryToleranceDeg,cycle.flushActive?1U:0U,
                 static_cast<unsigned long long>(cycle.flushRequestSequence),static_cast<unsigned long long>(cycle.flushCount));
             if(cycle.holdRecoveryEnabled&&cycle.holdActive)
-                PrintParent(s.sourceG,"event=HOLD_ROUTE session=%llu hold=%llu stage=%u declared=%u effective=%u available=%u jog=%u trace=%u anchorX=%.9f anchorY=%.9f anchorZ=%.9f processX=%.9f processY=%.9f processZ=%.9f E5=SUSPENDED discharge=0\n",
+                PrintParent(s.sourceG,s.sourceP,"event=HOLD_ROUTE session=%llu hold=%llu stage=%u declared=%u effective=%u available=%u jog=%u trace=%u anchorX=%.9f anchorY=%.9f anchorZ=%.9f processX=%.9f processY=%.9f processZ=%.9f E5=SUSPENDED discharge=0\n",
                     static_cast<unsigned long long>(s.session),static_cast<unsigned long long>(cycle.holdSequence),
                     static_cast<unsigned>(cycle.holdRecoveryPhase),cycle.holdDeclaredCount,cycle.holdEffectiveCount,
                     cycle.holdAvailableCount,cycle.inspectionJogActive?1U:0U,cycle.inspectionTraceCount,
                     observed.holdRetreatAnchorMCS[0],observed.holdRetreatAnchorMCS[1],observed.holdRetreatAnchorMCS[2],
                     observed.holdProcessPointMCS[0],observed.holdProcessPointMCS[1],observed.holdProcessPointMCS[2]);
             if(cycle.gapHistoryActive||cycle.historyBoundarySequence||cycle.historyReturnSequence)
-                PrintParent(s.sourceG,"event=HISTORY_STATE session=%llu tick=%llu phase=%s active=%u boundary=%llu returned=%llu nominal=%s layer=%u X=%.9f Y=%.9f Z=%.9f scope=%s depth=1 previousProgressMm=%.9f previousLengthMm=%.9f E5=SUSPENDED_WHILE_ACTIVE discharge=0\n",
+                PrintParent(s.sourceG,s.sourceP,"event=HISTORY_STATE session=%llu tick=%llu phase=%s active=%u boundary=%llu returned=%llu nominal=%s layer=%u X=%.9f Y=%.9f Z=%.9f scope=%s depth=1 previousProgressMm=%.9f previousLengthMm=%.9f E5=SUSPENDED_WHILE_ACTIVE discharge=0\n",
                     static_cast<unsigned long long>(s.session),static_cast<unsigned long long>(cycle.tick),
                     PhaseName(cycle.phase,s.sourceG),cycle.gapHistoryActive?1U:0U,
                     static_cast<unsigned long long>(cycle.historyBoundarySequence),
@@ -1476,7 +1817,7 @@ void NCManager::ServiceG76SphereSameThread()
             // Nominal station stays at its saved machining checkpoint during
             // return/resume; it is deliberately not the excursion's position.
             const auto& p=s.process;
-            PrintParent(s.sourceG,"event=PROCESS_CURSOR session=%llu valid=%u phase=%s role=%u stage=%u layer=%u radiusMm=%.9f depthMm=%.9f stationMm=%.9f saved=%u atNominal=%u gap=0 discharge=0\n",
+            PrintParent(s.sourceG,s.sourceP,"event=PROCESS_CURSOR session=%llu valid=%u phase=%s role=%u stage=%u layer=%u radiusMm=%.9f depthMm=%.9f stationMm=%.9f saved=%u atNominal=%u gap=0 discharge=0\n",
                 static_cast<unsigned long long>(s.session),p.valid?1U:0U,PhaseName(observed.cycle.phase,s.sourceG),
                 static_cast<unsigned>(p.role),static_cast<unsigned>(p.nominal.cursor.span.stage),
                 p.nominal.cursor.span.layerIndex,p.layerRadiusMm,p.layerDepthMm,p.nominal.cursor.stationMm,
@@ -1484,16 +1825,16 @@ void NCManager::ServiceG76SphereSameThread()
             if(cycle.flushActive&&(!cycle.holdRecoveryEnabled||!cycle.holdActive)){
                 const bool finishFlush=cycle.flushOrigin==2U;
                 const auto diagnosticSequence=finishFlush?cycle.finishAttemptCount:cycle.flushRequestSequence;
-                PrintParent(s.sourceG,"event=%s session=%llu request=%llu B=%u phase=%s leg=%llu stationMm=%.9f anchorStationMm=%.9f checkpoint=%u E5=SUSPENDED scope=SAME_PARENT discharge=0\n",
+                PrintParent(s.sourceG,s.sourceP,"event=%s session=%llu request=%llu B=%u phase=%s leg=%llu stationMm=%.9f anchorStationMm=%.9f checkpoint=%u E5=SUSPENDED scope=SAME_PARENT discharge=0\n",
                     finishFlush?"FINISH_FLUSH_ROUTE":"FLUSH_ROUTE",static_cast<unsigned long long>(s.session),static_cast<unsigned long long>(diagnosticSequence),
                     s.request.retreatMode,PhaseName(cycle.phase,s.sourceG),static_cast<unsigned long long>(cycle.flushLegSequence),
                     cycle.flushPathStationMm,cycle.flushAnchorStationMm,cycle.flushCheckpointSaved?1U:0U);
-                PrintParent(s.sourceG,"event=%s session=%llu request=%llu B=%u phase=%s leg=%llu stageSpeedMmMin=%.6f selectedMmMin=%.6f targetMmMin=%.6f remainingMm=%.9f approachActive=%u initialSlowActive=%u E5=SUSPENDED discharge=0\n",
+                PrintParent(s.sourceG,s.sourceP,"event=%s session=%llu request=%llu B=%u phase=%s leg=%llu stageSpeedMmMin=%.6f selectedMmMin=%.6f targetMmMin=%.6f remainingMm=%.9f approachActive=%u initialSlowActive=%u E5=SUSPENDED discharge=0\n",
                     finishFlush?"FINISH_FLUSH_SPEED":"FLUSH_SPEED",static_cast<unsigned long long>(s.session),static_cast<unsigned long long>(diagnosticSequence),
                     s.request.retreatMode,PhaseName(cycle.phase,s.sourceG),static_cast<unsigned long long>(cycle.flushLegSequence),
                     cycle.speedMmS*60.0,cycle.flushSelectedFeedMmMin,cycle.flushTargetFeedMmMin,
                     cycle.flushRemainingMm,cycle.flushApproachActive?1U:0U,cycle.flushInitialSlowActive?1U:0U);
-                PrintParent(s.sourceG,"event=%s session=%llu request=%llu phase=%s X=%.9f Y=%.9f Z=%.9f nominalX=%.9f nominalY=%.9f nominalZ=%.9f checkpoint=%u discharge=0\n",
+                PrintParent(s.sourceG,s.sourceP,"event=%s session=%llu request=%llu phase=%s X=%.9f Y=%.9f Z=%.9f nominalX=%.9f nominalY=%.9f nominalZ=%.9f checkpoint=%u discharge=0\n",
                     finishFlush?"FINISH_FLUSH_POSITION":"FLUSH_POSITION",static_cast<unsigned long long>(s.session),static_cast<unsigned long long>(diagnosticSequence),
                     PhaseName(cycle.phase,s.sourceG),observed.commandMCS[0],observed.commandMCS[1],observed.commandMCS[2],
                     p.nominal.position[0],p.nominal.position[1],p.nominal.position[2],cycle.flushCheckpointSaved?1U:0U);
@@ -1521,7 +1862,8 @@ bool NCManager::PollG76SphereSameThread()
     const auto& segment=ledger.motionSegments[0U];
     if(!segment.completed||!segment.terminal||!ledger.terminalSuccess||ledger.motionCompletedCount!=1U||
         ledger.motionTerminalCount!=1U||m_motion.HasPendingSafetyOrRecoveryRequests())return false;
-    if(!FinishTerminalQualified(s.feedback.cycle,s.finishRequiredCount)){
+    if(!FinishTerminalQualified(s.feedback.cycle,s.finishRequiredCount)||
+       !MotionG76SphereMachiningTime::TerminalQualified(s.feedback.cycle,s.request)){
         RejectG76SphereSameThread("FINISH_TERMINAL_NOT_QUALIFIED",AlarmManager::MOTION_GROUP_MAPPING_INTEGRITY);return false;
     }
     if(!s.endpointCommitted){
@@ -1534,20 +1876,40 @@ bool NCManager::PollG76SphereSameThread()
     if(!m_motion.ReleaseG76SphereBarrier(s.session,s.identity,s.owner))return false;
     s.active=false;s.completed=true;s.submitted=false;UpdateSystemVariables();
     if(s.sourceG!=76){
-        if(s.finishRequiredCount)PrintParent(s.sourceG,"event=FINISH_COMPLETE session=%llu required=%u verified=%u attempts=%llu forcedCompleted=%llu reworks=%llu endpointCommitted=1 countScope=THIS_PARENT discharge=0\n",
+        if(s.finishRequiredCount)PrintParent(s.sourceG,s.sourceP,"event=FINISH_COMPLETE session=%llu required=%u verified=%u attempts=%llu forcedCompleted=%llu reworks=%llu endpointCommitted=1 countScope=THIS_PARENT discharge=0\n",
             static_cast<unsigned long long>(s.session),s.finishRequiredCount,s.feedback.cycle.finishVerifiedCount,
             static_cast<unsigned long long>(s.feedback.cycle.finishAttemptCount),
             static_cast<unsigned long long>(s.feedback.cycle.finishForcedCompletedCount),
             static_cast<unsigned long long>(s.feedback.cycle.finishReworkCount));
-        PrintParent(s.sourceG,"event=COMPLETE session=%llu g=%d X=%.9f Y=%.9f Z=%.9f endpointCommitted=1 flushes=%llu completedFlushOffset=%llu historyEntered=%llu historyReturned=%llu simProbe=%s countScope=THIS_PARENT discharge=0\n",
+        PrintParent(s.sourceG,s.sourceP,"event=COMPLETE session=%llu g=%d X=%.9f Y=%.9f Z=%.9f endpointCommitted=1 flushes=%llu completedFlushOffset=%llu historyEntered=%llu historyReturned=%llu simProbe=%s countScope=THIS_PARENT discharge=0\n",
             static_cast<unsigned long long>(s.session),s.sourceG,s.endpoint[0],s.endpoint[1],s.endpoint[2],
             static_cast<unsigned long long>(s.feedback.cycle.flushCount),
             static_cast<unsigned long long>(s.feedback.completedFlushOffset),
             static_cast<unsigned long long>(s.feedback.cycle.historyBoundarySequence),
             static_cast<unsigned long long>(s.feedback.cycle.historyReturnSequence),
             NCG76SphereGapProcess::ProbePhaseName(s.feedback.processShadow.probePhase));
+    }else if(s.sourceP==15U){
+        PrintParent(s.sourceG,s.sourceP,"event=COMPLETE session=%llu P=15 nominalLegs=25 X=%.9f Y=%.9f Z=%.9f endpointCommitted=1 flushes=%llu additional=TERMINAL_VECTOR_DIAMOND sideLegs=4 corner=EXACT_STOP vector=COMPLETE_CONTOUR directionalClipping=0 discharge=0\n",
+            static_cast<unsigned long long>(s.session),s.endpoint[0],s.endpoint[1],s.endpoint[2],
+            static_cast<unsigned long long>(s.feedback.cycle.flushCount));
+    }else if(s.sourceP==14U){
+        PrintParent(s.sourceG,s.sourceP,"event=COMPLETE session=%llu P=14 nominalLegs=25 X=%.9f Y=%.9f Z=%.9f endpointCommitted=1 flushes=%llu additional=TERMINAL_VECTOR_SQUARE sideLegs=4 corner=EXACT_STOP vector=COMPLETE_CONTOUR directionalClipping=0 discharge=0\n",
+            static_cast<unsigned long long>(s.session),s.endpoint[0],s.endpoint[1],s.endpoint[2],
+            static_cast<unsigned long long>(s.feedback.cycle.flushCount));
+    }else if(s.sourceP==13U){
+        PrintParent(s.sourceG,s.sourceP,"event=COMPLETE session=%llu P=13 nominalLegs=25 X=%.9f Y=%.9f Z=%.9f endpointCommitted=1 flushes=%llu additional=TERMINAL_DIAMOND sideLegs=4 corner=EXACT_STOP discharge=0\n",
+            static_cast<unsigned long long>(s.session),s.endpoint[0],s.endpoint[1],s.endpoint[2],
+            static_cast<unsigned long long>(s.feedback.cycle.flushCount));
+    }else if(s.sourceP==12U){
+        PrintParent(s.sourceG,s.sourceP,"event=COMPLETE session=%llu P=12 nominalLegs=25 X=%.9f Y=%.9f Z=%.9f endpointCommitted=1 flushes=%llu additional=TERMINAL_SQUARE sideLegs=4 corner=EXACT_STOP discharge=0\n",
+            static_cast<unsigned long long>(s.session),s.endpoint[0],s.endpoint[1],s.endpoint[2],
+            static_cast<unsigned long long>(s.feedback.cycle.flushCount));
+    }else if(s.sourceP==11U){
+        PrintParent(s.sourceG,s.sourceP,"event=COMPLETE session=%llu P=11 nominalLegs=25 X=%.9f Y=%.9f Z=%.9f endpointCommitted=1 flushes=%llu additional=TERMINAL_ANALYTIC_CIRCLE discharge=0\n",
+            static_cast<unsigned long long>(s.session),s.endpoint[0],s.endpoint[1],s.endpoint[2],
+            static_cast<unsigned long long>(s.feedback.cycle.flushCount));
     }else{
-        PrintParent(s.sourceG,"event=COMPLETE session=%llu layers=%u X=%.9f Y=%.9f Z=%.9f endpointCommitted=1 flushes=%llu discharge=0\n",
+        PrintParent(s.sourceG,s.sourceP,"event=COMPLETE session=%llu layers=%u X=%.9f Y=%.9f Z=%.9f endpointCommitted=1 flushes=%llu discharge=0\n",
             static_cast<unsigned long long>(s.session),s.request.geometry.circleLayerCount,s.endpoint[0],s.endpoint[1],s.endpoint[2],
             static_cast<unsigned long long>(s.feedback.cycle.flushCount));
     }
@@ -1563,7 +1925,7 @@ bool NCManager::TryHoldG76SphereSameThread()
         // may still be waiting for ledger feedback. Retain that boundary;
         // never turn a valid late HOLD into an invalid running intent.
         m_state=NCState::HOLD;s.resumePending=false;
-        PrintParent(s.sourceG,"event=HOLD_AT_COMPLETED_PARENT session=%llu discharge=0\n",
+        PrintParent(s.sourceG,s.sourceP,"event=HOLD_AT_COMPLETED_PARENT session=%llu discharge=0\n",
             static_cast<unsigned long long>(s.session));return true;
     }
     m_g76PowerInhibited=true;ForceEDMPLCOutputsOffSameThread("P50_HOLD");
@@ -1579,7 +1941,7 @@ bool NCManager::TryHoldG76SphereSameThread()
         RejectG76SphereSameThread("HOLD_INTENT",AlarmManager::PATH_EXECUTION_NOT_READY);return true;
     }
     s.resumePending=false;m_state=NCState::HOLD;
-    PrintParent(s.sourceG,"event=HOLD_REQUEST session=%llu hold=%llu path=%s discharge=0\n",
+    PrintParent(s.sourceG,s.sourceP,"event=HOLD_REQUEST session=%llu hold=%llu path=%s discharge=0\n",
         static_cast<unsigned long long>(s.session),static_cast<unsigned long long>(s.holdSequence),
         s.feedback.cycle.holdRecoveryEnabled?"RETAINED_PROCESS_PATH_FRESH_START":
         s.sourceG==76?"CENTER_THEN_ORIGINAL_START":"IN_PLACE_FRESH_START");
@@ -1595,14 +1957,14 @@ bool NCManager::TryResumeG76SphereSameThread()
     }
     if(m_state==NCState::HOLD&&s.feedback.cycle.holdRecoveryEnabled&&s.feedback.cycle.held&&
         !s.feedback.holdRecoveryResumeReady){
-        PrintParent(s.sourceG,"event=START_CONSUMED session=%llu reason=INSPECTION_RECOVERY_NOT_READY freshStartRequired=1 discharge=0\n",
+        PrintParent(s.sourceG,s.sourceP,"event=START_CONSUMED session=%llu reason=INSPECTION_RECOVERY_NOT_READY freshStartRequired=1 discharge=0\n",
             static_cast<unsigned long long>(s.session));return true;
     }
     if(m_state!=NCState::HOLD||s.resumePending||!s.feedback.started||
         s.feedback.holdSequence!=s.holdSequence||s.feedback.cycle.holdSequence!=s.holdSequence||
         !s.feedback.cycle.held||
         s.feedback.cycle.phase!=NCG76SphereCycle::Phase::HeldAtStart){
-        PrintParent(s.sourceG,"event=START_CONSUMED session=%llu reason=%s freshStartRequired=1 discharge=0\n",
+        PrintParent(s.sourceG,s.sourceP,"event=START_CONSUMED session=%llu reason=%s freshStartRequired=1 discharge=0\n",
             static_cast<unsigned long long>(s.session),s.feedback.cycle.holdRecoveryEnabled?
             "WAIT_HOLD_RECOVERY_READY":s.sourceG==76?"WAIT_HELD_AT_START":"WAIT_HELD_IN_PLACE");return true;
     }
@@ -1624,7 +1986,7 @@ bool NCManager::TryResumeG76SphereSameThread()
             cycle.heldRequalificationSequence>heldRequalification&&
             (cycle.phase==NCG76SphereCycle::Phase::HoldSettle||cycle.phase==NCG76SphereCycle::Phase::RecoverySettle||
              cycle.phase==NCG76SphereCycle::Phase::HeldAtStart)&&IsG76SphereScopeCurrentSameThread()){
-            PrintParent(s.sourceG,"event=START_CONSUMED session=%llu reason=POSITION_REQUALIFICATION freshStartRequired=1 discharge=0\n",
+            PrintParent(s.sourceG,s.sourceP,"event=START_CONSUMED session=%llu reason=POSITION_REQUALIFICATION freshStartRequired=1 discharge=0\n",
                 static_cast<unsigned long long>(s.session));return true;
         }
         if(cycle.holdRecoveryEnabled&&m_state==NCState::HOLD&&report.started&&!report.terminal&&
@@ -1637,7 +1999,7 @@ bool NCManager::TryResumeG76SphereSameThread()
             // A protection/lease/queue qualification can change after the NC
             // read. Denied inspection recovery remains stopped and consumes
             // this START; it neither grants motion nor queues a later resume.
-            PrintParent(s.sourceG,"event=START_CONSUMED session=%llu reason=RECOVERY_INTENT_NOT_ADMITTED freshStartRequired=1 discharge=0\n",
+            PrintParent(s.sourceG,s.sourceP,"event=START_CONSUMED session=%llu reason=RECOVERY_INTENT_NOT_ADMITTED freshStartRequired=1 discharge=0\n",
                 static_cast<unsigned long long>(s.session));return true;
         }
         RejectG76SphereSameThread("RESUME_INTENT",AlarmManager::PATH_EXECUTION_NOT_READY);return true;
@@ -1669,9 +2031,12 @@ void NCManager::CancelG76SphereSameThread(const char* reason)
     m_g76PowerInhibited=true;ForceEDMPLCOutputsOffSameThread("P50_CANCEL");
     // RESET retains exact sidecar identity for the existing ticketed zero-hold
     // batch. All other cancellation is containment, never an automatic return.
-    if(submitted&&!reset)m_motion.RequestEmergencyStopAllAxes();
-    if(reportFailure)PrintSphereRuntimeFailure(observed,s.request,s.line,s.sourceG);
-    PrintParent(s.sourceG,"event=CANCEL session=%llu reason=%s observerWithdraw=%s automaticReturn=0 discharge=0\n",
+    const bool deadlineAlreadyStopped=reportFailure&&
+        observed.translationGeneration==s.request.geometry.frame.translation.generation&&
+        MotionG76SphereMachiningTime::TimeLimitStoppedQualified(observed,s.request);
+    if(submitted&&!reset&&!deadlineAlreadyStopped)m_motion.RequestEmergencyStopAllAxes();
+    if(reportFailure)PrintSphereRuntimeFailure(observed,s.request,s.line,s.sourceG,s.sourceP);
+    PrintParent(s.sourceG,s.sourceP,"event=CANCEL session=%llu reason=%s observerWithdraw=%s automaticReturn=0 discharge=0\n",
         static_cast<unsigned long long>(s.session),reason?reason:"UNSPECIFIED",
         reset?"EXACT_RESET_OUTPUT_HOLD":"NC_CONTAINMENT");
 }

@@ -3,6 +3,7 @@
 #include "NCG76SphereRetreat.h"
 #include "NCG76SphereDeepFlush.h"
 #include "HoldConfig.h"
+#include "NCMachiningTime.h"
 #include <array>
 #include <algorithm>
 #include <cmath>
@@ -41,13 +42,20 @@ enum class Phase : std::uint8_t
     FlushToCenter, FlushFromCenter, FlushPathRetreat, FlushPathReturn,
     // EDM331: opt-in common machining HOLD recovery and inspection detour.
     RecoveryBrake, RecoverySettle, RecoveryMove,
-    InspectionJog, InspectionJogBrake, InspectionJogReturn
+    InspectionJog, InspectionJogBrake, InspectionJogReturn,
+    // EDM340: controlled deadline stop preserves the active analytic leg.
+    TimeLimitBrake, TimeLimitSettle,
+    // EDM341: 25 native exact-stop P11 legs; layerIndex is the local leg.
+    ContourNominal,
+    // EDM342/343: one exact straight side of the final P12/P13 contour. The local
+    // layerIndex is a side ordinal, not a P50 layer or an analytic circle.
+    ContourFinish
 };
 enum class Fault : std::uint8_t
 {
     None, InvalidRequest, SourceLost, PdoLost, PowerNotInhibited, Clock,
     PhysicalSequence, IntentSequence, Numeric, TravelLimit, SettleTimeout,
-    CycleTimeout, RepeatedHold, Cancelled
+    CycleTimeout, RepeatedHold, Cancelled, TimeLimit
 };
 enum class FinishPhase : std::uint8_t { Disabled, Machining, ForcedFlush, Recheck, Passed, Fault };
 enum class FlushOrigin : std::uint8_t { None, Periodic, Finish };
@@ -72,6 +80,8 @@ struct Request
     // it never slows an independent flushing or return pump.
     bool parameterFeeds = false;
     double nominalFeedCapMmMin = 0.0;
+    // Exact microseconds from nonmodal D/H minute literals; zero disables.
+    std::uint64_t totalLimitUs=0ULL,additionalUs=0ULL;
 };
 
 struct Input
@@ -160,6 +170,10 @@ struct Feedback
     std::uint64_t finishAttemptCount=0ULL,finishForcedCompletedCount=0ULL,finishReworkCount=0ULL;
     std::uint8_t finishPhase=0U,flushOrigin=0U;
     bool finishActive=false;
+    // Authoritative RT clocks, separate from the existing wall watchdog/E5.
+    std::uint64_t totalLimitUs=0ULL,totalElapsedUs=0ULL,additionalUs=0ULL,additionalElapsedUs=0ULL;
+    std::uint8_t timePhase=0U,totalTimerState=0U,additionalTimerState=0U;
+    std::uint8_t totalPauseReason=0U,additionalPauseReason=0U;
 };
 static_assert(sizeof(Feedback) <= 512U, "P50 pure-cycle feedback remains bounded");
 
@@ -204,6 +218,15 @@ public:
         const GapConfig* gap = nullptr) noexcept;
     Output Step(const Input& input) noexcept;
     const Feedback& Current() const noexcept { return feedback_; }
+    // EDM339: the forward cursor is saved during historical GAP motion; the
+    // live leg may instead be an earlier pure depth or circle-entry segment.
+    Phase ResolveGapFeedPhase() const noexcept
+    {
+        const Phase phase=feedback_.gapHistoryActive?previousPhase_:feedback_.nominalPhase;
+        const unsigned index=feedback_.gapHistoryActive?previousLayer_:feedback_.layerIndex;
+        return phase==Phase::ContourNominal?(index<24U?Phase::Orbit:Phase::ReturnCenter):
+            phase==Phase::ContourFinish?Phase::Orbit:phase;
+    }
     const Output& Command() const noexcept { return output_; }
     const NCG76SphereRuntimeGeometry::Geometry& Geometry() const noexcept { return request_.geometry; }
     bool ZeroDemand() const noexcept { return output_.zeroDemand; }
@@ -242,7 +265,7 @@ private:
     enum class SettleAction : std::uint8_t
     { BeginNominal, NextNominal, HoldCenter, HoldStart, Held, ResumeCenter, ResumeAnchor, RestoreNominal, Complete, Fault,
       CaptureFlush, FlushReturn, RestoreAfterFlush, EnterGapHistory, RestoreGapHistory, NextFlushLeg, RestorePrimitivePause,
-      RecoveryContinue, FinishCheck };
+      RecoveryContinue, FinishCheck, TimeCheck, TimeLimitFault };
     struct ProfilePart
     {
         double length=0.0, initialSpeed=0.0, finalSpeed=0.0, peak=0.0;
@@ -286,6 +309,12 @@ private:
     bool Settled(const Input& input,double dt) noexcept;
     void ContinueAfterSettle(const Input& input) noexcept;
     void NextNominal(const Input& input) noexcept;
+    void RefreshMachiningTimeFeedback() noexcept;
+    bool UpdateMachiningTime(const Input&,std::uint64_t deltaUs,bool holdEdge) noexcept;
+    void BeginTimeLimitStop(const Input&) noexcept;
+    bool HandleAdditionalEndpoint(const Input&) noexcept;
+    void CompleteSphereWithAdditional(const Input&) noexcept;
+    void CompleteContourWithAdditional(const Input&) noexcept;
     void CheckFinishEndpoint(const Input& input) noexcept;
     void BeginFinishFlush(const Input& input) noexcept;
     bool ObserveFinishProgress(double previousPosition) noexcept;
@@ -365,6 +394,12 @@ private:
     NCG76SphereRuntimeGeometry::Geometry previousPrimitive_{};
     bool previousPrimitiveLegActive_ = false;
     struct FinishState { bool forcedFlush=false,returnedPending=false,reworkLatched=false; } finish_{};
+    struct MachiningTimeState {
+        std::uint64_t totalElapsedUs=0ULL,additionalElapsedUs=0ULL;
+        NCMachiningTime::PauseReason totalPause=NCMachiningTime::PauseReason::None;
+        NCMachiningTime::PauseReason additionalPause=NCMachiningTime::PauseReason::Waiting;
+        bool additionalStarted=false,additionalSatisfied=false,additionalSweeping=false,totalExpired=false;
+    } machiningTime_{};
     Point8 savedAnchor_{}, savedCenter_{};
     Point8 flushTop_{}, flushWaypoint_{};
     double flushPathTarget_ = 0.0, flushPathLegStart_ = 0.0, flushPathLegEnd_ = 0.0;
@@ -410,7 +445,8 @@ inline std::uint32_t ClassifyClockFault(std::uint64_t previousTick,
     return reasons;
 }
 inline bool IsNominal(Phase phase) noexcept
-{ return phase>=Phase::InitialDepth && phase<=Phase::AdvanceCenter; }
+{ return (phase>=Phase::InitialDepth && phase<=Phase::AdvanceCenter)||
+    phase==Phase::ContourNominal||phase==Phase::ContourFinish; }
 inline bool IsRecovery(Phase phase) noexcept
 {return phase>=Phase::RecoveryBrake&&phase<=Phase::InspectionJogReturn;}
 inline bool IsExcursion(Phase phase) noexcept
@@ -419,9 +455,10 @@ inline bool IsExcursion(Phase phase) noexcept
     phase==Phase::FlushFromCenter || phase==Phase::FlushPathRetreat || phase==Phase::FlushPathReturn; }
 inline bool IsSettling(Phase phase) noexcept
 { return phase==Phase::Settle || phase==Phase::HoldSettle || phase==Phase::FaultSettle || phase==Phase::FlushSettle ||
-    phase==Phase::GapHistorySettle || phase==Phase::RecoverySettle; }
-inline bool IsFlushWorkPhase(Phase phase) noexcept
-{ return phase==Phase::InitialDepth || phase==Phase::CircleEntry || phase==Phase::Orbit; }
+    phase==Phase::GapHistorySettle || phase==Phase::RecoverySettle || phase==Phase::TimeLimitSettle; }
+inline bool IsFlushWorkPhase(Phase phase,unsigned layer=0U) noexcept
+{ return phase==Phase::InitialDepth || phase==Phase::CircleEntry || phase==Phase::Orbit ||
+    (phase==Phase::ContourNominal&&layer<24U)||(phase==Phase::ContourFinish&&layer<4U); }
 inline bool IsFlushMotionPhase(Phase phase) noexcept
 {return phase==Phase::FlushToCenter||phase==Phase::FlushLift||phase==Phase::FlushReturn||
     phase==Phase::FlushFromCenter||phase==Phase::FlushPathRetreat||phase==Phase::FlushPathReturn;}
@@ -479,6 +516,11 @@ inline bool ResolveStoppedFlushStation(const Geometry& geometry,NCG76SphereRetre
 
 inline bool ValidateRequest(const Request& r) noexcept
 {
+    if(!NCMachiningTime::ValidConfig({r.totalLimitUs,r.additionalUs}))return false;
+    if(r.geometry.kind==NCG76SphereRuntimeGeometry::Kind::OrbitContour&&
+       (r.parameterFeeds||
+        NCG76OrbitContour::FinishEnabled(r.geometry)!=(r.additionalUs!=0ULL)||
+        (r.retreatMode!=0U&&r.retreatMode!=2U)))return false;
     if(r.parameterFeeds){
         if((r.geometry.kind!=NCG76SphereRuntimeGeometry::Kind::Line&&
             r.geometry.kind!=NCG76SphereRuntimeGeometry::Kind::Arc)||
@@ -536,7 +578,8 @@ inline bool ValidateFlushHeight(const Request& r,double height) noexcept
     // G02/G03 B0 freezes its instantaneous tangent only after braking.
     // Admit every possible tangent direction for this immutable arc before
     // motion starts. B1 has the separate, fixed machine +Z meaning.
-    if(r.geometry.kind==NCG76SphereRuntimeGeometry::Kind::Arc&&r.retreatMode==0U){
+    if((r.geometry.kind==NCG76SphereRuntimeGeometry::Kind::Arc||
+        r.geometry.kind==NCG76SphereRuntimeGeometry::Kind::OrbitContour)&&r.retreatMode==0U){
         Point3 error{};bool resolved=false;
         for(unsigned a=0U;a<3U;++a){
             const double low=r.geometry.boundsMinMCS[a]-height,high=r.geometry.boundsMaxMCS[a]+height;
@@ -697,7 +740,7 @@ inline void Cycle::RefreshOutput() noexcept
     feedback_.previousParentLengthMm=feedback_.previousParentHistoryReady?previousPrimitive_.travelMm:0.0;
     feedback_.previousParentProgressMm=feedback_.previousParentHistoryReady?
         (previousPrimitiveLegActive_?leg_.position:previousPrimitive_.travelMm):0.0;
-    if((!Detail::IsFlushWorkPhase(phase)&&phase!=Phase::GapHistory)||feedback_.holdActive||feedback_.flushActive)feedback_.gapApplied=false;
+    if((!Detail::IsFlushWorkPhase(phase,feedback_.layerIndex)&&phase!=Phase::GapHistory)||feedback_.holdActive||feedback_.flushActive)feedback_.gapApplied=false;
     // History movement is an excursion around the unchanged current forward
     // cursor. Its old layer/stage must not earn new work or layer completion.
     if(feedback_.gapHistoryActive)
@@ -710,6 +753,7 @@ inline void Cycle::RefreshOutput() noexcept
     else if(feedback_.holdActive)
     {feedback_.nominalProgressMm=savedLeg_.position;feedback_.nominalLengthMm=savedLeg_.length;}
     if(recovery_.enabled)RefreshRecoveryFeedback();
+    RefreshMachiningTimeFeedback();
 }
 inline bool Cycle::StartProfile(Leg& leg) noexcept
 {
@@ -867,7 +911,19 @@ inline bool Cycle::StartLine(const Point8& end,Phase phase,double feed) noexcept
 }
 inline bool Cycle::StartNominal(Phase phase) noexcept
 {
-    if(request_.geometry.kind!=NCG76SphereRuntimeGeometry::Kind::Sphere){
+    const bool contour=request_.geometry.kind==NCG76SphereRuntimeGeometry::Kind::OrbitContour;
+    if(contour&&(phase==Phase::InitialDepth||phase==Phase::ContourNominal)){
+        Point8 begin{},end{},center{};double length=0.0,prefix=0.0;
+        if(feedback_.layerIndex>=NCG76OrbitContour::NominalLegCount||
+           !NCG76OrbitContour::NominalLegAt(request_.geometry,feedback_.layerIndex,
+               begin,end,center,length,prefix)||output_.commandMCS!=begin)
+        {Fail(Fault::Numeric);return false;}
+        feedback_.nominalPhase=Phase::ContourNominal;
+        if(!StartLine(end,Phase::ContourNominal,
+            feedback_.layerIndex<24U?request_.feedMmMin:request_.returnFeedMmMin))return false;
+        leg_.center=center;return true;
+    }
+    if(request_.geometry.kind!=NCG76SphereRuntimeGeometry::Kind::Sphere&&!contour){
         if(phase!=Phase::InitialDepth||feedback_.layerIndex!=0U){Fail(Fault::Numeric);return false;}
         feedback_.nominalPhase=phase;
         const double nominalFeed=request_.parameterFeeds&&request_.nominalFeedCapMmMin>0.0?
@@ -888,6 +944,33 @@ inline bool Cycle::StartNominal(Phase phase) noexcept
         leg_=next;feedback_.phase=phase;
         output_.velocityNative.fill(0.0);output_.accelerationNative.fill(0.0);RefreshOutput();return true;
     }
+    if(contour&&NCG76OrbitContour::IsFourSideContour(request_.geometry)){
+        // P12/P13 have four physical straight sides, each independently stopped
+        // and qualified. Never route a polygon through LayerAt/CircleAt.
+        if(!machiningTime_.additionalStarted||!machiningTime_.additionalSweeping||
+           NCG76OrbitContour::FinishLegCount(request_.geometry)!=4U)
+        {Fail(Fault::Numeric);return false;}
+        Point8 begin{},end{},center{};double length=0.0,prefix=0.0;
+        if(phase==Phase::ContourFinish){
+            if(feedback_.layerIndex>=4U||!NCG76OrbitContour::FinishLegAt(request_.geometry,
+                feedback_.layerIndex,begin,end,center,length,prefix)||output_.commandMCS!=begin)
+            {Fail(Fault::Numeric);return false;}
+        }else{
+            if(feedback_.layerIndex!=0U||(phase!=Phase::CircleEntry&&phase!=Phase::ReturnCenter)||
+               !NCG76OrbitContour::FinishVertexAt(request_.geometry,0U,end))
+            {Fail(Fault::Numeric);return false;}
+            center=request_.geometry.endMCS;
+            begin=phase==Phase::CircleEntry?center:end;
+            if(phase==Phase::ReturnCenter)end=center;
+            if(output_.commandMCS!=begin){Fail(Fault::Numeric);return false;}
+        }
+        feedback_.nominalPhase=phase;
+        if(!StartLine(end,phase,phase==Phase::ReturnCenter?request_.returnFeedMmMin:request_.feedMmMin))return false;
+        leg_.center=center;return true;
+    }
+    if(contour&&(!machiningTime_.additionalStarted||!machiningTime_.additionalSweeping||
+        feedback_.layerIndex!=0U||(phase!=Phase::CircleEntry&&phase!=Phase::Orbit&&phase!=Phase::ReturnCenter)))
+    {Fail(Fault::Numeric);return false;}
     NCG76SphereRuntimeGeometry::Layer layer{};
     if(!NCG76SphereRuntimeGeometry::LayerAt(request_.geometry,feedback_.layerIndex,layer))
     {Fail(Fault::Numeric);return false;}
@@ -920,7 +1003,7 @@ inline bool Cycle::StartNominal(Phase phase) noexcept
     }
     if(phase==Phase::ReturnCenter)
     {
-        if(!StartLine(layer.center,phase,request_.feedMmMin))return false;
+        if(!StartLine(layer.center,phase,contour?request_.returnFeedMmMin:request_.feedMmMin))return false;
         leg_.center=layer.center;return true;
     }
     if(phase==Phase::AdvanceCenter)
@@ -1148,7 +1231,8 @@ inline bool Cycle::Settled(const Input& input,double dt) noexcept
     settleProvedSeconds_=proof?settleProvedSeconds_+dt:0.0;
     // Flush motion always needs the full physical zero proof, including pure
     // callers whose legacy AIR Request uses a smaller test-only settle count.
-    const bool strict=feedback_.phase==Phase::RecoverySettle||feedback_.phase==Phase::FlushSettle||feedback_.phase==Phase::GapHistorySettle||
+    const bool strict=feedback_.phase==Phase::RecoverySettle||feedback_.phase==Phase::FlushSettle||
+        feedback_.phase==Phase::TimeLimitSettle||feedback_.phase==Phase::GapHistorySettle||
         (request_.geometry.kind!=NCG76SphereRuntimeGeometry::Kind::Sphere&&feedback_.phase==Phase::HoldSettle);
     const unsigned requiredSamples=strict?(std::max)(200U,request_.settleSamples):request_.settleSamples;
     const double requiredSeconds=strict?(std::max)(0.05,request_.minimumSettleSeconds):request_.minimumSettleSeconds;
@@ -1158,15 +1242,43 @@ inline void Cycle::NextNominal(const Input& input) noexcept
 {
     // Only a normal forward leg which has completed its ordinary physical
     // stop proof becomes history. HOLD/flush/replayed motion never replaces it.
-    if(gap_.crossLegRetreatEnabled&&request_.geometry.kind==NCG76SphereRuntimeGeometry::Kind::Sphere)
+    if(gap_.crossLegRetreatEnabled&&(request_.geometry.kind==NCG76SphereRuntimeGeometry::Kind::Sphere||
+        request_.geometry.kind==NCG76SphereRuntimeGeometry::Kind::OrbitContour))
     {
         previousLegValid_=Detail::IsNominal(feedback_.nominalPhase)&&leg_.speed==0.0&&
             leg_.position==leg_.length&&leg_.length>0.0;
         if(previousLegValid_)
         {previousLeg_=leg_;previousPhase_=feedback_.nominalPhase;previousLayer_=feedback_.layerIndex;}
     }
+    if(request_.geometry.kind==NCG76SphereRuntimeGeometry::Kind::OrbitContour){
+        if(feedback_.nominalPhase==Phase::ContourNominal){
+            if(feedback_.layerIndex>=NCG76OrbitContour::NominalLegCount){Fail(Fault::Numeric);return;}
+            if(feedback_.layerIndex+1U<NCG76OrbitContour::NominalLegCount){
+                ++feedback_.layerIndex;(void)StartNominal(Phase::ContourNominal);return;
+            }
+            if(request_.additionalUs){CompleteContourWithAdditional(input);return;}
+            output_.commandMCS=request_.geometry.endMCS;feedback_.phase=Phase::Complete;
+            leg_.speed=leg_.accelerationNow=0.0;RefreshOutput();return;
+        }
+        if(feedback_.nominalPhase==Phase::CircleEntry){
+            (void)StartNominal(NCG76OrbitContour::IsFourSideContour(request_.geometry)?
+                Phase::ContourFinish:Phase::Orbit);return;
+        }
+        if(feedback_.nominalPhase==Phase::ContourFinish){
+            if(!NCG76OrbitContour::IsFourSideContour(request_.geometry)||feedback_.layerIndex>=4U)
+            {Fail(Fault::Numeric);return;}
+            if(feedback_.layerIndex+1U<4U){
+                ++feedback_.layerIndex;(void)StartNominal(Phase::ContourFinish);return;
+            }
+            feedback_.layerIndex=0U;(void)StartNominal(Phase::ReturnCenter);return;
+        }
+        if(feedback_.nominalPhase==Phase::Orbit){(void)StartNominal(Phase::ReturnCenter);return;}
+        if(feedback_.nominalPhase==Phase::ReturnCenter){CompleteContourWithAdditional(input);return;}
+        Fail(Fault::Numeric);return;
+    }
     if(request_.geometry.kind!=NCG76SphereRuntimeGeometry::Kind::Sphere){
         if(feedback_.nominalPhase!=Phase::InitialDepth){Fail(Fault::Numeric);return;}
+        if(HandleAdditionalEndpoint(input))return;
         if(feedback_.finishRequiredCount){CheckFinishEndpoint(input);return;}
         output_.commandMCS=request_.geometry.endMCS;feedback_.phase=Phase::Complete;
         leg_.speed=0.0;RefreshOutput();return;
@@ -1179,9 +1291,10 @@ inline void Cycle::NextNominal(const Input& input) noexcept
     case Phase::Orbit:(void)StartNominal(Phase::ReturnCenter);break;
     case Phase::ReturnCenter:(void)StartNominal(Phase::AdvanceCenter);break;
     case Phase::AdvanceCenter:
-        ++feedback_.completedLayers;
+        if(!machiningTime_.additionalSweeping)++feedback_.completedLayers;
         if(feedback_.layerIndex+1U==request_.geometry.circleLayerCount)
         {
+            if(request_.additionalUs){CompleteSphereWithAdditional(input);return;}
             output_.commandMCS=request_.geometry.endMCS;feedback_.phase=Phase::Complete;
             leg_.speed=0.0;RefreshOutput();
         }
@@ -1222,7 +1335,7 @@ inline void Cycle::SaveHoldAnchor(const Input& input) noexcept
     savedLeg_=leg_;savedPhase_=feedback_.gapHistoryActive?Phase::GapHistory:feedback_.nominalPhase;
     savedAnchor_=output_.commandMCS;
     savedCenter_=feedback_.gapHistoryActive?historyNominalLeg_.center:
-        (savedPhase_==Phase::CircleEntry || savedPhase_==Phase::Orbit || savedPhase_==Phase::ReturnCenter)
+        (savedPhase_==Phase::CircleEntry || savedPhase_==Phase::Orbit || savedPhase_==Phase::ContourFinish || savedPhase_==Phase::ReturnCenter)
         ?leg_.center:savedAnchor_;
     feedback_.holdActive=true;
     StartSettle(Phase::HoldSettle,SettleAction::HoldCenter,input);
@@ -1257,8 +1370,10 @@ inline bool Cycle::FlushDistanceAvailable() const noexcept
     if(request_.retreatMode!=2U)return true;
     if(leg_.speed<0.0||!(leg_.length>0.0))return false;
     double station=0.0;
-    const auto stage=static_cast<NCG76SphereRetreat::Stage>(static_cast<unsigned>(feedback_.nominalPhase)-
-        static_cast<unsigned>(Phase::InitialDepth));
+    const auto stage=feedback_.nominalPhase==Phase::ContourNominal?NCG76SphereRetreat::Stage::ContourNominal:
+        feedback_.nominalPhase==Phase::ContourFinish?NCG76SphereRetreat::Stage::ContourFinish:
+        static_cast<NCG76SphereRetreat::Stage>(static_cast<unsigned>(feedback_.nominalPhase)-
+            static_cast<unsigned>(Phase::InitialDepth));
     bool deep=false;std::uint64_t ordinal=0ULL;
     const double height=NextFlushHeight(deep,ordinal);
     return NCG76SphereRetreat::Station(request_.geometry,stage,feedback_.layerIndex,
@@ -1311,12 +1426,14 @@ inline void Cycle::CaptureFlush(const Input& input) noexcept
 {
     // Stop evidence, never the earlier observer candidate, seals this anchor.
     savedLeg_=leg_;savedPhase_=feedback_.nominalPhase;savedAnchor_=output_.commandMCS;
-    savedCenter_=(savedPhase_==Phase::CircleEntry||savedPhase_==Phase::Orbit||savedPhase_==Phase::ReturnCenter)
+    savedCenter_=(savedPhase_==Phase::CircleEntry||savedPhase_==Phase::Orbit||savedPhase_==Phase::ContourFinish||savedPhase_==Phase::ReturnCenter)
         ?leg_.center:savedAnchor_;
     feedback_.flushCheckpointSaved=true;flushRouteIndex_=0U;
     if(request_.retreatMode==2U){
-        const auto stage=static_cast<NCG76SphereRetreat::Stage>(static_cast<unsigned>(savedPhase_)-
-            static_cast<unsigned>(Phase::InitialDepth));
+        const auto stage=savedPhase_==Phase::ContourNominal?NCG76SphereRetreat::Stage::ContourNominal:
+            savedPhase_==Phase::ContourFinish?NCG76SphereRetreat::Stage::ContourFinish:
+            static_cast<NCG76SphereRetreat::Stage>(static_cast<unsigned>(savedPhase_)-
+                static_cast<unsigned>(Phase::InitialDepth));
         double station=0.0;
         if(!Detail::ResolveStoppedFlushStation(request_.geometry,stage,feedback_.layerIndex,
             savedLeg_.position,savedLeg_.length,savedAnchor_,feedback_.flushSelectedHeightMm,station)||
@@ -1336,6 +1453,17 @@ inline void Cycle::CaptureFlush(const Input& input) noexcept
         Point8 nominal{};Point3 curvature{};
         if(!NCG76SphereRuntimeGeometry::NominalAt(request_.geometry,savedLeg_.position/savedLeg_.length,
             nominal,liftDirection,curvature)){Fail(Fault::Numeric);return;}
+    }
+    if(request_.geometry.kind==NCG76SphereRuntimeGeometry::Kind::OrbitContour&&request_.retreatMode==0U){
+        liftDirection=savedLeg_.direction;
+        if(savedLeg_.circle){
+            Point8 point{};Point3 curvature{};
+            const double angle=savedLeg_.position==savedLeg_.length?savedLeg_.circleEndAngle:
+                savedLeg_.circleStartAngle+(savedLeg_.circleEndAngle-savedLeg_.circleStartAngle)*
+                    (savedLeg_.position/savedLeg_.length);
+            if(!NCG76SphereRuntimeGeometry::CircleAt(request_.geometry,0U,angle,point,liftDirection,curvature))
+            {Fail(Fault::Numeric);return;}
+        }
     }
     Point3 actualLift{},error{};
     for(unsigned a=0U;a<3U;++a){
@@ -1425,6 +1553,18 @@ inline bool Cycle::CanEnterGapHistory() const noexcept
         return request_.retreatMode==2U&&feedback_.nominalPhase==Phase::InitialDepth&&
             request_.geometry.kind!=NCG76SphereRuntimeGeometry::Kind::Sphere;
     if(previousLeg_.circle)return false;
+    if(request_.geometry.kind==NCG76SphereRuntimeGeometry::Kind::OrbitContour&&
+       feedback_.nominalPhase==Phase::ContourNominal)
+        return feedback_.layerIndex>0U&&feedback_.layerIndex<24U&&
+            previousPhase_==Phase::ContourNominal&&previousLayer_+1U==feedback_.layerIndex;
+    if(request_.geometry.kind==NCG76SphereRuntimeGeometry::Kind::OrbitContour&&
+       feedback_.nominalPhase==Phase::CircleEntry)
+        return feedback_.layerIndex==0U&&previousPhase_==Phase::ContourNominal&&previousLayer_==24U;
+    if(request_.geometry.kind==NCG76SphereRuntimeGeometry::Kind::OrbitContour&&
+       feedback_.nominalPhase==Phase::ContourFinish)
+        return NCG76OrbitContour::IsFourSideContour(request_.geometry)&&feedback_.layerIndex<4U&&
+            (feedback_.layerIndex==0U?(previousPhase_==Phase::CircleEntry&&previousLayer_==0U):
+                previousPhase_==Phase::ContourFinish&&previousLayer_+1U==feedback_.layerIndex);
     if(feedback_.nominalPhase==Phase::Orbit)
         return previousPhase_==Phase::CircleEntry&&previousLayer_==feedback_.layerIndex;
     if(feedback_.nominalPhase==Phase::CircleEntry)
@@ -1485,6 +1625,10 @@ inline void Cycle::ContinueAfterSettle(const Input& input) noexcept
     case SettleAction::RecoveryContinue:ContinueRecovery(input);break;
     case SettleAction::NextNominal:NextNominal(input);break;
     case SettleAction::FinishCheck:CheckFinishEndpoint(input);break;
+    case SettleAction::TimeCheck:
+        if(request_.geometry.kind==NCG76SphereRuntimeGeometry::Kind::OrbitContour)CompleteContourWithAdditional(input);
+        else CompleteSphereWithAdditional(input);break;
+    case SettleAction::TimeLimitFault:Fail(Fault::TimeLimit,false);break;
     case SettleAction::HoldCenter:(void)StartLine(savedCenter_,Phase::HoldToCenter,request_.returnFeedMmMin);break;
     case SettleAction::HoldStart:(void)StartLine(request_.geometry.startMCS,Phase::HoldToStart,request_.returnFeedMmMin);break;
     case SettleAction::Held:
@@ -1573,9 +1717,13 @@ inline bool Cycle::Begin(const Request& request,const Input& input,const FlushCo
     if(Detail::Finite(frozen.geometry.startMCS))output_.commandMCS=frozen.geometry.startMCS;
     if((frozenGap.crossLegRetreatEnabled&&!frozenGap.enabled)||
        (frozenGap.completedFlushOffset!=0ULL&&(!frozenGap.enabled||
-            frozen.geometry.kind==NCG76SphereRuntimeGeometry::Kind::Sphere))||
+            (frozen.geometry.kind==NCG76SphereRuntimeGeometry::Kind::Sphere||
+             frozen.geometry.kind==NCG76SphereRuntimeGeometry::Kind::OrbitContour)))||
        frozenGap.completedFlushOffset>(std::numeric_limits<std::uint64_t>::max)()-
             static_cast<std::uint64_t>((std::numeric_limits<unsigned>::max)())-1ULL||
+       (frozen.additionalUs&&(!frozenGap.enabled||frozen.geometry.travelMm<=0.0))||
+       (frozen.geometry.kind==NCG76SphereRuntimeGeometry::Kind::OrbitContour&&
+           (!frozenGap.enabled||(input.gapValid&&!std::isfinite(input.signedGapSpeedMmMin))))||
        !ValidateFlushConfig(frozen,frozenFlush) ||
        !input.tick || !input.nowUs || !input.physicalSequence ||
        !Detail::Finite(input.actualMCS)) {Fail(Fault::InvalidRequest,false);return false;}
@@ -1626,23 +1774,26 @@ inline Output Cycle::Step(const Input& input) noexcept
     if(input.physicalSequence<=lastPhysical_){Fail(Fault::PhysicalSequence);return output_;}
     if(input.holdSequence<lastHold_ || input.startSequence<lastStart_){Fail(Fault::IntentSequence);return output_;}
     if(!InsideTravel(input.actualMCS)){Fail(Fault::TravelLimit);return output_;}
-    const double dt=static_cast<double>(input.nowUs-lastNowUs_)*1e-6;
+    const auto deltaUs=input.nowUs-lastNowUs_;
+    const double dt=static_cast<double>(deltaUs)*1e-6;
     const bool holdEdge=(input.hold && !lastHoldLevel_) || input.holdSequence>lastHold_;
     lastTick_=input.tick;lastNowUs_=input.nowUs;lastPhysical_=input.physicalSequence;
     lastHold_=input.holdSequence;lastStart_=input.startSequence;lastHoldLevel_=input.hold;
     elapsed_+=dt;
     if(!std::isfinite(elapsed_) || elapsed_>request_.maximumCycleSeconds){Fail(Fault::CycleTimeout);return output_;}
 
+    if(!UpdateMachiningTime(input,deltaUs,holdEdge))return output_;
+
     // Opt-in recovery is an excursion owned by this same unfinished parent.
     // Nominal/flush state is captured once; no old parent is re-opened here.
-    if(recovery_.enabled){
+    if(!machiningTime_.totalExpired&&recovery_.enabled){
         if(holdEdge&&!recovery_.active&&!feedback_.holdActive){
             if(!BeginRecoveryHold(input))return output_;
         }
         if(recovery_.active){StepRecovery(input,dt,holdEdge);return output_;}
     }
 
-    if(holdEdge)
+    if(holdEdge&&!machiningTime_.totalExpired)
     {
         feedback_.holdSequence=input.holdSequence;
         if(primitivePaused_)BeginPrimitiveHold(input);
@@ -1678,9 +1829,10 @@ inline Output Cycle::Step(const Input& input) noexcept
     // Consume its pending id at the leg's ordinary endpoint settle too, before
     // advancing the nominal state; a terminal parent can never reopen here.
     const bool flushBoundary=feedback_.phase==Phase::Settle && settleAction_==SettleAction::NextNominal &&
-        Detail::IsFlushWorkPhase(feedback_.nominalPhase);
+        Detail::IsFlushWorkPhase(feedback_.nominalPhase,feedback_.layerIndex);
     if(flush_.enabled && input.flushRequestSequence>flushHighWater_ && !feedback_.flushActive &&
-       !feedback_.holdActive && !feedback_.gapHistoryActive && !feedback_.finishActive && !input.hold && (Detail::IsFlushWorkPhase(feedback_.phase) || flushBoundary) && FlushDistanceAvailable())
+       !feedback_.holdActive && !feedback_.gapHistoryActive && !feedback_.finishActive && !input.hold &&
+       !machiningTime_.totalExpired && (Detail::IsFlushWorkPhase(feedback_.phase,feedback_.layerIndex) || flushBoundary) && FlushDistanceAvailable())
         BeginFlush(input);
     if(output_.faulted)return output_;
     const Phase phase=feedback_.phase;
@@ -1711,16 +1863,17 @@ inline Output Cycle::Step(const Input& input) noexcept
         }
     }
     else if(Detail::IsNominal(phase) || Detail::IsExcursion(phase) || phase==Phase::GapHistory || phase==Phase::HoldBrake ||
-            phase==Phase::FaultBrake || phase==Phase::ResumeBrake || phase==Phase::FlushBrake || phase==Phase::FlushHoldBrake)
+            phase==Phase::FaultBrake || phase==Phase::ResumeBrake || phase==Phase::FlushBrake || phase==Phase::FlushHoldBrake ||
+            phase==Phase::TimeLimitBrake)
     {
         bool finished=false;
-        const bool gapStep=gap_.enabled&&(Detail::IsFlushWorkPhase(phase)||phase==Phase::GapHistory)&&
+        const bool gapStep=gap_.enabled&&(Detail::IsFlushWorkPhase(phase,feedback_.layerIndex)||phase==Phase::GapHistory)&&
             !feedback_.holdActive&&!feedback_.flushActive;
         if(gapStep&&!input.gapValid){Fail(Fault::SourceLost);return output_;}
         const double previousPosition=leg_.position;
         const bool advanced=gapStep?AdvanceGap(dt,input.signedGapSpeedMmMin,finished):
             AdvanceLeg(dt,phase==Phase::HoldBrake || phase==Phase::FaultBrake || phase==Phase::ResumeBrake ||
-                phase==Phase::FlushBrake || phase==Phase::FlushHoldBrake,finished);
+                phase==Phase::FlushBrake || phase==Phase::FlushHoldBrake || phase==Phase::TimeLimitBrake,finished);
         if(!advanced){Fail(Fault::Numeric);return output_;}
         if(gapStep&&phase==Phase::InitialDepth&&!ObserveFinishProgress(previousPosition))return output_;
         if(gapStep&&!finished&&phase!=Phase::GapHistory&&input.signedGapSpeedMmMin<0.0&&CanEnterGapHistory())
@@ -1735,6 +1888,7 @@ inline Output Cycle::Step(const Input& input) noexcept
             else if(phase==Phase::FlushLift||phase==Phase::FlushReturn||phase==Phase::FlushToCenter||
                 phase==Phase::FlushFromCenter||phase==Phase::FlushPathRetreat||phase==Phase::FlushPathReturn)
                 StartSettle(Phase::FlushSettle,SettleAction::NextFlushLeg,input);
+            else if(phase==Phase::TimeLimitBrake)StartSettle(Phase::TimeLimitSettle,SettleAction::TimeLimitFault,input);
             else if(phase==Phase::FaultBrake)StartSettle(Phase::FaultSettle,SettleAction::Fault,input);
             else if(phase==Phase::HoldToCenter)StartSettle(Phase::HoldSettle,SettleAction::HoldStart,input);
             else if(phase==Phase::HoldToStart)StartSettle(Phase::HoldSettle,SettleAction::Held,input);
@@ -1750,3 +1904,4 @@ inline Output Cycle::Step(const Input& input) noexcept
 
 #include "NCG76SphereHoldRecovery.h"
 #include "NCG76SphereFinishVerification.h"
+#include "NCG76SphereMachiningTime.h"

@@ -19,7 +19,7 @@ namespace EDMProcessTuning
         const auto& values = request.Values;
         if ((request.SelectionMask & 1U) == 0U) {
             if (!Zero(&values.Process, sizeof(values.Process))) return false;
-        } else if (values.Process.Reserved32 != 0U || (values.Process.Flags & ~7U) != 0U ||
+        } else if (values.Process.ParameterVersion != EDM_PROCESS_TUNING_PARAMETER_VERSION || (values.Process.Flags & ~7U) != 0U ||
             !Zero(values.Process.Reserved, sizeof(values.Process.Reserved))) return false;
         for (unsigned bank = 0U; bank < 2U; ++bank) {
             const auto* gains = bank == 0U ? values.Discharge : values.Flush;
@@ -40,9 +40,11 @@ namespace EDMProcessTuning
         p.MachineProfileId = profile.machineProfileId; p.Mode = static_cast<std::uint32_t>(profile.mode);
         p.Flags = (s.limitsConfirmed ? 1U : 0U) | (s.shortIdleEnabled ? 2U : 0U) | (s.shortMachiningEnabled ? 4U : 0U);
         p.ShortEnterMs = s.shortEnterMs; p.ShortExitMs = s.shortExitMs;
+        p.ParameterVersion = EDM_PROCESS_TUNING_PARAMETER_VERSION;
         for (unsigned i = 0U; i < 3U; ++i) { p.PositiveGain[i] = s.positiveGain[i]; p.NegativeGain[i] = s.negativeGain[i]; }
         for (unsigned i = 0U; i < 2U; ++i) { p.PositiveBreakV[i] = s.positiveBreakV[i]; p.NegativeBreakV[i] = s.negativeBreakV[i]; }
         p.CuttingScaleMmPerVoltMin = s.cuttingScaleMmPerVoltMin;
+        p.OrbitScaleMmPerVoltMin = profile.orbitScaleMmPerVoltMin;
         p.MaxFeedMmPerMin = s.maxFeedMmPerMin;
         p.MaxRetreatMmPerMin = s.maxRetreatMmPerMin;
         p.DeadbandV = s.deadbandV;
@@ -90,6 +92,7 @@ namespace EDMProcessTuning
             for (unsigned i = 0U; i < 3U; ++i) { s.positiveGain[i] = p.PositiveGain[i]; s.negativeGain[i] = p.NegativeGain[i]; }
             for (unsigned i = 0U; i < 2U; ++i) { s.positiveBreakV[i] = p.PositiveBreakV[i]; s.negativeBreakV[i] = p.NegativeBreakV[i]; }
             s.cuttingScaleMmPerVoltMin = p.CuttingScaleMmPerVoltMin;
+            candidate.orbitScaleMmPerVoltMin = p.OrbitScaleMmPerVoltMin;
             s.maxFeedMmPerMin = p.MaxFeedMmPerMin;
             s.maxRetreatMmPerMin = p.MaxRetreatMmPerMin;
             s.deadbandV = p.DeadbandV;

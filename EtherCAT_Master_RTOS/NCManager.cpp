@@ -1,6 +1,7 @@
 ﻿#include "PositionPidService.h"
 #include "NCManager.h"
 #include "NCFinishPolicy.h"
+#include "NCMachiningTimePolicy.h"
 #include "NCSpindleSource.h"
 #include "EDMProcessTuningService.h"
 #include "MacroEngine.h"
@@ -1326,6 +1327,7 @@ void NCManager::Reset()
     const MotionOwnerLease resetG76SphereOwner=resetSubmittedG76Sphere?
         m_g76Sphere->owner:MotionOwnerLease{};
     CancelG76SphereSameThread("RESET");
+    ClearMachiningTimeTelemetrySameThread();
     m_g76Confirmation = G76Confirmation{}; m_g76Modal = G76ModalState{};
     m_edm149Confirmation = EDM149Confirmation{};
     ForceEDMPLCOutputsOffSameThread("RESET");
@@ -4920,6 +4922,20 @@ void NCManager::ProcessExecutionEngine()
             return;
         }
 
+        // EDM340: time metadata belongs only to a literal, explicitly
+        // admitted analytic EDM parent. Reject before resolution and settings.
+        if(NCMachiningTimePolicy::Requests(parsedBlock)){
+            NCBlock timeLiteral{};NCMachiningTime::Config timing{};
+            if(!NCPreparedBlockQueueShadow::TryBuildLiteralBlock(parsedBlock,timeLiteral)||
+               !NCMachiningTimePolicy::Decode(parsedBlock,timeLiteral,timing)||
+               !(IsG76SphereBlock(timeLiteral)||IsEDMProcessPathCandidateSameThread(timeLiteral))){
+                markDispatchFailed(static_cast<std::uint32_t>(AlarmManager::G_Code_Invalid_parameter));
+                RtPrintf("[TIME] build=EDM340 event=SOURCE_REJECT pc=%d line=%d reason=DH_REQUIRES_LITERAL_EDM_PARENT beforeResolve=1\n",currentPC,sourceLineNumber);
+                AlarmManager::GetInstance().Trigger(AlarmManager::G_Code_Invalid_parameter,sourceLineNumber);
+                ChangeState(NCState::HOLD);return;
+            }
+        }
+
         // EDM335: an authored L on a literal process G belongs only to the
         // admitted analytic EDM lane. Reject before resolver/cutter/frame work;
         // other G/M uses of L (including M98) retain their own existing owners.
@@ -5629,6 +5645,18 @@ void NCManager::ProcessExecutionEngine()
                 }
             }
 
+            // EDM340: the resolved row cannot turn computed G/D/H into an
+            // implicit time declaration or pass it to an ordinary CNC lane.
+            if(NCMachiningTimePolicy::Requests(block)){
+                NCMachiningTime::Config timing{};
+                if(!NCMachiningTimePolicy::Decode(parsedBlock,block,timing)||
+                   !(IsG76SphereBlock(block)||IsEDMProcessPathCandidateSameThread(block))){
+                    markDispatchFailed(static_cast<std::uint32_t>(AlarmManager::G_Code_Invalid_parameter));
+                    RtPrintf("[TIME] build=EDM340 event=SOURCE_REJECT pc=%d line=%d reason=DH_REQUIRES_LITERAL_EDM_PARENT beforeFrame=1\n",currentPC,sourceLineNumber);
+                    AlarmManager::GetInstance().Trigger(AlarmManager::G_Code_Invalid_parameter,sourceLineNumber);
+                    ChangeState(NCState::HOLD);return;
+                }
+            }
             // EDM335: computed G codes cannot evade the authored L contract.
             // Recheck the actual resolved row before coordinate transitions.
             if(NCFinishPolicy::Requests(block)){
@@ -7065,8 +7093,9 @@ WaitConditionFunc NCManager::DispatchSingleGCode(
         return GCodeHandlers::Handle_G00(block, this);
     case 80:
         return StartG80SameThread(block);
-    case 76: // P50 is one dedicated AIR parent; other modes retain the orbit path.
+    case 76: // P50 and explicitly timed P11 use one dedicated AIR parent.
         if (IsG76SphereBlock(block)) return StartG76SphereSameThread(block);
+        ClearMachiningTimeTelemetrySameThread(); // Passive UI boundary; legacy motion remains unchanged.
         return StartG76OrbitSameThread(block);
     case 1: // EDM307: explicitly confirmed EDM paths use the shared analytic parent.
         if (IsEDMProcessPathCandidateSameThread(block)) {
@@ -7206,6 +7235,18 @@ void NCManager::ExecuteBlock(
     NCBlockDispatchId dispatchId)
 {
     m_waitCallback = nullptr;
+    // EDM340: retain the authored time owner before every M/T/E/frame effect.
+    if(NCMachiningTimePolicy::Requests(inputBlock)){
+        const auto* timeSource=GetBaseProgramCache().TryGetLine(sourcePC);
+        NCMachiningTime::Config timing{};
+        if(!timeSource||(sourceLineNumber&&timeSource->sourceLineNumber!=sourceLineNumber)||
+           !NCMachiningTimePolicy::Decode(timeSource->parsedBlock,inputBlock,timing)||
+           !(IsG76SphereBlock(inputBlock)||IsEDMProcessPathCandidateSameThread(inputBlock))){
+            RtPrintf("[TIME] build=EDM340 event=SOURCE_REJECT pc=%d line=%d reason=DH_REQUIRES_LITERAL_EDM_PARENT beforeSideEffects=1\n",sourcePC,sourceLineNumber);
+            AlarmManager::GetInstance().Trigger(AlarmManager::G_Code_Invalid_parameter,sourceLineNumber);
+            ChangeState(NCState::HOLD);return;
+        }
+    }
     // EDM335: explicit L must never be ignored by an ordinary CNC producer.
     // Keep the immutable authored count before any M/T, recipe or frame effect.
     if(NCFinishPolicy::Requests(inputBlock)){

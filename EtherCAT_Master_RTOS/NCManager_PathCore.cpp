@@ -3600,11 +3600,28 @@ bool NCManager::IsFixedTranslationBlockAllowedSameThread(const NCBlock& block)
     // WORK/compensated frame. The terminal proves its original parent and
     // full drain; it does not inherit generic neutral-frame permission.
     if(block.mCount==1&&block.mCode[0]==30&&m_g76Sphere->completed&&
-       m_g76Sphere->sourceG>=1&&m_g76Sphere->sourceG<=3&&
+       ((m_g76Sphere->sourceG>=1&&m_g76Sphere->sourceG<=3)||
+        (m_g76Sphere->sourceG==76&&(m_g76Sphere->sourceP==11U||m_g76Sphere->sourceP==12U||m_g76Sphere->sourceP==13U||m_g76Sphere->sourceP==14U||m_g76Sphere->sourceP==15U)))&&
        m_g76Sphere->run==m_pathCoreLiveBookkeeping.currentRunToken&&
        m_g76Sphere->cache==GetBaseProgramCache().GetGeneration()){
         if(IsCompletedEDMProcessPathTerminalAllowedSameThread(block))return true;
         RejectG76SphereSameThread("PROCESS_PATH_M30_COMPLETION_SCOPE",AlarmManager::PATH_EXECUTION_NOT_READY);
+        return false;
+    }
+    // EDM340 FIX3: the completed compensated six-axis parent may reach a
+    // pure authored M00. Reuse its exact endpoint/ledger/frame/drain proof;
+    // no generic neutral-frame exception or new motion grant is introduced.
+    if(block.mCount==1&&block.mCode[0]==0&&m_g76Sphere->completed&&
+       ((m_g76Sphere->sourceG>=1&&m_g76Sphere->sourceG<=3)||m_g76Sphere->sourceG==76)&&
+       m_g76Sphere->run==m_pathCoreLiveBookkeeping.currentRunToken&&
+       m_g76Sphere->cache==GetBaseProgramCache().GetGeneration()){
+        if(IsCompletedEDMProcessPathTerminalAllowedSameThread(block,0)){
+            RtPrintf("[EDM340_FIX3] event=COMPLETED_PARENT_M00_ACCEPTED session=%llu parentPC=%d pc=%d sourceG=%d evidence=EXACT_COMPLETED_PARENT_FRAME_LEDGER_DRAIN motionSubmitted=0 discharge=0\n",
+                static_cast<unsigned long long>(m_g76Sphere->session),m_g76Sphere->pc,
+                GetActiveDispatchPC(),m_g76Sphere->sourceG);
+            return true;
+        }
+        RejectG76SphereSameThread("COMPLETED_PARENT_M00_SCOPE",AlarmManager::PATH_EXECUTION_NOT_READY);
         return false;
     }
     if(IsG76SphereBlock(block))return ValidateG76SphereBlockSameThread(block,GetActiveDispatchPC(),0);

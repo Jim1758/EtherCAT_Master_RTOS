@@ -2,6 +2,7 @@
 #include "EtherCatMaster_DC_Internal.h"
 #include "EtherCatMaster_DC_Topology.h"
 #include "EtherCatMaster_DC_Tuning.h"
+#include "PdoTimerStackPolicy.h"
 #include "AlarmManager.h"
 #include "ConfigReader.h"
 #include "GlobalConfig.h"
@@ -2373,7 +2374,7 @@ int EtherCatMaster::StartDcPdoRuntime()
     hTimer_PDO =
         RtCreateTimer(
             NULL,
-            0,
+            PdoTimerStack::RequiredBytes,
             GlobalTimerHandler_PDO,
             m_pdoTimerContext,
             80,
@@ -2394,7 +2395,7 @@ int EtherCatMaster::StartDcPdoRuntime()
     // Step 4：PDO One-Shot Scheduler V1B，同一個正式 timer 的 warm-up
     //
     // 新建 timer 的第一次 relative arm 偶爾有一次性較大成本，因此真正 PDO timer
-    // 也要 warm-up 一次。StartupMode=1 時 Runtime callback 只設 WarmupDone 後返回，
+    // 也要 warm-up 一次。StartupMode=1 時 Runtime callback 驗證實際堆疊並發布結果，
     // 不做 EtherCAT I/O、不 re-arm；PASS 後才切換 StartupMode=2 LIVE。
     // ============================================================
 
@@ -2477,7 +2478,7 @@ int EtherCatMaster::StartDcPdoRuntime()
     bool pdoWarmupPassed =
         (
             pdoWarmupArmOk &&
-            g_pdoOneShotWarmupCallbackDone != 0
+            g_pdoOneShotWarmupCallbackDone == PdoTimerStack::WarmupReady
             );
 
 

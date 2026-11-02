@@ -323,6 +323,17 @@ bool MotionCore::TryG01MoveTransactionalCncTail(
     const bool coupledPlanarEndpoint = NCTranslationHasPlanarRotation(m_pendingTranslation) ||
         m_pendingTranslation.polarMode == 16;
     const bool coupledPlanarQueuedLine = coupledPlanarEndpoint && cncFeedLookahead;
+    // EDM295: only the ordinary exact-stop XYZ lane may share an explicitly
+    // admitted spindle run. A rotary sample is observational geometry here;
+    // this producer must never publish a stationary tail for an owned spindle.
+    const bool concurrentXYZLane = source == MotionCommandSource::NC_MEMORY &&
+        !cutterActive && !cncFeedLookahead && predecessor == nullptr &&
+        cornerNextMCS == nullptr && cornerToleranceMM == 0.0 &&
+        cornerTravelGuard == nullptr && cornerNextFeedMMMin == 0.0 &&
+        endpointAxisMask == 0U &&
+        IsNCNativeXYZLinearMapping(static_cast<int>(axes.size()), axes.data());
+    const std::uint32_t concurrentSpindleMask = concurrentXYZLane ?
+        GetRotarySpindleConcurrentAxisMask(plannedEpoch, plannedOwner) : 0U;
     if (!IsPendingFixedTranslationSourceAllowed() ||
         (nativeXYZBaseline && (!nominalLineNotation ||
             !IsNCTranslationSnapshotValid(m_pendingTranslation) ||
@@ -410,6 +421,10 @@ bool MotionCore::TryG01MoveTransactionalCncTail(
     {
         return false;
     }
+    // The sampled spindle slots are not accepted positioning endpoints. Only
+    // the exact current session's mapped axes lose their producer proof bits;
+    // unclaimed stationary axes retain the legacy native-tail contract.
+    result.validAxisMask &= ~concurrentSpindleMask;
 
     const bool incrementalEndpoint = m_pendingTranslation.distanceMode == 91;
     const std::uint32_t requiredBaselineMask =
@@ -553,7 +568,10 @@ bool MotionCore::TryG01MoveTransactionalCncTail(
             owner1.Matches(result.ownerLease) && owner2.Matches(result.ownerLease) &&
             state1 == state2 && !UnpackMotionOwnerSafetyHandshake(state2) &&
             UnpackMotionOwnerSafetyRequestTicket(state2) ==
-            m_safetyRequestAcknowledgedTicket.load(std::memory_order_acquire);
+            m_safetyRequestAcknowledgedTicket.load(std::memory_order_acquire) &&
+            (concurrentSpindleMask == 0U ||
+                (result.identity.epoch == plannedEpoch &&
+                    GetRotarySpindleConcurrentAxisMask(plannedEpoch, plannedOwner) == concurrentSpindleMask));
     };
     const auto revokeAccepted = [&](MotionFeedLineCode code) -> bool
     {
@@ -594,10 +612,15 @@ bool MotionCore::TryG01MoveTransactionalCncTail(
     }
 
     // Assignment-only commit after enqueue, same tagged pulse tail used by G00.
-    m_g00ProducerQueueTailPulse = workspace.stagedPulse;
+    // The spindle lane alone owns its live reference and handback. Excluding
+    // its bits from the shared tail also prevents a later native-basis lookup
+    // from treating one moving-axis sample as a stationary positioning proof.
     for (std::size_t slot = 0U; slot < 8U; ++slot)
     {
-        if ((result.validAxisMask & (1U << static_cast<unsigned>(slot))) != 0U)
+        const std::uint32_t bit = 1U << static_cast<unsigned>(slot);
+        if ((concurrentSpindleMask & bit) != 0U) continue;
+        m_g00ProducerQueueTailPulse[slot] = workspace.stagedPulse[slot];
+        if ((result.validAxisMask & bit) != 0U)
         {
             (*m_pContexts)[slot].lastQueuedPulse.Store(workspace.stagedPulse[slot]);
         }

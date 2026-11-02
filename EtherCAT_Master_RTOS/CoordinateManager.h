@@ -16,6 +16,8 @@ public:
     bool BeginTranslationRun(std::uint64_t runToken, NCManager* nc) noexcept;
     bool IsTranslationAxisIdentityCurrent() const noexcept;
     NCTranslationSnapshot GetTranslationSnapshot() const noexcept;
+    // Explicit caller storage keeps NC startup snapshots out of hidden return buffers.
+    void CopyTranslationSnapshot(NCTranslationSnapshot& output) const noexcept;
     bool FreezeTranslationRun() noexcept;
     // BASE-PLANE-1: standalone, drained arc-plane change; no table/tail rewrite.
     bool IsBaseArcPlaneSelectionSupported(int plane) const noexcept;
@@ -644,6 +646,8 @@ private:
     bool TryBuildAxisIdentity(const NCManager* nc, NCAxisIdentitySnapshot& identity) const noexcept;
     NCTranslationSnapshot BuildCurrentCoordinateSnapshot() const noexcept;
     NCTranslationSnapshot BuildLiveTranslationSnapshot() const noexcept;
+    void BuildCurrentCoordinateSnapshotInto(NCTranslationSnapshot& output) const noexcept;
+    void BuildLiveTranslationSnapshotInto(NCTranslationSnapshot& output) const noexcept;
     bool IsTranslationModeSupported() const noexcept;
     bool TryPrepareG92Origin(const bool* fields, const double* nativeTargets,
         NCManager* nc, double* proposed, bool& changed) const noexcept;

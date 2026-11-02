@@ -8,6 +8,9 @@
 #include <cstring> 
 #include "PLCManager.h"
 #include "NCPLCMap.h"
+#include "RotarySpindleTelemetry.h"
+#include "NCHoldTelemetry.h"
+#include "NCHoldInspectionCommand.h"
 
 #include <cmath>
 #include <cstddef>
@@ -27,6 +30,53 @@ namespace HMI_Bridge
 {
     namespace
     {
+        // The command tail is distinct from NC_Status's occupied spindle page.
+        static_assert(sizeof(((SHM_NC_Command*)nullptr)->reserved)==NCHoldInspectionCommand::Size,
+            "HOLD inspection command must fit the unchanged NC command reserve");
+        NCHoldInspectionCommand::ReplayFence holdInspectionReplayFence{};
+        void ConsumeHoldInspectionCommandSameThread(NCManager& nc,SHM_Data& shared,bool blocked) noexcept
+        {
+            auto* request=reinterpret_cast<volatile std::uint8_t*>(shared.NC_Command.reserved);
+            const auto opcode=request[0];if(!opcode)return;
+            MemoryBarrier();
+            NCHoldInspectionCommand::Bytes bytes{};
+            for(unsigned i=0U;i<NCHoldInspectionCommand::Size;++i)bytes[i]=request[i];
+            MemoryBarrier();
+            NCHoldInspectionCommand::Request command{};
+            NCHoldTelemetry::Image current{};
+            if(request[0]==opcode&&NCHoldInspectionCommand::Decode(bytes,command)){
+                nc.ExportHoldRecoveryTelemetrySameThread(current);
+                if(NCHoldInspectionCommand::ScopeMatches(command,NCHoldTelemetry::CurrentPublisherGeneration(),current)&&
+                   holdInspectionReplayFence.AdmitFresh(command)&&!blocked)
+                    (void)nc.TryG76SphereInspectionJogSameThread(command.axis,command.direction);
+            }
+            // Consumption is not an acceptance/stop ACK. RT expires the scoped
+            // input lease after750ms without an accepted fresh renewal.
+            MemoryBarrier();request[0]=0U;
+        }
+
+        // EDM291 promotes only the existing 92 reserved bytes. The legacy
+        // packed ABI puts them at offset525; byte3 is the aligned sequence.
+        static_assert(sizeof(((SHM_NC_Status*)nullptr)->reserved)==RotarySpindleTelemetry::ImageSize,
+            "Spindle telemetry must fit the unchanged NC reserve");
+        static_assert((offsetof(SHM_Data,NC_Status)+offsetof(SHM_NC_Status,reserved)+
+            RotarySpindleTelemetry::SequenceOffset)%alignof(LONG)==0U,"Spindle sequence must be naturally aligned");
+        void PublishRotarySpindleTelemetrySameThread(NCManager& nc,SHM_Data& shared) noexcept
+        {
+            RotarySpindleTelemetry::Image image{};
+            nc.ExportRotarySpindleTelemetrySameThread(shared.axisDebug,image);
+            auto* destination=reinterpret_cast<unsigned char*>(shared.NC_Status.reserved);
+            constexpr auto offset=RotarySpindleTelemetry::SequenceOffset;
+            std::uint32_t previous=0U;std::memcpy(&previous,destination+offset,sizeof(previous));
+            const auto writing=(previous+1U)|1U;
+            auto* sequence=reinterpret_cast<volatile LONG*>(destination+offset);
+            InterlockedExchange(sequence,static_cast<LONG>(writing));MemoryBarrier();
+            std::memcpy(destination,image.data(),offset);
+            std::memcpy(destination+offset+sizeof(previous),image.data()+offset+sizeof(previous),
+                image.size()-offset-sizeof(previous));
+            MemoryBarrier();InterlockedExchange(sequence,static_cast<LONG>(writing+1U));
+        }
+
         // Same supervisory writer as NCManager::PublishG80SameThread. This
         // automatic page is independent of the legacy macro refresh request.
         void PublishG80ResultsSameThread(NCManager& nc,SHM_Data& shared) noexcept
@@ -61,6 +111,10 @@ namespace HMI_Bridge
             publication.Header.Magic = SHM_EDM_DIAG_MAGIC;
             publication.Header.VersionMajor = SHM_EDM_DIAG_VERSION_MAJOR;
             publication.Header.VersionMinor = SHM_EDM_DIAG_VERSION_MINOR;
+            const int retreatMode=nc.GetCurrentRetreatModeSameThread();
+            publication.Header.Reserved32[SHM_EDM_CURRENT_RETREAT_MODE_INDEX]=
+                retreatMode>=0&&retreatMode<=4 ?
+                SHM_EDM_CURRENT_RETREAT_MODE_VALID|static_cast<std::uint32_t>(retreatMode):0U;
             publication.Header.StructSize = SHM_EDM_DIAG_SIZE;
             publication.Header.Heartbeat = target->Header.Heartbeat + 1U;
             publication.Header.Flags = SHM_EDM_DIAG_PUBLISHED |
@@ -3002,6 +3056,8 @@ namespace HMI_Bridge
             pShm->NC_Command.reqChangeMode = false;
         }
 
+        ConsumeHoldInspectionCommandSameThread(*nc,*pShm,closeRequested||resetRequested||holdRequested||modeRequested||loadRequested||startRequested);
+
         if (loadRequested)
         {
             const size_t safeLength = strnlen(
@@ -3248,6 +3304,9 @@ namespace HMI_Bridge
         PublishG80ResultsSameThread(*nc,*pShm);
         ProcessEDMConditionServiceSameThread(*nc);
         PublishEDMObservationSameThread(*nc);
+        NCHoldTelemetry::Image holdImage{};
+        nc->ExportHoldRecoveryTelemetrySameThread(holdImage);
+        NCHoldTelemetry::Publish(holdImage);
 
 
         // --- 警報檢查 (自帶條件判斷，極快) ---
@@ -3309,7 +3368,23 @@ namespace HMI_Bridge
         // 4. 判斷目前這張單子是屬於主程式還是副程式
         bool isMacroRunning = !nc->m_macroStack.empty();
 
-        if (isMacroRunning) {
+        // EDM333: the committed E-aware parent is observed through its exact
+        // published feedback. Legacy group idle/queued PC does not supersede it.
+        int committedParentPC = -1;
+        const bool committedParentVisible =
+            nc->TryGetCommittedProcessParentDisplayPCSameThread(committedParentPC);
+        static int lastCommittedParentDisplayPC = -1;
+        if (!committedParentVisible) lastCommittedParentDisplayPC = -1;
+        else if (lastCommittedParentDisplayPC != committedParentPC) {
+            RtPrintf("[NC-PARENT-DISPLAY] build=EDM333 pc=%d interpreterPC=%d source=COMMITTED_PROCESS_PARENT\n",
+                committedParentPC, interpreterMainPC);
+            lastCommittedParentDisplayPC = committedParentPC;
+        }
+        if (committedParentVisible) {
+            pShm->NC_Status.mainCurrentLine = committedParentPC;
+            pShm->NC_Status.macroCurrentLine = -1;
+        }
+        else if (isMacroRunning) {
             // 在跑副程式
             // 🌟 如果機台靜止，游標顯示大腦卡住的地方(如 M00)；如果機台在動，顯示馬達正在跑的路徑
             pShm->NC_Status.macroCurrentLine = isMachineIdle ? interpreterMacroPC : physicalPC;
@@ -3569,6 +3644,7 @@ namespace HMI_Bridge
         // =======================================================
         // 取代你原本手寫的 for 迴圈與 m_pContexts
         nc->GetMotion().ExportDebugInfo(pShm->axisDebug, true);
+        PublishRotarySpindleTelemetrySameThread(*nc,*pShm);
     }
 
     // =========================================================================

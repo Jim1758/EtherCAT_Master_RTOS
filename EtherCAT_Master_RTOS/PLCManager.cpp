@@ -2519,7 +2519,14 @@ void PLCManager::PublishAuxiliaryOutputs(
     m_auxiliaryRequestWord.store(requestWord, std::memory_order_release);
 }
 
+void PLCManager::PublishRotarySpindleOutputs(unsigned mask) noexcept
+{
+    m_rotarySpindleOutputWord.store(mask & 7U, std::memory_order_release);
+}
+
 void PLCManager::Set_S(int index, bool value) {
+    if (index >= NCPLC::S::ROTARY_SPINDLE_ACTIVE_BASE &&
+        index < NCPLC::S::ROTARY_SPINDLE_ACTIVE_BASE + NCPLC::S::ROTARY_SPINDLE_COUNT) return;
     if (index == 51 || index == 52) return; // EDM282: NC-owned request levels.
     if (EDM137PLC::ReservedPoint(index)) return;
     if (index >= 0 && index < MAX_PLC_S) {
@@ -2528,6 +2535,10 @@ void PLCManager::Set_S(int index, bool value) {
 }
 
 bool PLCManager::Get_S(int index) const {
+    if (index >= NCPLC::S::ROTARY_SPINDLE_ACTIVE_BASE &&
+        index < NCPLC::S::ROTARY_SPINDLE_ACTIVE_BASE + NCPLC::S::ROTARY_SPINDLE_COUNT)
+        return (m_rotarySpindleOutputWord.load(std::memory_order_acquire) &
+            (1U << static_cast<unsigned>(index - NCPLC::S::ROTARY_SPINDLE_ACTIVE_BASE))) != 0U;
     if (index == 51 || index == 52)
         return (m_auxiliaryRequestWord.load(std::memory_order_acquire) &
             (index == 51 ? 1U : 2U)) != 0U;
@@ -2712,6 +2723,9 @@ void PLCManager::ExportPLCStatus(SHM_PLC_Status* pStatus) const
     std::memcpy(pStatus->R, m_R, sizeof(m_R));
     std::memcpy(pStatus->DR, m_DR, sizeof(m_DR));
     const unsigned auxiliaryWord = m_auxiliaryRequestWord.load(std::memory_order_acquire);
+    const unsigned spindleWord = m_rotarySpindleOutputWord.load(std::memory_order_acquire);
+    for (unsigned i = 0U; i < static_cast<unsigned>(NCPLC::S::ROTARY_SPINDLE_COUNT); ++i)
+        pStatus->S[NCPLC::S::ROTARY_SPINDLE_ACTIVE_BASE + i] = (spindleWord & (1U << i)) != 0U;
     pStatus->S[51] = (auxiliaryWord & 1U) != 0U;
     pStatus->S[52] = (auxiliaryWord & 2U) != 0U;
     pStatus->R[1] = GetReg_R(1);

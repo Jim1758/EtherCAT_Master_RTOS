@@ -17,8 +17,9 @@ void NCManager::UpdateSystemVariables()
     // 🌟 新增：取得目前的顯示單位倍率 (公制=1.0, 英制=1/25.4)
     // RESET may clean live modes before the frozen display frame is retired.
     const bool displayFrozen = CoordSys.IsTranslationRunFrozen();
-    const NCTranslationSnapshot display = displayFrozen ?
-        CoordSys.GetTranslationSnapshot() : NCTranslationSnapshot{};
+    auto& display=m_ncDispatchScratch->displayTranslation;
+    if(displayFrozen)CoordSys.CopyTranslationSnapshot(display);
+    else display=NCTranslationSnapshot{};
     const bool displayInch = displayFrozen ? display.unitsMode == 20 : CoordSys.isInchMode;
     const double unitScale = displayInch ? (1.0 / 25.4) : 1.0;
     double axisUnitScale[8] = {};

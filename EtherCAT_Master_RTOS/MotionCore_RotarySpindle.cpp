@@ -17,6 +17,8 @@ int SpindleCode(unsigned i,double rpm) noexcept
     const int codes[3][3]={{3,4,5},{13,14,15},{16,17,18}};
     return codes[i][rpm>0.0?0U:rpm<0.0?1U:2U];
 }
+void SpindleDiagnosticCount(std::uint32_t& value) noexcept
+{if(value!=(std::numeric_limits<std::uint32_t>::max)())++value;}
 bool SpindlePacketShape(const NCSpindleDispatch::Packet& p) noexcept
 {
     if(!p.authority.Valid()||!p.sequence||p.spindle>=3U||p.axisSlot>=8U||!std::isfinite(p.signedRpm))return false;
@@ -30,10 +32,118 @@ bool SpindlePacketShape(const NCSpindleDispatch::Packet& p) noexcept
     return p.signedRpm==0.0&&!p.startSequence&&
         (p.kind==NCSpindleDispatch::Kind::HoldStop||p.kind==NCSpindleDispatch::Kind::EndStop||SpindleSafetyPacket(p));
 }
+bool SpindleXYZBooleanEncodingValid(const MotionCommand& command) noexcept
+{
+    // This public sharing predicate can see an untrusted transport image.
+    // Validate every bool it or the fixed-source helpers may read first.
+    const auto* bytes=reinterpret_cast<const unsigned char*>(&command);
+    const std::size_t offsets[]={
+        offsetof(MotionCommand,pathCorePlanarCircle),offsetof(MotionCommand,pathCoreFullCircle),
+        offsetof(MotionCommand,pathCoreRetainedTraversal),offsetof(MotionCommand,pathCoreRetainedReverse),
+        offsetof(MotionCommand,replayTerminalAlreadyPublished),offsetof(MotionCommand,cncFeedLookahead),
+        offsetof(MotionCommand,cncCornerBlend),offsetof(MotionCommand,pathCoreFeedExactStop),
+        offsetof(MotionCommand,pathCoreRotaryFeedExactStop),offsetof(MotionCommand,pathCoreZCFeedExactStop),
+        offsetof(MotionCommand,pathCoreXYZCFeedExactStop),offsetof(MotionCommand,pathCoreXYZCUVFeedExactStop),
+        offsetof(MotionCommand,mem_enableTransform),offsetof(MotionCommand,pathCoreEccentricCFeedExactStop),
+        offsetof(MotionCommand,edm149ZOnlyCommissioning),offsetof(MotionCommand,edm150XYZOnlyCommissioning),
+        offsetof(MotionCommand,edm154SparseCommissioning),offsetof(MotionCommand,edm173G76Gap),
+        offsetof(MotionCommand,sourceIsAbsoluteMode),offsetof(MotionCommand,sourceG68Active),
+        offsetof(MotionCommand,g80EdgeFind),offsetof(MotionCommand,g76SphereAir),
+        offsetof(MotionCommand,sourceG168Active),offsetof(MotionCommand,sourceG51Active),
+        offsetof(MotionCommand,sourceG16Active),offsetof(MotionCommand,sourceG162Active)};
+    for(const auto offset:offsets)if(bytes[offset]>1U)return false;
+    return true;
+}
 }
 
 bool MotionCore::IsRotarySpindleSessionClaimed() const noexcept
 {return m_rotarySpindleClaim.load(std::memory_order_acquire)!=0ULL;}
+
+std::uint32_t MotionCore::GetRotarySpindleConcurrentAxisMask(MotionExecutionEpoch epoch,
+    const MotionOwnerLease& owner) const noexcept
+{
+    const auto claim=m_rotarySpindleClaim.load(std::memory_order_acquire);
+    if(!claim||!epoch||owner.owner!=MotionOwner::AUTO||!owner.IsValid())return 0U;
+    RotarySpindleFrozen frozen{};
+    if(!m_rotarySpindleBegin.Read(frozen).Ready()||!frozen.allowXYZFeed||
+        frozen.authority.scope.runToken!=claim||frozen.authority.scope.epoch!=epoch||
+        frozen.authority.scope.ownerGeneration!=owner.generation||!frozen.axisMask||
+        (frozen.axisMask&~0x38U)!=0U||!IsRotarySpindleAuthorityCurrent(frozen)||
+        !IsRotarySpindleConfigurationCurrent(frozen)||
+        m_rotarySpindleClaim.load(std::memory_order_acquire)!=claim)return 0U;
+    return frozen.axisMask;
+}
+
+bool MotionCore::IsRotarySpindleXYZFeedCommandAllowed(const MotionCommand& command,
+    const RotarySpindleFrozen& frozen) const noexcept
+{
+    // Marker bytes are validated before typed flag reads. This is a narrow
+    // sharing gate; the ordinary command geometry/frame gates still run too.
+    if(!SpindleXYZBooleanEncodingValid(command)||!IsMotionEDMCommissioningMarkerEncodingValid(command)||!frozen.allowXYZFeed||
+        !frozen.axisMask||(frozen.axisMask&~0x38U)!=0U||
+        m_rotarySpindleClaim.load(std::memory_order_acquire)!=frozen.authority.scope.runToken||
+        !IsRotarySpindleAuthorityCurrent(frozen)||!IsRotarySpindleConfigurationCurrent(frozen)||
+        !command.execution.IsAssigned()||command.execution.source!=MotionCommandSource::NC_MEMORY||
+        command.execution.epoch!=frozen.authority.scope.epoch||
+        command.ownerLease.owner!=MotionOwner::AUTO||
+        command.ownerLease.generation!=frozen.authority.scope.ownerGeneration||
+        command.mode!=InterpolationMode::LINEAR||command.positioningOperation!=0U||
+        !command.pathCoreFeedExactStop||command.commandPathMode!=MotionCommandPathMode::EXACT_STOP||
+        !IsNCNativeXYZLinearMapping(command.axisCount,command.axisIndices)||
+        command.pathCoreRotaryFeedExactStop||command.pathCoreZCFeedExactStop||
+        command.pathCoreXYZCFeedExactStop||command.pathCoreXYZCUVFeedExactStop||
+        command.pathCoreEccentricCFeedExactStop||command.pathCorePlanarCircle||command.pathCoreFullCircle||
+        command.pathCoreRetainedTraversal||command.pathCoreRetainedReverse||command.replayTerminalAlreadyPublished||
+        command.cncFeedLookahead||command.cncCornerBlend||command.mem_enableTransform||
+        command.g80EdgeFind||command.g76SphereAir||command.edm173G76Gap||
+        command.edm149ZOnlyCommissioning||command.edm150XYZOnlyCommissioning||command.edm154SparseCommissioning||
+        command.sourceG162Active||command.sourceG16Active||command.sourceToolRadiusMode!=40||
+        IsNCTranslationSnapshotEmpty(command.sourceTranslation)||
+        !IsMotionFixedTranslationSourceAllowed(command)||
+        !MatchesNCTranslation(command.sourceTranslation)||!IsNCTranslationAxisIdentityCurrent(command.sourceTranslation))return false;
+    for(int slot=0;slot<command.axisCount;++slot){
+        const auto axis=static_cast<unsigned>(command.axisIndices[slot]);
+        if(axis>=3U||!m_pContexts||axis>=m_pContexts->size()||
+           !(*m_pContexts)[axis].isExist||(*m_pContexts)[axis].axisType!=AxisType::LINEAR||
+           (frozen.axisMask&(1U<<axis)))return false;
+    }
+    return true;
+}
+
+bool MotionCore::IsRotarySpindleXYZFeedCommandAllowed(const MotionCommand& command) const noexcept
+{
+    const auto claim=m_rotarySpindleClaim.load(std::memory_order_acquire);
+    if(!claim)return false;
+    RotarySpindleFrozen frozen{};
+    return m_rotarySpindleBegin.Read(frozen).Ready()&&frozen.authority.scope.runToken==claim&&
+        IsRotarySpindleXYZFeedCommandAllowed(command,frozen);
+}
+
+bool MotionCore::IsRotarySpindleXYZGroupAllowed() const noexcept
+{
+    const auto& r=m_rotarySpindle;
+    if(!m_Group.isActive||!r.loaded||r.fault||
+       !IsRotarySpindleXYZFeedCommandAllowed(m_Group.currentCmd,r.frozen)||
+       m_Group.mode!=InterpolationMode::LINEAR||m_Group.pathMode!=PathMode::EXACT_STOP||
+       m_Group.enableHistory||m_Group.enableTransform||m_Group.jumpManager.state!=JumpState::IDLE||
+       m_Group.axisCount!=m_Group.currentCmd.axisCount)return false;
+    for(int slot=0;slot<m_Group.axisCount;++slot)
+        if(m_Group.axisIndices[slot]!=m_Group.currentCmd.axisIndices[slot])return false;
+    return true;
+}
+
+bool MotionCore::IsRotarySpindleXYZQueueAllowed() const noexcept
+{
+    const auto queued=GetQueueSize();
+    if(!queued)return !GetCommandIngressSize()&&!GetCommandReplaySize();
+    const auto& r=m_rotarySpindle;
+    // NC submits one exact-stop row at a time. Never grant replay, lookahead,
+    // or an uninspected tail permission merely because its head is XYZ.
+    if(!r.loaded||r.fault||!r.frozen.allowXYZFeed||queued!=1U||
+        GetCommandIngressSize()!=1U||GetCommandReplaySize())return false;
+    MotionCommand next{};
+    return m_Group.cmdQueue.ConsumerTryPeek(next)&&IsRotarySpindleXYZFeedCommandAllowed(next,r.frozen);
+}
 
 bool MotionCore::IsRotarySpindleAuthorityCurrent(const RotarySpindleFrozen& f) const noexcept
 {
@@ -77,12 +187,13 @@ bool MotionCore::IsRotarySpindleConfigurationCurrent(const RotarySpindleFrozen& 
 }
 
 bool MotionCore::BeginRotarySpindleSession(const NCSpindleDispatch::Authority& authority,
-    const NCSpindleDispatch::Config& config) noexcept
+    const NCSpindleDispatch::Config& config,bool allowXYZFeed) noexcept
 {
     if(!authority.Valid()||authority.scope.runToken<=m_rotarySpindleProducerRun||IsRotarySpindleSessionClaimed()||
         authority.scope.epoch>UINT32_MAX||authority.scope.ownerGeneration>UINT32_MAX||
         !m_pContexts||!m_pDrives||m_pContexts->size()!=m_pDrives->size()||m_pContexts->size()>8U)return false;
     RotarySpindleFrozen f{};f.authority=authority;f.config=config;f.slots=static_cast<std::uint32_t>(m_pDrives->size());
+    f.allowXYZFeed=allowXYZFeed;
     for(unsigned slot=0;slot<f.slots;++slot){
         f.inputMapping[slot]=reinterpret_cast<std::uintptr_t>((*m_pDrives)[slot].pInput);
         f.outputMapping[slot]=reinterpret_cast<std::uintptr_t>((*m_pDrives)[slot].pOutput);
@@ -91,7 +202,8 @@ bool MotionCore::BeginRotarySpindleSession(const NCSpindleDispatch::Authority& a
     if(GetQueueSize()||GetCommandIngressSize()||GetCommandReplaySize()||m_axisCommandChannel.command_size())return false;
     for(unsigned i=0U;i<3U;++i){
         const auto& c=config[i];if(!NCRotarySpindle::ValidConfig(c,i))return false;if(!c.enabled)continue;
-        if(c.axisSlot>=m_pContexts->size()||(f.axisMask&(1U<<c.axisSlot)))return false;
+        if(c.axisSlot>=m_pContexts->size()||(f.axisMask&(1U<<c.axisSlot))||
+            (allowXYZFeed&&(c.axisSlot<3U||c.axisSlot>5U)))return false;
         const auto& a=(*m_pContexts)[c.axisSlot];auto& b=f.binding[i];
         if(!std::isfinite(a.finalLead)||a.finalLead<=0.0||!std::isfinite(a.resolution_PPR)||a.resolution_PPR<=0.0||
             !std::isfinite(a.maxVel_PPS)||a.maxVel_PPS<=0.0||!std::isfinite(a.machineCoordinateOffsetPulse)||
@@ -125,6 +237,7 @@ bool MotionCore::BeginRotarySpindleSession(const NCSpindleDispatch::Authority& a
     if(!IsRotarySpindleAuthorityCurrent(f)||!IsRotarySpindleConfigurationCurrent(f))return false;
     if(!m_rotarySpindleBegin.Publish(f))return false;
     m_rotarySpindleRelease.store(0ULL,std::memory_order_release);
+    m_rotarySpindleAxisClaim.store(f.axisMask,std::memory_order_release);
     m_rotarySpindleClaim.store(authority.scope.runToken,std::memory_order_release);
     m_rotarySpindleProducerRun=authority.scope.runToken;
     return true;
@@ -175,6 +288,13 @@ void MotionCore::ContainRotarySpindleRuntime(MotionRotarySpindle::Fault fault,bo
     if(!r.faultCode)r.faultCode=static_cast<std::uint32_t>(fault);
     r.hardwarePps.fill(0);r.commandRpm.fill(0.0);
     if(first){
+        // Preserve the last completed physical observation before containment
+        // resets proof or NC replaces the authored request with a safety stop.
+        // observationTick identifies an earlier sample for faults before input
+        // processing; this is evidence, never an extra control decision.
+        auto& diagnostic=r.feedback.firstFault;
+        diagnostic.progress=r.feedback.progress;diagnostic.tick=r.tick;diagnostic.beginTick=r.beginTick;
+        diagnostic.code=r.faultCode;diagnostic.initialized=r.initialized;diagnostic.valid=true;
         r.handback=false;r.zeroSamples.fill(0U);r.feedback.receipt={};
         if(r.initialized){NCRotarySpindle::Input cancel{};cancel.scope=r.frozen.authority.scope;
             cancel.lifecycle=NCRotarySpindle::Lifecycle::Alarm;(void)r.controller.Step(cancel);}
@@ -201,12 +321,14 @@ void MotionCore::ObserveRotarySpindleRuntimeInput() noexcept
     if(!configuration)ContainRotarySpindleRuntime(MotionRotarySpindle::Fault::Configuration,true);
     if(!authority)ContainRotarySpindleRuntime(MotionRotarySpindle::Fault::Authority,
         GetMotionOwnerLease().owner!=MotionOwner::SAFETY&&!HasPendingSafetyOrRecoveryRequests());
-    bool allSource=fresh&&configuration;
+    const bool xyzGroup=IsRotarySpindleXYZGroupAllowed();
+    bool allSource=fresh&&configuration,allStopMotion=true;
     NCRotarySpindle::Input input{};input.scope=r.frozen.authority.scope;input.tick=r.tick;input.physicalSequence=r.tick;
     input.lifecycle=NCRotarySpindle::Lifecycle::Run;input.pdoValid=fresh;input.configurationCurrent=configuration;
     input.memoryProgram=input.programCommitted=true;
     for(unsigned i=0;i<3U;++i){
         const auto& c=r.frozen.config[i];if(!c.enabled)continue;
+        std::int32_t diagnosticRawDelta=0;bool diagnosticRawDeltaValid=false;double rawRpm=0.0;
         bool valid=fresh&&configuration&&ReadMotionServoInputCompatibilitySnapshotBySlot(static_cast<int>(c.axisSlot),r.input[i]);
         if(valid){
             const auto& a=(*m_pContexts)[c.axisSlot];const auto& p=r.input[i];
@@ -215,6 +337,8 @@ void MotionCore::ObserveRotarySpindleRuntimeInput() noexcept
             const auto raw=static_cast<std::uint32_t>(p.ActualPosition);double rpm=0.0;
             const bool delta=r.rawSeen[i]&&r.rawTick[i]+1ULL==r.tick&&fresh&&
                 MotionRotarySpindleProof::DecodeRpm(raw,r.previousRaw[i],c.pulsesPerOutputRevolution,a.isReverse,a.Axis_Reverse,rpm);
+            diagnosticRawDeltaValid=delta;
+            if(delta)diagnosticRawDelta=MotionRotarySpindleProof::RawDelta(raw,r.previousRaw[i]);
             bool unwrap=false;
             if(!r.rawTick[i]){
                 r.rawUnwrapped[i]=a.unwrappedActPos+static_cast<double>(MotionRotarySpindleProof::RawDelta(raw,static_cast<std::uint32_t>(a.lastRawActPos)));
@@ -228,7 +352,7 @@ void MotionCore::ObserveRotarySpindleRuntimeInput() noexcept
                 if(unwrap)r.rawUnwrapped[i]+=static_cast<double>(MotionRotarySpindleProof::RawDelta(raw,r.previousRaw[i]));
             }
             if(unwrap){r.previousRaw[i]=raw;r.rawTick[i]=r.tick;}
-            r.rawSeen[i]=unwrap;r.actualRpm[i]=rpm;
+            r.rawSeen[i]=unwrap;rawRpm=rpm;
             r.actualPulse[i]=r.rawUnwrapped[i]*(a.isReverse!=a.Axis_Reverse?-1.0:1.0)-a.machineCoordinateOffsetPulse;
             valid=valid&&delta&&unwrap&&std::isfinite(r.actualPulse[i]);
             if(a.isFault||a.isLagAlarm||a.resetRequest||a.homeRuntime.active||a.hardLimitPositive||a.hardLimitNegative||
@@ -236,6 +360,21 @@ void MotionCore::ObserveRotarySpindleRuntimeInput() noexcept
                 ContainRotarySpindleRuntime(MotionRotarySpindle::Fault::Source,
                     GetMotionOwnerLease().owner!=MotionOwner::SAFETY&&!HasPendingSafetyOrRecoveryRequests());
         }else r.rawSeen[i]=false;
+        const bool physicalSourceValid=valid;
+        auto& speed=r.speedWindow[i];
+        const auto reverseFlags=r.frozen.binding[i].reverseFlags;
+        const bool speedReady=speed.Observe(r.tick,diagnosticRawDelta,valid,
+            c.pulsesPerOutputRevolution,reverseFlags==1U||reverseFlags==2U);
+        r.actualRpm[i]=speed.Rpm();
+        const bool rawAboveMaximum=valid&&std::fabs(rawRpm)-c.maximumRpm>c.readyToleranceRpm;
+        // Even during safety recovery, an instantaneous overspeed sample
+        // cannot contribute to a stop receipt or reference handback.
+        const bool stopMotion=speedReady&&!rawAboveMaximum&&speed.MotionRpm()<=c.stoppedToleranceRpm;
+        allStopMotion=allStopMotion&&stopMotion;
+        // Preserve the original instantaneous overspeed rejection while the
+        // signed finite-window estimate is used for normal speed readiness.
+        const bool rawOverspeed=rawAboveMaximum&&r.initialized&&!r.fault&&r.controller.Current().axis[i].ownsAxis;
+        valid=valid&&speedReady;
         r.sourceValid[i]=valid;allSource=allSource&&valid;
         const auto& sent=r.sent[i];const auto currentOwner=GetMotionOwnerLease();
         const auto currentTicket=UnpackMotionOwnerSafetyRequestTicket(m_motionOwnerState.load(std::memory_order_acquire));
@@ -243,15 +382,58 @@ void MotionCore::ObserveRotarySpindleRuntimeInput() noexcept
             (currentOwner.owner==MotionOwner::SAFETY&&currentOwner.Matches(sent.owner)&&
                 GetCurrentExecutionEpoch()==sent.epoch&&currentTicket==sent.safetyTicket):authority;
         const bool prior=valid&&sent.exact&&sent.tick+1ULL==r.tick&&sameSendScope;
-        const bool zero=prior&&sent.commandRpm==0.0&&std::fabs(r.actualRpm[i])<=c.stoppedToleranceRpm;
-        r.zeroSamples[i]=zero?(std::min)(r.zeroSamples[i]+1U,NCRotarySpindle::RequiredSamples):0U;
+        const bool zero=prior&&!rawOverspeed&&sent.commandRpm==0.0&&stopMotion;
+        const auto previousZeroSamples=r.zeroSamples[i];
+        // Begin does not count its own sample in the numerical controller.
+        // Keep this barrier aligned, including first-row M3 without an M5.
+        r.zeroSamples[i]=zero&&(r.initialized||r.fault)?
+            (std::min)(r.zeroSamples[i]+1U,NCRotarySpindle::RequiredSamples):0U;
+        auto& progress=r.feedback.progress[i];progress.observationTick=r.tick;
+        progress.rawDelta=diagnosticRawDelta;progress.rawDeltaValid=diagnosticRawDeltaValid;
+        progress.actualRpm=rawRpm;progress.priorCommandRpm=sent.commandRpm;
+        progress.filteredRpm=r.actualRpm[i];progress.stopMotionRpm=speed.MotionRpm();
+        progress.speedSamples=speed.Samples();progress.speedReady=speedReady;
+        if(diagnosticRawDeltaValid){
+            const auto wide=static_cast<std::int64_t>(diagnosticRawDelta);
+            const auto magnitude=static_cast<std::uint64_t>(wide<0?-wide:wide);
+            progress.maximumAbsRawDelta=(std::max)(progress.maximumAbsRawDelta,magnitude);
+        }
+        if(physicalSourceValid)progress.maximumAbsActualRpm=(std::max)(progress.maximumAbsActualRpm,std::fabs(rawRpm));
+        progress.stoppedToleranceRpm=c.stoppedToleranceRpm;progress.sourceValid=physicalSourceValid;
+        progress.exactPriorSend=prior;progress.zeroSent=prior&&sent.commandRpm==0.0;
+        progress.finalSendTick=sent.tick;progress.finalSendRequestSequence=sent.request;
+        progress.zeroSamples=r.zeroSamples[i];
+        progress.maximumZeroSamples=(std::max)(progress.maximumZeroSamples,progress.zeroSamples);
+        progress.packetApplied=r.havePacket[i];progress.appliedSequence=r.havePacket[i]?r.packet[i].sequence:0ULL;
+        std::uint32_t reason=0U;
+        if(!physicalSourceValid)reason|=MotionRotarySpindle::InvalidSource;
+        if(!sent.exact)reason|=MotionRotarySpindle::NoExactSend;
+        if(sent.tick+1ULL!=r.tick)reason|=MotionRotarySpindle::NonAdjacentSend;
+        if(!sameSendScope)reason|=MotionRotarySpindle::SendScopeChanged;
+        if(sent.commandRpm!=0.0)reason|=MotionRotarySpindle::NonzeroPriorCommand;
+        if(speedReady&&speed.MotionRpm()>c.stoppedToleranceRpm)reason|=MotionRotarySpindle::AboveStopTolerance;
+        if(!speedReady)reason|=MotionRotarySpindle::SpeedWindowIncomplete;
+        if(rawAboveMaximum)reason|=MotionRotarySpindle::InstantaneousOverspeed;
+        if(!r.havePacket[i])reason|=MotionRotarySpindle::NoAppliedPacket;
+        if(r.havePacket[i]&&sent.request!=r.packet[i].sequence)reason|=MotionRotarySpindle::SendRequestMismatch;
+        if(!configuration)reason|=MotionRotarySpindle::ConfigurationChanged;
+        if(!diagnosticRawDeltaValid)reason|=MotionRotarySpindle::RawDeltaUnavailable;
+        progress.currentReasonMask=reason;
+        if(previousZeroSamples&&!zero){SpindleDiagnosticCount(progress.zeroResetCount);progress.lastResetReasonMask=reason;}
+        if(!physicalSourceValid)SpindleDiagnosticCount(progress.invalidSourceSamples);
+        if(!sent.exact||sent.tick+1ULL!=r.tick||!sameSendScope)SpindleDiagnosticCount(progress.missingSendSamples);
+        if(reason&MotionRotarySpindle::AboveStopTolerance)SpindleDiagnosticCount(progress.overStopSamples);
+        if(reason&MotionRotarySpindle::SendRequestMismatch)SpindleDiagnosticCount(progress.requestMismatchSamples);
+        if(rawOverspeed)ContainRotarySpindleRuntime(MotionRotarySpindle::Fault::Feedback,true);
         input.axis[i].actualRpm=r.actualRpm[i];input.axis[i].sourceValid=valid;
-        input.axis[i].positioningActive=m_Group.isActive||(*m_pContexts)[c.axisSlot].homeRuntime.active;
+        input.axis[i].positioningActive=(m_Group.isActive&&!xyzGroup)||(*m_pContexts)[c.axisSlot].homeRuntime.active;
         input.axis[i].finalZeroSent=zero;input.axis[i].zeroSendTick=sent.tick;input.axis[i].zeroSendRequestSequence=sent.request;
         if(r.havePacket[i]){
             auto& receipt=r.feedback.receipt[i];
-            if(r.window[i].Observe(r.tick,r.tick,r.actualRpm[i],sent.commandRpm,prior,sent.tick,sent.request,
-                configuration,authority,c.stoppedToleranceRpm,c.readyToleranceRpm)&&r.window[i].Populate(receipt)){
+            // Do not recreate proof on the sample that just triggered an
+            // instantaneous overspeed, even if its window average is low.
+            if(r.window[i].Observe(r.tick,r.tick,r.actualRpm[i],sent.commandRpm,prior&&!rawAboveMaximum,sent.tick,sent.request,
+                configuration,authority,c.stoppedToleranceRpm,c.readyToleranceRpm,stopMotion)&&r.window[i].Populate(receipt)){
                 receipt.publicationSequence=++r.publication;receipt.accepted=true;receipt.authorityCurrent=authority;
                 receipt.ready=r.packet[i].signedRpm!=0.0&&!r.fault;receipt.stopped=r.packet[i].signedRpm==0.0;
                 r.qualifiedSequence[i]=r.packet[i].sequence;
@@ -262,21 +444,30 @@ void MotionCore::ObserveRotarySpindleRuntimeInput() noexcept
                 }
             }else receipt=NCSpindleDispatch::Receipt{};
         }
+        progress.qualifiedSequence=r.qualifiedSequence[i];
     }
     // A first encoder sample establishes a delta baseline only. It cannot
     // authorize motion, invalidate HOME or contribute a physical stop sample.
-    if(!r.initialized&&allSource&&authority&&!r.fault){
+    if(!r.initialized&&allSource&&allStopMotion&&authority&&!r.fault){
         r.initialized=r.controller.Begin(input.scope,r.frozen.config,input);
     }else if(r.initialized&&!r.fault&&!allSource){
         ContainRotarySpindleRuntime(MotionRotarySpindle::Fault::Source,true);
     }
     if(!r.initialized&&!r.fault&&r.tick-r.beginTick>20000ULL)
         ContainRotarySpindleRuntime(MotionRotarySpindle::Fault::Timeout,true);
-    if(m_Group.isActive||GetQueueSize()||GetCommandIngressSize()||GetCommandReplaySize())
+    if((m_Group.isActive&&!xyzGroup)||!IsRotarySpindleXYZQueueAllowed())
         ContainRotarySpindleRuntime(MotionRotarySpindle::Fault::Positioning,true);
-    if(!r.fault&&m_pContexts)for(const auto& axis:*m_pContexts)if(axis.isExist&&
-        (axis.homeRuntime.active||axis.state!=MotionState::MotionState_IDLE))
-        ContainRotarySpindleRuntime(MotionRotarySpindle::Fault::Positioning,true);
+    if(!r.fault&&m_pContexts)for(const auto& axis:*m_pContexts)if(axis.isExist){
+        bool xyzMember=false;
+        if(xyzGroup&&axis.axisIndex>=0&&axis.axisIndex<3)
+            for(int slot=0;slot<m_Group.axisCount;++slot)
+                xyzMember=xyzMember||m_Group.axisIndices[slot]==axis.axisIndex;
+        const bool admittedState=xyzMember&&(axis.state==MotionState::MotionState_INTERPOLATING||
+            axis.state==MotionState::MotionState_STOPPING);
+        if(axis.homeRuntime.active||axis.isFault||axis.isLagAlarm||
+            (axis.state!=MotionState::MotionState_IDLE&&!admittedState))
+            ContainRotarySpindleRuntime(MotionRotarySpindle::Fault::Positioning,true);
+    }
     std::array<NCRotarySpindle::Request,3> requests{};std::array<bool,3> present{};
     std::array<NCSpindleDispatch::Packet,3> incoming{};
     for(unsigned i=0;i<3U;++i){
@@ -289,6 +480,8 @@ void MotionCore::ObserveRotarySpindleRuntimeInput() noexcept
             const auto ticks=static_cast<std::uint64_t>(std::ceil((2.0*ramp+5.0)/NCRotarySpindle::CycleSeconds));
             r.deadlineSequence[i]=packet.sequence;r.deadlineTick[i]=r.tick+ticks;
         }
+        r.feedback.progress[i].requestedSequence=packet.sequence;
+        r.feedback.progress[i].deadlineTick=r.deadlineTick[i];
         if(!r.fault&&r.qualifiedSequence[i]!=packet.sequence&&r.tick>r.deadlineTick[i])
             ContainRotarySpindleRuntime(MotionRotarySpindle::Fault::Timeout,true);
         if(r.havePacket[i]&&packet.sequence==r.packet[i].sequence){
@@ -365,7 +558,8 @@ void MotionCore::ObserveRotarySpindleRuntimeInput() noexcept
     if(allStopped&&!r.handback)r.handback=HandbackRotarySpindleAxes(!authority);
     if(!allStopped)r.handback=false;
     r.feedback.allStopped=allStopped;r.feedback.handbackReady=r.handback;
-    if(r.handback&&m_rotarySpindleRelease.load(std::memory_order_acquire)==claim&&
+    if(r.handback&&!m_Group.isActive&&!GetQueueSize()&&!GetCommandIngressSize()&&!GetCommandReplaySize()&&
+        m_rotarySpindleRelease.load(std::memory_order_acquire)==claim&&
         (r.fault||r.controller.RetireStopped(r.frozen.authority.scope))){
         // A HOLD/NC scan may outlive the first stopped window. Rebind the
         // complete raw reference to this final fresh sample before releasing
@@ -412,9 +606,12 @@ bool MotionCore::ApplyRotarySpindleAxis(AxisContext& axis,const MotionServoInput
     hardwarePps=0;const auto claim=m_rotarySpindleClaim.load(std::memory_order_acquire);auto& r=m_rotarySpindle;
     if(!claim)return false;
     // NC may publish a claim after this pass captured its physical inputs.
-    // Until the next source callback adopts it, every axis is zero-only.
+    // Until the next source callback adopts it, only the claimed CSV axes
+    // are zero-only. Disjoint XYZ must retain their ordinary PID path.
     // This is neither an accepted start nor a source failure.
-    if(!r.loaded||r.frozen.authority.scope.runToken!=claim)return true;
+    if(!r.loaded||r.frozen.authority.scope.runToken!=claim)
+        return axis.axisIndex>=0&&axis.axisIndex<8&&
+            (m_rotarySpindleAxisClaim.load(std::memory_order_acquire)&(1U<<static_cast<unsigned>(axis.axisIndex)))!=0U;
     unsigned i=0;for(;i<3U;++i)if(r.frozen.config[i].enabled&&r.frozen.config[i].axisSlot==static_cast<unsigned>(axis.axisIndex))break;
     if(i==3U)return false;
     const bool firstDeltaPending=!r.initialized&&r.rawSeen[i]&&m_ncSettleRuntimeCycleValid&&m_ncSettleRuntimeCycleContiguous;
@@ -472,8 +669,17 @@ bool MotionCore::ValidateRotarySpindleSend(const ServoOutputFrameReservation& re
     bool valid=r.loaded&&reservation.rotarySpindleRun==claim&&r.frozen.authority.scope.runToken==claim&&
         reservation.rotarySpindleTick==r.tick&&r.tick==m_ncSettleRuntimeCycleTick&&reservation.handoff.sourceTick==r.tick&&
         IsRotarySpindleConfigurationCurrent(r.frozen);
-    if(valid&&!r.fault)for(const auto& axis:*m_pContexts)if(axis.isExist&&
-        (axis.homeRuntime.active||axis.state!=MotionState::MotionState_IDLE))valid=false;
+    const bool xyzGroup=valid&&!r.fault&&IsRotarySpindleXYZGroupAllowed();
+    if(valid&&!r.fault)for(const auto& axis:*m_pContexts)if(axis.isExist){
+        bool xyzMember=false;
+        if(xyzGroup&&axis.axisIndex>=0&&axis.axisIndex<3)
+            for(int slot=0;slot<m_Group.axisCount;++slot)
+                xyzMember=xyzMember||m_Group.axisIndices[slot]==axis.axisIndex;
+        const bool admittedState=xyzMember&&(axis.state==MotionState::MotionState_INTERPOLATING||
+            axis.state==MotionState::MotionState_STOPPING);
+        if(axis.homeRuntime.active||axis.isFault||axis.isLagAlarm||
+            (axis.state!=MotionState::MotionState_IDLE&&!admittedState))valid=false;
+    }
     for(unsigned i=0;valid&&i<3U;++i)if(r.frozen.config[i].enabled){
         valid=reservation.rotarySpindleRequest[i]==(r.havePacket[i]?r.packet[i].sequence:0ULL)&&
             reservation.rotarySpindleHardwarePps[i]==r.hardwarePps[i]&&reservation.rotarySpindleRpm[i]==r.commandRpm[i];
@@ -490,8 +696,12 @@ bool MotionCore::SealRotarySpindleSerializedImage(ServoOutputFrameReservation& r
     const auto claim=m_rotarySpindleClaim.load(std::memory_order_acquire);auto& r=m_rotarySpindle;
     if(claim&&(!r.loaded||r.frozen.authority.scope.runToken!=claim)){
         if(!ioMapBase||!payload||payloadSize!=ioMapSize||!m_pDrives||m_pDrives->size()>8U)return false;
+        const auto claimed=m_rotarySpindleAxisClaim.load(std::memory_order_acquire);
+        if(!claimed||(claimed&~((1U<<m_pDrives->size())-1U))!=0U)return false;
         const auto base=reinterpret_cast<std::uintptr_t>(ioMapBase);
-        for(const auto& drive:*m_pDrives){
+        for(unsigned slot=0;slot<m_pDrives->size();++slot){
+            if((claimed&(1U<<slot))==0U)continue;
+            const auto& drive=(*m_pDrives)[slot];
             const auto address=reinterpret_cast<std::uintptr_t>(drive.pOutput);
             if(!drive.pOutput||address<base||address-base>ioMapSize)return false;
             const auto offset=static_cast<std::size_t>(address-base);
@@ -499,7 +709,10 @@ bool MotionCore::SealRotarySpindleSerializedImage(ServoOutputFrameReservation& r
             std::int32_t wire=0;std::memcpy(&wire,payload+offset+offsetof(ServoOutput,TargetVelocity),sizeof(wire));
             if(wire!=0)return false;
         }
-        return true; // Safe zero transport only; no spindle receipt is sealed.
+        // Claimed CSV slots are zero; no spindle receipt is sealed. A retired
+        // claim may be replaced while the payload is inspected.
+        return m_rotarySpindleClaim.load(std::memory_order_acquire)==claim&&
+            m_rotarySpindleAxisClaim.load(std::memory_order_acquire)==claimed;
     }
     if(!reservation.rotarySpindleRun)return !IsRotarySpindleSessionClaimed();
     if(!ValidateRotarySpindleSend(reservation)||!ioMapBase||!payload||payloadSize!=ioMapSize)return false;
@@ -569,5 +782,29 @@ void MotionCore::PublishRotarySpindleRuntime() noexcept
     auto& r=m_rotarySpindle;r.feedback.authority=r.frozen.authority;r.feedback.tick=r.tick;r.feedback.axisMask=r.frozen.axisMask;
     r.feedback.initialized=r.initialized;r.feedback.fault=r.fault;r.feedback.faultCode=r.faultCode;
     r.feedback.commandRpm=r.commandRpm;r.feedback.actualRpm=r.actualRpm;
+    // State follows the current physical stop barrier, including containment.
+    // A new nonzero command is visible immediately even when the prior zero
+    // count is still complete; losing feedback cannot manufacture an OFF.
+    r.feedback.rotationActiveMask=0U;
+    r.feedback.positionValidMask=r.feedback.homedMask=0U;
+    r.feedback.requestedRpm.fill(0.0);r.feedback.actualMcsDegrees.fill(0.0);
+    r.feedback.phase.fill(NCRotarySpindle::Phase::Stopped);
+    for(unsigned i=0;i<3U;++i)if(r.frozen.config[i].enabled){
+        const auto& config=r.frozen.config[i];const auto& binding=r.frozen.binding[i];
+        r.feedback.requestedRpm[i]=r.havePacket[i]?r.packet[i].signedRpm:0.0;
+        r.feedback.phase[i]=r.fault?NCRotarySpindle::Phase::Fault:r.controller.Current().axis[i].phase;
+        const double degrees=r.actualPulse[i]*(binding.lead/binding.resolution);
+        if(r.feedback.progress[i].sourceValid&&r.rawTick[i]==r.tick&&std::isfinite(degrees)){
+            r.feedback.actualMcsDegrees[i]=degrees;r.feedback.positionValidMask|=1U<<i;
+            if(m_pContexts&&config.axisSlot<m_pContexts->size()&&(*m_pContexts)[config.axisSlot].isHomed)
+                r.feedback.homedMask|=1U<<i;
+        }
+        const bool stopped=r.sourceValid[i]&&r.commandRpm[i]==0.0&&
+            r.zeroSamples[i]>=NCRotarySpindle::RequiredSamples;
+        if(!stopped)r.feedback.rotationActiveMask|=1U<<i;
+        auto& progress=r.feedback.progress[i];progress.packetApplied=r.havePacket[i];
+        progress.appliedSequence=r.havePacket[i]?r.packet[i].sequence:0ULL;
+        progress.qualifiedSequence=r.qualifiedSequence[i];
+    }
     if(!m_rotarySpindleFeedback.Publish(r.feedback))ContainRotarySpindleRuntime(MotionRotarySpindle::Fault::Feedback,true);
 }

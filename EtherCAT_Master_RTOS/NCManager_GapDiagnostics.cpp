@@ -1,6 +1,57 @@
 // EDM267 FIX1: single-copy NC diagnostic observers, extracted without behavior changes.
 #include "NCManager_GapInternal.h"
 
+int NCManager::GetCurrentRetreatModeSameThread() const noexcept
+{
+    // HMI_Bridge's 100 ms publisher runs on the NC owner, after ProcessTask.
+    // This is an observation, never an admission or a control side effect.
+    const NCState state=m_state.load(std::memory_order_acquire);
+    if((state!=NCState::RUN&&state!=NCState::HOLD)||m_mode!=NCOperationMode::MEMORY||
+       !m_programMotionLease.IsValid()||m_programMotionLease.owner!=MotionOwner::AUTO||
+       !m_pathCoreLiveBookkeeping.currentRunToken)
+        return -1;
+    const auto run=m_pathCoreLiveBookkeeping.currentRunToken;
+    const auto cache=GetBaseProgramCache().GetGeneration();
+    if(!cache)return -1;
+    const auto& live=m_edm94;
+    if(live.latched)
+    {
+        if(!live.session||live.run!=run||live.cache!=cache||live.cancelled||
+           !live.lease.Matches(m_programMotionLease))return -1;
+        // An actual RT-bound row wins over a later NC selector. These are
+        // coherent feedback copies; never inspect RT's mutable group object.
+        if(live.gapHistoryMode)
+        {
+            EDM128::MotionFeedback current{};
+            if(!m_motion.ReadEDM128Feedback(current)||!current.enabled||!current.active||current.faulted||
+               current.session!=live.session||current.armEpoch!=live.armEpoch||
+               current.ownerGeneration!=live.lease.generation)return -1;
+            if(current.authorizedRows>current.completedRows)
+                return EDM116::ValidPolicy(current.rowPolicy)?static_cast<int>(current.rowPolicy.mode):-1;
+            if(current.authorizedRows<current.completedRows)return -1;
+        }
+        else if(live.gapModeFlush)
+        {
+            EDM116::MotionFeedback current{};
+            if(!m_motion.ReadEDM116Feedback(current)||!current.enabled||
+               current.session!=live.session||current.armEpoch!=live.armEpoch||
+               current.ownerGeneration!=live.lease.generation)return -1;
+            if(current.authorizedRows>current.completedRows)
+                return EDM116::ValidPolicy(current.rowPolicy)?static_cast<int>(current.rowPolicy.mode):-1;
+            if(current.authorizedRows<current.completedRows)return -1;
+        }
+        // No row is executing: only an accepted modal selector is current.
+        // expectedMode[] and pending hold future intent and are excluded.
+        return EDM116::IsModalFixture(live.gapModeFixture)&&EDM127::Valid(m_edm127.current)?
+            static_cast<int>(m_edm127.current.mode):-1;
+    }
+    // AIR G01/G02/G03/G76 and P50 publish this value after exact ledger
+    // commit/binding. Their completion callbacks serialize the next motion.
+    const auto& modal=m_g76Modal;
+    return modal.valid&&modal.mode<=4U&&modal.commit&&modal.run==run&&modal.cache==cache&&
+        modal.lease.Matches(m_programMotionLease)?static_cast<int>(modal.mode):-1;
+}
+
 namespace NCGapDetail
 {
 namespace

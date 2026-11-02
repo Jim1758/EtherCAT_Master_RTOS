@@ -12147,8 +12147,11 @@ bool MotionCore::ProcessNCSettleRequestsAndResetRebase() noexcept
                 m_Group.pathMode != PathMode::PATH_SERVO &&
                 m_Group.pathMode != PathMode::JUMP_TRACKING &&
                 m_Group.jumpManager.state == JumpState::IDLE;
+            const std::uint32_t concurrentSpindleMask = tupleCurrent
+                ? GetRotarySpindleConcurrentAxisMask(request.executionEpoch, request.ownerLease)
+                : 0U;
             tracker.scopeMask = pureProgramScope
-                ? BuildExistingNCAxisMask()
+                ? (BuildExistingNCAxisMask() & ~concurrentSpindleMask)
                 : currentScopeMask;
             if (requestIdentityCurrent && tracker.scopeMask != 0U)
             {
@@ -12168,6 +12171,8 @@ bool MotionCore::ProcessNCSettleRequestsAndResetRebase() noexcept
             tracker.requestAccepted =
                 tupleCurrent &&
                 (requestIdentityCurrent || pureProgramScope) &&
+                (concurrentSpindleMask == 0U || pureProgramScope ||
+                    IsRotarySpindleXYZFeedCommandAllowed(m_Group.currentCmd)) &&
                 tracker.scopeMask != 0U;
             if (!tracker.requestAccepted)
             {
@@ -17738,9 +17743,12 @@ bool MotionCore::IsEccentricCStartBindingCurrent(const MotionCommand& command,
 MotionRejectReason MotionCore::GetCommandAuthorizationFailure(
     const MotionCommand& command, EDM174Leaf::Sample* edm174Trace) const noexcept
 {
-    // EDM289 first live scope is spindle-only: no ordinary group may claim
-    // positioning until exact stop and reference handback release the session.
-    if (IsRotarySpindleSessionClaimed()) return MotionRejectReason::OWNER_CONFLICT;
+    // EDM295: only the frozen, same-epoch MEMORY/AUTO native XYZ G01 lane
+    // may share a claimed C/U/V spindle session.  Its ordinary epoch, frame,
+    // geometry, compensation and safety authorization still runs below.
+    if (IsRotarySpindleSessionClaimed() &&
+        !IsRotarySpindleXYZFeedCommandAllowed(command))
+        return MotionRejectReason::OWNER_CONFLICT;
     // FIX6_AUTH_OBSERVATION_BEGIN: null producer callers access no RT recorder.
     EDM174Leaf::Scope edm174Total(edm174Trace);
     const auto edm174Read128 = [this,edm174Trace](EDM128::MotionFeedback& mode) noexcept {
@@ -28923,6 +28931,40 @@ bool MotionCore::TryLineMove(
         return true;
     }
 
+    if (IsRotarySpindleSessionClaimed())
+    {
+        // ABORTING normally replaces the execution epoch. A frozen spindle
+        // run owns that same epoch, so its one permitted XYZ lane instead
+        // enters only at an exact, physically settled and drained boundary.
+        // It never aborts, clears, replays or rewrites the C/U/V runtime.
+        AssignExecutionIdentity(cmd, commandEpoch, commandSource, commandOwnerLease);
+        if (producedIdentity != nullptr) *producedIdentity = cmd.execution;
+        if (producedOwnerLease != nullptr) *producedOwnerLease = cmd.ownerLease;
+        const auto rejectConcurrent = [&](MotionRejectReason reason) noexcept
+        {
+            m_lastRejectedSegmentId.store(cmd.execution.segmentId, std::memory_order_relaxed);
+            TryQueueProducerFeedbackNotice(cmd, MotionFeedbackType::REJECTED, reason, 0U, 0.0);
+            ObserveCommandPathModeProducer(cmd, false);
+            RecordProgramBlockMotionSubmission(cmd, false, reason);
+            return false;
+        };
+        if (mode != BufferMode::ABORTING || !plannedTailWellFormed ||
+            commandEpoch != entryEpoch || !commandOwnerLease.Matches(entryOwnerLease) ||
+            !pathCoreFeedExactStop || edm94Authorization != nullptr ||
+            !IsRotarySpindleXYZFeedCommandAllowed(cmd))
+            return rejectConcurrent(MotionRejectReason::OWNER_CONFLICT);
+
+        LifecycleCommitReservationGuard concurrentCommit(*this, cmd.execution);
+        if (!concurrentCommit.IsAcquired() ||
+            !IsRotarySpindleXYZFeedCommandAllowed(cmd) ||
+            !HasRotarySpindleXYZSettleAcknowledgementImpl(commandEpoch, commandOwnerLease, true) ||
+            GetQueueSize() != 0U || GetCommandIngressSize() != 0U || GetCommandReplaySize() != 0U ||
+            m_axisCommandChannel.command_size() != 0U || m_Group.enableHistory ||
+            m_Group.enableTransform || m_Group.jumpManager.state != JumpState::IDLE)
+            return rejectConcurrent(MotionRejectReason::NOT_READY);
+        return TryEnqueueMotionCommand(cmd);
+    }
+
     EDM94HandoffMessage edm94Handoff{};
     const bool edm94Scoped = edm94Authorization != nullptr && edm94Authorization->session != 0ULL;
     if (edm94Scoped && (mode != BufferMode::ABORTING || !xyzcuvScope ||
@@ -36703,7 +36745,8 @@ void MotionCore::UpdateNCSettleProducer(
                 ++counters.runtimeGapCount;
             }
 
-            if (profile == MotionNCSettleProfile::GROUP_COMPLETION)
+            if (profile == MotionNCSettleProfile::GROUP_COMPLETION ||
+                profile == MotionNCSettleProfile::ROTARY_XYZ_COMPLETION)
             {
                 // NC-0.2K.2.1: Program End is a machine-wide standstill
                 // boundary.  The previous latest-segment mask could be Y-only
@@ -36734,10 +36777,26 @@ void MotionCore::UpdateNCSettleProducer(
                     MOTION_EXECUTION_EPOCH_INVALID &&
                     groupDrained;
 
+                // EDM295 uses a separate automatic proof for the positional
+                // lane. GROUP_COMPLETION above remains machine-wide for M30
+                // and owner handback. Exclude only frozen, exact claimed CUV;
+                // an unclaimed rotary/extra axis still has to prove stopped.
+                const bool concurrentProfile =
+                    profile == MotionNCSettleProfile::ROTARY_XYZ_COMPLETION;
+                const std::uint32_t concurrentSpindleMask = concurrentProfile
+                    ? GetRotarySpindleConcurrentAxisMask(currentExecutionEpoch, currentOwnerLease)
+                    : 0U;
+                const bool concurrentScopeAllowed = !concurrentProfile ||
+                    (concurrentSpindleMask != 0U &&
+                        (!currentGroupIdentityCorrelated ||
+                            IsRotarySpindleXYZFeedCommandAllowed(m_Group.currentCmd)) &&
+                        !m_Group.enableHistory && !m_Group.enableTransform &&
+                        m_Group.jumpManager.state == JumpState::IDLE &&
+                        m_axisCommandChannel.command_size() == 0U);
                 const std::uint32_t scopeMask =
-                    (currentGroupIdentityCorrelated ||
-                        pureProgramExecutionScope)
-                    ? existingAxisMask
+                    concurrentScopeAllowed &&
+                    (currentGroupIdentityCorrelated || pureProgramExecutionScope)
+                    ? (existingAxisMask & ~concurrentSpindleMask)
                     : 0U;
 
                 const bool identityChanged =
@@ -36894,7 +36953,8 @@ void MotionCore::UpdateNCSettleProducer(
                 resetAuthoritativeCurrent &&
                 !resetInternalCoherent;
 
-            if (profile != MotionNCSettleProfile::GROUP_COMPLETION)
+            if (profile != MotionNCSettleProfile::GROUP_COMPLETION &&
+                profile != MotionNCSettleProfile::ROTARY_XYZ_COMPLETION)
             {
                 if (tracker.requestSequence ==
                     MOTION_NC_SETTLE_REQUEST_SEQUENCE_INVALID ||
@@ -36937,7 +36997,8 @@ void MotionCore::UpdateNCSettleProducer(
                             m_Group.pathMode != PathMode::JUMP_TRACKING &&
                             m_Group.jumpManager.state == JumpState::IDLE &&
                             tracker.scopeMask != 0U &&
-                            tracker.scopeMask == existingAxisMask &&
+                            tracker.scopeMask == (existingAxisMask &
+                                ~GetRotarySpindleConcurrentAxisMask(currentExecutionEpoch, currentOwnerLease)) &&
                             MotionExecutionIdentityExactlyMatches(
                                 tracker.executionIdentity,
                                 currentGroupIdentity);
@@ -37037,7 +37098,8 @@ void MotionCore::UpdateNCSettleProducer(
             }
 
             if (blocker == MotionNCSettleBlocker::NONE &&
-                profile == MotionNCSettleProfile::GROUP_COMPLETION &&
+                (profile == MotionNCSettleProfile::GROUP_COMPLETION ||
+                    profile == MotionNCSettleProfile::ROTARY_XYZ_COMPLETION) &&
                 !groupDrained)
             {
                 blocker = m_Group.isActive
@@ -38861,6 +38923,56 @@ bool MotionCore::IsGroupNCDrained() const noexcept
             counters) &&
         snapshot.runtimeCycleValid &&
         snapshot.groupDrained;
+}
+
+
+bool MotionCore::HasRotarySpindleXYZSettleAcknowledgement(
+    MotionExecutionEpoch executionEpoch, const MotionOwnerLease& ownerLease) const noexcept
+{
+    return HasRotarySpindleXYZSettleAcknowledgementImpl(executionEpoch, ownerLease, false);
+}
+
+bool MotionCore::HasRotarySpindleXYZSettleAcknowledgementImpl(
+    MotionExecutionEpoch executionEpoch, const MotionOwnerLease& ownerLease,
+    bool ownsCommitReservation) const noexcept
+{
+    const std::uint32_t spindleMask =
+        GetRotarySpindleConcurrentAxisMask(executionEpoch, ownerLease);
+    if (spindleMask == 0U ||
+        !HasExactExecutionDrainAcknowledgementImpl(executionEpoch, ownerLease, ownsCommitReservation))
+        return false;
+
+    // Both profiles come from the same atomic RT bank. This proof is only
+    // positional-lane admission; GROUP_COMPLETION remains the whole-program
+    // and M30 boundary, including every spindle after it has been stopped.
+    MotionStopSettlePublicationPayload payload{};
+    if (!TryReadStopSettlePublication(payload)) return false;
+    const auto& proof = payload.ncSettleSnapshots[static_cast<std::size_t>(
+        MotionNCSettleProfile::ROTARY_XYZ_COMPLETION)];
+    const auto& drain = payload.ncSettleSnapshots[static_cast<std::size_t>(
+        MotionNCSettleProfile::GROUP_COMPLETION)];
+    const std::uint32_t scopeMask = BuildExistingNCAxisMask() & ~spindleMask;
+    if (scopeMask == 0U || proof.publicationGeneration == 0ULL ||
+        proof.publicationGeneration != drain.publicationGeneration ||
+        proof.profile != MotionNCSettleProfile::ROTARY_XYZ_COMPLETION ||
+        proof.executionEpoch != executionEpoch || proof.owner != ownerLease.owner ||
+        proof.ownerGeneration != ownerLease.generation || proof.scopeMask != scopeMask ||
+        !proof.runtimeObserved || !proof.runtimeCycleValid || !proof.runtimeCycleContiguous ||
+        !proof.requestAccepted || !proof.settled || proof.proofSequence == 0ULL ||
+        proof.requiredCycles != MOTION_NC_SETTLE_REQUIRED_CYCLES ||
+        proof.dwellCycles < proof.requiredCycles || proof.groupActive || !proof.groupDrained ||
+        !proof.virtualCommandStopped || !proof.allAxisCommandStopped ||
+        proof.anyAxisFaultOrEstop || proof.safetyOrRecoveryPending ||
+        proof.commandQueueDepth != 0U || proof.commandIngressDepth != 0U ||
+        proof.commandReplayDepth != 0U || drain.executionEpoch != executionEpoch ||
+        drain.owner != ownerLease.owner || drain.ownerGeneration != ownerLease.generation ||
+        drain.groupActive || !drain.groupDrained || drain.safetyOrRecoveryPending ||
+        drain.commandQueueDepth != 0U || drain.commandIngressDepth != 0U ||
+        drain.commandReplayDepth != 0U)
+        return false;
+
+    return GetRotarySpindleConcurrentAxisMask(executionEpoch, ownerLease) == spindleMask &&
+        HasExactExecutionDrainAcknowledgementImpl(executionEpoch, ownerLease, ownsCommitReservation);
 }
 
 

@@ -2,6 +2,7 @@
 #include "MotionExecutionContract.h"
 #include "MotionServoHandoffDiagnostic.h"
 #include "NCSpindleDispatch.h"
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <limits>
@@ -71,6 +72,59 @@ inline bool DecodeRpm(std::uint32_t raw, std::uint32_t previousRaw,
     return true;
 }
 
+// FIX3: bounded 50 ms encoder estimate. The signed mean reports direction and
+// speed; the mean ABSOLUTE incremental travel qualifies standstill. Opposite
+// movements cannot cancel in the stop metric. No zero padding, allocation,
+// unwrapped-double subtraction or tolerance increase is used. This is a
+// finite-window measurement, not an instantaneous-speed guarantee.
+class EncoderSpeedWindow
+{
+public:
+    static constexpr unsigned SamplesRequired = 200U;
+    void Reset() noexcept
+    {
+        m_tick=0ULL;m_count=m_next=0U;m_sum=0LL;m_travel=0ULL;
+        m_rpm=m_motionRpm=0.0;m_pulsesPerRevolution=0.0;m_reverse=false;
+    }
+    bool Observe(std::uint64_t tick,std::int32_t delta,bool sourceValid,
+        double pulsesPerRevolution,bool reverse) noexcept
+    {
+        if(!sourceValid||!tick||!std::isfinite(pulsesPerRevolution)||pulsesPerRevolution<=0.0||
+            delta==(std::numeric_limits<std::int32_t>::min)()){
+            Reset();return false;
+        }
+        if(m_tick&&(tick!=m_tick+1ULL||m_tick==(std::numeric_limits<std::uint64_t>::max)()||
+            pulsesPerRevolution!=m_pulsesPerRevolution||reverse!=m_reverse))Reset();
+        if(m_count==SamplesRequired){
+            const auto old=static_cast<std::int64_t>(m_delta[m_next]);
+            m_sum-=old;m_travel-=static_cast<std::uint64_t>(old<0?-old:old);
+        }else ++m_count;
+        const auto wide=static_cast<std::int64_t>(delta);
+        m_delta[m_next]=delta;m_next=(m_next+1U)%SamplesRequired;
+        m_sum+=wide;m_travel+=static_cast<std::uint64_t>(wide<0?-wide:wide);
+        m_tick=tick;m_pulsesPerRevolution=pulsesPerRevolution;m_reverse=reverse;
+        m_rpm=m_motionRpm=0.0;
+        if(!Ready())return false;
+        const double seconds=NCRotarySpindle::CycleSeconds*SamplesRequired;
+        m_rpm=static_cast<double>(m_sum)/pulsesPerRevolution/seconds*60.0;
+        if(reverse)m_rpm=-m_rpm;
+        m_motionRpm=static_cast<double>(m_travel)/pulsesPerRevolution/seconds*60.0;
+        if(!std::isfinite(m_rpm)||!std::isfinite(m_motionRpm)){Reset();return false;}
+        return true;
+    }
+    bool Ready() const noexcept {return m_count==SamplesRequired;}
+    unsigned Samples() const noexcept {return m_count;}
+    double Rpm() const noexcept {return m_rpm;}
+    double MotionRpm() const noexcept {return m_motionRpm;}
+private:
+    std::array<std::int32_t,SamplesRequired> m_delta{};
+    std::uint64_t m_tick=0ULL,m_travel=0ULL;
+    std::int64_t m_sum=0LL;
+    unsigned m_count=0U,m_next=0U;
+    double m_rpm=0.0,m_motionRpm=0.0,m_pulsesPerRevolution=0.0;
+    bool m_reverse=false;
+};
+
 class ReceiptWindow
 {
 public:
@@ -91,7 +145,7 @@ public:
     bool Observe(std::uint64_t inputTick, std::uint64_t physicalSequence, double actualRpm,
         double priorCommandRpm, bool exactFinalSend, std::uint64_t finalSendTick,
         std::uint64_t finalSendRequestSequence, bool configurationCurrent, bool authorityCurrent,
-        double stoppedToleranceRpm, double readyToleranceRpm) noexcept
+        double stoppedToleranceRpm, double readyToleranceRpm, bool stopMotionQualified) noexcept
     {
         const bool numeric = std::isfinite(actualRpm) && std::isfinite(priorCommandRpm) &&
             std::isfinite(stoppedToleranceRpm) && stoppedToleranceRpm > 0.0 &&
@@ -114,6 +168,7 @@ public:
             inputTick <= m_appliedTick || !exactFinalSend || !configurationCurrent || (!authorityCurrent && !safetyCancellation) ||
             finalSendTick != inputTick - 1ULL || finalSendRequestSequence != m_packet.sequence ||
             priorCommandRpm != m_packet.signedRpm || !std::isfinite(trackingError) ||
+            (m_packet.signedRpm == 0.0 && !stopMotionQualified) ||
             (m_packet.signedRpm == 0.0 ? std::fabs(actualRpm) > stoppedToleranceRpm : trackingError > readyToleranceRpm) ||
             m_window.samples == (std::numeric_limits<unsigned>::max)()) {
             ClearSamples(); return false;

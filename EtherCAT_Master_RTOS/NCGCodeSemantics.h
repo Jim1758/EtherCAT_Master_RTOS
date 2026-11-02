@@ -32,6 +32,7 @@ enum class NCGCodeModalGroup : std::uint8_t
     POLAR,
     C_AXIS_OFFSET_ROTATION,
     MODAL_MACRO,
+    HOLD_RETREAT, // EDM331: NC-only persistent inspection retreat policy.
     COUNT
 };
 

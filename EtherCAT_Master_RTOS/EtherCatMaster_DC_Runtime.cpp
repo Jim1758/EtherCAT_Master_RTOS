@@ -1,4 +1,5 @@
 ﻿#include "EtherCatMaster.h"
+#include "PdoTimerStackPolicy.h"
 #include "EtherCatMaster_DC_Internal.h"
 #include "EtherCatMaster_DC_Topology.h"
 #include "EtherCatMaster_DC_Tuning.h"
@@ -5622,12 +5623,29 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
 
     if (oneShotStartupMode == 1)
     {
+        // EDM308 FIX5: query this actual handler thread during warm-up only.
+        // No stack query, allocation or logging is added to the live PDO path.
+        const DWORD incomingError = GetLastError();
+        DWORD stackBytes = 0U, availableBytes = 0U;
+        ULONG_PTR stackBase = 0U, stackLimit = 0U, stackTop = 0U;
+        const bool queried = RtGetThreadStack(GetCurrentThread(), &stackBytes,
+            &availableBytes, &stackBase, &stackLimit, &stackTop) != 0;
+        const DWORD queryError = queried ? ERROR_SUCCESS : GetLastError();
+        const auto stackResult = PdoTimerStack::Evaluate(queried, stackBytes,
+            availableBytes, stackBase, stackLimit, stackTop);
+        RtPrintf("[PDO-STACK] build=EDM308_FIX5 phase=WARMUP result=%s required=%lu actual=%lu available=%lu minimumFree=%lu threadId=%lu queryError=%lu base=%llu limit=%llu top=%llu\n",
+            PdoTimerStack::Name(stackResult),
+            static_cast<unsigned long>(PdoTimerStack::RequiredBytes),
+            static_cast<unsigned long>(stackBytes), static_cast<unsigned long>(availableBytes),
+            static_cast<unsigned long>(PdoTimerStack::RequiredWarmupFreeBytes),
+            static_cast<unsigned long>(GetCurrentThreadId()), static_cast<unsigned long>(queryError),
+            static_cast<unsigned long long>(stackBase), static_cast<unsigned long long>(stackLimit),
+            static_cast<unsigned long long>(stackTop));
+        SetLastError(incomingError);
         MemoryBarrier();
-
-        InterlockedExchange(
-            &g_pdoOneShotWarmupCallbackDone,
-            1);
-
+        InterlockedExchange(&g_pdoOneShotWarmupCallbackDone,
+            stackResult == PdoTimerStack::Result::Ready ?
+                PdoTimerStack::WarmupReady : PdoTimerStack::WarmupRejected);
         return;
     }
 

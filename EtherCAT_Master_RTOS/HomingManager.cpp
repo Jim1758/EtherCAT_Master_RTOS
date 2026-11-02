@@ -543,6 +543,16 @@ bool HomingManager::QueueHomeProbeFunction(
 bool HomingManager::Start(
     const HomeRequest& request)
 {
+    // EDM291: a spindle session retains the CSV axes until physical stop
+    // and reference handback release its claim. Reject before changing
+    // HOME runtime or transferring the current program motion owner.
+    if (m_motion.IsRotarySpindleSessionClaimed())
+    {
+        m_lastError = HomeErrorReason::MOTION_BUSY;
+        m_lastErrorAxis = -1;
+        return false;
+    }
+
     // 已經有 HOME Request 在執行時，
     // 不允許第二個 Request 搶控制權。
     if (m_active)

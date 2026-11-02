@@ -1,8 +1,10 @@
 ﻿#pragma once
 #include "NC_Types.h"
+#include "NCHoldPolicy.h"
 #include "NCAuxiliaryHandshake.h"
 #include "RotarySpindleConfig.h"
 #include "NCSpindleDispatch.h"
+#include "RotarySpindleTelemetry.h"
 #include "NCG80Block.h"
 #include "G80Cycle.h"
 #include "G80Coordinates.h"
@@ -25,6 +27,7 @@
 #include "EDMProcessTuningContract.h" // EDM20 owner-thread shadow calculations only.
 class EtherCatMaster;
 namespace NCSpindleSource { struct Words; }
+namespace NCHoldTelemetry { struct Image; }
 struct NCMacroAssignmentCommit;
 #include "EDMProcessSimulationTest.h" // EDM01: no physical output or motion.
 #include "EDMFeedRetreatSimulationTest.h" // EDM02: simulated consumer only.
@@ -67,6 +70,8 @@ struct NCMacroAssignmentCommit;
 #include "EDM171G76Config.h"
 #include "MotionG76OrbitReceipt.h"
 #include "NCG76SphereArchitecture.h"
+#include "NCG76SphereProcess.h"
+#include "NCG76SphereGapBinding.h"
 #include "MotionCore_G76Sphere.h"
 #include "EDMSixAxisCurveFixture.h" // EDM112 NC-only curve fixture; no physical arc output.
 #include "EDMSixAxisCurveRuntime.h" // EDM113 independent RT observation receipts; no arc authority.
@@ -326,10 +331,18 @@ public:
     NCManager(MotionCore& motion);
     // Parameters load once before cyclic workers; execution uses committed MEMORY sessions.
     void LoadRotarySpindleParametersBeforeStart(const std::string& path) noexcept;
+    // NC-owner display only. axes is the just-exported native-degree debug image.
+    void ExportRotarySpindleTelemetrySameThread(const SHM_AxisDebugInfo* axes,
+        RotarySpindleTelemetry::Image& out) noexcept;
     bool ValidateRotarySpindleSourceSameThread(const NCBlock& block,int sourcePC,int sourceLineNumber,NCSpindleSource::Words& words) noexcept;
     bool ValidateRotarySpindleBlockSameThread(const NCBlock& block,int sourcePC,int sourceLineNumber) noexcept;
     WaitConditionFunc HandleRotarySpindleMCodeSameThread(const NCBlock& block) noexcept;
     bool ValidateRotarySpindleParsedScopeSameThread(const NCParsedBlock&,int) noexcept;
+    bool IsRotarySpindleXYZProgramSameThread() const noexcept;
+    bool IsRotarySpindleXYZFeedBlockSameThread(const NCBlock&) const noexcept;
+    bool IsRotarySpindleXYZResumeReadySameThread() noexcept;
+    bool IsRotarySpindleXYZHoldReadySameThread() const noexcept;
+    bool CompleteRotarySpindleXYZResumeSameThread() noexcept;
     void CommitRotarySpindleCaptureSameThread(NCBlockDispatchId,const MotionProgramBlockCapture&,
         const NCProgramCommitSnapshot&,bool,bool,const NCBlockLifecycleSnapshot&,int,int) noexcept;
     void ServiceRotarySpindleSameThread() noexcept;
@@ -584,6 +597,17 @@ public:
     }
 
     void Reset_Gode();       // 重置G碼相關
+    // EDM331 NC-owner observation only; this declaration submits no motion.
+    std::uint32_t GetHoldRetreatSegmentsSameThread() const noexcept {return m_holdPolicy.previousSegments;}
+    bool IsHoldRetreatDeclarationActiveSameThread() const noexcept {return m_holdPolicy.declared;}
+    const NCHoldRecovery::Config& GetHoldRecoveryConfigSameThread() const noexcept;
+    void ExportHoldRecoveryTelemetrySameThread(NCHoldTelemetry::Image&) const noexcept;
+    // EDM333 display-only committed parent PC; never grants motion or resume.
+    bool TryGetCommittedProcessParentDisplayPCSameThread(int& pc) const noexcept;
+    bool TryG76SphereInspectionJogSameThread(int axis,int direction);
+    bool IsDeclaredHoldRecoveryPathSupportedSameThread(const NCBlock&) const noexcept;
+    bool ValidateHoldPolicyBlockSameThread(const NCBlock&,int pc,int line,bool report=true);
+    bool CommitHoldPolicySameThread(const NCBlock&,int pc,int line);
     bool IsFeedHoldActive() const {
         return m_state == NCState::HOLD;
     }
@@ -858,6 +882,9 @@ public:
     // Dispatch 已完成；它不等同馬達 COMPLETED，後者仍由 Motion Feedback 表示。
     int GetActiveDispatchPC() const noexcept;
     int GetActiveCommittedPC() const noexcept;
+    // EDM299: NC-owner display only. -1 means no current accepted B mode;
+    // pending selectors and read-ahead never participate in this value.
+    int GetCurrentRetreatModeSameThread() const noexcept;
 
     NCProgramCommitSnapshot GetLastProgramCommitSnapshot() const noexcept
     {
@@ -2041,14 +2068,23 @@ private:
         NCSpindleDispatch::Config config{};
         NCSpindleDispatch::Row stagedRow{};
         std::array<std::uint64_t,3> submitted{};
-        std::uint64_t lifecycleSequence=0ULL,waitSequence=0ULL;
-        unsigned waitSpindle=0U;
+        std::uint64_t lifecycleSequence=0ULL,waitSequence=0ULL,diagnosticLastMs=0ULL;
+        std::uint64_t plcFeedbackTick=0ULL;
+        std::uint64_t telemetryTick=0ULL,telemetryTickMs=0ULL,telemetryClockMs=0ULL,telemetryScope=0ULL;
+        bool telemetryClaim=false;
+        bool concurrentXYZ=false; // EDM295: literal XYZ G01 shares only disjoint axes.
+        bool combinedResumeCommitInProgress=false; // Only the combined service may enter generic XYZ resume.
+        unsigned waitSpindle=0U,progressLogCount=0U;
+        unsigned plcActiveMask=0U,plcLogCount=0U;
+        bool firstFaultLogged=false; // Observation only; reset once per accepted run.
         bool active=false,rtBegun=false,waitActive=false,waitComplete=false,servicing=false,resumeReadyPending=false;
     } m_rotarySpindle{};
     std::uint64_t m_rotarySpindleParameterGeneration=0ULL;
     bool BuildRotarySpindleRuntimeSameThread(NCSpindleDispatch::Config&,RotarySpindleFile::Error&) noexcept;
     bool IsRotarySpindleScopeCurrentSameThread() noexcept;
     bool PublishRotarySpindleRequestsSameThread() noexcept;
+    void PublishRotarySpindlePLCActiveSameThread(unsigned,const char*) noexcept;
+    void SyncRotarySpindlePLCFeedbackSameThread(const MotionRotarySpindleFeedback&) noexcept;
     void RejectRotarySpindleSameThread(const char*,int,int=0) noexcept;
     // TUNE01: one callback-owned diagnostic cycle; no live gain changes.
     std::shared_ptr<PositionAutoTuneNCState> m_positionAutoTune;
@@ -2686,6 +2722,17 @@ private:
         NCG76SphereArchitecture::Preparation prepared{};
         NCG76SphereArchitecture::Workspace workspace{};
         NCG76SphereCycle::Request request{};
+        // NC-only canonical cursor; observation never grants GAP or power authority.
+        NCG76SpherePath::Descriptor path{};
+        NCG76SphereProcess::Envelope process{};
+        NCG76SphereGapBinding::Binding gapBinding{};
+        NCG76SphereGapProcess::Feedback gapShadow{};
+        std::uint64_t gapRequestLogged=0ULL;
+        std::uint64_t flushAcceptedLogged=0ULL,flushCompletedLogged=0ULL,flushAbandonedLogged=0ULL;
+        unsigned flushDiagnosticEvents=0U;
+        unsigned gapDiagnosticEvents=0U;
+        int gapLastDirection=0;
+        bool gapShadowRevoked=false,gapDiagnosticInitialized=false,gapLastValid=false,gapLastSuspended=false;
         NCTranslationSnapshot frame{};
         MotionExecutionIdentity identity{};
         MotionOwnerLease owner{};
@@ -2697,17 +2744,67 @@ private:
         std::uint64_t holdSequence=0ULL,startSequence=0ULL;
         unsigned diagnosticEvents=0U,lastLayer=0U;
         NCG76SphereCycle::Phase lastPhase=NCG76SphereCycle::Phase::Idle;
-        int pc=-1,line=0;
+        int pc=-1,line=0,sourceG=76;
+        NCTranslationSnapshot scopeTranslation{}; // Explicit-output comparison scratch, NC only.
+        NCBlock pathSource{}; // EDM307 exact authored G01/G02/G03, never a synthetic P50.
+        double processMotionCeiling=0.0; // EDM308 native parameter envelope; never a fabricated modal F.
+        std::uint32_t finishRequiredCount=0U,finishLoggedVerified=0U;
+        std::uint64_t finishLoggedAttempt=0ULL,finishLoggedCompleted=0ULL,finishLoggedRework=0ULL;
+        std::uint8_t finishLoggedPhase=0U;bool finishLogInitialized=false; // EDM335 NC-only diagnostics.
         bool staged=false,active=false,submitted=false,bound=false,endpointCommitted=false;
         bool resumePending=false,completed=false,diagnosticInitialized=false;
+        bool processSeedLogged=false; // One coherent RT continuation diagnostic per real source.
+        std::uint64_t startupTraceMask=0ULL; // NC-only, first occurrence of each bounded startup stage.
     };
     std::unique_ptr<G76SphereNCState> m_g76Sphere{new G76SphereNCState{}};
     std::uint64_t m_g76SphereNextSession=1ULL;
+    NCHoldPolicy::State m_holdPolicy{};
+    std::uint64_t m_g76InspectionJogSequence=0ULL;
+    bool IsEDMProcessPathCandidateSameThread(const NCBlock&) const noexcept;
+    bool ValidateEDMProcessPathBlockSameThread(const NCBlock&,int pc,int line=0);
+    bool PrepareEDMProcessPathTranslationSameThread(const NCBlock&);
+    WaitConditionFunc StartEDMProcessPathSameThread(const NCBlock&);
+    bool IsCompletedEDMProcessPathTerminalAllowedSameThread(const NCBlock&);
     static bool IsG76SphereBlock(const NCBlock&) noexcept;
     bool ValidateG76SphereBlockSameThread(const NCBlock&,int pc,int line=0);
     bool PrepareG76SphereTranslationSameThread(const NCBlock&);
     bool IsG76SphereScopeCurrentSameThread();
     WaitConditionFunc StartG76SphereSameThread(const NCBlock&);
+    static bool WaitForG76SphereCallback(NCManager*);
+    bool ValidateG76SphereWaitCallbackSameThread(WaitConditionFunc);
+    // NC-only return-slot observations. These never authorize or alter motion.
+    // Storage outlives one parent preparation; pointers are usable only while
+    // the corresponding ProcessTask/ProcessExecutionEngine frame is alive.
+    struct NCReturnProbe
+    {
+        const void* slot=nullptr;
+        std::uintptr_t expected=0U;
+        std::uint64_t loggedSession=0ULL,mismatchLoggedSession=0ULL;
+        bool available=false,active=false;
+    };
+    static bool ReadNCReturnProbeSameThread(const NCReturnProbe&,std::uintptr_t&) noexcept;
+    void TraceG76SphereReturnProbeSameThread(NCReturnProbe&,const char*,unsigned,bool finish=false);
+    enum G76SphereStartupStage : unsigned
+    {
+        G76SphereStartupFeedbackReadBegin=0U, G76SphereStartupFeedbackReadEnd=1U,
+        G76SphereStartupScopeCheckBegin=2U, G76SphereStartupScopeCheckEnd=3U,
+        G76SphereStartupRecipeCheckBegin=4U, G76SphereStartupRecipeCheckEnd=5U,
+        G76SphereStartupServiceDone=6U, G76SphereStartupCallbackEnter=7U,
+        G76SphereStartupCallbackLeave=8U,
+        G76SphereStartupCoordinateCurrentBegin=9U, G76SphereStartupCoordinateCurrentEnd=10U,
+        G76SphereStartupFrameCompareBegin=11U, G76SphereStartupFrameCompareEnd=12U,
+        G76SphereStartupNativeConfigBegin=13U, G76SphereStartupNativeConfigEnd=14U,
+        G76SphereStartupTravelConfigBegin=15U, G76SphereStartupTravelConfigEnd=16U,
+        G76SphereStartupServiceEnter=17U, G76SphereStartupEngineReturnCheck=18U,
+        G76SphereStartupEngineReturned=19U, G76SphereStartupPreparedPostBegin=20U,
+        G76SphereStartupPreparedPostEnd=21U, G76SphereStartupLifecyclePostEnd=22U,
+        G76SphereStartupEDMPLCExitDone=23U, G76SphereStartupAuxExitDone=24U,
+        G76SphereStartupSpindleExitDone=25U, G76SphereStartupTaskReturnCheck=26U,
+        G76SphereStartupParentBindReturned=27U,
+        G76SphereStartupPostParentCommits=28U, G76SphereStartupWaitBoundaryBound=29U,
+        G76SphereStartupCallbackDispatch=30U, G76SphereStartupTaskNextEntry=31U
+    };
+    void TraceG76SphereStartupSameThread(unsigned,const char*);
     void CommitG76SphereCaptureSameThread(NCBlockDispatchId,const MotionProgramBlockCapture&,
         const NCProgramCommitSnapshot&,bool,bool,const NCBlockLifecycleSnapshot&,int,int);
     void ServiceG76SphereSameThread();
@@ -2761,11 +2858,14 @@ private:
     struct NCDispatchScratch
     {
         MotionProgramBlockCapture capture{};
+        // Explicit output storage for aggregate snapshots on the NC writer.
+        NCTranslationSnapshot pendingTranslation{},displayTranslation{},processValidationTranslation{};
         NCBlockLifecycleSnapshot readAheadLedger{},bypassLedger{},commitLedger{};
+        NCReturnProbe taskReturnProbe{},engineReturnProbe{}; // Never held in resettable parent state.
     };
     std::unique_ptr<NCDispatchScratch> m_ncDispatchScratch{new NCDispatchScratch{}};
     bool IsEDM171AirProgramSameThread(int firstPC) const noexcept;
-    bool IsEDM171AirGrantCurrentSameThread() const noexcept;
+    bool IsEDM171AirGrantCurrentSameThread(bool processPathSingleBlock = false) const noexcept;
     void CaptureEDM171AirE6SameThread() noexcept;
     bool ReadEDM171AirE6SameThread(EDMRecipe::ParameterSnapshot&) const noexcept;
     bool NormalizeEDM171AirBlockSameThread(const NCBlock&,NCBlock&,int,int,NCBlockDispatchId);

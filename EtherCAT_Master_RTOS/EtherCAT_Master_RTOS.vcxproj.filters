@@ -156,6 +156,8 @@
     <ClCompile Include="MotionCore_G80.cpp">
       <Filter>Source Files\Motion</Filter>
     </ClCompile>
+    <ClCompile Include="HoldConfig.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="NCHoldTelemetry.cpp"><Filter>Source Files</Filter></ClCompile>
     <ClCompile Include="RotarySpindleConfig.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -587,9 +589,28 @@
     <ClInclude Include="NCG76SphereCycle.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="NCG76SpherePath.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="NCG76SphereProcess.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="NCG76SphereGapProcess.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="NCG76SphereGapBinding.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="MotionCore_G76Sphere.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="HoldConfig.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="NCHoldPolicy.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="NCFinishPolicy.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="NCG76SphereFinishVerification.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="NCG76SphereHoldRecovery.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="NCHoldTelemetry.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="NCHoldInspectionCommand.h"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="RotarySpindleConfig.h">
       <Filter>Header Files\NC</Filter>
     </ClInclude>

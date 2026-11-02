@@ -1,6 +1,7 @@
 ﻿#pragma once
 
 #include "EDMRecipe.h"
+#include "EDMConditionUnits.h"
 #include <algorithm>
 #include <array>
 #include <cstddef>
@@ -446,6 +447,7 @@ namespace EDMRecipeConfigIO
                     field.unitConfirmed = value == 1ULL;
                     if (!field.unitConfirmed && std::strcmp(field.unit, "raw") != 0) return reader.Reject(Error::Profile, "Unit");
                 }
+                EDMConditionUnits::NormalizeLegacyField(catalog.schemaVersion, catalog.profileId, field);
                 catalog.fields.push_back(std::move(field));
             }
             return End(reader);

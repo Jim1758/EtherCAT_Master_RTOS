@@ -298,6 +298,11 @@ namespace NCPLC
         // --------------------------------------------------------
 
         constexpr int SOFTWARE_POSITIVE_LIMIT_BASE = 210;           // S210~217 Software + Limit Active
+        // EDM290: logical spindle 1/2/3 is rotating or stop is not yet proven.
+        // NC-owned status levels; not motion or discharge permits.
+        constexpr int ROTARY_SPINDLE_ACTIVE_BASE = 230; // S230/S231/S232
+        constexpr int ROTARY_SPINDLE_COUNT = 3;
+
         constexpr int SOFTWARE_NEGATIVE_LIMIT_BASE = 220;           // S220~227 Software - Limit Active
 
 

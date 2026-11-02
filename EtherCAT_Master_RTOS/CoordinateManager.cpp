@@ -747,16 +747,23 @@ bool CoordinateManager::IsTranslationModeSupported() const noexcept
 NCTranslationSnapshot CoordinateManager::BuildCurrentCoordinateSnapshot() const noexcept
 {
     NCTranslationSnapshot result{};
+    BuildCurrentCoordinateSnapshotInto(result);
+    return result;
+}
+
+void CoordinateManager::BuildCurrentCoordinateSnapshotInto(NCTranslationSnapshot& result) const noexcept
+{
+    result = NCTranslationSnapshot{};
     int wcsCode = 0;
     if (!TryEncodeNCWorkCoordinateCode(currentWCSIndex, wcsCode) ||
         static_cast<std::size_t>(currentWCSIndex) >= m_WCSTable.size() ||
         m_WCSTable[currentWCSIndex].size() != 8U ||
-        !TryBuildAxisIdentity(m_translationAxisSource, result.axisIdentity)) return result;
+        !TryBuildAxisIdentity(m_translationAxisSource, result.axisIdentity)) return;
     if (m_translationRunToken != 0ULL)
     {
         NCAxisIdentitySnapshot expected = m_runAxisIdentity;
         expected.eccentricEnabled = result.axisIdentity.eccentricEnabled;
-        if (!SameNCAxisIdentitySnapshot(expected, result.axisIdentity)) return NCTranslationSnapshot{};
+        if (!SameNCAxisIdentitySnapshot(expected, result.axisIdentity)) { result = NCTranslationSnapshot{}; return; }
     }
     result.runToken = m_translationRunToken;
     result.generation = m_translationGeneration;
@@ -789,7 +796,7 @@ NCTranslationSnapshot CoordinateManager::BuildCurrentCoordinateSnapshot() const 
     if (isG68Active)
     {
         NCArcPlaneAxes plane{};
-        if (!TryGetNCArcPlaneAxes(activePlane, plane)) return NCTranslationSnapshot{};
+        if (!TryGetNCArcPlaneAxes(activePlane, plane)) { result = NCTranslationSnapshot{}; return; }
         result.rotationCenterMM[0] = g68CenterWCS[plane.u];
         result.rotationCenterMM[1] = g68CenterWCS[plane.v];
         result.rotationAngleDeg = g68Angle;
@@ -809,29 +816,46 @@ NCTranslationSnapshot CoordinateManager::BuildCurrentCoordinateSnapshot() const 
         workPlaneAngle != 0.0)
     {
         NCArcPlaneAxes plane{};
-        if (!TryGetNCArcPlaneAxes(activePlane, plane)) return NCTranslationSnapshot{};
+        if (!TryGetNCArcPlaneAxes(activePlane, plane)) { result = NCTranslationSnapshot{}; return; }
         result.workRotationCenterMM[0] = rotationCenterMCS[plane.u];
         result.workRotationCenterMM[1] = rotationCenterMCS[plane.v];
     }
-    return result;
+    return;
 }
 
 NCTranslationSnapshot CoordinateManager::BuildLiveTranslationSnapshot() const noexcept
 {
-    if (m_translationRunToken == 0ULL || !IsTranslationModeSupported()) return NCTranslationSnapshot{};
-    const NCTranslationSnapshot result = BuildCurrentCoordinateSnapshot();
-    return IsNCTranslationSnapshotValid(result) ? result : NCTranslationSnapshot{};
+    NCTranslationSnapshot result{};
+    BuildLiveTranslationSnapshotInto(result);
+    return result;
+}
+
+void CoordinateManager::BuildLiveTranslationSnapshotInto(NCTranslationSnapshot& result) const noexcept
+{
+    result = NCTranslationSnapshot{};
+    if (m_translationRunToken == 0ULL || !IsTranslationModeSupported()) return;
+    BuildCurrentCoordinateSnapshotInto(result);
+    if (!IsNCTranslationSnapshotValid(result)) result = NCTranslationSnapshot{};
 }
 
 NCTranslationSnapshot CoordinateManager::GetTranslationSnapshot() const noexcept
 {
-    return m_translationFrozen ? m_frozenTranslation : BuildLiveTranslationSnapshot();
+    NCTranslationSnapshot result{};
+    CopyTranslationSnapshot(result);
+    return result;
+}
+
+void CoordinateManager::CopyTranslationSnapshot(NCTranslationSnapshot& result) const noexcept
+{
+    if (m_translationFrozen) result = m_frozenTranslation;
+    else BuildLiveTranslationSnapshotInto(result);
 }
 
 bool CoordinateManager::FreezeTranslationRun() noexcept
 {
     if (m_translationFrozen) return IsTranslationRunCurrent();
-    const NCTranslationSnapshot candidate = BuildLiveTranslationSnapshot();
+    NCTranslationSnapshot candidate{};
+    BuildLiveTranslationSnapshotInto(candidate);
     if (!IsNCTranslationSnapshotValid(candidate)) return false;
     m_frozenTranslation = candidate;
     m_translationFrozen = true;
@@ -1526,10 +1550,10 @@ bool CoordinateManager::CommitWorkpieceTransition(int mode, int wCode,
 
 bool CoordinateManager::IsTranslationRunCurrent() const noexcept
 {
-    if (!m_translationFrozen) return IsNCTranslationSnapshotValid(BuildLiveTranslationSnapshot());
-    const NCTranslationSnapshot live = BuildLiveTranslationSnapshot();
+    NCTranslationSnapshot live{};
+    BuildLiveTranslationSnapshotInto(live);
     return IsNCTranslationSnapshotValid(live) &&
-        SameNCTranslationSnapshot(live, m_frozenTranslation);
+        (!m_translationFrozen || SameNCTranslationSnapshot(live, m_frozenTranslation));
 }
 
 bool CoordinateManager::IsTranslationRunFrozen() const noexcept
@@ -1890,8 +1914,9 @@ bool CoordinateManager::CompleteFixedPlanarEndpoint(
     {
         if (m_translationFrozen && !IsTranslationRunCurrent()) return false;
         if (!m_translationFrozen && !IsTranslationModeSupported()) return false;
-        NCTranslationSnapshot source = m_translationFrozen ?
-            m_frozenTranslation : BuildCurrentCoordinateSnapshot();
+        NCTranslationSnapshot source{};
+        if (m_translationFrozen) source = m_frozenTranslation;
+        else BuildCurrentCoordinateSnapshotInto(source);
         if (!IsNCAxisIdentitySnapshotValid(source.axisIdentity)) return false;
         if (!m_translationFrozen)
         {
@@ -1952,8 +1977,9 @@ void CoordinateManager::Transform_WCS_to_MCS_Internal(
     }
     if (m_translationFrozen || ((IsFixedPlanarRotationActive() || IsScaleMirrorActive() || isPolarCoordinateActive) && IsTranslationModeSupported()))
     {
-        const NCTranslationSnapshot source = m_translationFrozen ?
-            m_frozenTranslation : BuildCurrentCoordinateSnapshot();
+        NCTranslationSnapshot source{};
+        if (m_translationFrozen) source = m_frozenTranslation;
+        else BuildCurrentCoordinateSnapshotInto(source);
         // A failed identity capture must never become an identity transform.
         // Validate before any output selection or commanded endpoint write.
         if (!IsNCAxisIdentitySnapshotValid(source.axisIdentity) ||
@@ -2308,8 +2334,9 @@ void CoordinateManager::UpdateActualMCS(const double* newMCS, const double* unwr
 void CoordinateManager::GetActualWCS(double* outWCS) const {
     if (m_translationFrozen || ((IsFixedPlanarRotationActive() || IsScaleMirrorActive() || isPolarCoordinateActive) && IsTranslationModeSupported()))
     {
-        const NCTranslationSnapshot source = m_translationFrozen ?
-            m_frozenTranslation : BuildCurrentCoordinateSnapshot();
+        NCTranslationSnapshot source{};
+        if (m_translationFrozen) source = m_frozenTranslation;
+        else BuildCurrentCoordinateSnapshotInto(source);
         if (!IsNCAxisIdentitySnapshotValid(source.axisIdentity))
         {
             for (unsigned axis = 0U; axis < 8U; ++axis)
@@ -2428,8 +2455,9 @@ void CoordinateManager::GetActualWCS(double* outWCS) const {
 void CoordinateManager::GetCommandedWCS(double* outWCS) const {
     if (m_translationFrozen || ((IsFixedPlanarRotationActive() || IsScaleMirrorActive() || isPolarCoordinateActive) && IsTranslationModeSupported()))
     {
-        const NCTranslationSnapshot source = m_translationFrozen ?
-            m_frozenTranslation : BuildCurrentCoordinateSnapshot();
+        NCTranslationSnapshot source{};
+        if (m_translationFrozen) source = m_frozenTranslation;
+        else BuildCurrentCoordinateSnapshotInto(source);
         if (!IsNCAxisIdentitySnapshotValid(source.axisIdentity))
         {
             for (unsigned axis = 0U; axis < 8U; ++axis)

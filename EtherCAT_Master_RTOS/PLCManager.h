@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <atomic>
 #include "EDMPLCOutputState.h"
+#include "NCPLCMap.h"
 static_assert(ATOMIC_INT_LOCK_FREE == 2, "EDM137 PLC image requires lock-free atomic unsigned");
 #include <string>
 #include <unordered_map>
@@ -308,6 +309,10 @@ private:
     std::atomic<int32_t> m_auxiliaryMCode{-1};
     std::atomic<int32_t> m_auxiliaryTCode{-1};
     std::atomic<unsigned> m_auxiliaryRequestWord{0U};
+    // EDM290: only NC may publish coherent S230/S231/S232 status.
+    // Init/Close cannot manufacture a stopped indication during rotation.
+    void PublishRotarySpindleOutputs(unsigned mask) noexcept;
+    std::atomic<unsigned> m_rotarySpindleOutputWord{0U};
     // C10 remains PLC/HMI writable; NC only observes the atomic FIN level.
     std::atomic<unsigned> m_auxiliaryFinishLevel{0U};
 

@@ -1,9 +1,20 @@
 ﻿#include "PositionPidService.h"
 #include "NCManager.h"
+#include "NCFinishPolicy.h"
 #include "NCSpindleSource.h"
 #include "EDMProcessTuningService.h"
 #include "MacroEngine.h"
 #include <memory>
+#if defined(_MSC_VER)
+#include <intrin.h>
+#pragma intrinsic(_AddressOfReturnAddress)
+#pragma intrinsic(_ReturnAddress)
+#define NC_RETURN_PROBE_NOINLINE __declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+#define NC_RETURN_PROBE_NOINLINE __attribute__((noinline))
+#else
+#define NC_RETURN_PROBE_NOINLINE
+#endif
 #include "MacroParser.h"
 #include "GCodeParser.h"
 #include "NCGCodeSemantics.h"
@@ -372,6 +383,7 @@ bool NCManager::RejectProgramLoad(
 
 bool NCManager::LoadProgram(const std::string& filepath)
 {
+    m_holdPolicy.Clear(); // EDM331 replacement intent cannot inherit another file's declaration.
     m_g76Confirmation = G76Confirmation{}; m_g76Modal = G76ModalState{};
     m_edm149Confirmation = EDM149Confirmation{};
     // Selecting another image cancels a waiting explicit START, including a
@@ -778,6 +790,11 @@ void NCManager::ChangeMode(NCOperationMode newMode)
 }
 
 void NCManager::ChangeState(NCState newState) {
+    // EDM295: every public HOLD uses the ordinary XYZ stop boundary as well
+    // as the spindle hold. M00 and direct state requests share this seam.
+    if(newState==NCState::HOLD&&IsRotarySpindleXYZProgramSameThread()&&m_state==NCState::RUN){
+        FeedHoldInternal();return;
+    }
     if(newState==NCState::HOLD&&TryHoldRotarySpindleSameThread())return;
     if(newState==NCState::RUN&&m_rotarySpindle.active&&m_state==NCState::HOLD)return;
     if(newState!=NCState::RUN&&newState!=NCState::HOLD)
@@ -1287,6 +1304,11 @@ void NCManager::FeedHoldInternal()
 
 void NCManager::Reset()
 {
+    const unsigned holdBeforeReset=m_holdPolicy.previousSegments;
+    const unsigned holdDeclaredBeforeReset=m_holdPolicy.declared?1U:0U;
+    m_holdPolicy.Clear(); // EDM331: operator RESET clears before every admission/early return.
+    RtPrintf("[HOLD] build=EDM332 event=DECLARATION_CLEARED reason=RESET beforePreviousParents=%u beforeDeclared=%u afterPreviousParents=%u afterDeclared=%u motionSubmitted=0\n",
+        holdBeforeReset,holdDeclaredBeforeReset,static_cast<unsigned>(m_holdPolicy.previousSegments),m_holdPolicy.declared?1U:0U);
     CancelRotarySpindleSameThread(NCSpindleDispatch::State::Reset,"RESET_BUTTON");
     ResetAuxiliaryHandshakeSameThread(); // EDM282: revoke before every Reset admission/early return.
     // EDM279: G80 has no ordinary virtual-axis stop trajectory. Capture its
@@ -3695,18 +3717,44 @@ void NCManager::ObserveBootstrapSafetyHandoff() noexcept
 
 
 // 🌟 放在 RTOS 迴圈的核心任務
+NC_RETURN_PROBE_NOINLINE
 void NCManager::ProcessTask()
 {
+    // Capture in this actual noinline frame, not in a helper. This is NC-only
+    // return-address evidence; it never repairs a return slot or changes flow.
+    auto& taskReturnProbe=m_ncDispatchScratch->taskReturnProbe;
+    taskReturnProbe.slot=nullptr;taskReturnProbe.expected=0U;
+    taskReturnProbe.available=false;taskReturnProbe.active=true;
+#if defined(_MSC_VER)
+    taskReturnProbe.slot=_AddressOfReturnAddress();
+    taskReturnProbe.expected=reinterpret_cast<std::uintptr_t>(_ReturnAddress());
+    taskReturnProbe.available=taskReturnProbe.slot!=nullptr;
+#endif
+    struct TaskReturnProbeExit {
+        NCManager& nc;
+        ~TaskReturnProbeExit() noexcept {
+            nc.TraceG76SphereStartupSameThread(G76SphereStartupTaskReturnCheck,"TASK_RETURN_CHECK");
+            nc.TraceG76SphereReturnProbeSameThread(nc.m_ncDispatchScratch->taskReturnProbe,
+                "TASK",G76SphereStartupTaskReturnCheck,true);
+        }
+    } taskReturnProbeExit{*this}; // Construct first; observe after all exit services.
+    TraceG76SphereStartupSameThread(G76SphereStartupTaskNextEntry,"TASK_NEXT_ENTRY");
     struct RotarySpindleExitSync {
         NCManager& nc;
-        ~RotarySpindleExitSync() noexcept {nc.ServiceRotarySpindleSameThread();}
+        ~RotarySpindleExitSync() noexcept {
+            nc.ServiceRotarySpindleSameThread();
+            nc.TraceG76SphereStartupSameThread(G76SphereStartupSpindleExitDone,"SPINDLE_EXIT_DONE");
+        }
     } rotarySpindleExitSync{*this};
     ServiceRotarySpindleSameThread(); // Includes direct HOLD/ALARM state writers.
     // EDM282: HOLD may acknowledge an existing request, but cannot issue another.
     // Exit publication also cancels a late alarm raised below in this scan.
     struct AuxiliaryPLCExitSync {
         NCManager& nc;
-        ~AuxiliaryPLCExitSync() noexcept { nc.SyncAuxiliaryHandshakeToPLCSameThread(); }
+        ~AuxiliaryPLCExitSync() noexcept {
+            nc.SyncAuxiliaryHandshakeToPLCSameThread();
+            nc.TraceG76SphereStartupSameThread(G76SphereStartupAuxExitDone,"AUX_EXIT_DONE");
+        }
     } auxiliaryPLCExitSync{*this};
     ServiceAuxiliaryHandshakeSameThread(m_state == NCState::RUN);
     ServiceG80SameThread(); // G80 cancellation/publication precedes early returns.
@@ -3715,7 +3763,10 @@ void NCManager::ProcessTask()
     // Refresh before service and after every early return (Reset, Alarm, wait).
     struct EDM137PLCExitSync {
         NCManager& nc;
-        ~EDM137PLCExitSync() noexcept { nc.SyncEDMPLCOutputsSameThread(); }
+        ~EDM137PLCExitSync() noexcept {
+            nc.SyncEDMPLCOutputsSameThread();
+            nc.TraceG76SphereStartupSameThread(G76SphereStartupEDMPLCExitDone,"EDM_PLC_EXIT_DONE");
+        }
     } edm137PLCExitSync{*this};
     SyncEDMPLCOutputsSameThread();
     ServiceEDM94SameThread(); // Independent physical bracket service before early returns.
@@ -4432,14 +4483,18 @@ void NCManager::ProcessTask()
     {
     case NCOperationMode::MEMORY:
         if (m_state == NCState::RUN) {
+            TraceG76SphereStartupSameThread(32U,"TASK_BEFORE_ENGINE");
             ProcessExecutionEngine();
+            TraceG76SphereStartupSameThread(G76SphereStartupEngineReturned,"ENGINE_RETURNED");
         }
         break;
 
     case NCOperationMode::MDI:
         // 🌟 關鍵修改：MDI 模式現在也支援手動操作了！
         if (m_state == NCState::RUN) {
+            TraceG76SphereStartupSameThread(32U,"TASK_BEFORE_ENGINE");
             ProcessExecutionEngine(); // 如果按下 Cycle Start，執行 MDI 字串
+            TraceG76SphereStartupSameThread(G76SphereStartupEngineReturned,"ENGINE_RETURNED");
         }
         else {
             ProcessManualMode();      // 閒置時，允許操作員直接使用手輪或 JOG
@@ -4448,7 +4503,9 @@ void NCManager::ProcessTask()
 
     case NCOperationMode::MANUAL:
         if (m_state == NCState::RUN && m_manualAutoRunning) {
+            TraceG76SphereStartupSameThread(32U,"TASK_BEFORE_ENGINE");
             ProcessExecutionEngine();
+            TraceG76SphereStartupSameThread(G76SphereStartupEngineReturned,"ENGINE_RETURNED");
         }
         else {
             ProcessManualMode();
@@ -4461,16 +4518,36 @@ void NCManager::ProcessTask()
 
     // Observe the Dispatch / Commit evidence created by the unchanged
     // Runtime path in this same 10 ms task.
+    TraceG76SphereStartupSameThread(G76SphereStartupPreparedPostBegin,"PREPARED_POST_BEGIN");
     ObservePreparedBlockQueueShadow(false);
+    TraceG76SphereStartupSameThread(G76SphereStartupPreparedPostEnd,"PREPARED_POST_END");
     ObserveLifecycleInterruptionShadow();
+    TraceG76SphereStartupSameThread(G76SphereStartupLifecyclePostEnd,"LIFECYCLE_POST_END");
 }
 
 
 // ==========================================
 // 🚀 終極統一執行引擎 (完美 M30 歸零卡住、M00 單擊解鎖)
 // ==========================================
+NC_RETURN_PROBE_NOINLINE
 void NCManager::ProcessExecutionEngine()
 {
+    auto& engineReturnProbe=m_ncDispatchScratch->engineReturnProbe;
+    engineReturnProbe.slot=nullptr;engineReturnProbe.expected=0U;
+    engineReturnProbe.available=false;engineReturnProbe.active=true;
+#if defined(_MSC_VER)
+    engineReturnProbe.slot=_AddressOfReturnAddress();
+    engineReturnProbe.expected=reinterpret_cast<std::uintptr_t>(_ReturnAddress());
+    engineReturnProbe.available=engineReturnProbe.slot!=nullptr;
+#endif
+    struct EngineReturnProbeExit {
+        NCManager& nc;
+        ~EngineReturnProbeExit() noexcept {
+            nc.TraceG76SphereStartupSameThread(G76SphereStartupEngineReturnCheck,"ENGINE_RETURN_CHECK");
+            nc.TraceG76SphereReturnProbeSameThread(nc.m_ncDispatchScratch->engineReturnProbe,
+                "ENGINE",G76SphereStartupEngineReturnCheck,true);
+        }
+    } engineReturnProbeExit{*this};
     // 只有 RUN 狀態才會解析 / 預讀。
     if (m_state != NCState::RUN) return;
 
@@ -4512,6 +4589,10 @@ void NCManager::ProcessExecutionEngine()
     // ==========================================================
     // --- 階段 A：等待條件檢查與【神級任務接力】 ---
     // ==========================================================
+    // EDM308 FIX1: a bound analytic parent has exactly one named wait target.
+    // Check its value before an indirect call; an invalid value is evidence,
+    // never a callback to invoke. Other execution lanes are unchanged.
+    if (!ValidateG76SphereWaitCallbackSameThread(m_waitCallback)) return;
     if (m_waitCallback != nullptr) {
         const WaitConditionFunc activeWaitCallback = m_waitCallback;
         const bool wasWaitingForStart =
@@ -4522,6 +4603,7 @@ void NCManager::ProcessExecutionEngine()
             (activeWaitCallback ==
                 WaitForSingleBlockControlledHoldCallback);
 
+        TraceG76SphereStartupSameThread(G76SphereStartupCallbackDispatch, "CALLBACK_DISPATCH");
         const bool legacyReady = activeWaitCallback(this);
         bool effectiveReady = legacyReady;
         if (!wasWaitingForStart)
@@ -4836,6 +4918,21 @@ void NCManager::ProcessExecutionEngine()
         if(!ValidateRotarySpindleParsedScopeSameThread(parsedBlock,sourceLineNumber)) {
             markDispatchFailed(static_cast<std::uint32_t>(AlarmManager::G_Code_Invalid_parameter));
             return;
+        }
+
+        // EDM335: an authored L on a literal process G belongs only to the
+        // admitted analytic EDM lane. Reject before resolver/cutter/frame work;
+        // other G/M uses of L (including M98) retain their own existing owners.
+        if(NCFinishPolicy::Requests(parsedBlock)){
+            NCBlock finishLiteral{};std::uint32_t finishCount=0U;
+            if(!NCPreparedBlockQueueShadow::TryBuildLiteralBlock(parsedBlock,finishLiteral)||
+               !NCFinishPolicy::Decode(parsedBlock,finishLiteral,finishCount)||
+               !IsEDMProcessPathCandidateSameThread(finishLiteral)){
+                markDispatchFailed(static_cast<std::uint32_t>(AlarmManager::G_Code_Invalid_parameter));
+                RtPrintf("[FINISH] build=EDM335 event=SOURCE_REJECT pc=%d line=%d reason=L_REQUIRES_LITERAL_EDM_G01_G02_G03_0_TO_99 beforeResolve=1\n",currentPC,sourceLineNumber);
+                AlarmManager::GetInstance().Trigger(AlarmManager::G_Code_Invalid_parameter,sourceLineNumber);
+                ChangeState(NCState::HOLD);return;
+            }
         }
 
         // Cutter lookahead is an immutable literal contour. Reject control-flow,
@@ -5532,6 +5629,39 @@ void NCManager::ProcessExecutionEngine()
                 }
             }
 
+            // EDM335: computed G codes cannot evade the authored L contract.
+            // Recheck the actual resolved row before coordinate transitions.
+            if(NCFinishPolicy::Requests(block)){
+                std::uint32_t finishCount=0U;
+                if(!NCFinishPolicy::Decode(parsedBlock,block,finishCount)||
+                   !IsEDMProcessPathCandidateSameThread(block)){
+                    markDispatchFailed(static_cast<std::uint32_t>(AlarmManager::G_Code_Invalid_parameter));
+                    RtPrintf("[FINISH] build=EDM335 event=SOURCE_REJECT pc=%d line=%d reason=L_REQUIRES_LITERAL_EDM_G01_G02_G03_0_TO_99 beforeFrame=1\n",currentPC,sourceLineNumber);
+                    AlarmManager::GetInstance().Trigger(AlarmManager::G_Code_Invalid_parameter,sourceLineNumber);
+                    ChangeState(NCState::HOLD);return;
+                }
+            }
+            // EDM331 validates the actual resolved authored row before any
+            // coordinate transition or source-capture side effect. This is
+            // not lookahead; only ExecuteBlock below commits the declaration.
+            if(NCGCodeSemantics::Contains(block,NCHoldPolicy::DeclarationCode)){
+                std::uint32_t ignored=0U;
+                if(!NCHoldPolicy::DecodeAuthored(parsedBlock,block,ignored)){
+                    markDispatchFailed(static_cast<std::uint32_t>(AlarmManager::G_Code_Invalid_parameter));
+                    RtPrintf("[HOLD] build=EDM332 event=DECLARATION_REJECT pc=%d line=%d reason=STANDALONE_LITERAL_G181_P0_TO_15 beforeFrame=1\n",currentPC,sourceLineNumber);
+                    AlarmManager::GetInstance().Trigger(AlarmManager::G_Code_Invalid_parameter,sourceLineNumber);
+                    ChangeState(NCState::HOLD);return;
+                }
+            }
+            if(m_holdPolicy.declared&&(NCGCodeSemantics::Contains(block,1)||NCGCodeSemantics::Contains(block,2)||
+                NCGCodeSemantics::Contains(block,3)||NCGCodeSemantics::Contains(block,76))&&
+                !IsDeclaredHoldRecoveryPathSupportedSameThread(block)){
+                markDispatchFailed(static_cast<std::uint32_t>(AlarmManager::G_Code_Invalid_parameter));
+                RtPrintf("[HOLD] build=EDM332 event=SOURCE_REJECT pc=%d line=%d reason=HOLD_RECOVERY_UNSUPPORTED_LANE declaredPreviousParents=%u beforeFrame=1\n",
+                    currentPC,sourceLineNumber,m_holdPolicy.previousSegments);
+                AlarmManager::GetInstance().Trigger(AlarmManager::G_Code_Invalid_parameter,sourceLineNumber);
+                ChangeState(NCState::HOLD);return;
+            }
             // EDM288: reject mixed or altered spindle rows before coordinate
             // selection changes; ExecuteBlock later checks dispatch authority.
             NCSpindleSource::Words spindleSourceWords{};
@@ -5684,7 +5814,18 @@ void NCManager::ProcessExecutionEngine()
                 const bool coordinateTransition =
                     RequiresFixedTranslationSelectionTransitionSameThread(block)||
                     (NCGCodeSemantics::Contains(block,80)&&!IsG80CompoundContinuationSameThread(block,currentPC,sourceLineNumber));
-                const bool groupStandstill = m_motion.IsGroupNCDrained() &&
+                // EDM295: an admitted spindle/XYZ row drains the positional
+                // lane without waiting for its independently owned C/U/V
+                // spindles to stop. The final Program-End gate still proves
+                // every physical axis after its spindle cancellation.
+                const bool spindleXYZBarrier = IsRotarySpindleXYZProgramSameThread() &&
+                    IsRotarySpindleScopeCurrentSameThread() &&
+                    NCSpindleSource::ValidateProgramResolved(parsedBlock, block);
+                const bool positionalDrained = spindleXYZBarrier ?
+                    m_motion.HasRotarySpindleXYZSettleAcknowledgement(
+                        m_motion.GetCurrentExecutionEpoch(), m_programMotionLease) :
+                    m_motion.IsGroupNCDrained();
+                const bool groupStandstill = positionalDrained &&
                     (!coordinateTransition || m_motion.HasExactExecutionDrainAcknowledgement(
                         m_motion.GetCurrentExecutionEpoch(), m_programMotionLease));
                 preparedCutoverContext.legacyDrainSatisfied =
@@ -5935,11 +6076,13 @@ void NCManager::ProcessExecutionEngine()
             m_currentExecutingBlockDispatchId = dispatchId;
             if (!block.isEmpty)
             {
+                TraceG76SphereStartupSameThread(33U,"BEFORE_EXECUTE_BLOCK");
                 ExecuteBlock(
                     block,
                     currentPC,
                     sourceLineNumber,
                     dispatchId);
+                TraceG76SphereStartupSameThread(34U,"AFTER_EXECUTE_BLOCK");
             }
             m_currentExecutingBlockDispatchId =
                 NC_BLOCK_DISPATCH_ID_INVALID;
@@ -6371,6 +6514,7 @@ void NCManager::ProcessExecutionEngine()
             CommitG76SphereCaptureSameThread(dispatchId, motionCapture,
                 lineCommitSnapshot, lineCommitSucceeded, resolverBypassCommitLedgerFound,
                 resolverBypassCommitLedger, currentPC, sourceLineNumber);
+            TraceG76SphereStartupSameThread(G76SphereStartupParentBindReturned, "PARENT_BIND_RETURNED");
             CommitPathCoreFeedCaptureSameThread(dispatchId, motionCapture,
                 lineCommitSnapshot, lineCommitSucceeded, resolverBypassCommitLedgerFound,
                 resolverBypassCommitLedger, currentPC, sourceLineNumber); // BX-FEED
@@ -6384,6 +6528,8 @@ void NCManager::ProcessExecutionEngine()
                 resolverBypassCommitLedger, currentPC, sourceLineNumber); // BZ-REPLAY
             CommitPathCoreHoldCaptureSameThread(dispatchId); // CB: only after authoritative BX/BY ledger binding.
             if (m_state == NCState::ALARM) return;
+            TraceG76SphereStartupSameThread(G76SphereStartupPostParentCommits, "POST_PARENT_COMMITS");
+            if (!ValidateG76SphereWaitCallbackSameThread(m_waitCallback)) return;
             // DN producer diagnostic only, after the authoritative dispatch
             // and program Commit. Motion's CNC-DC events remain the evidence
             // of an actual nonzero seam; this line alone is not that proof.
@@ -6518,6 +6664,7 @@ void NCManager::ProcessExecutionEngine()
             BindCompletionWaitBoundary(
                 blockDispatchId,
                 m_waitCallback);
+            TraceG76SphereStartupSameThread(G76SphereStartupWaitBoundaryBound, "WAIT_BOUNDARY_BOUND");
         }
     }
 }
@@ -6803,8 +6950,10 @@ int NCManager::GetActiveCommittedPC() const noexcept
 }
 void NCManager::CapturePendingCommandState(int sourcePC)
 {
-    m_motion.SetNextCommandTranslation(CoordSys.IsTranslationRunFrozen()
-        ? CoordSys.GetTranslationSnapshot() : NCTranslationSnapshot{});
+    auto& pendingTranslation=m_ncDispatchScratch->pendingTranslation;
+    if(CoordSys.IsTranslationRunFrozen())CoordSys.CopyTranslationSnapshot(pendingTranslation);
+    else pendingTranslation=NCTranslationSnapshot{};
+    m_motion.SetNextCommandTranslation(pendingTranslation);
     const int currentBrainWCS = CoordSys.GetCurrentWCSGCode();
     const int currentBrainToolMode = CoordSys.toolLengthMode;
     const int currentBrainHCode = CoordSys.currentHCode;
@@ -6855,6 +7004,38 @@ void NCManager::CapturePendingCommandState(int sourcePC)
         currentPlane);
 }
 
+const NCHoldRecovery::Config& NCManager::GetHoldRecoveryConfigSameThread() const noexcept
+{
+    return GlobalConfig::GetInstance().GetHoldRecoveryConfig();
+}
+
+bool NCManager::ValidateHoldPolicyBlockSameThread(const NCBlock& block,int pc,int line,bool report)
+{
+    const NCProgramCache* program=m_macroStack.empty()?&GetBaseProgramCache():m_macroStack.back().program;
+    const auto* source=program?program->TryGetLine(pc):nullptr;std::uint32_t count=0U;
+    const bool valid=m_state==NCState::RUN&&(m_mode==NCOperationMode::MEMORY||m_mode==NCOperationMode::MDI)&&
+        m_currentExecutingBlockDispatchId!=NC_BLOCK_DISPATCH_ID_INVALID&&source&&source->sourceLineNumber==line&&
+        NCHoldPolicy::DecodeAuthored(source->parsedBlock,block,count);
+    if(!valid&&report){
+        RtPrintf("[HOLD] build=EDM332 event=DECLARATION_REJECT pc=%d line=%d reason=STANDALONE_LITERAL_G181_P0_TO_15\n",pc,line);
+        AlarmManager::GetInstance().Trigger(AlarmManager::G_Code_Invalid_parameter,line);
+        ChangeState(NCState::HOLD);
+    }
+    return valid;
+}
+
+bool NCManager::CommitHoldPolicySameThread(const NCBlock& block,int pc,int line)
+{
+    if(!ValidateHoldPolicyBlockSameThread(block,pc,line))return false;
+    std::uint32_t count=0U;
+    if(!NCHoldPolicy::Decode(block,count)||!m_holdPolicy.Commit(count))return false;
+    // Pure executed NC setting: no Motion frame, feed, source or output change.
+    // M30 retains the last declaration for observation; RESET or base-source
+    // replacement clears it. G76's complete NC command counts as one parent.
+    RtPrintf("[HOLD] build=EDM332 event=DECLARATION_COMMITTED pc=%d line=%d previousParents=%u currentParentStart=1 g76Parent=WHOLE_NC_COMMAND motionSubmitted=0\n",pc,line,count);
+    return true;
+}
+
 WaitConditionFunc NCManager::DispatchSingleGCode(
     const NCBlock& sourceBlock,
     int gCode)
@@ -6887,11 +7068,23 @@ WaitConditionFunc NCManager::DispatchSingleGCode(
     case 76: // P50 is one dedicated AIR parent; other modes retain the orbit path.
         if (IsG76SphereBlock(block)) return StartG76SphereSameThread(block);
         return StartG76OrbitSameThread(block);
-    case 1: // BX-FEED: explicit G01 uses its own feed producer.
+    case 1: // EDM307: explicitly confirmed EDM paths use the shared analytic parent.
+        if (IsEDMProcessPathCandidateSameThread(block)) {
+            TraceG76SphereStartupSameThread(36U,"BEFORE_SOURCE_START");
+            const WaitConditionFunc callback=StartEDMProcessPathSameThread(block);
+            TraceG76SphereStartupSameThread(37U,"AFTER_SOURCE_START");
+            return callback;
+        }
         if (m_edm171Air->selected && m_edm171Air->mode==2U) return StartEDM171MixedMotionSameThread(block);
         return StartPathCoreFeedSameThread(block);
     case 2: // BY-ARC: G17 XY circular interpolation, exact stop.
     case 3:
+        if (IsEDMProcessPathCandidateSameThread(block)) {
+            TraceG76SphereStartupSameThread(36U,"BEFORE_SOURCE_START");
+            const WaitConditionFunc callback=StartEDMProcessPathSameThread(block);
+            TraceG76SphereStartupSameThread(37U,"AFTER_SOURCE_START");
+            return callback;
+        }
         if (m_edm171Air->selected && m_edm171Air->mode==2U) return StartEDM171MixedMotionSameThread(block);
         return StartPathCoreArcSameThread(block);
     case 39: // EDM17: prevalidated owner-thread recipe operation.
@@ -7013,12 +7206,45 @@ void NCManager::ExecuteBlock(
     NCBlockDispatchId dispatchId)
 {
     m_waitCallback = nullptr;
+    // EDM335: explicit L must never be ignored by an ordinary CNC producer.
+    // Keep the immutable authored count before any M/T, recipe or frame effect.
+    if(NCFinishPolicy::Requests(inputBlock)){
+        const auto* finishSource=GetBaseProgramCache().TryGetLine(sourcePC);
+        std::uint32_t finishCount=0U;
+        if(!finishSource||(sourceLineNumber&&finishSource->sourceLineNumber!=sourceLineNumber)||
+           !NCFinishPolicy::Decode(finishSource->parsedBlock,inputBlock,finishCount)||
+           !IsEDMProcessPathCandidateSameThread(inputBlock)){
+            RtPrintf("[FINISH] build=EDM335 event=SOURCE_REJECT pc=%d line=%d reason=L_REQUIRES_LITERAL_EDM_G01_G02_G03_0_TO_99 beforeSideEffects=1\n",sourcePC,sourceLineNumber);
+            AlarmManager::GetInstance().Trigger(AlarmManager::G_Code_Invalid_parameter,sourceLineNumber);
+            ChangeState(NCState::HOLD);return;
+        }
+    }
+    // EDM331 is a standalone pure NC setting. Reject its entire authored row
+    // before spindle/tool/recipe/frame effects; do not route P through any
+    // coordinate parameter-owner guard or capture a Motion frame for it.
+    if(NCGCodeSemantics::Contains(inputBlock,NCHoldPolicy::DeclarationCode)){
+        (void)CommitHoldPolicySameThread(inputBlock,sourcePC,sourceLineNumber);return;
+    }
+    if(m_holdPolicy.declared&&(NCGCodeSemantics::Contains(inputBlock,1)||NCGCodeSemantics::Contains(inputBlock,2)||
+        NCGCodeSemantics::Contains(inputBlock,3)||NCGCodeSemantics::Contains(inputBlock,76))&&
+        !IsDeclaredHoldRecoveryPathSupportedSameThread(inputBlock)){
+        RtPrintf("[HOLD] build=EDM332 event=SOURCE_REJECT pc=%d line=%d reason=HOLD_RECOVERY_UNSUPPORTED_LANE declaredPreviousParents=%u\n",
+            sourcePC,sourceLineNumber,m_holdPolicy.previousSegments);
+        AlarmManager::GetInstance().Trigger(AlarmManager::G_Code_Invalid_parameter,sourceLineNumber);
+        ChangeState(NCState::HOLD);return;
+    }
+    // EDM331: a real M/T row is an inspection-history boundary, including
+    // M00/M30. Revoke only the future continuation token; the RT-owned active
+    // parent/checkpoint remains immutable until its existing retirement.
+    if(inputBlock.mCount>0||inputBlock.has('T'))m_motion.InvalidateHoldRecoveryContinuation();
     // EDM288: reject reserved spindle/S rows before every G/T/recipe side effect.
     if(!ValidateRotarySpindleBlockSameThread(inputBlock,sourcePC,sourceLineNumber))return;
     if(NCGCodeSemantics::Contains(inputBlock,80)&&
         !ValidateG80BlockSameThread(inputBlock,sourcePC,sourceLineNumber))return;
     if(IsG76SphereBlock(inputBlock)&&
         !ValidateG76SphereBlockSameThread(inputBlock,sourcePC,sourceLineNumber))return;
+    if(IsEDMProcessPathCandidateSameThread(inputBlock)&&
+        !ValidateEDMProcessPathBlockSameThread(inputBlock,sourcePC,sourceLineNumber))return;
     // TUNE01: reject the full authored row before any EDM/settings/output side effect.
     if (NCGCodeSemantics::Contains(inputBlock, 190) &&
         !ValidatePositionAutoTuneBlockSameThread(inputBlock, sourcePC, sourceLineNumber)) return;
@@ -7040,7 +7266,7 @@ void NCManager::ExecuteBlock(
     // BASE79G: resolved doubles alone cannot prove literal authorship. Bind
     // the restricted feed to the immutable MEMORY cache before settings/capture.
     if (CoordSys.isCAxisOffsetRotationEnabled && CoordSys.toolLengthMode != 49 &&
-        NCGCodeSemantics::Contains(block, 1))
+        NCGCodeSemantics::Contains(block, 1) && !IsEDMProcessPathCandidateSameThread(block))
     {
         const NCProgramCacheLine* line = GetBaseProgramCache().TryGetLine(sourcePC);
         if (m_mode != NCOperationMode::MEMORY || !m_macroStack.empty() || !line ||
@@ -7100,13 +7326,14 @@ void NCManager::ExecuteBlock(
     }
     // BY-ARC-BEGIN: whole-block guard before any setting/tool/M side effect.
     const bool explicitArc = NCGCodeSemantics::Contains(block, 2) || NCGCodeSemantics::Contains(block, 3);
-    if ((explicitArc && (!IsPathCoreArcBlockShapeValid(block, true, CoordSys.isInchMode ? 20 : 21,
+    if (!IsEDMProcessPathCandidateSameThread(block) &&
+        ((explicitArc && (!IsPathCoreArcBlockShapeValid(block, true, CoordSys.isInchMode ? 20 : 21,
         CoordSys.isPolarCoordinateActive, CoordSys.activePlane, IsNCPolarRadiusArcNotationAllowed(CoordSys.activePlane, CoordSys.isAbsoluteMode,
                 CoordSys.isPolarCoordinateActive, CoordSys.toolRadiusMode),
             IsNCPolarRadiusArcNotationAllowed(CoordSys.activePlane, CoordSys.isAbsoluteMode,
                 CoordSys.isPolarCoordinateActive, CoordSys.toolRadiusMode)) || m_pathFeed.pending)) ||
         IsPathCoreArcInputOmission(block) ||
-        (m_pathArc.pending && (explicitArc || NCGCodeSemantics::Contains(block, 0) || NCGCodeSemantics::Contains(block, 1))))
+        (m_pathArc.pending && (explicitArc || NCGCodeSemantics::Contains(block, 0) || NCGCodeSemantics::Contains(block, 1)))))
     {
         if (!m_pathArc.pending)
         {
@@ -7132,7 +7359,10 @@ void NCManager::ExecuteBlock(
     // BX-FEED: reject unsupported shape before setting/tool/M-code side effects.
     // BASE70-FIX1: use the same bounded Z+C admission as the motion entry.
     // Without this branch, ExecuteBlock rejects a valid pair before dispatch.
-    if ((NCGCodeSemantics::Contains(block, 1) &&
+    // EDM308: the confirmed EDM path was validated above with its literal B
+    // and optional F. It must not re-enter the ordinary CNC shape decoder.
+    if (!IsEDMProcessPathCandidateSameThread(block) &&
+        ((NCGCodeSemantics::Contains(block, 1) &&
         !IsPathCoreFeedBlockShapeValid(block, true, CoordSys.isInchMode ? 20 : 21, CoordSys.isPolarCoordinateActive, CoordSys.activePlane) &&
         !IsNCRotaryFeedBlockAllowed(CoordSys.GetTranslationSnapshot(), block) &&
         !IsNCZCFeedBlockAllowed(CoordSys.GetTranslationSnapshot(), block) &&
@@ -7142,7 +7372,7 @@ void NCManager::ExecuteBlock(
         !IsEDM150XYZFeedBlockSameThread(block) &&
         !IsEDM154SparseFeedBlockSameThread(block) &&
         !IsNCEccentricCFeedBlockAllowed(CoordSys.GetTranslationSnapshot(), block)) ||
-        IsPathCoreFeedInputOmission(block))
+        IsPathCoreFeedInputOmission(block)))
     {
         if (!m_pathFeed.pending)
         {
@@ -7321,9 +7551,12 @@ void NCManager::ExecuteBlock(
             const bool edm94BracketControl = gCode == 180 &&
                 IsEDM94TranslationBracketAllowedSameThread(block);
             if (gCode == 76) PrintNCG76StartCheckpoint("BEFORE_FRAME_PREPARE", sourcePC);
+            TraceG76SphereStartupSameThread(39U,"BEFORE_SOURCE_PREPARE");
             if (!edm94BracketControl && !PrepareFixedTranslationMotionSameThread(block, gCode)) return;
+            TraceG76SphereStartupSameThread(38U,"AFTER_SOURCE_PREPARE");
             if (gCode == 76) PrintNCG76StartCheckpoint("AFTER_FRAME_PREPARE", sourcePC);
             CapturePendingCommandState(sourcePC);
+            TraceG76SphereStartupSameThread(35U,"AFTER_PENDING_CAPTURE");
             if (gCode == 76) PrintNCG76StartCheckpoint("AFTER_SOURCE_CAPTURE", sourcePC);
         }
 
@@ -7534,6 +7767,7 @@ char NCManager::GetAxisName(
 // ==========================================
 bool NCManager::LoadMDI(const std::string& mdiContent)
 {
+    m_holdPolicy.Clear(); // EDM331: a new base source starts with P0 default.
     if (m_state == NCState::RESET_STATE)
     {
         return false;
@@ -7605,6 +7839,7 @@ bool NCManager::LoadMDI(const std::string& mdiContent)
 // ==========================================
 bool NCManager::LoadManualAuto(const std::string& manualContent)
 {
+    m_holdPolicy.Clear(); // EDM331: never leak a replaced base-source policy.
     if (m_state == NCState::RESET_STATE)
     {
         return false;
@@ -8976,7 +9211,7 @@ NCManager::BuildPreparedBlockModalSnapshot() const noexcept
     modal.unitsMode = CoordSys.isInchMode ? 20 : 21;
     modal.planeMode = CoordSys.activePlane;
     modal.workCoordinateCode = CoordSys.GetCurrentWCSGCode();
-    modal.translation = CoordSys.GetTranslationSnapshot();
+    CoordSys.CopyTranslationSnapshot(modal.translation);
     modal.storedStrokeMode =
         CoordSys.IsProgrammableTravelLimitEnabled() ? 22 : 23;
     modal.toolLengthMode = CoordSys.toolLengthMode;
@@ -10390,6 +10625,71 @@ void NCManager::ObserveOrdinaryG00FeedHoldCohortCutover() noexcept
 // =============================================================================
 // Stage NC-0.2I.3 - Program Feed Hold ACK-Gated Resume Controlled Cutover
 // =============================================================================
+bool NCManager::IsRotarySpindleXYZHoldReadySameThread() const noexcept
+{
+    if (!IsRotarySpindleXYZProgramSameThread() || m_state != NCState::HOLD ||
+        !m_rotarySpindle.rtBegun || AlarmManager::GetInstance().HasAlarm() ||
+        !m_motion.IsMotionOwnerLeaseCurrent(m_programMotionLease) ||
+        m_motion.HasPendingSafetyOrRecoveryRequests()) return false;
+    const MotionExecutionEpoch epoch = m_motion.GetCurrentExecutionEpoch();
+    const auto& scope = m_rotarySpindle.authority.scope;
+    if (scope.epoch != epoch || scope.ownerGeneration != m_programMotionLease.generation ||
+        scope.runToken != m_pathCoreLiveBookkeeping.currentRunToken ||
+        m_motion.GetRotarySpindleConcurrentAxisMask(epoch, m_programMotionLease) == 0U) return false;
+    const NCFeedHoldBoundarySnapshot hold = m_feedHoldBoundaryShadow.GetSnapshot();
+    // requestLatched survives successful resume for diagnostics. Only a live
+    // stop lifetime may own this gate; a later M00 needs its own fresh proof.
+    if (m_programFeedHoldLifetimeActive || hold.active)
+        return IsProgramFeedHoldResumeCandidate() && hold.acknowledged &&
+            !hold.acknowledgeLost && !hold.failed &&
+            hold.requestExecutionEpoch == epoch && hold.currentExecutionEpoch == epoch &&
+            hold.requestOwner == m_programMotionLease.owner &&
+            hold.currentOwner == m_programMotionLease.owner &&
+            hold.requestOwnerGeneration == m_programMotionLease.generation &&
+            hold.currentOwnerGeneration == m_programMotionLease.generation &&
+            hold.expectedSettleRequestSequence != MOTION_NC_SETTLE_REQUEST_SEQUENCE_INVALID &&
+            hold.expectedSettleRequestSequence == m_feedHoldNCSettleRequestSequence;
+    // A nonmoving M00 boundary has no in-flight PROGRAM Feed Hold. It still
+    // needs the separate physical XYZ/unclaimed-axis proof, never a queue-only
+    // predicate and never the machinewide M30 proof with rotating spindles.
+    return m_motion.HasRotarySpindleXYZSettleAcknowledgement(epoch, m_programMotionLease);
+}
+
+bool NCManager::CompleteRotarySpindleXYZResumeSameThread() noexcept
+{
+    if (!IsRotarySpindleXYZResumeReadySameThread() ||
+        !IsRotarySpindleXYZHoldReadySameThread()) return false;
+    if (m_holdResumeAdmissionKind != HoldResumeAdmissionKind::PROGRAM_HOLD &&
+        !ArmHoldResumeAlarmAdmission(HoldResumeAdmissionKind::PROGRAM_HOLD)) return false;
+    const bool candidate = IsProgramFeedHoldResumeCandidate();
+    if (candidate)
+    {
+        ObserveFeedHoldResumeRequestedShadow();
+        if (!m_feedHoldResumeGate.ShouldApplyResume())
+        {
+            const NCFeedHoldResumeGateRequestResult result =
+                m_feedHoldResumeGate.RequestResume(m_feedHoldBoundaryShadow.GetSnapshot());
+            if (result == NCFeedHoldResumeGateRequestResult::DEFERRED)
+            { m_holdResumeGateControlled = true; return false; }
+            if (result != NCFeedHoldResumeGateRequestResult::APPLY_NOW)
+            {
+                ClearHoldResumeAlarmAdmission(HoldResumeAdmissionKind::PROGRAM_HOLD);
+                return false;
+            }
+        }
+    }
+    m_holdResumeGateControlled = candidate;
+    // Only this broker-ready transaction may enter the shared final alarm /
+    // lease admission. Periodic generic resume paths cannot release XYZ.
+    struct ResumeCommitScope
+    {
+        bool& flag;
+        explicit ResumeCommitScope(bool& value) noexcept : flag(value) { flag = true; }
+        ~ResumeCommitScope() noexcept { flag = false; }
+    } commit(m_rotarySpindle.combinedResumeCommitInProgress);
+    return ApplyProgramHoldResume(candidate);
+}
+
 bool NCManager::IsProgramFeedHoldResumeCandidate() const noexcept
 {
     const NCFeedHoldBoundarySnapshot snapshot =
@@ -10407,6 +10707,9 @@ bool NCManager::IsProgramFeedHoldResumeCandidate() const noexcept
 bool NCManager::ApplyProgramHoldResume(
     bool gateControlled) noexcept
 {
+    if (IsRotarySpindleXYZProgramSameThread() &&
+        (!m_rotarySpindle.combinedResumeCommitInProgress ||
+            !IsRotarySpindleXYZResumeReadySameThread())) return false;
     if (m_state != NCState::HOLD ||
         m_holdResumeAdmissionKind !=
         HoldResumeAdmissionKind::PROGRAM_HOLD)
@@ -10748,7 +11051,13 @@ void NCManager::ClearCompletionWaitBoundary(
 
 // 1. 等待馬達靜止
 bool NCManager::WaitAndHoldCallback(NCManager* nc) {
-    if (nc->m_motion.GetQueueSize() > 0 || !nc->m_motion.IsGroupNCDrained()) return false;
+    const bool spindleXYZ = nc->IsRotarySpindleXYZProgramSameThread() &&
+        nc->IsRotarySpindleScopeCurrentSameThread();
+    const bool positionalDrained = spindleXYZ ?
+        nc->m_motion.HasRotarySpindleXYZSettleAcknowledgement(
+            nc->m_motion.GetCurrentExecutionEpoch(), nc->m_programMotionLease) :
+        nc->m_motion.IsGroupNCDrained();
+    if (nc->m_motion.GetQueueSize() > 0 || !positionalDrained) return false;
     return true;
 }
 
@@ -10775,8 +11084,15 @@ bool NCManager::WaitForCycleStartCallback(NCManager* nc) {
 
 // 3. 只等待馬達靜止 (清空預讀)
 bool NCManager::WaitAndClearQueueCallback(NCManager* nc) {
+    const bool spindleXYZ = !nc->m_gotoQueueTailRebasePending &&
+        nc->IsRotarySpindleXYZProgramSameThread() &&
+        nc->IsRotarySpindleScopeCurrentSameThread();
+    const bool positionalDrained = spindleXYZ ?
+        nc->m_motion.HasRotarySpindleXYZSettleAcknowledgement(
+            nc->m_motion.GetCurrentExecutionEpoch(), nc->m_programMotionLease) :
+        nc->m_motion.IsGroupNCDrained();
     if (nc->m_motion.GetQueueSize() > 0 ||
-        !nc->m_motion.IsGroupNCDrained())
+        !positionalDrained)
     {
         return false;
     }

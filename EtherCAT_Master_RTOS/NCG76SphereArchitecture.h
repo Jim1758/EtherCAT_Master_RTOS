@@ -12,11 +12,11 @@
 // Never enlarge the legacy 25/26-child P01..P27 compound to carry P50 layers.
 namespace NCG76SphereArchitecture
 {
-    constexpr unsigned Revision = 286U;
+    constexpr unsigned Revision = 301U;
     constexpr unsigned Mode = 50U;
-    constexpr bool MotionExecutionReleased = true; // Scoped B0 AIR parent only.
+    constexpr bool MotionExecutionReleased = true; // Scoped AIR/SIM parent; B0 and SIM E5 B2/B3/B4.
     constexpr bool DischargeExecutionReleased = false;
-    constexpr bool AutomaticHoldMotionReleased = true; // Same AIR parent only.
+    constexpr bool AutomaticHoldMotionReleased = true; // Same AIR/SIM parent only.
 
     enum class Status : unsigned char
     {

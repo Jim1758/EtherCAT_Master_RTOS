@@ -335,6 +335,22 @@ bool GlobalConfig::LoadAxisConfig(const std::string& filePath, std::vector<AxisC
 }
 
 
+bool GlobalConfig::LoadHoldRecoveryConfig(const std::string& filePath)
+{
+    NCHoldRecovery::Config candidate{};std::string error;
+    bool loaded=false;
+    try {loaded=NCHoldRecovery::LoadFile(filePath,candidate,error);}catch(...){error="READ_EXCEPTION";}
+    if(!loaded||!NCHoldRecovery::Valid(candidate)){
+        RtPrintf("[HOLD] build=EDM331 event=CONFIG_REJECT field=%.96s phase=STARTUP\n",error.c_str());return false;
+    }
+    m_holdRecoveryConfig=candidate;
+    RtPrintf("[HOLD] build=EDM331 event=CONFIG_READY retreatMmMin=%.9g resumeMmMin=%.9g jogMmMin=%.9g retreatAccSec=%.9g retreatDecSec=%.9g resumeAccSec=%.9g resumeDecSec=%.9g jogAccSec=%.9g jogDecSec=%.9g historyMaxPrevious=%u phase=STARTUP\n",
+        candidate.retreatFeedMmMin,candidate.resumeFeedMmMin,candidate.jogRecoveryFeedMmMin,
+        candidate.retreatAccelSeconds,candidate.retreatDecelSeconds,candidate.resumeAccelSeconds,candidate.resumeDecelSeconds,
+        candidate.jogAccelSeconds,candidate.jogDecelSeconds,candidate.historyMaxPrevious);
+    return true;
+}
+
 bool GlobalConfig::LoadPIDConfig(const std::string& filePath, std::vector<AxisContext>& axis, MotionCore& motion)
 {
     EDM171Config::G76CenterReturnSpeeds centerReturn{};
@@ -1395,6 +1411,10 @@ bool GlobalConfig::InitSystemParameters(EtherCatMaster& master)
         DEBUG_PRINT("LoadConfigPathConfig Error！>>SpeedConfig.txt\n");
         return false; // PBC-1: bool(-1) is true, never use it for failure.
     }
+
+    // EDM331 independent HOLD recovery profile. Boot only; missing file uses
+    // conservative defaults and existing user bytes are never rewritten.
+    if(!LoadHoldRecoveryConfig(ParameterDir+"HoldConfig.txt"))return false;
 
     // PBC-1: validate a complete pair and every axis before sealing the model.
     if (!StagePbcPitchPair(GlobalConfig::GetInstance().ParameterDir, master.m_Motion.m_CompEngine))

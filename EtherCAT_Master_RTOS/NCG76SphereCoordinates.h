@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <new>
 
 // EDM285: pure coordinate adapter; no queue, Motion, PDO or discharge admission.
 // All lengths enter as canonical mm, F remains native mm/min (never scaled).
@@ -42,6 +43,8 @@ struct FrozenFrame
     double nativeScale=0.0;
     bool fixedEccentric=false,valid=false;
 };
+static_assert(std::is_trivially_destructible<FrozenFrame>::value,
+    "P50 caller-storage reset must have no destruction side effects");
 struct NativePlan
 {
     NCG76Sphere::Descriptor descriptor{};
@@ -54,6 +57,15 @@ struct NativePlan
 };
 namespace Detail
 {
+// EDM293 FIX1: initialize the caller's value storage directly. In Debug builds,
+// assigning a whole default aggregate can materialize another frame on the
+// fixed RTSS stack. This placement construction allocates no memory. Inputs
+// must be frozen before this replacement is used.
+inline void ClearFrame(FrozenFrame& frame) noexcept
+{
+    frame.~FrozenFrame();
+    ::new (static_cast<void*>(&frame)) FrozenFrame{};
+}
 inline bool Bits(double a,double b) noexcept {return std::memcmp(&a,&b,sizeof(double))==0;}
 template<std::size_t N> inline bool Same(const std::array<double,N>& a,const std::array<double,N>& b) noexcept
 {return std::memcmp(a.data(),b.data(),N*sizeof(double))==0;}
@@ -128,13 +140,13 @@ inline bool SameFrame(const FrozenFrame& a,const FrozenFrame& b) noexcept
 inline Status BuildFrame(const NCTranslationSnapshot& source,const Point8& acceptedStart,FrozenFrame& output) noexcept
 {
     // Copy inputs before clearing output, including callers rebuilding in place.
-    const NCTranslationSnapshot frozen=source;const Point8 initial=acceptedStart;output=FrozenFrame{};
+    const NCTranslationSnapshot frozen=source;const Point8 initial=acceptedStart;Detail::ClearFrame(output);
     const auto status=Detail::Supported(frozen);if(status!=Status::Ok)return status;
     if(!Detail::Finite(initial))return Status::InvalidStart;
-    FrozenFrame frame{};frame.translation=frozen;frame.startMCS=initial;frame.nativeScale=frozen.scalingFactor;
+    auto& frame=output;frame.translation=frozen;frame.startMCS=initial;frame.nativeScale=frozen.scalingFactor;
     frame.fixedEccentric=frozen.axisIdentity.eccentricEnabled==1U&&frozen.toolLengthMode!=49;
     if(frame.fixedEccentric&&!NCEccentricCDetail::Offset(frozen,initial[3],frame.signedEccentricOffset))
-        return Status::UnsupportedEccentric;
+        { Detail::ClearFrame(output);return Status::UnsupportedEccentric; }
     if(frozen.distanceMode==90){
         if(frame.fixedEccentric){
             for(unsigned a=0;a<8;++a){
@@ -142,13 +154,13 @@ inline Status BuildFrame(const NCTranslationSnapshot& source,const Point8& accep
                 frame.programStart[a]=nominal-(frozen.extOffsetMM[a]+frozen.wcsOffsetMM[a]);
             }
         }else NCTranslationInversePoint(frozen,initial.data(),frame.programStart.data());
-        if(!Detail::Finite(frame.programStart))return Status::NumericRange;
+        if(!Detail::Finite(frame.programStart)){Detail::ClearFrame(output);return Status::NumericRange;}
         Point8 reconstructed{};Point3 program{{frame.programStart[0],frame.programStart[1],frame.programStart[2]}};
-        if(!Detail::RawForward(frame,program,reconstructed))return Status::NumericRange;
+        if(!Detail::RawForward(frame,program,reconstructed)){Detail::ClearFrame(output);return Status::NumericRange;}
         if(!Detail::WithinError({{reconstructed[0],reconstructed[1],reconstructed[2]}},{{initial[0],initial[1],initial[2]}}))
-            return Status::PrecisionLoss;
+            {Detail::ClearFrame(output);return Status::PrecisionLoss;}
     }
-    frame.valid=true;output=frame;return Status::Ok;
+    frame.valid=true;return Status::Ok;
 }
 inline bool ValidFrame(const FrozenFrame& frame) noexcept
 {

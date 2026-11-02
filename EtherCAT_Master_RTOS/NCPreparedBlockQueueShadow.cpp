@@ -5,9 +5,28 @@
 #include <cmath>
 #include <cstdlib>
 #include <limits>
+#include <new>
 
 namespace
 {
+    // EDM308 FIX2: reset the persistent queue in its own storage. A whole
+    // array assignment can create a 56 KiB temporary on the fixed NC stack
+    // when aggregate-copy elision is unavailable. Preserve every declared
+    // field default; placement construction neither allocates nor zero-fills
+    // semantic defaults such as -1 PCs, G90, G54 and scaling factor 1.
+    void ResetPreparedEntries(std::array<NCPreparedBlockEntrySnapshot,
+        NC_PREPARED_BLOCK_QUEUE_CAPACITY>& entries) noexcept
+    {
+        static_assert(std::is_trivially_destructible<
+            NCPreparedBlockEntrySnapshot>::value,
+            "Prepared entries must remain trivial values for in-place reset.");
+        for (auto& entry : entries)
+        {
+            entry.~NCPreparedBlockEntrySnapshot();
+            ::new (static_cast<void*>(&entry)) NCPreparedBlockEntrySnapshot{};
+        }
+    }
+
     bool TryParseLiteralDouble(
         const std::string& expression,
         double& value) noexcept
@@ -382,7 +401,7 @@ void NCPreparedBlockQueueShadow::InvalidateActive(
     m_counters.invalidatedEntries +=
         static_cast<std::uint64_t>(m_depth);
 
-    m_entries = {};
+    ResetPreparedEntries(m_entries);
     m_head = 0U;
     m_depth = 0U;
     m_active = false;
@@ -453,7 +472,7 @@ void NCPreparedBlockQueueShadow::BeginNewSession(
     bool permitCommittedBaseline,
     bool blockPlanningAtCommittedBaseline) noexcept
 {
-    m_entries = {};
+    ResetPreparedEntries(m_entries);
     m_head = 0U;
     m_depth = 0U;
     m_source = source;
@@ -1195,6 +1214,12 @@ NCPreparedBlockQueueShadow::ClassifyLiteralBlock(
                 result,
                 NCPreparedBarrierKind::PROGRAM_FLOW,
                 NC_PREPARED_BARRIER_FLAG_FLOW);
+            continue;
+        }
+
+        if(code==181) // EDM331: commit policy only at the actual NC boundary.
+        {
+            AddBarrier(result,NCPreparedBarrierKind::MODAL_SNAPSHOT,NC_PREPARED_BARRIER_FLAG_MODAL);
             continue;
         }
 

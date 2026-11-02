@@ -10,13 +10,17 @@
 // ObservedAtMs is the NC owner's clock, not a Windows UTC timestamp.
 static constexpr std::uint32_t SHM_EDM_DIAG_MAGIC = 0x444D4445U;
 static constexpr std::uint16_t SHM_EDM_DIAG_VERSION_MAJOR = 1U;
-static constexpr std::uint16_t SHM_EDM_DIAG_VERSION_MINOR = 0U;
+static constexpr std::uint16_t SHM_EDM_DIAG_VERSION_MINOR = 1U;
 static constexpr std::uint32_t SHM_EDM_DIAG_FIELD_CAPACITY = 256U;
 static constexpr std::uint32_t SHM_EDM_DIAG_FIELD_SIZE = 144U;
 static constexpr std::uint32_t SHM_EDM_DIAG_SIZE = 37184U;
 
 static constexpr std::uint32_t SHM_EDM_DIAG_PUBLISHED = 1U << 0U;
 static constexpr std::uint32_t SHM_EDM_DIAG_CLOCK_VALID = 1U << 1U;
+// EDM299 minor 1 promotes Header.Reserved32[0] without changing the mapping.
+// Zero is unavailable, 0x100|0..4 is a valid accepted B0..B4 selection.
+static constexpr std::uint32_t SHM_EDM_CURRENT_RETREAT_MODE_VALID = 0x100U;
+static constexpr unsigned SHM_EDM_CURRENT_RETREAT_MODE_INDEX = 0U;
 
 static constexpr std::uint8_t SHM_EDM_GAP_CONFIG_VALID = 1U << 0U;
 static constexpr std::uint8_t SHM_EDM_GAP_LIVE_VALID = 1U << 1U;
@@ -42,7 +46,7 @@ struct SHM_EDM_DiagHeader
     std::uint32_t Flags;
     std::uint64_t PublishCount;
     std::uint64_t ObservedAtMs;
-    std::uint32_t Reserved32[6];
+    std::uint32_t Reserved32[6]; // [0] = EDM299 current retreat-mode word.
 };
 
 struct SHM_EDM_DiagGap
@@ -139,6 +143,7 @@ struct SHM_EDM_DiagData
 static_assert(sizeof(SHM_EDM_DiagHeader) == 64U, "EDM diagnostic header ABI");
 static_assert(offsetof(SHM_EDM_DiagHeader, Sequence) == 12U, "EDM sequence ABI");
 static_assert(offsetof(SHM_EDM_DiagHeader, Heartbeat) == 16U, "EDM heartbeat ABI");
+static_assert(offsetof(SHM_EDM_DiagHeader, Reserved32) == 40U, "EDM current retreat-mode word ABI");
 static_assert(sizeof(SHM_EDM_DiagGap) == 128U, "EDM GAP ABI");
 static_assert(offsetof(SHM_EDM_DiagGap, BoardVoltageMv) == 120U, "EDM board voltage ABI");
 static_assert(sizeof(SHM_EDM_DiagRecipe) == 128U, "EDM recipe ABI");

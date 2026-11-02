@@ -1,5 +1,6 @@
 ﻿#include "PositionPidService.h"
 #include "SHMManager.h"
+#include "NCHoldTelemetry.h"
 #include "PositionAutoTuneJob.h"
 #include "EDMProcessTuningService.h"
 
@@ -1696,6 +1697,7 @@ bool SHMManager::Initialize(
         InitializeEtherCatServiceSharedMemory();
 
         InitializeEDMDiagnosticSharedMemory();
+        (void)NCHoldTelemetry::Initialize();
         InitializeEDMProcessTuningService();
         InitializePositionPidService();
         InitializeEDMConditionService((GlobalConfig::GetInstance().BaseDataDir + "Data\\EDM\\").c_str());
@@ -1791,6 +1793,7 @@ bool SHMManager::Initialize(
     InitializeEtherCatServiceSharedMemory();
 
     InitializeEDMDiagnosticSharedMemory();
+    (void)NCHoldTelemetry::Initialize();
     InitializeEDMProcessTuningService();
         InitializePositionPidService();
     InitializeEDMConditionService((GlobalConfig::GetInstance().BaseDataDir + "Data\\EDM\\").c_str());
@@ -1806,6 +1809,7 @@ void SHMManager::Shutdown()
     ShutdownEDMProcessTuningService();
     PositionAutoTune::ShutdownJobs(); // TUNE01: join analysis before storage teardown.
     ShutdownEDMConditionService();
+    NCHoldTelemetry::Shutdown();
     ShutdownEDMDiagnosticSharedMemory();
 
     ShutdownEtherCatServiceSharedMemory();

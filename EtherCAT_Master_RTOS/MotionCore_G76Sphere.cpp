@@ -1,6 +1,8 @@
 #include "MotionCore.h"
 #include "AlarmManager.h"
 #include "PLCManager.h"
+#include "NCG76StartDiagnostic.h"
+#include "NCG76SphereSimulationTestPolicy.h"
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -8,6 +10,12 @@
 
 extern PLCManager* g_PLC;
 namespace {
+void PrintSphereMotionMemoryStage(const char* stage,int pc) noexcept
+{
+    PrintG76SphereMemoryDiagnostic(stage,pc,sizeof(NCTranslationSnapshot),
+        sizeof(NCG76SphereCoordinates::FrozenFrame),sizeof(NCG76SphereRuntimeGeometry::Geometry),
+        sizeof(NCG76SphereCycle::Request),sizeof(MotionG76SphereFeedback),sizeof(MotionCore));
+}
 bool SphereIdentity(const MotionExecutionIdentity& a,const MotionExecutionIdentity& b) noexcept
 { return a.IsAssigned() && b.IsAssigned() && a.epoch==b.epoch && a.segmentId==b.segmentId &&
     a.sourceBlockId==b.sourceBlockId && a.source==b.source; }
@@ -21,15 +29,38 @@ bool MotionCore::ReadG76SphereFeedback(MotionG76SphereFeedback& out) const noexc
 {
     if(!m_g76SphereFeedback.Read(out).Ready())return false;
     out.endpointCommitted=out.completed&&m_g76SphereEndpointCommitted.load(std::memory_order_acquire)==out.session;
+    if(m_g76SphereInspectionProducerBlocked.load(std::memory_order_acquire)){
+        out.holdInspectionJogReady=false;out.holdRecoveryResumeReady=false;
+    }
+    if(m_g76SphereProcessRevokedSession.load(std::memory_order_acquire)==out.session)
+        out.processShadow=NCG76SphereGapProcess::Feedback{};
+    return true;
+}
+
+bool MotionCore::RevokeG76SphereProcessShadow(std::uint64_t session,
+    const MotionExecutionIdentity& identity,const MotionOwnerLease& owner) noexcept
+{
+    // Withdrawal is data-only and is allowed after owner/epoch revocation too.
+    // A stale parent can never withdraw a newer parent's observer.
+    G76SphereFrozen frozen{};
+    if(!session||m_g76SphereClaim.load(std::memory_order_acquire)!=session||
+       !m_g76SphereRequests.Read(frozen).Ready()||frozen.request.session!=session||
+       !SphereIdentity(frozen.command.execution,identity)||!frozen.command.ownerLease.Matches(owner))return false;
+    auto previous=m_g76SphereProcessRevokedSession.load(std::memory_order_acquire);
+    while(previous<session&&!m_g76SphereProcessRevokedSession.compare_exchange_weak(previous,session,
+        std::memory_order_acq_rel,std::memory_order_acquire)){}
     return true;
 }
 
 bool MotionCore::TryG76SphereMove(const NCG76SphereCycle::Request& requested,
     const NCTranslationSnapshot& frame,MotionExecutionEpoch epoch,const MotionOwnerLease& owner,
-    int sourcePC,MotionExecutionIdentity& identity,MotionG76SphereAdmission* admission) noexcept
+    int sourcePC,MotionExecutionIdentity& identity,MotionG76SphereAdmission* admission,
+    const NCG76SphereGapProcess::Config* processShadow,const NCHoldRecovery::Config* holdConfig,
+    std::uint32_t declaredPreviousParents,std::uint32_t finishRequiredCount) noexcept
 {
     identity=MotionExecutionIdentity{};
     if(admission)*admission=MotionG76SphereAdmission{};
+    PrintSphereMotionMemoryStage("NC_MOTION_ADMISSION_BEGIN",sourcePC);
     const auto reject=[&](MotionG76SphereAdmissionGate gate,int axis=-1) noexcept {
         if(admission){admission->gate=gate;admission->axis=axis;}return false;
     };
@@ -42,8 +73,63 @@ bool MotionCore::TryG76SphereMove(const NCG76SphereCycle::Request& requested,
         !HasExactExecutionDrainAcknowledgement(epoch,owner)||m_pContexts==nullptr||m_pCoordMgr==nullptr||
         m_pContexts->size()<6U||GetQueueSize()!=0U||GetCommandIngressSize()!=0U||GetCommandReplaySize()!=0U)
         return reject(MotionG76SphereAdmissionGate::OwnerDrain);
+    if(finishRequiredCount>99U||(holdConfig&&(!NCHoldRecovery::Valid(*holdConfig)||
+            declaredPreviousParents>NCHoldPolicy::MaximumPreviousParents))||
+       (!holdConfig&&declaredPreviousParents!=0U))return reject(MotionG76SphereAdmissionGate::Request);
+    G76SphereHoldFrozen hold{};hold.session=requested.session;hold.enabled=holdConfig!=nullptr;
+    hold.declaredPreviousParents=declaredPreviousParents;
+    hold.finishRequiredCount=finishRequiredCount;
+    if(holdConfig)hold.config=*holdConfig;
     G76SphereFrozen frozen{};frozen.request=requested;
+    frozen.holdRecoveryEnabled=hold.enabled;
+    frozen.holdDeclaredPreviousParents=static_cast<std::uint8_t>(declaredPreviousParents);
+    frozen.finishRequiredCount=static_cast<std::uint8_t>(finishRequiredCount);
     auto& request=frozen.request;auto& command=frozen.command;
+    // Capture the optional SIM-only process snapshot before checking its whole
+    // flush travel envelope. An explicitly enabled, unsafe excursion rejects
+    // this parent before publication rather than becoming an AIR fallback.
+    G76SphereProcessFrozen process{};process.session=request.session;
+    if(processShadow&&NCG76SphereGapProcess::Valid(*processShadow))process.config=*processShadow;
+    else if(processShadow&&(processShadow->parameterFeeds||processShadow->flushMotionEnabled||processShadow->signedMotionEnabled||
+        processShadow->independentFeedsEnabled||processShadow->finalApproachEnabled||
+        processShadow->initialSlowEnabled||processShadow->initialSlowPercent!=0.0||
+        processShadow->initialSlowDistanceMm!=0.0||processShadow->deepFlushEnabled||
+        processShadow->deepFlushCycleInterval!=0U||processShadow->deepFlushHeightMultiplier!=0.0||
+        processShadow->deepFlushHeightMm!=0.0))
+        return reject(MotionG76SphereAdmissionGate::FlushEnvelope);
+    if(!MotionG76SphereParameterFeeds::Matches(request,process.config))
+        return reject(MotionG76SphereAdmissionGate::FlushEnvelope);
+    frozen.signedMotionEnabled=process.config.signedMotionEnabled;
+    frozen.flushFeatureFlags=static_cast<std::uint8_t>((process.config.independentFeedsEnabled?1U:0U)|
+        (process.config.finalApproachEnabled?2U:0U)|(process.config.initialSlowEnabled?4U:0U)|
+        (process.config.deepFlushEnabled?8U:0U));
+    const bool commonProcess=request.geometry.kind!=NCG76SphereRuntimeGeometry::Kind::Sphere;
+    const bool stationaryLine=request.geometry.kind==NCG76SphereRuntimeGeometry::Kind::Line&&request.geometry.travelMm==0.0;
+    // The explicit common G01/G02/G03 lane is an E-aware SIM parent even in
+    // B0. It may not silently become ordinary AIR when its sidecar is absent.
+    if(commonProcess&&(!process.config.enabled||!frozen.signedMotionEnabled))
+        return reject(MotionG76SphereAdmissionGate::FlushEnvelope);
+    // EDM301: an explicit process mode must never silently become a B0 AIR
+    // parent when its recipe or independent SIM sidecar is unavailable.
+    if(request.retreatMode!=0U&&(!process.config.enabled||
+        (!stationaryLine&&!process.config.flushMotionEnabled)||!frozen.signedMotionEnabled))
+        return reject(MotionG76SphereAdmissionGate::FlushEnvelope);
+    if(request.retreatMode!=0U){
+        // NC-side admission only: establish distinct canonical stations before
+        // any B2 traversal can begin. The RT cycle uses a bounded borrowed view
+        // and never rebuilds/scans the parent's layers on an interpolation tick.
+        NCG76SpherePath::Descriptor path{};
+        if(NCG76SpherePath::Build(request.geometry,path)!=NCG76SpherePath::Status::Ok)
+            return reject(MotionG76SphereAdmissionGate::FlushEnvelope);
+    }
+    NCG76SphereCycle::FlushConfig flush{};
+    if(!NCG76SphereGapProcess::BuildFlushConfig(process.config,request.feedMmMin,flush))
+        return reject(MotionG76SphereAdmissionGate::FlushEnvelope);
+    // A positive L belongs to this real analytic machining parent. It cannot
+    // turn an AIR, zero-length or spherical request into a verified finish.
+    if(finishRequiredCount!=0U&&(!commonProcess||request.geometry.travelMm<=0.0||
+       !process.config.enabled||!frozen.signedMotionEnabled||!process.config.flushMotionEnabled||!flush.enabled))
+        return reject(MotionG76SphereAdmissionGate::FlushEnvelope);
     command.g76SphereAir=true;command.mode=InterpolationMode::LINEAR;
     command.commandPathMode=MotionCommandPathMode::EXACT_STOP;
     command.sourceLinePC=sourcePC;command.sourceTranslation=frame;
@@ -127,8 +213,11 @@ bool MotionCore::TryG76SphereMove(const NCG76SphereCycle::Request& requested,
                 axis.axisType==AxisType::ROTARY,axis.rotaryModulo)||
             (axis.axisType==AxisType::ROTARY&&(retainedNative(m_zcFeedProducerTail)||retainedNative(m_rotaryFeedProducerTail)));
         if(!std::isfinite(startPulse)||!baseline)return reject(MotionG76SphereAdmissionGate::NativeBaseline,static_cast<int>(i));
-        if(!m_pCoordMgr->IsTargetWithinSoftwareTravelLimit(axis,request.geometry.boundsMinMCS[i])||
-            !m_pCoordMgr->IsTargetWithinSoftwareTravelLimit(axis,request.geometry.boundsMaxMCS[i]))
+        double envelopeMin=0.0,envelopeMax=0.0;
+        if(!MotionG76SphereFlush::AxisEnvelope(request.geometry,flush,i,envelopeMin,envelopeMax,request.retreatMode))
+            return reject(MotionG76SphereAdmissionGate::FlushEnvelope,static_cast<int>(i));
+        if(!m_pCoordMgr->IsTargetWithinSoftwareTravelLimit(axis,envelopeMin)||
+            !m_pCoordMgr->IsTargetWithinSoftwareTravelLimit(axis,envelopeMax))
             return reject(MotionG76SphereAdmissionGate::Travel,static_cast<int>(i));
         const bool enabled[3]={axis.travelLimit1Enable&&frame.storedStrokeMode==22,axis.travelLimit2Enable,axis.travelLimit3Enable};
         const double lows[3]={axis.travelLimit1Negative_unit,axis.travelLimit2Negative_unit,axis.travelLimit3Negative_unit};
@@ -147,6 +236,8 @@ bool MotionCore::TryG76SphereMove(const NCG76SphereCycle::Request& requested,
     const double commonRamp=(std::min)(request.accelerationMmS2,request.decelerationMmS2);
     request.accelerationMmS2=commonRamp;request.decelerationMmS2=commonRamp;
     if(command.axisCount!=6||!NCG76SphereCycle::ValidateRequest(request))return reject(MotionG76SphereAdmissionGate::RuntimeRequest);
+    if(flush.enabled&&!NCG76SphereCycle::ValidateFlushConfig(request,flush))
+        return reject(MotionG76SphereAdmissionGate::FlushEnvelope);
     command.accTime=rampSeconds;command.decTime=stopSeconds;command.targetVel=1.0;
     AssignExecutionIdentity(command,epoch,MotionCommandSource::NC_MEMORY,owner);
     LifecycleCommitReservationGuard reservation(*this,command.execution);
@@ -155,6 +246,13 @@ bool MotionCore::TryG76SphereMove(const NCG76SphereCycle::Request& requested,
     const auto previous=m_g76SphereClaim.load(std::memory_order_acquire);
     m_g76SphereEndpointCommitted.store(0ULL,std::memory_order_release);
     m_g76SphereParentBound.store(0ULL,std::memory_order_release);
+    // A signed SIM parent requires this exact independent data snapshot.
+    // Publication failure rejects admission; no process-mode AIR fallback.
+    process.identity=command.execution;process.owner=owner;
+    hold.identity=command.execution;hold.owner=owner;
+    if(!m_g76SphereHoldRequests.Publish(hold))return reject(MotionG76SphereAdmissionGate::Publication);
+    if(!m_g76SphereProcessRequests.Publish(process)&&frozen.signedMotionEnabled)
+        return reject(MotionG76SphereAdmissionGate::Publication);
     if(!m_g76SphereRequests.Publish(frozen))return reject(MotionG76SphereAdmissionGate::Publication);
     m_g76SphereClaim.store(request.session,std::memory_order_release);
     m_g76SphereBarrier.store(request.session,std::memory_order_release);
@@ -162,6 +260,8 @@ bool MotionCore::TryG76SphereMove(const NCG76SphereCycle::Request& requested,
         m_g76SphereClaim.store(previous,std::memory_order_release);m_g76SphereBarrier.store(0ULL,std::memory_order_release);return reject(MotionG76SphereAdmissionGate::Enqueue);
     }
     m_g76SphereProducerHighWater=request.session;m_g76SphereProducerControl=G76SphereControl{};
+    m_g76SphereInspectionProducer=G76SphereInspectionIntent{};
+    m_g76SphereInspectionProducerBlocked.store(false,std::memory_order_release);
     identity=command.execution;return true;
 }
 
@@ -175,7 +275,47 @@ bool MotionCore::IsG76SphereCommandAuthorized(const MotionCommand& command) cons
     G76SphereFrozen frozen{};
     if(!m_g76SphereRequests.Read(frozen).Ready()||!frozen.request.session||
         m_g76SphereClaim.load(std::memory_order_acquire)!=frozen.request.session||
-        std::memcmp(&command,&frozen.command,sizeof(command))!=0||frozen.axisMask!=63U)return false;
+        std::memcmp(&command,&frozen.command,sizeof(command))!=0||frozen.axisMask!=63U||
+        !NCG76SphereRetreat::ValidMode(frozen.request.geometry,frozen.request.retreatMode)||
+        (frozen.flushFeatureFlags&~15U)!=0U||
+        (frozen.flushFeatureFlags!=0U&&(frozen.flushFeatureFlags&1U)==0U)||
+        (frozen.flushFeatureFlags!=0U&&!frozen.signedMotionEnabled)||
+        (frozen.request.retreatMode!=0U&&!frozen.signedMotionEnabled)||
+        frozen.holdDeclaredPreviousParents>NCHoldPolicy::MaximumPreviousParents||
+        (!frozen.holdRecoveryEnabled&&frozen.holdDeclaredPreviousParents!=0U)||
+        frozen.finishRequiredCount>99U)return false;
+    G76SphereHoldFrozen hold{};
+    if(!m_g76SphereHoldRequests.Read(hold).Ready()||hold.session!=frozen.request.session||
+       !SphereIdentity(hold.identity,command.execution)||!hold.owner.Matches(command.ownerLease)||
+       hold.enabled!=frozen.holdRecoveryEnabled||hold.declaredPreviousParents!=frozen.holdDeclaredPreviousParents||
+       hold.finishRequiredCount!=frozen.finishRequiredCount||hold.finishRequiredCount>99U||
+       (hold.enabled&&!NCHoldRecovery::Valid(hold.config)))return false;
+    const auto kind=frozen.request.geometry.kind;
+    if((kind!=NCG76SphereRuntimeGeometry::Kind::Sphere&&
+        kind!=NCG76SphereRuntimeGeometry::Kind::Line&&
+        kind!=NCG76SphereRuntimeGeometry::Kind::Arc)||
+        (kind!=NCG76SphereRuntimeGeometry::Kind::Sphere&&!frozen.signedMotionEnabled))return false;
+    const auto& request=frozen.request;
+    if(hold.finishRequiredCount!=0U&&(kind==NCG76SphereRuntimeGeometry::Kind::Sphere||
+       !std::isfinite(request.geometry.travelMm)||request.geometry.travelMm<=0.0||
+       !frozen.signedMotionEnabled))return false;
+    if(request.parameterFeeds){
+        if(kind==NCG76SphereRuntimeGeometry::Kind::Sphere||
+           (kind==NCG76SphereRuntimeGeometry::Kind::Arc&&request.retreatMode!=2U)||
+           !std::isfinite(request.nominalFeedCapMmMin)||request.nominalFeedCapMmMin<0.0||
+           request.nominalFeedCapMmMin>100.0)return false;
+    }else if(request.nominalFeedCapMmMin!=0.0)return false;
+    if(m_g76SphereRunning&&m_g76SphereFrozen.request.session==request.session){
+        const auto& active=m_g76SphereFrozen.request;
+        if(active.parameterFeeds!=request.parameterFeeds||active.geometry.kind!=kind||
+           !MotionG76SphereFixedAxes::SameBits(active.nominalFeedCapMmMin,request.nominalFeedCapMmMin)||
+           !MotionG76SphereFixedAxes::SameBits(active.feedMmMin,request.feedMmMin)||
+           !MotionG76SphereFixedAxes::SameBits(active.geometry.feedMmMin,request.geometry.feedMmMin)||
+           hold.enabled!=m_g76SphereHoldFrozen.enabled||
+           hold.declaredPreviousParents!=m_g76SphereHoldFrozen.declaredPreviousParents||
+           hold.finishRequiredCount!=m_g76SphereHoldFrozen.finishRequiredCount||
+           (hold.enabled&&!NCHoldRecovery::SameConfig(hold.config,m_g76SphereHoldFrozen.config)))return false;
+    }
     for(unsigned i=0U;i<6U;++i){
         const auto& axis=(*m_pContexts)[i];const auto& b=frozen.axis[i];
         if(!axis.isExist||axis.axisIndex!=static_cast<int>(i)||axis.resolution_PPR!=b.resolution||
@@ -226,11 +366,74 @@ bool MotionCore::RequestG76SphereResume(std::uint64_t session,const MotionExecut
         m_g76SphereClaim.load(std::memory_order_acquire)!=session||!IsMotionOwnerLeaseCurrent(owner)||
         GetCurrentExecutionEpoch()!=identity.epoch||HasPendingSafetyOrRecoveryRequests()||
         m_g76SphereProducerControl.session!=session||m_g76SphereProducerControl.holdSequence!=holdSequence||
-        startSequence<=m_g76SphereProducerControl.startSequence)return false;
+        startSequence<=m_g76SphereProducerControl.startSequence||
+        (report.cycle.holdRecoveryEnabled&&!report.holdRecoveryResumeReady)||
+        (m_g76SphereInspectionProducer.session==session&&
+         m_g76SphereInspectionProducer.holdSequence==holdSequence&&m_g76SphereInspectionProducer.direction!=0))return false;
+    if(report.cycle.holdRecoveryEnabled&&report.cycle.inspectionTraceCount!=0U){
+        EDMShortCircuitProtection::Snapshot collision{};
+        if(m_g76SphereInspectionProducerBlocked.load(std::memory_order_acquire)||
+           !ReadCollisionProtection(collision)||!collision.valid||
+           (collision.shortActive&&!m_collisionManualBypass.load(std::memory_order_acquire)))return false;
+    }
     G76SphereControl intent{};intent.session=session;intent.identity=identity;intent.owner=owner;
     intent.holdSequence=holdSequence;intent.startSequence=startSequence;
     if(!m_g76SphereControls.ProducerTryPush(intent))return false;
     m_g76SphereProducerControl=intent;return true;
+}
+
+bool MotionCore::RequestG76SphereInspectionJog(std::uint64_t session,const MotionExecutionIdentity& identity,
+    const MotionOwnerLease& owner,std::uint64_t holdSequence,int axis,int direction,
+    std::uint64_t inspectionSequence) noexcept
+{
+    // Repeated NC heartbeat commands refresh a scoped lease without filling
+    // the intent queue. Repeating an old sequence never extends its lifetime.
+    const bool stop=axis==-1&&direction==0;
+    if(!inspectionSequence||(!stop&&(axis<0||axis>2||(direction!=1&&direction!=-1))))return false;
+    MotionG76SphereFeedback report{};G76SphereHoldFrozen hold{};
+    if(!session||!holdSequence||!ReadG76SphereFeedback(report)||report.session!=session||
+       !report.started||report.terminal||!report.cycle.holdRecoveryEnabled||!report.cycle.holdActive||
+       report.holdSequence!=holdSequence||report.cycle.holdSequence!=holdSequence||
+       !SphereIdentity(report.identity,identity)||!report.owner.Matches(owner)||
+       m_g76SphereClaim.load(std::memory_order_acquire)!=session||!IsMotionOwnerLeaseCurrent(owner)||
+       GetCurrentExecutionEpoch()!=identity.epoch||HasPendingSafetyOrRecoveryRequests()||
+       !SpherePowerOff()||AlarmManager::GetInstance().HasAlarm()||
+       !m_g76SphereHoldRequests.Read(hold).Ready()||!hold.enabled||hold.session!=session||
+       !SphereIdentity(hold.identity,identity)||!hold.owner.Matches(owner)||!NCHoldRecovery::Valid(hold.config))return false;
+    if(!stop){
+        EDMShortCircuitProtection::Snapshot collision{};
+        if(!ReadCollisionProtection(collision)||!collision.valid||
+           (collision.shortActive&&!m_collisionManualBypass.load(std::memory_order_acquire))){
+            m_g76SphereInspectionProducerBlocked.store(true,std::memory_order_release);return false;
+        }
+        if(m_g76SphereInspectionProducerBlocked.load(std::memory_order_acquire))return false;
+    }
+    auto& previous=m_g76SphereInspectionProducer;
+    const bool sameScope=previous.session==session&&previous.holdSequence==holdSequence&&
+        SphereIdentity(previous.identity,identity)&&previous.owner.Matches(owner);
+    if(sameScope&&inspectionSequence<=previous.sequence)
+        return inspectionSequence==previous.sequence&&previous.axis==axis&&previous.direction==direction;
+    G76SphereInspectionIntent intent{};intent.session=session;intent.identity=identity;intent.owner=owner;
+    intent.holdSequence=holdSequence;intent.sequence=inspectionSequence;intent.axis=axis;intent.direction=direction;
+    if(sameScope&&previous.axis==axis&&previous.direction==direction){
+        if(!m_g76SphereInspectionLease.Publish(intent))return false;
+        previous=intent;
+        if(stop)m_g76SphereInspectionProducerBlocked.store(false,std::memory_order_release);
+        return true;
+    }
+    if(!stop&&(!report.holdInspectionJogReady||!report.cycle.held||
+       report.cycle.phase!=NCG76SphereCycle::Phase::HeldAtStart||
+       (m_g76SphereProducerControl.session==session&&
+            m_g76SphereProducerControl.startSequence>report.startSequence)))return false;
+    if(!m_g76SphereInspectionLease.Publish(intent))return false;
+    if(stop){
+        // The data-only STOP page also contains an earlier queued start if the
+        // bounded state-change queue is temporarily full.
+        (void)m_g76SphereInspectionControls.ProducerTryPush(intent);
+        previous=intent;m_g76SphereInspectionProducerBlocked.store(false,std::memory_order_release);return true;
+    }
+    if(!m_g76SphereInspectionControls.ProducerTryPush(intent))return false;
+    previous=intent;return true;
 }
 
 bool MotionCore::BindG76SphereParent(std::uint64_t session,const MotionExecutionIdentity& identity,
@@ -252,36 +455,108 @@ bool MotionCore::BindG76SphereParent(std::uint64_t session,const MotionExecution
     m_g76SphereParentBound.store(session,std::memory_order_release);return true;
 }
 
+void MotionCore::SetG76SphereInputDiagnostic(MotionG76SphereInputStage stage,
+    MotionG76SphereInputGate gate,int axis) noexcept
+{
+    auto& d=m_g76SphereInputObservation;const auto& input=m_g76SphereInput;
+    const auto& frozen=stage==MotionG76SphereInputStage::Observe&&!m_g76SphereRunning?
+        m_g76SpherePendingWorkspace:m_g76SphereFrozen;
+    d.valid=true;d.stage=stage;d.gate=gate;d.axis=static_cast<std::int8_t>(axis);
+    d.tick=m_ncSettleRuntimeCycleTick;d.inputTick=input.tick;d.physicalSequence=input.physicalSequence;
+    d.nowUs=input.nowUs;d.clockFrequency=m_edmZClockFrequency;d.inputSession=m_g76SphereInputSession;
+    d.expectedSession=frozen.request.session;d.inputIdentity=m_g76SphereInputIdentity;
+    using namespace MotionG76SphereInputFlags;
+    std::uint32_t flags=d.flags&RequestRead;
+    if(m_g76SphereClaim.load(std::memory_order_acquire))flags|=Claim;
+    if(m_g76SphereRunning)flags|=Running;
+    if(m_ncSettleRuntimeCycleValid)flags|=PdoCycleValid;
+    if(m_ncSettleRuntimeCycleContiguous)flags|=Contiguous;
+    if(input.powerInhibited)flags|=PowerInhibited|InputPowerInhibited;
+    if(m_edmZClockValid)flags|=ClockValid;
+    if(m_edmZClockFrequency)flags|=ClockFrequency;
+    if(m_edmZMonotonicUs)flags|=ClockNow;
+    if(m_pContexts&&m_pContexts->size()>=6U)flags|=Contexts;
+    if(input.sourceValid)flags|=SourceValid;
+    if(input.pdoValid)flags|=InputPdoValid;
+    if(input.cancel)flags|=Cancelled;
+    if(input.tick==m_ncSettleRuntimeCycleTick)flags|=TickMatches;
+    if(MotionG80RuntimeProof::SameInputScope(m_g76SphereInputSession,m_g76SphereInputIdentity,
+        frozen.request.session,frozen.command.execution))flags|=ScopeMatches;
+    if(input.physicalSequence==input.tick)flags|=PhysicalSequenceMatches;
+    if(m_ncSettleRuntimeCycleTick>=m_g76SphereAdmissionTick)flags|=AdmissionTickValid;
+    d.flags=flags;
+}
+
+void MotionCore::CaptureG76SphereInputFault() noexcept
+{
+    if(m_g76SphereCurrent.firstInputFault.valid)return;
+    m_g76SphereCurrent.firstInputFault=m_g76SphereInputObservation;
+    // Keep values, sequence and validity from the same pre-cancellation input.
+    // Later source callbacks may reset their working sample after containment.
+    m_g76SphereCurrent.actualMCS=m_g76SphereInput.actualMCS;
+    m_g76SphereCurrent.commandMCS=m_g76SphereRunning?m_g76SphereCycle.Command().commandMCS:
+        m_g76SphereFrozen.request.geometry.startMCS;
+    m_g76SphereCurrent.inputSequence=m_g76SphereInput.physicalSequence;
+    m_g76SphereCurrent.inputValidAxisMask=m_g76SphereInputObservation.validAxisMask;
+}
+
 void MotionCore::ObserveG76SphereRuntimeInput() noexcept
 {
     m_g76SphereInput=NCG76SphereCycle::Input{};
     m_g76SphereInputSession=0ULL;m_g76SphereInputIdentity=MotionExecutionIdentity{};
-    if(!m_g76SphereClaim.load(std::memory_order_acquire))return;
+    m_g76SphereInputObservation=MotionG76SphereInputDiagnostic{};
+    if(!m_g76SphereClaim.load(std::memory_order_acquire)){
+        if(m_g76SphereRunning)
+            SetG76SphereInputDiagnostic(MotionG76SphereInputStage::Observe,MotionG76SphereInputGate::ClaimMissing);
+        return;
+    }
     auto& input=m_g76SphereInput;
     input.tick=m_ncSettleRuntimeCycleTick;input.nowUs=m_edmZMonotonicUs;
     input.physicalSequence=input.tick;
     input.pdoValid=m_ncSettleRuntimeCycleValid&&m_ncSettleRuntimeCycleContiguous;
     input.powerInhibited=SpherePowerOff();
-    G76SphereFrozen pending{};
-    const bool read=m_g76SphereRunning||m_g76SphereRequests.Read(pending).Ready();
-    const auto& frozen=m_g76SphereRunning?m_g76SphereFrozen:pending;
+    const bool read=m_g76SphereRunning||m_g76SphereRequests.Read(m_g76SpherePendingWorkspace).Ready();
+    const auto& frozen=m_g76SphereRunning?m_g76SphereFrozen:m_g76SpherePendingWorkspace;
+    if(read)m_g76SphereInputObservation.flags|=MotionG76SphereInputFlags::RequestRead;
     if(read){m_g76SphereInputSession=frozen.request.session;m_g76SphereInputIdentity=frozen.command.execution;
         input.actualMCS=frozen.request.geometry.startMCS;}
     bool source=read&&frozen.request.session&&input.pdoValid&&input.powerInhibited&&
         m_edmZClockValid&&m_edmZClockFrequency!=0ULL&&input.nowUs&&m_pContexts!=nullptr&&m_pContexts->size()>=6U;
+    MotionG76SphereInputGate gate=MotionG76SphereInputGate::None;int failedAxis=-1;
+    if(!read)gate=MotionG76SphereInputGate::RequestUnavailable;
+    else if(!frozen.request.session)gate=MotionG76SphereInputGate::SessionMissing;
+    else if(!m_ncSettleRuntimeCycleValid)gate=MotionG76SphereInputGate::PdoCycleInvalid;
+    else if(!m_ncSettleRuntimeCycleContiguous)gate=MotionG76SphereInputGate::PdoNotContiguous;
+    else if(!input.powerInhibited)gate=MotionG76SphereInputGate::PowerNotInhibited;
+    else if(!m_edmZClockValid)gate=MotionG76SphereInputGate::ClockInvalid;
+    else if(!m_edmZClockFrequency)gate=MotionG76SphereInputGate::ClockFrequencyMissing;
+    else if(!input.nowUs)gate=MotionG76SphereInputGate::ClockTimeMissing;
+    else if(!m_pContexts||m_pContexts->size()<6U)gate=MotionG76SphereInputGate::ContextsMissing;
     for(unsigned i=0U;source&&i<6U;++i){
         const auto& axis=(*m_pContexts)[i];MotionServoInputSnapshot physical{};
-        source=axis.isExist&&!axis.isFirstCycle&&!axis.isFault&&!axis.isLagAlarm&&
-            ReadMotionServoInputCompatibilitySnapshotBySlot(static_cast<int>(i),physical)&&
-            (physical.StatusWord&0x006FU)==0x0027U&&physical.ModesOfOperationDisplay==9;
+        failedAxis=static_cast<int>(i);
+        if(!axis.isExist){source=false;gate=MotionG76SphereInputGate::AxisMissing;}
+        else if(axis.isFirstCycle){source=false;gate=MotionG76SphereInputGate::AxisFirstCycle;}
+        else if(axis.isFault){source=false;gate=MotionG76SphereInputGate::AxisFault;}
+        else if(axis.isLagAlarm){source=false;gate=MotionG76SphereInputGate::AxisLag;}
+        else if(!ReadMotionServoInputCompatibilitySnapshotBySlot(static_cast<int>(i),physical)){
+            source=false;gate=MotionG76SphereInputGate::ServoSnapshotUnavailable;
+        }else if((physical.StatusWord&0x006FU)!=0x0027U){source=false;gate=MotionG76SphereInputGate::ServoStatus;}
+        else if(physical.ModesOfOperationDisplay!=9){source=false;gate=MotionG76SphereInputGate::ServoMode;}
+        m_g76SphereInputObservation.statusWord=physical.StatusWord;
+        m_g76SphereInputObservation.mode=physical.ModesOfOperationDisplay;
+        m_g76SphereInputObservation.rawPosition=physical.ActualPosition;
         if(!source)break;
         double pulse=MotionG80RuntimeProof::DecodeMotorPulse(physical.ActualPosition,
             static_cast<std::uint32_t>(axis.lastRawActPos),axis.unwrappedActPos,
             axis.isReverse,axis.Axis_Reverse,axis.machineCoordinateOffsetPulse);
         if(axis.fbMode==FeedbackSource::LINEAR_SCALE){
-            if(axis.pScaleActualPos==nullptr){source=false;break;}
+            if(axis.pScaleActualPos==nullptr){source=false;gate=MotionG76SphereInputGate::ScalePointerMissing;break;}
             const double scale=static_cast<double>(*axis.pScaleActualPos)*axis.scaleToMotorRatio;
-            if(!std::isfinite(scale)||std::fabs(pulse+axis.machineCoordinateOffsetPulse-scale)>axis.maxDeviation){source=false;break;}
+            if(!std::isfinite(scale)){source=false;gate=MotionG76SphereInputGate::ScaleNonfinite;break;}
+            if(std::fabs(pulse+axis.machineCoordinateOffsetPulse-scale)>axis.maxDeviation){
+                source=false;gate=MotionG76SphereInputGate::ScaleDeviation;break;
+            }
             pulse=scale-axis.machineCoordinateOffsetPulse;
         }
         const double nominal=pbc::NominalFeedbackPulse(axis.enablePitch||axis.enableBacklash,
@@ -289,9 +564,19 @@ void MotionCore::ObserveG76SphereRuntimeInput() noexcept
         if(i<3U){input.actualMCS[i]=nominal/frozen.pulsePerNative[i];source=std::isfinite(input.actualMCS[i]);}
         else source=MotionG76SphereFixedAxes::FeedbackNative(frozen.request.geometry.startMCS[i],
             frozen.command.mem_startPos[i],nominal,frozen.pulsePerNative[i],input.actualMCS[i]);
+        if(!source){gate=std::isfinite(nominal)?MotionG76SphereInputGate::NativeNonfinite:MotionG76SphereInputGate::NominalNonfinite;break;}
+        m_g76SphereInputObservation.validAxisMask|=1U<<i;
+        failedAxis=-1;
     }
     input.sourceValid=source;
-    input.holdSequence=m_g76SphereCurrent.holdSequence;input.startSequence=m_g76SphereCurrent.startSequence;
+    SetG76SphereInputDiagnostic(MotionG76SphereInputStage::Observe,gate,failedAxis);
+    // A completed parent may retain its HOLD/START high-water marks while NC
+    // publishes the next one. Only the exact sampled parent owns those marks.
+    if(m_g76SphereCurrent.session==frozen.request.session&&
+       SphereIdentity(m_g76SphereCurrent.identity,frozen.command.execution)&&
+       m_g76SphereCurrent.owner.Matches(frozen.command.ownerLease)){
+        input.holdSequence=m_g76SphereCurrent.holdSequence;input.startSequence=m_g76SphereCurrent.startSequence;
+    }
     if(m_g76SphereRunning){
         const auto& output=m_g76SphereCycle.Command();
         input.zeroSendTick=m_g76SphereZeroSentTick;
@@ -333,6 +618,7 @@ bool MotionCore::LoadG76SphereCommand(const MotionCommand& front) noexcept
         m_g76SphereCurrent=MotionG76SphereFeedback{};m_g76SphereCurrent.session=m_g76SphereFrozen.request.session;
         m_g76SphereCurrent.identity=popped.execution;m_g76SphereCurrent.owner=popped.ownerLease;
         m_g76SphereCurrent.accepted=true;m_g76SphereCurrent.terminal=true;m_g76SphereCurrent.runtimeFault=code;
+        if(code==1U)CaptureG76SphereInputFault();
         m_g76SphereCycle.Reset();RejectMotionCommand(popped,MotionRejectReason::NOT_READY,SphereRuntimeAlarm);
         PublishG76SphereRuntime();AlarmManager::GetInstance().Trigger(SphereRuntimeAlarm,popped.sourceLinePC);
         RequestEmergencyStopAllAxes();return false;
@@ -342,7 +628,23 @@ bool MotionCore::LoadG76SphereCommand(const MotionCommand& front) noexcept
         !m_g76SphereInput.tick||!m_g76SphereInput.nowUs||m_g76SphereInput.cancel||
         m_g76SphereInput.tick!=m_ncSettleRuntimeCycleTick||
         m_g76SphereInput.physicalSequence!=m_g76SphereInput.tick||
-        m_ncSettleRuntimeCycleTick<m_g76SphereAdmissionTick)return reject(1U);
+        m_ncSettleRuntimeCycleTick<m_g76SphereAdmissionTick){
+        auto gate=MotionG76SphereInputGate::InputSourceInvalid;
+        if(!m_g76SphereInput.sourceValid){
+            // Preserve the exact observer subgate instead of replacing it
+            // with the loader's coarser source-invalid predicate.
+            if(m_g76SphereInputObservation.valid&&m_g76SphereInputObservation.gate!=MotionG76SphereInputGate::None)
+                return reject(1U);
+        }else if(!m_g76SphereInput.pdoValid)gate=MotionG76SphereInputGate::InputPdoInvalid;
+        else if(!m_g76SphereInput.powerInhibited)gate=MotionG76SphereInputGate::InputPowerNotInhibited;
+        else if(!m_g76SphereInput.tick)gate=MotionG76SphereInputGate::AdmissionTickMissing;
+        else if(!m_g76SphereInput.nowUs)gate=MotionG76SphereInputGate::AdmissionTimeMissing;
+        else if(m_g76SphereInput.cancel)gate=MotionG76SphereInputGate::AdmissionCancelled;
+        else if(m_g76SphereInput.tick!=m_ncSettleRuntimeCycleTick)gate=MotionG76SphereInputGate::InputTickMismatch;
+        else if(m_g76SphereInput.physicalSequence!=m_g76SphereInput.tick)gate=MotionG76SphereInputGate::AdmissionPhysicalSequenceMismatch;
+        else gate=MotionG76SphereInputGate::AdmissionTickBackwards;
+        SetG76SphereInputDiagnostic(MotionG76SphereInputStage::Admission,gate);return reject(1U);
+    }
     const double waited=static_cast<double>(m_ncSettleRuntimeCycleTick-m_g76SphereAdmissionTick)*CYCLE_TIME_SEC;
     // EDM287 FIX1: the generic incoming-axis window can be wider than P50's
     // unchanged start tolerance. Do not pop/accept the parent while a valid
@@ -353,7 +655,10 @@ bool MotionCore::LoadG76SphereCommand(const MotionCommand& front) noexcept
     for(unsigned i=0U;i<8U;++i){
         const double actual=m_g76SphereInput.actualMCS[i];
         const double error=std::fabs(actual-request.geometry.startMCS[i]);
-        if(!std::isfinite(actual)||!std::isfinite(error))return reject(1U);
+        if(!std::isfinite(actual)||!std::isfinite(error)){
+            SetG76SphereInputDiagnostic(MotionG76SphereInputStage::Admission,
+                MotionG76SphereInputGate::AdmissionActualNonfinite,static_cast<int>(i));return reject(1U);
+        }
         if((request.travelMask&(1U<<i))&&(actual<request.travelMin[i]||actual>request.travelMax[i]))
             return reject(8U);
         if(error>(i<3U?request.positionToleranceMm:request.rotaryToleranceDeg))atStart=false;
@@ -380,14 +685,240 @@ bool MotionCore::LoadG76SphereCommand(const MotionCommand& front) noexcept
     if(!SphereIdentity(command.execution,front.execution)||GetCommandAuthorizationFailure(command)!=MotionRejectReason::NONE){
         loadReservation.Release();RejectMotionCommand(command,MotionRejectReason::NOT_READY,SphereRuntimeAlarm);return false;
     }
+    // EDM307: the NC endpoint/drain release creates one small continuation
+    // token. Read the incoming process page into persistent RT storage before
+    // replacing the previous terminal observer or its immutable config.
+    const bool processRead=m_g76SphereProcessRequests.Read(m_g76SphereIncomingProcessFrozen).Ready();
+    const auto& incoming=m_g76SphereIncomingProcessFrozen;
+    const bool holdRead=m_g76SphereHoldRequests.Read(m_g76SphereIncomingHoldFrozen).Ready();
+    const auto& incomingHold=m_g76SphereIncomingHoldFrozen;
+    const auto& previous=m_g76SphereCurrent;const auto& previousProcess=m_g76SphereProcess.Current();
+    const auto& previousGeometry=m_g76SphereCycle.Geometry();
+    const auto& nextRequest=m_g76SphereFrozen.request;
+    // HOLD history has its own success/release proof. E5 may reset across P50
+    // or a G181 declaration, whereas these are still executed machining parents.
+    const auto holdRelease=m_g76SphereHoldContinuationReleased.load(std::memory_order_acquire);
+    bool keepHoldHistory=holdRead&&incomingHold.enabled&&m_g76SphereHoldFrozen.enabled&&
+        !IsResetSafetyOutputHoldEstablished()&&previous.session&&holdRelease==previous.session&&
+        previous.session<nextRequest.session&&previous.completed&&previous.terminal&&!previous.runtimeFault&&
+        previous.cycle.phase==NCG76SphereCycle::Phase::Complete&&previous.cycle.fault==NCG76SphereCycle::Fault::None&&
+        !previous.cycle.holdActive&&!previous.cycle.held&&previous.identity.source==MotionCommandSource::NC_MEMORY&&
+        previous.identity.epoch==command.execution.epoch&&previous.owner.Matches(command.ownerLease)&&
+        m_g76SphereHoldReleaseFeedbackSequence.load(std::memory_order_acquire)==
+            m_lastPublishedMotionFeedbackSequence.load(std::memory_order_acquire)&&
+        m_g76SphereCycle.Current().session==previous.session&&m_g76SphereCycle.Command().complete&&
+        previousGeometry.valid&&previousGeometry.kind==previous.nominalKind&&
+        SameNCTranslationSnapshot(m_g76SphereHoldHistoryFrame,nextRequest.geometry.frame.translation)&&
+        SameNCTranslationSnapshot(previousGeometry.frame.translation,nextRequest.geometry.frame.translation)&&
+        std::memcmp(previousGeometry.endMCS.data(),previous.endpointMCS.data(),sizeof(previous.endpointMCS))==0&&
+        std::memcmp(previous.endpointMCS.data(),nextRequest.geometry.startMCS.data(),sizeof(previous.endpointMCS))==0;
+    // The journal uses the same installed mapping/configuration as the current
+    // parent; no old lead, feedback source, home or limit setting is restored.
+    if(keepHoldHistory)for(unsigned i=0U;i<6U;++i){
+        const auto& a=m_g76SphereHoldHistoryBindings[i];const auto& b=m_g76SphereFrozen.axis[i];
+        if(a.resolution!=b.resolution||a.lead!=b.lead||a.maxVelocity!=b.maxVelocity||
+           a.accSeconds!=b.accSeconds||a.decSeconds!=b.decSeconds||a.stopSeconds!=b.stopSeconds||
+           a.machineOffset!=b.machineOffset||a.scaleRatio!=b.scaleRatio||a.maxDeviation!=b.maxDeviation||
+           a.followingWindow!=b.followingWindow||!MotionG76SphereFixedAxes::SameBits(a.rotaryModulo,b.rotaryModulo)||
+           a.scalePointer!=b.scalePointer||a.feedbackMode!=b.feedbackMode||a.reverseFlags!=b.reverseFlags||
+           a.axisType!=b.axisType||a.configurationFlags!=b.configurationFlags||
+           a.travelLimits!=b.travelLimits||a.compensationParameters!=b.compensationParameters){
+            keepHoldHistory=false;break;
+        }
+    }
+    if(!keepHoldHistory||m_g76SphereHoldHistoryCount>NCHoldPolicy::MaximumPreviousParents)
+        m_g76SphereHoldHistoryCount=0U;
+    else{
+        if(m_g76SphereHoldHistoryCount==NCHoldPolicy::MaximumPreviousParents){
+            for(unsigned i=1U;i<NCHoldPolicy::MaximumPreviousParents;++i)
+                m_g76SphereHoldHistory[i-1U]=m_g76SphereHoldHistory[i];
+            --m_g76SphereHoldHistoryCount;
+        }
+        m_g76SphereHoldHistory[m_g76SphereHoldHistoryCount++]=previousGeometry;
+    }
+    // Recheck every borrowed physical envelope against CURRENT travel guards.
+    // An incompatible older path is a history boundary, never a widened limit.
+    bool historyWithinTravel=true;
+    for(unsigned row=0U;historyWithinTravel&&row<m_g76SphereHoldHistoryCount;++row){
+        const auto& g=m_g76SphereHoldHistory[row];
+        for(unsigned axis=0U;axis<8U;++axis){
+            const double low=g.boundsMinMCS[axis],high=g.boundsMaxMCS[axis];
+            if(!std::isfinite(low)||!std::isfinite(high)||low>high||
+               ((nextRequest.travelMask&(1U<<axis))&&(low<nextRequest.travelMin[axis]||high>nextRequest.travelMax[axis]))||
+               (axis<6U&&(!m_pCoordMgr->IsTargetWithinSoftwareTravelLimit((*m_pContexts)[axis],low)||
+                          !m_pCoordMgr->IsTargetWithinSoftwareTravelLimit((*m_pContexts)[axis],high)))){
+                historyWithinTravel=false;break;
+            }
+        }
+    }
+    if(!historyWithinTravel)m_g76SphereHoldHistoryCount=0U;
+    m_g76SphereHoldHistoryFrame=nextRequest.geometry.frame.translation;
+    m_g76SphereHoldHistoryBindings=m_g76SphereFrozen.axis;
+    auto staleHoldRelease=holdRelease;
+    if(staleHoldRelease)(void)m_g76SphereHoldContinuationReleased.compare_exchange_strong(staleHoldRelease,0ULL,
+        std::memory_order_acq_rel,std::memory_order_acquire);
+    NCG76SphereGapProcess::Continuation continuation{};bool continueProcess=false;
+    const auto nextKind=m_g76SphereFrozen.request.geometry.kind;
+    const bool previousSingle=previous.nominalKind==NCG76SphereRuntimeGeometry::Kind::Line||
+        previous.nominalKind==NCG76SphereRuntimeGeometry::Kind::Arc;
+    const bool nextSingle=nextKind==NCG76SphereRuntimeGeometry::Kind::Line||nextKind==NCG76SphereRuntimeGeometry::Kind::Arc;
+    const bool continuationScope=!IsResetSafetyOutputHoldEstablished()&&previousSingle&&nextSingle&&previous.session&&
+        previous.session<m_g76SphereFrozen.request.session&&previous.completed&&previous.terminal&&
+        !previous.runtimeFault&&previous.cycle.phase==NCG76SphereCycle::Phase::Complete&&
+        previous.cycle.fault==NCG76SphereCycle::Fault::None&&!previous.cycle.holdActive&&
+        !previous.cycle.held&&previous.identity.source==MotionCommandSource::NC_MEMORY&&
+        previous.identity.epoch==command.execution.epoch&&previous.owner.Matches(command.ownerLease)&&
+        previous.identity.sourceBlockId>=0&&previous.identity.sourceBlockId<(std::numeric_limits<int>::max)()&&
+        previous.identity.sourceBlockId+1==command.sourceLinePC&&
+        previous.translationGeneration==m_g76SphereFrozen.request.geometry.frame.translation.generation&&
+        std::memcmp(previous.endpointMCS.data(),m_g76SphereFrozen.request.geometry.startMCS.data(),sizeof(previous.endpointMCS))==0&&
+        previousProcess.enabled&&previousProcess.terminal&&previousProcess.reason==NCG76SphereGapProcess::Reason::Terminal&&
+        previousProcess.session==previous.session&&m_g76SphereProcessFrozen.session==previous.session&&
+        SphereIdentity(m_g76SphereProcessFrozen.identity,previous.identity)&&m_g76SphereProcessFrozen.owner.Matches(previous.owner)&&
+        m_g76SphereProcessRevokedSession.load(std::memory_order_acquire)!=previous.session&&
+        processRead&&incoming.session==m_g76SphereFrozen.request.session&&SphereIdentity(incoming.identity,command.execution)&&
+        incoming.owner.Matches(command.ownerLease)&&NCG76SphereGapProcess::Valid(incoming.config)&&
+        NCG76SphereGapProcess::EquivalentForContinuation(m_g76SphereProcessFrozen.config,incoming.config);
+    if(continuationScope){
+        continuation.intervalWorkUs=previousProcess.intervalWorkUs;
+        continuation.simulatedWorkUs=previousProcess.simulatedWorkUs;
+        continuation.completedFlushes=previousProcess.completedFlushes;
+        continuation.abortedFlushes=previousProcess.abortedFlushes;
+        if(NCG76SphereGapProcess::ValidContinuation(incoming.config,continuation)){
+            auto released=previous.session;
+            continueProcess=m_g76SphereContinuationReleased.compare_exchange_strong(released,0ULL,
+                std::memory_order_acq_rel,std::memory_order_acquire);
+        }
+    }
+    // A consumed/rejected predecessor page must never be reconsidered by a
+    // later source after a mode/configuration or control-flow boundary.
+    auto oldRelease=previous.session;
+    if(oldRelease)(void)m_g76SphereContinuationReleased.compare_exchange_strong(oldRelease,0ULL,
+        std::memory_order_acq_rel,std::memory_order_acquire);
+    // EDM309: only the just-consumed NC endpoint/drain receipt can lend ONE
+    // completed analytic predecessor to B2. Scope changes never resurrect it.
+    bool previousParentReady=continueProcess&&nextRequest.retreatMode==2U&&
+        m_g76SphereCycle.Current().session==previous.session&&m_g76SphereCycle.Command().complete&&
+        previousGeometry.valid&&previousGeometry.travelMm>0.0&&nextRequest.geometry.travelMm>0.0&&
+        previousGeometry.kind==previous.nominalKind&&
+        SameNCTranslationSnapshot(previousGeometry.frame.translation,nextRequest.geometry.frame.translation)&&
+        std::memcmp(previousGeometry.endMCS.data(),nextRequest.geometry.startMCS.data(),sizeof(previousGeometry.endMCS))==0;
+    // Recheck the retained envelope against CURRENT installed travel bounds.
+    // The new frozen request already contains their intersection; no old
+    // geometry can widen those limits or reuse an old axis binding.
+    if(previousParentReady)for(unsigned axis=0U;axis<8U;++axis){
+        const double low=previousGeometry.boundsMinMCS[axis],high=previousGeometry.boundsMaxMCS[axis];
+        if(!std::isfinite(low)||!std::isfinite(high)||low>high||
+           ((nextRequest.travelMask&(1U<<axis))&&(low<nextRequest.travelMin[axis]||high>nextRequest.travelMax[axis]))||
+           (axis<6U&&(!m_pCoordMgr->IsTargetWithinSoftwareTravelLimit((*m_pContexts)[axis],low)||
+                      !m_pCoordMgr->IsTargetWithinSoftwareTravelLimit((*m_pContexts)[axis],high)))){
+            previousParentReady=false;break;
+        }
+    }
+    const std::uint64_t previousParentSession=previousParentReady?previous.session:0ULL;
+    const std::int32_t previousParentPC=previousParentReady?previous.identity.sourceBlockId:-1;
+    if(previousParentReady)m_g76SpherePreviousGeometry=previousGeometry;
     m_g76SphereCurrent=MotionG76SphereFeedback{};m_g76SphereCurrent.session=m_g76SphereFrozen.request.session;
     m_g76SphereCurrent.identity=command.execution;m_g76SphereCurrent.owner=command.ownerLease;m_g76SphereCurrent.accepted=true;
+    m_g76SphereCurrent.initialIntervalWorkUs=continueProcess?continuation.intervalWorkUs:0ULL;
+    m_g76SphereCurrent.completedFlushOffset=continueProcess?continuation.completedFlushes:0ULL;
+    m_g76SphereCurrent.previousParentSession=previousParentSession;
+    m_g76SphereCurrent.previousParentPC=previousParentPC;
     TrackMotionCommandAccepted(command);m_g76SphereCycle.Reset();
-    if(!m_g76SphereCycle.Begin(m_g76SphereFrozen.request,m_g76SphereInput)){
+    m_g76SphereProcessFrozen=processRead?incoming:G76SphereProcessFrozen{};
+    m_g76SphereHoldFrozen=holdRead?incomingHold:G76SphereHoldFrozen{};
+    m_g76SphereInspectionConsumedSequence=0ULL;
+    m_g76SphereInspectionLeaseSeen=m_g76SphereInspectionDeadlineUs=m_g76SphereInspectionLeaseHold=0ULL;
+    m_g76SphereInspectionLeaseAxis=-1;m_g76SphereInspectionLeaseDirection=0;
+    m_g76SphereInspectionBlocked=false;
+    const auto& process=m_g76SphereProcessFrozen;
+    const bool processScope=processRead&&process.session==m_g76SphereFrozen.request.session&&
+        SphereIdentity(process.identity,command.execution)&&process.owner.Matches(command.ownerLease)&&
+        NCG76SphereGapProcess::Valid(process.config)&&
+        m_g76SphereProcessRevokedSession.load(std::memory_order_acquire)!=process.session;
+    // EDM310 explicit SIM test build. Selecting a voltage waveform cannot
+    // lend a predecessor or bypass the consumed NC endpoint release above.
+    const auto simulationMode=NCG76SphereSimulationTestPolicy::PreviousParentProbeEnabled&&
+        previousParentReady&&processScope&&process.config.parameterFeeds?
+        NCG76SphereGapProcess::SimulationMode::PreviousParentProbe:NCG76SphereGapProcess::SimulationMode::Wave;
+    const bool processReady=m_g76SphereProcess.Begin(processScope?process.config:NCG76SphereGapProcess::Config{},
+        m_g76SphereFrozen.request.session,continueProcess?&continuation:nullptr,simulationMode);
+    NCG76SphereCycle::FlushConfig flush{};
+    if(!holdRead||m_g76SphereHoldFrozen.session!=m_g76SphereFrozen.request.session||
+       !SphereIdentity(m_g76SphereHoldFrozen.identity,command.execution)||
+       !m_g76SphereHoldFrozen.owner.Matches(command.ownerLease)||
+       m_g76SphereHoldFrozen.enabled!=m_g76SphereFrozen.holdRecoveryEnabled||
+       m_g76SphereHoldFrozen.declaredPreviousParents!=m_g76SphereFrozen.holdDeclaredPreviousParents||
+       m_g76SphereHoldFrozen.finishRequiredCount!=m_g76SphereFrozen.finishRequiredCount||
+       m_g76SphereHoldFrozen.finishRequiredCount>99U||
+       (m_g76SphereHoldFrozen.enabled&&!NCHoldRecovery::Valid(m_g76SphereHoldFrozen.config))||
+       !MotionG76SphereParameterFeeds::Matches(m_g76SphereFrozen.request,process.config)||
+       (m_g76SphereFrozen.signedMotionEnabled&&
+        (!processScope||!processReady||!process.config.signedMotionEnabled))||
+       (processScope&&m_g76SphereFrozen.flushFeatureFlags!=
+        static_cast<std::uint8_t>((process.config.independentFeedsEnabled?1U:0U)|
+            (process.config.finalApproachEnabled?2U:0U)|(process.config.initialSlowEnabled?4U:0U)|
+            (process.config.deepFlushEnabled?8U:0U)))||
+       (m_g76SphereFrozen.request.retreatMode!=0U&&
+        (!m_g76SphereFrozen.signedMotionEnabled||!processScope||!processReady||
+         !process.config.enabled||(!process.config.flushMotionEnabled&&
+             !(m_g76SphereFrozen.request.geometry.kind==NCG76SphereRuntimeGeometry::Kind::Line&&
+               m_g76SphereFrozen.request.geometry.travelMm==0.0))))||
+       (processScope&&processReady&&
+        !NCG76SphereGapProcess::BuildFlushConfig(process.config,m_g76SphereFrozen.request.feedMmMin,flush))||
+       (m_g76SphereHoldFrozen.finishRequiredCount!=0U&&
+        (m_g76SphereFrozen.request.geometry.kind==NCG76SphereRuntimeGeometry::Kind::Sphere||
+         !std::isfinite(m_g76SphereFrozen.request.geometry.travelMm)||m_g76SphereFrozen.request.geometry.travelMm<=0.0||
+         !processScope||!processReady||!process.config.enabled||!process.config.signedMotionEnabled||
+         !process.config.flushMotionEnabled||!flush.enabled))){
+        m_g76SphereProcess.Revoke();m_g76SphereCurrent.runtimeFault=9U;m_g76SphereCurrent.terminal=true;
+        loadReservation.Release();FaultTrackedMotionCommand(SphereRuntimeAlarm,MotionRejectReason::NOT_READY);PublishG76SphereRuntime();
+        AlarmManager::GetInstance().Trigger(SphereRuntimeAlarm,command.sourceLinePC);RequestEmergencyStopAllAxes();return false;
+    }
+    // EDM306 FIX1: this loader runs inside the EtherCAT callback. Keep stack
+    // queries, CRT formatting and RtPrintf out of it; their variable cost can
+    // disturb the next measured cycle interval. NC admission still records
+    // memory observations. The clock and fresh-source guards remain strict.
+    NCG76SphereCycle::GapConfig gap{};gap.enabled=m_g76SphereFrozen.signedMotionEnabled;
+    // P50 keeps its existing internal-leg history. EDM309 adds one released
+    // primitive predecessor for signed B2 GAP only; E5 flush remains local.
+    gap.crossLegRetreatEnabled=gap.enabled&&
+        (m_g76SphereFrozen.request.geometry.kind==NCG76SphereRuntimeGeometry::Kind::Sphere||previousParentReady);
+    if(previousParentReady)gap.previousPrimitive=&m_g76SpherePreviousGeometry;
+    if(continueProcess)gap.completedFlushOffset=continuation.completedFlushes;
+    if(!m_g76SphereCycle.Begin(m_g76SphereFrozen.request,m_g76SphereInput,flush.enabled?&flush:nullptr,&gap)||
+       (m_g76SphereHoldFrozen.enabled&&!m_g76SphereCycle.ConfigureHoldRecoveryAdmitted(m_g76SphereHoldFrozen.config,
+            m_g76SphereHoldFrozen.declaredPreviousParents,m_g76SphereHoldHistory.data(),m_g76SphereHoldHistoryCount))||
+       !m_g76SphereCycle.ConfigureFinishVerification(m_g76SphereHoldFrozen.finishRequiredCount)){
+        m_g76SphereProcess.Revoke();
         m_g76SphereCurrent.runtimeFault=3U;m_g76SphereCurrent.terminal=true;
         loadReservation.Release();FaultTrackedMotionCommand(SphereRuntimeAlarm,MotionRejectReason::NOT_READY);PublishG76SphereRuntime();
         AlarmManager::GetInstance().Trigger(SphereRuntimeAlarm,command.sourceLinePC);RequestEmergencyStopAllAxes();return false;
     }
+    // Inspection has a stricter installed XYZ box independent of G22/G23.
+    // Do not tighten the machining or nominal-history envelope under G23.
+    m_g76SphereInspectionTravelMask=0U;
+    if(m_g76SphereHoldFrozen.enabled){
+        for(unsigned axis=0U;axis<3U;++axis){
+            const auto& binding=m_g76SphereFrozen.axis[axis];
+            bool bounded=false,valid=(binding.configurationFlags&1U)!=0U;
+            double low=-(std::numeric_limits<double>::max)(),high=(std::numeric_limits<double>::max)();
+            for(unsigned limit=0U;valid&&limit<3U;++limit){
+                if((binding.configurationFlags&(2U<<limit))==0U)continue;
+                const double lo=binding.travelLimits[2U*limit],hi=binding.travelLimits[2U*limit+1U];
+                if(!std::isfinite(lo)||!std::isfinite(hi)||lo>=hi){valid=false;break;}
+                low=(std::max)(low,lo);high=(std::min)(high,hi);bounded=true;
+            }
+            if(valid&&bounded&&low<high){
+                m_g76SphereInspectionMinimum[axis]=low;m_g76SphereInspectionMaximum[axis]=high;
+                m_g76SphereInspectionTravelMask|=1U<<axis;
+            }
+        }
+        if(m_g76SphereInspectionTravelMask!=7U||
+           !m_g76SphereCycle.ConfigureInspectionTravel(m_g76SphereInspectionMinimum,
+                m_g76SphereInspectionMaximum,m_g76SphereInspectionTravelMask))m_g76SphereInspectionTravelMask=0U;
+    }
+    m_g76SphereProcessSentTick=m_g76SphereProcessSendSequence=m_g76SphereProcessSendFrame=0ULL;
     m_g76SphereZeroDemand=false;m_g76SphereZeroSentTick=0ULL;m_g76SpherePhysicalRange=false;m_g76SpherePhysicalTick=0ULL;
     m_Group.currentCmd=command;m_Group.isActive=true;m_Group.mode=InterpolationMode::LINEAR;
     m_Group.pathMode=PathMode::EXACT_STOP;m_Group.enableHistory=false;m_Group.enableTransform=false;
@@ -567,14 +1098,22 @@ bool MotionCore::RetireG76SphereForResetSafetyBatch(MotionExecutionEpoch resetEp
             return false;
     }
     m_g76SphereZeroDemand=true;m_g76SphereRunning=false;
+    m_g76SphereProcess.Revoke();m_g76SphereCurrent.processShadow=m_g76SphereProcess.Current();
     m_g76SphereCurrent.cycle=m_g76SphereCycle.Current();
     m_g76SphereCurrent.cycle.phase=NCG76SphereCycle::Phase::Fault;m_g76SphereCurrent.cycle.fault=NCG76SphereCycle::Fault::Cancelled;
+    m_g76SphereCurrent.cycle.finishActive=false;
+    m_g76SphereCurrent.cycle.finishPhase=m_g76SphereCurrent.cycle.finishRequiredCount?5U:0U;
     m_g76SphereCurrent.cycle.tick=m_ncSettleRuntimeCycleTick;m_g76SphereCurrent.cycle.held=false;
+    m_g76SphereCurrent.cycle.flushActive=false;m_g76SphereCurrent.cycle.flushCheckpointSaved=false;
     m_g76SphereCurrent.commandMCS=m_g76SphereCycle.Command().commandMCS;
     m_g76SphereCurrent.endpointMCS=m_g76SphereCurrent.commandMCS;m_g76SphereCurrent.velocityNative.fill(0.0);
     m_g76SphereCurrent.actualMCS=m_g76SphereInput.actualMCS;
     m_g76SphereCurrent.terminal=true;m_g76SphereCurrent.completed=false;m_g76SphereCurrent.runtimeFault=0U;
     m_g76SphereCurrent.endpointCommitted=false;
+    m_g76SphereCurrent.holdInspectionJogReady=m_g76SphereCurrent.holdRecoveryResumeReady=false;
+    m_g76SphereCurrent.cycle.inspectionJogActive=false;
+    m_g76SphereInspectionDeadlineUs=0ULL;m_g76SphereInspectionLeaseAxis=-1;
+    m_g76SphereInspectionLeaseDirection=0;
     (void)m_g76SphereFeedback.Publish(m_g76SphereCurrent);
     return true;
 }
@@ -586,9 +1125,11 @@ void MotionCore::FailG76SphereRuntime(std::uint32_t fault,bool emergency) noexce
     if(fault==2U&&IsG76SphereResetOutputHeld())return;
     const bool cancelled=GetCurrentExecutionEpoch()!=m_g76SphereFrozen.command.execution.epoch||
         !IsMotionOwnerLeaseCurrent(m_g76SphereFrozen.command.ownerLease)||HasPendingSafetyOrRecoveryRequests();
+    if(fault==1U)CaptureG76SphereInputFault();
     m_g76SphereCurrent.runtimeFault=fault;m_g76SphereCurrent.terminal=true;m_g76SphereCurrent.completed=false;
     m_g76SphereInput.cancel=true;
     (void)m_g76SphereCycle.Step(m_g76SphereInput);
+    m_g76SphereProcess.Revoke();m_g76SphereProcessSentTick=0ULL;
     if(cancelled)AbortTrackedMotionCommand();
     else{
         FaultTrackedMotionCommand(SphereRuntimeAlarm,MotionRejectReason::NOT_READY);
@@ -605,9 +1146,25 @@ bool MotionCore::StepG76SphereRuntime() noexcept
     if(!input.sourceValid||!input.pdoValid||!input.powerInhibited||input.tick!=m_ncSettleRuntimeCycleTick||
         !MotionG80RuntimeProof::SameInputScope(m_g76SphereInputSession,m_g76SphereInputIdentity,
             m_g76SphereFrozen.request.session,m_g76SphereFrozen.command.execution)){
+        auto gate=MotionG76SphereInputGate::InputSourceInvalid;
+        if(!input.sourceValid){
+            if(m_g76SphereInputObservation.valid&&m_g76SphereInputObservation.gate!=MotionG76SphereInputGate::None){
+                FailG76SphereRuntime(1U,true);return true;
+            }
+        }else if(!input.pdoValid)gate=MotionG76SphereInputGate::InputPdoInvalid;
+        else if(!input.powerInhibited)gate=MotionG76SphereInputGate::InputPowerNotInhibited;
+        else if(input.tick!=m_ncSettleRuntimeCycleTick)gate=MotionG76SphereInputGate::InputTickMismatch;
+        else gate=MotionG76SphereInputGate::InputScopeMismatch;
+        SetG76SphereInputDiagnostic(MotionG76SphereInputStage::Step,gate);
         FailG76SphereRuntime(1U,true);return true;
     }
-    if(IsG76SphereResetOutputHeld())return true;
+    if(IsG76SphereResetOutputHeld()){
+        m_g76SphereProcess.Revoke();m_g76SphereProcessSentTick=0ULL;
+        // This exact active reset scope owns the RT callback. Withdraw the
+        // observation immediately without reading a large producer snapshot.
+        m_g76SphereProcessRevokedSession.store(m_g76SphereFrozen.request.session,std::memory_order_release);
+        return true;
+    }
     if(GetCommandAuthorizationFailure(m_Group.currentCmd)!=MotionRejectReason::NONE||
         m_g76SphereParentBound.load(std::memory_order_acquire)!=m_g76SphereFrozen.request.session||
         m_Group.enableTransform||m_Group.enableHistory||m_Group.jumpManager.state!=JumpState::IDLE||
@@ -638,6 +1195,11 @@ bool MotionCore::StepG76SphereRuntime() noexcept
         if(intent.hold){
             if(intent.holdSequence<=m_g76SphereCurrent.holdSequence){guardedFail(6U,true);return true;}
             haveHold=true;input.hold=true;m_g76SphereCurrent.holdSequence=intent.holdSequence;
+            // A new operator HOLD supersedes the old inspection lease. Its
+            // detour remains in the Cycle, but an old button heartbeat cannot
+            // restart it or expire later and block this newer held scope.
+            m_g76SphereInspectionDeadlineUs=0ULL;m_g76SphereInspectionLeaseAxis=-1;
+            m_g76SphereInspectionLeaseDirection=0;m_g76SphereInspectionLeaseHold=0ULL;
             m_g76SphereCurrent.startSequence=(std::max)(m_g76SphereCurrent.startSequence,intent.startSequence);
         }else if(!haveHold){
             if(intent.holdSequence!=m_g76SphereCurrent.holdSequence||
@@ -645,9 +1207,183 @@ bool MotionCore::StepG76SphereRuntime() noexcept
             m_g76SphereCurrent.startSequence=intent.startSequence;
         }
     }
+    // Inspection is a bounded manual detour under this exact suspended AUTO
+    // parent. It never acquires or relaxes the generic JOG/MPG motion owner.
+    const auto collisionRequested=m_collisionConfigurationRequested.load(std::memory_order_acquire);
+    const bool inspectionCollisionSafe=collisionRequested!=0ULL&&
+        m_collisionRuntimeConfiguration==collisionRequested&&m_collisionConfigurationValid&&m_collisionCurrent.valid&&
+        (!m_collisionCurrent.shortActive||m_collisionManualBypass.load(std::memory_order_acquire));
+    const bool leaseRead=m_g76SphereInspectionLease.Read(m_g76SphereInspectionLeaseIncoming).Ready();
+    const auto& lease=m_g76SphereInspectionLeaseIncoming;
+    const bool leaseScoped=leaseRead&&lease.session==m_g76SphereFrozen.request.session&&lease.sequence&&
+        lease.holdSequence==m_g76SphereCurrent.holdSequence&&
+        SphereIdentity(lease.identity,m_g76SphereFrozen.command.execution)&&
+        lease.owner.Matches(m_g76SphereFrozen.command.ownerLease);
+    for(unsigned count=0U;count<8U&&m_g76SphereInspectionControls.ConsumerTryPop(m_g76SphereInspectionIncoming);++count){
+        const auto& intent=m_g76SphereInspectionIncoming;
+        if(intent.session!=m_g76SphereFrozen.request.session)continue;
+        if(!SphereIdentity(intent.identity,m_g76SphereFrozen.command.execution)||
+           !intent.owner.Matches(m_g76SphereFrozen.command.ownerLease)||!intent.holdSequence||!intent.sequence){
+            guardedFail(6U,true);return true;
+        }
+        if(intent.sequence<=m_g76SphereInspectionConsumedSequence)continue;
+        m_g76SphereInspectionConsumedSequence=intent.sequence;
+        if(intent.holdSequence<m_g76SphereCurrent.holdSequence)continue;
+        if(intent.holdSequence!=m_g76SphereCurrent.holdSequence||!m_g76SphereHoldFrozen.enabled||
+           !m_g76SphereCycle.Current().holdRecoveryEnabled){guardedFail(6U,true);return true;}
+        const bool stop=intent.axis==-1&&intent.direction==0;
+        if(!stop&&(intent.axis<0||intent.axis>2||(intent.direction!=1&&intent.direction!=-1))){
+            guardedFail(6U,true);return true;
+        }
+        if(stop){
+            (void)m_g76SphereCycle.EndInspectionJog();m_g76SphereInspectionDeadlineUs=0ULL;
+            m_g76SphereInspectionLeaseAxis=-1;m_g76SphereInspectionLeaseDirection=0;
+            m_g76SphereInspectionBlocked=false;continue;
+        }
+        // A later scoped STOP must contain an earlier queued button press.
+        if(leaseScoped&&lease.sequence>=intent.sequence&&lease.axis==-1&&lease.direction==0)continue;
+        bool atHeldCommand=!haveHold&&!m_g76SphereInspectionBlocked&&inspectionCollisionSafe&&
+            input.physicalSettled&&input.zeroFinalSend&&m_g76SphereCycle.CanInspectionJog()&&
+            m_g76SphereCycle.Command().stopped&&m_g76SphereCycle.Command().zeroDemand;
+        for(unsigned i=0U;atHeldCommand&&i<6U;++i){
+            const auto& axis=(*m_pContexts)[i];const double ppu=m_g76SphereFrozen.pulsePerNative[i];
+            const double tolerance=(std::min)(axis.inPositionWindow_Pulse/ppu,i<3U?
+                m_g76SphereFrozen.request.positionToleranceMm:m_g76SphereFrozen.request.rotaryToleranceDeg);
+            atHeldCommand=std::isfinite(input.actualMCS[i])&&
+                std::fabs(input.actualMCS[i]-m_g76SphereCycle.Command().commandMCS[i])<=tolerance;
+        }
+        if(!inspectionCollisionSafe)m_g76SphereInspectionBlocked=true;
+        // Qualification changes consume this JOG request; no automatic motion
+        // is queued until a new released/repressed, exact-scoped command.
+        if(atHeldCommand&&m_g76SphereCycle.BeginInspectionJog(static_cast<unsigned>(intent.axis),
+            static_cast<double>(intent.direction)*m_g76SphereHoldFrozen.config.jogRecoveryFeedMmMin)){
+            m_g76SphereInspectionLeaseAxis=intent.axis;m_g76SphereInspectionLeaseDirection=intent.direction;
+            m_g76SphereInspectionLeaseHold=intent.holdSequence;
+            m_g76SphereInspectionLeaseSeen=intent.sequence;
+            m_g76SphereInspectionDeadlineUs=input.nowUs>(std::numeric_limits<std::uint64_t>::max)()-750000ULL?
+                (std::numeric_limits<std::uint64_t>::max)():input.nowUs+750000ULL;
+        }
+    }
+    if(leaseScoped&&lease.sequence>m_g76SphereInspectionLeaseSeen){
+        m_g76SphereInspectionLeaseSeen=lease.sequence;
+        if(lease.axis==-1&&lease.direction==0){
+            (void)m_g76SphereCycle.EndInspectionJog();m_g76SphereInspectionDeadlineUs=0ULL;
+            m_g76SphereInspectionLeaseAxis=-1;m_g76SphereInspectionLeaseDirection=0;
+            m_g76SphereInspectionBlocked=false;
+        }else if(m_g76SphereInspectionDeadlineUs!=0ULL&&!m_g76SphereInspectionBlocked&&
+                 lease.holdSequence==m_g76SphereInspectionLeaseHold&&lease.axis==m_g76SphereInspectionLeaseAxis&&
+                 lease.direction==m_g76SphereInspectionLeaseDirection&&m_g76SphereCycle.Current().inspectionJogActive){
+            m_g76SphereInspectionDeadlineUs=input.nowUs>(std::numeric_limits<std::uint64_t>::max)()-750000ULL?
+                (std::numeric_limits<std::uint64_t>::max)():input.nowUs+750000ULL;
+        }
+    }
+    if(m_g76SphereInspectionDeadlineUs!=0ULL&&input.nowUs>=m_g76SphereInspectionDeadlineUs){
+        (void)m_g76SphereCycle.EndInspectionJog();m_g76SphereInspectionDeadlineUs=0ULL;
+        m_g76SphereInspectionLeaseAxis=-1;m_g76SphereInspectionLeaseDirection=0;
+        m_g76SphereInspectionBlocked=true; // Late heartbeats cannot restart it.
+    }
+    if(!inspectionCollisionSafe&&(m_g76SphereCycle.Current().inspectionJogActive||
+        m_g76SphereCycle.Current().holdRecoveryPhase==6U)){
+        if(m_g76SphereCycle.Current().inspectionJogActive)(void)m_g76SphereCycle.EndInspectionJog();
+        else input.hold=true; // Pause the return leg with the same held-parent sequence.
+        m_g76SphereInspectionDeadlineUs=0ULL;m_g76SphereInspectionLeaseAxis=-1;
+        m_g76SphereInspectionLeaseDirection=0;m_g76SphereInspectionBlocked=true;
+    }
+    if(m_g76SphereInspectionBlocked)input.hold=true; // Latched until an exact scoped STOP.
     input.holdSequence=m_g76SphereCurrent.holdSequence;input.startSequence=m_g76SphereCurrent.startSequence;
+    const auto previousNominal=m_g76SphereCycle.Current();
+    const auto previousCommand=m_g76SphereCycle.Command().commandMCS;
+    const auto& processBefore=m_g76SphereProcess.Current();
+    const auto& processFrozen=m_g76SphereProcessFrozen;
+    if(previousNominal.finishRequiredCount!=m_g76SphereHoldFrozen.finishRequiredCount||
+       (m_g76SphereHoldFrozen.finishRequiredCount!=0U&&
+        (!processFrozen.config.enabled||!processFrozen.config.signedMotionEnabled||!processFrozen.config.flushMotionEnabled))){
+        guardedFail(9U,true);return true;
+    }
+    if(!MotionG76SphereParameterFeeds::Matches(m_g76SphereFrozen.request,processFrozen.config)){
+        guardedFail(9U,true);return true;
+    }
+    if(m_g76SphereFrozen.request.parameterFeeds){
+        // Parameter-mode data remains immutable for the whole parent. This
+        // persistent fixed-size copy adds no stack-sized process temporary.
+        const bool read=m_g76SphereProcessRequests.Read(m_g76SphereIncomingProcessFrozen).Ready();
+        const auto& published=m_g76SphereIncomingProcessFrozen;
+        if(!read||published.session!=m_g76SphereFrozen.request.session||
+           !SphereIdentity(published.identity,m_g76SphereFrozen.command.execution)||
+           !published.owner.Matches(m_g76SphereFrozen.command.ownerLease)||
+           !NCG76SphereGapProcess::EquivalentForContinuation(published.config,processFrozen.config)){
+            guardedFail(9U,true);return true;
+        }
+    }
+    const bool processRevoked=m_g76SphereProcessRevokedSession.load(std::memory_order_acquire)==m_g76SphereFrozen.request.session;
+    const bool processCurrent=!processRevoked&&processBefore.enabled&&processBefore.valid&&
+        processBefore.reason==NCG76SphereGapProcess::Reason::None&&
+        processBefore.session==m_g76SphereFrozen.request.session&&processBefore.tick&&
+        processBefore.tick==input.tick-1ULL&&
+        processBefore.recipeGeneration==processFrozen.config.recipeGeneration&&
+        processBefore.tuningGeneration==processFrozen.config.tuningGeneration;
+    const bool signedMotion=m_g76SphereFrozen.signedMotionEnabled;
+    const auto flushFeatures=static_cast<std::uint8_t>((processFrozen.config.independentFeedsEnabled?1U:0U)|
+        (processFrozen.config.finalApproachEnabled?2U:0U)|(processFrozen.config.initialSlowEnabled?4U:0U)|
+        (processFrozen.config.deepFlushEnabled?8U:0U));
+    if(flushFeatures!=m_g76SphereFrozen.flushFeatureFlags||
+       (flushFeatures!=0U&&!NCG76SphereGapProcess::Valid(processFrozen.config))){
+        guardedFail(9U,true);return true;
+    }
+    if(m_g76SphereFrozen.request.retreatMode!=0U&&(!signedMotion||
+        !processFrozen.config.enabled||(!processFrozen.config.flushMotionEnabled&&
+            !(m_g76SphereFrozen.request.geometry.kind==NCG76SphereRuntimeGeometry::Kind::Line&&
+              m_g76SphereFrozen.request.geometry.travelMm==0.0)))){
+        guardedFail(9U,true);return true;
+    }
+    const bool gapCurrent=processCurrent&&processFrozen.config.signedMotionEnabled&&
+        processBefore.sourceSequence&&processBefore.sourceCapturedAtUs&&
+        processBefore.sourceCapturedAtUs<=input.nowUs&&
+        input.nowUs-processBefore.sourceCapturedAtUs<=NCG76SphereGapProcess::MaximumSourceAgeUs&&
+        std::isfinite(processBefore.signedGapSpeedMmMin);
+    // Only the first stationary callback may seed the SIM source. Once this
+    // motion contract is admitted it can never fall back to fixed AIR feed.
+    const bool processSeed=signedMotion&&!processRevoked&&processBefore.enabled&&
+        !processBefore.valid&&processBefore.reason==NCG76SphereGapProcess::Reason::None&&
+        processBefore.session==m_g76SphereFrozen.request.session&&
+        processBefore.recipeGeneration==processFrozen.config.recipeGeneration&&
+        processBefore.tuningGeneration==processFrozen.config.tuningGeneration&&processFrozen.config.signedMotionEnabled&&
+        !processBefore.tick&&previousNominal.phase==NCG76SphereCycle::Phase::Settle&&
+        previousNominal.nominalProgressMm==0.0;
+    if(signedMotion&&!gapCurrent&&!processSeed){guardedFail(9U,true);return true;}
+    input.gapValid=signedMotion&&gapCurrent;
+    input.signedGapSpeedMmMin=input.gapValid?processBefore.signedGapSpeedMmMin:0.0;
+    // The observer proposes a request only. The pure parent owns braking,
+    // fresh-zero settle, the stopped checkpoint, excursion and path restore.
+    input.flushRequestSequence=processCurrent&&processFrozen.config.enabled&&
+        processFrozen.config.flushMotionEnabled&&processBefore.pending?processBefore.requestSequence:0ULL;
+    if(previousNominal.flushActive&&!processCurrent){guardedFail(9U,true);return true;}
     const auto output=m_g76SphereCycle.Step(input);
     if(output.emergencyStopRequired||output.faulted){guardedFail(3U,true);return true;}
+    NCG76SphereGapProcess::Input processInput{};processInput.nominal=previousNominal;
+    processInput.candidateMCS=previousCommand;processInput.session=m_g76SphereFrozen.request.session;
+    processInput.tick=input.tick;processInput.nowUs=input.nowUs;
+    processInput.stationaryNominal=m_g76SphereFrozen.request.geometry.kind==NCG76SphereRuntimeGeometry::Kind::Line&&
+        m_g76SphereFrozen.request.geometry.travelMm==0.0;
+    processInput.acceptedSendTick=m_g76SphereProcessSentTick;
+    processInput.sourceValid=input.sourceValid&&input.pdoValid;
+    processInput.powerInhibited=input.powerInhibited;
+    const auto& currentNominal=m_g76SphereCycle.Current();
+    processInput.suspended=input.hold||previousNominal.holdActive||currentNominal.holdActive||
+        previousNominal.flushActive||currentNominal.flushActive||
+        previousNominal.gapHistoryActive||currentNominal.gapHistoryActive||
+        previousNominal.finishActive||currentNominal.finishActive;
+    processInput.terminal=output.complete;processInput.cancel=input.cancel;
+    processInput.completedFlushSequence=currentNominal.flushCompletedSequence;
+    processInput.abortedFlushSequence=currentNominal.flushAbandonedSequence;
+    if(m_g76SphereProcessRevokedSession.load(std::memory_order_acquire)==processInput.session)
+        m_g76SphereProcess.Revoke();
+    else (void)m_g76SphereProcess.Step(processInput);
+    if((previousNominal.flushActive||currentNominal.flushActive||(signedMotion&&!output.complete))&&
+       (!m_g76SphereProcess.Current().valid||
+        m_g76SphereProcessRevokedSession.load(std::memory_order_acquire)==processInput.session)){
+        guardedFail(9U,true);return true;
+    }
     bool positionReady=output.stopped&&output.zeroDemand;
     for(int slot=0;slot<m_Group.axisCount;++slot){
         const unsigned i=static_cast<unsigned>(m_Group.axisIndices[slot]);
@@ -687,6 +1423,13 @@ bool MotionCore::StepG76SphereRuntime() noexcept
     if(!m_g76SphereZeroDemand){m_g76SphereZeroSentTick=0ULL;m_g76SpherePhysicalRange=false;}
     if(output.complete&&output.stopped){
         if(!input.physicalSettled||!input.zeroFinalSend||!m_g76SphereZeroDemand){guardedFail(4U,true);return true;}
+        const auto& finish=m_g76SphereCycle.Current();
+        if(m_g76SphereHoldFrozen.finishRequiredCount!=0U&&
+           (finish.finishActive||finish.finishPhase!=4U||
+            finish.finishVerifiedCount!=m_g76SphereHoldFrozen.finishRequiredCount||
+            finish.finishForcedCompletedCount<finish.finishVerifiedCount)){
+            guardedFail(3U,true);return true;
+        }
         if(!AlarmManager::GetInstance().HasAlarm()&&
             GetCommandAuthorizationFailure(m_Group.currentCmd)==MotionRejectReason::NONE){
             // This helper canonicalizes common stopped-axis state only; no
@@ -706,8 +1449,24 @@ bool MotionCore::StepG76SphereRuntime() noexcept
 
 void MotionCore::ObserveG76SphereSend(const MotionServoHandoffSample& sample) noexcept
 {
-    if(!m_g76SphereRunning||!m_g76SphereZeroDemand)return;
+    if(!m_g76SphereRunning)return;
     const auto& command=m_g76SphereFrozen.command;
+    m_g76SphereProcessSentTick=0ULL;
+    bool scoped=m_Group.isActive&&SphereIdentity(m_Group.currentCmd.execution,command.execution)&&
+        m_Group.currentCmd.ownerLease.Matches(command.ownerLease)&&IsMotionOwnerLeaseCurrent(command.ownerLease)&&
+        GetCurrentExecutionEpoch()==command.execution.epoch&&!HasPendingSafetyOrRecoveryRequests()&&
+        m_g76SphereCycle.Current().tick==m_ncSettleRuntimeCycleTick;
+    const auto& nominal=m_g76SphereCycle.Command();
+    for(unsigned axis=3U;scoped&&axis<6U;++axis)
+        scoped=nominal.velocityNative[axis]==0.0&&nominal.accelerationNative[axis]==0.0&&
+            MotionG76SphereFixedAxes::SameBits(nominal.commandMCS[axis],m_g76SphereFrozen.request.geometry.startMCS[axis]);
+    if(scoped&&sample.sequence>m_g76SphereProcessSendSequence&&sample.frameGeneration>m_g76SphereProcessSendFrame&&
+       MotionG76SphereProcessSend::ExactNonzeroSend(sample,command.execution.epoch,command.ownerLease,
+           m_g76SphereFrozen.axisMask,m_ncSettleRuntimeCycleTick)){
+        m_g76SphereProcessSentTick=sample.sourceTick;m_g76SphereProcessSendSequence=sample.sequence;
+        m_g76SphereProcessSendFrame=sample.frameGeneration;
+    }
+    if(!m_g76SphereZeroDemand)return;
     const bool exact=MotionG80RuntimeProof::ExactZeroSend(sample,command.execution.epoch,command.ownerLease,
         m_g76SphereFrozen.axisMask,m_ncSettleRuntimeCycleTick);
     m_g76SphereZeroSentTick=exact?sample.sourceTick:0ULL;
@@ -722,13 +1481,37 @@ bool MotionCore::G76SphereDemandsZero(const AxisContext& axis) const noexcept
 void MotionCore::PublishG76SphereRuntime() noexcept
 {
     m_g76SphereCurrent.cycle=m_g76SphereCycle.Current();
+    m_g76SphereCurrent.holdRetreatAnchorMCS=m_g76SphereCycle.HoldRetreatAnchor();
+    m_g76SphereCurrent.holdInspectionAxisMask=m_g76SphereInspectionTravelMask;
+    m_g76SphereCurrent.holdProcessPointMCS=m_g76SphereCycle.HoldProcessPoint();
+    const auto collisionRequested=m_collisionConfigurationRequested.load(std::memory_order_acquire);
+    const bool collisionReady=collisionRequested!=0ULL&&m_collisionRuntimeConfiguration==collisionRequested&&
+        m_collisionConfigurationValid&&m_collisionCurrent.valid&&
+        (!m_collisionCurrent.shortActive||m_collisionManualBypass.load(std::memory_order_acquire));
+    m_g76SphereCurrent.holdInspectionJogReady=m_g76SphereCycle.Current().holdRecoveryEnabled&&
+        m_g76SphereCycle.CanInspectionJog()&&m_g76SphereInspectionTravelMask==7U&&
+        collisionReady&&!m_g76SphereInspectionBlocked;
+    m_g76SphereCurrent.holdRecoveryResumeReady=m_g76SphereCycle.Current().holdRecoveryEnabled&&
+        m_g76SphereCycle.Current().held&&m_g76SphereCycle.Current().inspectionTraceValid&&
+        m_g76SphereCycle.Current().phase==NCG76SphereCycle::Phase::HeldAtStart&&
+        !m_g76SphereInspectionBlocked&&
+        (m_g76SphereCycle.Current().inspectionTraceCount==0U||collisionReady);
+    m_g76SphereCurrent.processShadow=m_g76SphereProcess.Current();
+    if(m_g76SphereCurrent.processShadow.session!=m_g76SphereCurrent.session||
+       m_g76SphereProcessRevokedSession.load(std::memory_order_acquire)==m_g76SphereCurrent.session)
+        m_g76SphereCurrent.processShadow=NCG76SphereGapProcess::Feedback{};
     m_g76SphereCurrent.endpointMCS=m_g76SphereCycle.Command().commandMCS;
-    m_g76SphereCurrent.commandMCS=m_g76SphereCycle.Command().commandMCS;
+    if(!m_g76SphereCurrent.firstInputFault.valid){
+        m_g76SphereCurrent.commandMCS=m_g76SphereCycle.Command().commandMCS;
+        m_g76SphereCurrent.actualMCS=m_g76SphereInput.actualMCS;
+        m_g76SphereCurrent.inputSequence=m_g76SphereInput.physicalSequence;
+        m_g76SphereCurrent.inputValidAxisMask=m_g76SphereInputObservation.validAxisMask;
+    }
     m_g76SphereCurrent.velocityNative=m_g76SphereCycle.Command().velocityNative;
-    m_g76SphereCurrent.actualMCS=m_g76SphereInput.actualMCS;
     m_g76SphereCurrent.positionToleranceMm=m_g76SphereFrozen.request.positionToleranceMm;
     m_g76SphereCurrent.rotaryToleranceDeg=m_g76SphereFrozen.request.rotaryToleranceDeg;
-    m_g76SphereCurrent.inputSequence=m_g76SphereInput.physicalSequence;
+    m_g76SphereCurrent.translationGeneration=m_g76SphereFrozen.request.geometry.frame.translation.generation;
+    m_g76SphereCurrent.nominalKind=m_g76SphereFrozen.request.geometry.kind;
     if(!m_g76SphereFeedback.Publish(m_g76SphereCurrent)&&m_g76SphereRunning){
         m_g76SphereZeroDemand=true;EmergencyStopAllAxesImpl(false);
     }
@@ -788,6 +1571,16 @@ bool MotionCore::ReleaseG76SphereBarrier(std::uint64_t session,const MotionExecu
         !HasExactExecutionDrainAcknowledgement(identity.epoch,owner))return false;
     LifecycleCommitReservationGuard reservation(*this,identity);
     if(!reservation.IsAcquired()||!HasExactExecutionDrainAcknowledgementImpl(identity.epoch,owner,true))return false;
-    auto expected=session;return m_g76SphereBarrier.compare_exchange_strong(expected,0ULL,
-        std::memory_order_acq_rel,std::memory_order_acquire);
+    auto expected=session;
+    if(!m_g76SphereBarrier.compare_exchange_strong(expected,0ULL,
+        std::memory_order_acq_rel,std::memory_order_acquire))return false;
+    if(report.cycle.holdRecoveryEnabled){
+        m_g76SphereHoldReleaseFeedbackSequence.store(
+            m_lastPublishedMotionFeedbackSequence.load(std::memory_order_acquire),std::memory_order_relaxed);
+        m_g76SphereHoldContinuationReleased.store(session,std::memory_order_release);
+    }
+    if(report.nominalKind==NCG76SphereRuntimeGeometry::Kind::Line||
+        report.nominalKind==NCG76SphereRuntimeGeometry::Kind::Arc)
+        m_g76SphereContinuationReleased.store(session,std::memory_order_release);
+    return true;
 }

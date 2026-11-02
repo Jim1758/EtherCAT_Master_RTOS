@@ -2594,6 +2594,12 @@ bool NCManager::IsFixedTranslationTravelCurrentSameThread() const noexcept
     if (!CoordSys.IsTranslationRunFrozen()) return true;
     const NCTranslationSnapshot snapshot = CoordSys.GetTranslationSnapshot();
     if (snapshot.generation != m_fixedTranslationTravelGeneration) return false;
+    // EDM295: the velocity owner invalidates HOME only on its frozen C/U/V
+    // claim. This expected one-way change cannot retire the XYZ source frame
+    // or relax any native scale, travel, or profile comparison below.
+    const std::uint32_t spindleMask = IsRotarySpindleXYZProgramSameThread() ?
+        m_motion.GetRotarySpindleConcurrentAxisMask(
+            m_motion.GetCurrentExecutionEpoch(), m_programMotionLease) : 0U;
     for (unsigned i = 0U; i < 8U; ++i)
     {
         const AxisContext& axis = m_motion.GetAxisContext(static_cast<int>(i));
@@ -2604,7 +2610,9 @@ bool NCManager::IsFixedTranslationTravelCurrentSameThread() const noexcept
             axis.travelLimit2Positive_unit, axis.travelLimit3Positive_unit };
         const bool enabled[3] = { axis.travelLimit1Enable,
             axis.travelLimit2Enable, axis.travelLimit3Enable };
-        if (captured.homed != axis.isHomed) return false;
+        if (captured.homed != axis.isHomed &&
+            !(captured.homed && !axis.isHomed && i >= 3U && i <= 5U &&
+                (spindleMask & (1U << i)) != 0U)) return false;
         const bool positionalRotary = axis.isExist && axis.axisType == AxisType::ROTARY;
         if (captured.positionalRotary != positionalRotary) return false;
         if (positionalRotary && (captured.shortestPath != axis.useShortestPath ||
@@ -2737,6 +2745,8 @@ bool NCManager::IsEDMPathXYZTranslationBlockAllowedSameThread(const NCBlock& blo
 bool NCManager::PrepareFixedTranslationMotionSameThread(const NCBlock& block, int gCode)
 {
     if(gCode==76&&IsG76SphereBlock(block))return PrepareG76SphereTranslationSameThread(block);
+    if((gCode==1||gCode==2||gCode==3)&&IsEDMProcessPathCandidateSameThread(block))
+        return PrepareEDMProcessPathTranslationSameThread(block);
     if(gCode==80)return PrepareG80TranslationSameThread(block);
     if (gCode==76 || (m_edm171Air->selected && (gCode==1 || gCode==2 || gCode==3))) return PrepareG76OrbitTranslationSameThread(block);
     // BASE58-BEGIN: repeatable side-effect-free extra-axis XYZ feed policy.
@@ -3586,7 +3596,20 @@ bool NCManager::IsFixedTranslationBlockAllowedSameThread(const NCBlock& block)
         RejectG76SphereSameThread("NEXT_BLOCK_BEFORE_P50_COMPLETION",AlarmManager::PATH_EXECUTION_NOT_READY);
         return false;
     }
+    // EDM307: a completed analytic EDM path can end in the exact frozen
+    // WORK/compensated frame. The terminal proves its original parent and
+    // full drain; it does not inherit generic neutral-frame permission.
+    if(block.mCount==1&&block.mCode[0]==30&&m_g76Sphere->completed&&
+       m_g76Sphere->sourceG>=1&&m_g76Sphere->sourceG<=3&&
+       m_g76Sphere->run==m_pathCoreLiveBookkeeping.currentRunToken&&
+       m_g76Sphere->cache==GetBaseProgramCache().GetGeneration()){
+        if(IsCompletedEDMProcessPathTerminalAllowedSameThread(block))return true;
+        RejectG76SphereSameThread("PROCESS_PATH_M30_COMPLETION_SCOPE",AlarmManager::PATH_EXECUTION_NOT_READY);
+        return false;
+    }
     if(IsG76SphereBlock(block))return ValidateG76SphereBlockSameThread(block,GetActiveDispatchPC(),0);
+    if(IsEDMProcessPathCandidateSameThread(block))
+        return ValidateEDMProcessPathBlockSameThread(block,GetActiveDispatchPC(),0);
     if(NCGCodeSemantics::Contains(block,80))return ValidateG80BlockSameThread(block,GetActiveDispatchPC(),0);
     if (m_edm171Air->selected && (NCGCodeSemantics::Contains(block,1) || NCGCodeSemantics::Contains(block,2) || NCGCodeSemantics::Contains(block,3)))
         return IsEDM171AirGrantCurrentSameThread() &&
@@ -4002,7 +4025,23 @@ bool NCManager::IsFixedTranslationBlockAllowedSameThread(const NCBlock& block)
     const bool activeEccentricH = xyzFeedMemoryBound && CoordSys.isCAxisOffsetRotationEnabled &&
         (CoordSys.toolLengthMode == 43 || CoordSys.toolLengthMode == 44);
     const bool edmPathXYZAllowed = IsEDMPathXYZTranslationBlockAllowedSameThread(block, xyzFeedSource, xyzFeedPresentMask);
-    NCXYZFeedScopeDecision xyzFeedDecision = (edmPathXYZAllowed || eccentricFeedAllowed || rotaryFeedAllowed || zcFeedAllowed || xyzcFeedAllowed || xyzcuvFeedAllowed) ?
+    // EDM295: the generic frozen XYZ policy predates spindle M13/M16 and
+    // accepts only M00/M30. Admit just the immutable concurrent program's
+    // nonpositioning spindle/dwell/control rows, keeping the same neutral
+    // frame, live configuration and runtime-clear checks below.
+    const auto* spindleXYZSource = IsRotarySpindleXYZProgramSameThread() ?
+        GetBaseProgramCache().TryGetLine(GetActiveDispatchPC()) : nullptr;
+    const auto spindleXYZKind = spindleXYZSource ?
+        NCSpindleSource::ClassifyProgramRow(spindleXYZSource->parsedBlock) :
+        NCSpindleSource::ProgramRowKind::Invalid;
+    const bool spindleXYZNonMotion = xyzFeedFrozen && xyzFeedMemoryBound && xyzFeedRuntimeClear &&
+        xyzFeedPresentMask == NCXYZFeedPresentMask(xyzFeedSource.axisIdentity) &&
+        IsNCXYZFeedNeutralFrame(xyzFeedSource) && IsRotarySpindleScopeCurrentSameThread() &&
+        spindleXYZSource && NCSpindleSource::ValidateProgramResolved(spindleXYZSource->parsedBlock, block) &&
+        (spindleXYZKind == NCSpindleSource::ProgramRowKind::Spindle ||
+            spindleXYZKind == NCSpindleSource::ProgramRowKind::Dwell ||
+            spindleXYZKind == NCSpindleSource::ProgramRowKind::Control);
+    NCXYZFeedScopeDecision xyzFeedDecision = (spindleXYZNonMotion || edmPathXYZAllowed || eccentricFeedAllowed || rotaryFeedAllowed || zcFeedAllowed || xyzcFeedAllowed || xyzcuvFeedAllowed) ?
         NCXYZFeedScopeDecision::ALLOWED : EvaluateNCXYZFeedScope(
             xyzFeedSource, block, xyzFeedPresentMask, xyzFeedFrozen,
             xyzFeedMemoryBound, xyzFeedRuntimeClear);

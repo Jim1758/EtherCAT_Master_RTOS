@@ -126,7 +126,8 @@ public:
     // Run, request, lifecycle, receipt, RT tick and physical sequences remain
     // monotonic for this broker's lifetime; callers must not reset them at Begin.
     // Only authored dispatch/commit counters and the START floor are run-local.
-    Status Begin(const Authority& authority,const Config& config,std::uint64_t startSequence=0ULL) noexcept
+    Status Begin(const Authority& authority,const Config& config,std::uint64_t startSequence=0ULL,
+        bool deferResumeCommit=false) noexcept
     {
         if(m_state!=State::Inactive||m_prepared||AnyPending())return Status::Busy;
         if(!authority.Valid())return Status::InvalidAuthority;
@@ -140,7 +141,7 @@ public:
         }
         if(!enabled)return Status::InvalidConfig;
         m_authority=authority;m_config=config;m_highWaterRun=authority.scope.runToken;
-        m_state=State::Run;m_lastCommit=m_lastDispatch=0ULL;m_startFloor=startSequence;
+        m_state=State::Run;m_lastCommit=m_lastDispatch=0ULL;m_startFloor=startSequence;m_deferResumeCommit=deferResumeCommit;
         m_intent={};m_saved={};m_acknowledged={};m_packet={};m_prepared=false;return Status::Ok;
     }
 
@@ -229,7 +230,7 @@ public:
             receipt.window.maximumAbsTrackingErrorRpm<std::fabs(receipt.actualRpm-packet.signedRpm))return Status::NotReady;
         m_receiptHighWater[i]=receipt.publicationSequence;m_tickHighWater[i]=receipt.window.lastTick;
         m_physicalHighWater[i]=receipt.window.lastPhysicalSequence;m_pending[i]=false;m_acknowledged[i]=true;
-        if(m_state==State::Resuming&&AllAcknowledged())m_state=State::Run;
+        if(m_state==State::Resuming&&AllAcknowledged()&&!m_deferResumeCommit)m_state=State::Run;
         return Status::Ok;
     }
 
@@ -269,6 +270,22 @@ public:
         m_state=State::Resuming;
         PublishControl(Kind::Resume,m_lifecycleHighWater,startSequence,true);m_saved={};return Status::Ok;
     }
+    // A concurrent XYZ lane may still be braking after all spindle zero
+    // receipts arrived. Consume that early button without publishing Resume.
+    Status ConsumeStart(const Authority& authority,std::uint64_t startSequence) noexcept
+    {
+        if(!authority.Same(m_authority))return Status::InvalidAuthority;
+        if(!startSequence||startSequence<=m_startFloor)return Status::StaleStart;
+        m_startFloor=startSequence;return Status::Ok;
+    }
+    bool ResumeReady() const noexcept {return m_state==State::Resuming&&AllAcknowledged();}
+    Status CommitResume(const Authority& authority) noexcept
+    {
+        if(!authority.Same(m_authority))return Status::InvalidAuthority;
+        if(!m_deferResumeCommit||m_state!=State::Resuming)return Status::InvalidLifecycle;
+        if(!AllAcknowledged())return Status::NotReady;
+        m_state=State::Run;return Status::Ok;
+    }
     // Terminal cancellation is not a reusable run. Retiring it requires all
     // mapped axes' exact fresh physical stop receipts, including after faults.
     Status Retire() noexcept
@@ -293,7 +310,7 @@ private:
     std::array<bool,NCRotarySpindle::Count> m_pending{},m_acknowledged{};
     std::array<double,NCRotarySpindle::Count> m_intent{},m_saved{};
     std::uint64_t m_highWaterRun=0ULL,m_lastCommit=0ULL,m_lastDispatch=0ULL,m_lifecycleHighWater=0ULL,m_startFloor=0ULL;
-    bool m_prepared=false;
+    bool m_prepared=false,m_deferResumeCommit=false;
     bool AnyPending() const noexcept {for(bool pending:m_pending)if(pending)return true;return false;}
     bool AllAcknowledged() const noexcept
     {for(unsigned i=0U;i<NCRotarySpindle::Count;++i)if(m_config[i].enabled&&(!m_acknowledged[i]||m_pending[i]))return false;return true;}

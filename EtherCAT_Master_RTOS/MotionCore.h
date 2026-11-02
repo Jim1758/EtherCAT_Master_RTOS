@@ -22,6 +22,7 @@
 #include "MotionCore_RotarySpindle.h"
 #include "MotionRotarySpindleProof.h"
 #include "MotionCore_G76Sphere.h"
+#include "NCHoldPolicy.h"
 #include "EDMShortCircuitProtection.h"
 #include "G80VoltageSimulator.h"
 #include "G80PID.h"
@@ -2376,7 +2377,8 @@ enum class MotionNCSettleProfile : std::uint8_t
     GROUP_COMPLETION = 0,
     FEED_HOLD_GROUP = 1,
     RESET_ALL = 2,
-    COUNT = 3
+    ROTARY_XYZ_COMPLETION = 3,
+    COUNT = 4
 };
 
 enum class MotionNCSettleBlocker : std::uint8_t
@@ -2689,15 +2691,27 @@ public:
         MotionExecutionIdentity& identity) noexcept;
     bool ReadG80Feedback(MotionG80Feedback& out) const noexcept;
     bool BeginRotarySpindleSession(const NCSpindleDispatch::Authority& authority,
-        const NCSpindleDispatch::Config& config) noexcept;
+        const NCSpindleDispatch::Config& config,bool allowXYZFeed=false) noexcept;
     bool SubmitRotarySpindlePacket(const NCSpindleDispatch::Packet& packet) noexcept;
     bool ReadRotarySpindleFeedback(MotionRotarySpindleFeedback& out) const noexcept;
     bool ReleaseRotarySpindleSession(const NCSpindleDispatch::Authority& authority) noexcept;
     bool IsRotarySpindleSessionClaimed() const noexcept;
+    // EDM295: an opt-in spindle run may share only disjoint, exact-stop
+    // native XYZ G01 commands under its same MEMORY/AUTO scope.
+    bool IsRotarySpindleXYZFeedCommandAllowed(const MotionCommand& command) const noexcept;
+    std::uint32_t GetRotarySpindleConcurrentAxisMask(MotionExecutionEpoch epoch,
+        const MotionOwnerLease& owner) const noexcept;
+    bool HasRotarySpindleXYZSettleAcknowledgement(MotionExecutionEpoch epoch,
+        const MotionOwnerLease& owner) const noexcept;
 
     bool TryG76SphereMove(const NCG76SphereCycle::Request& request,const NCTranslationSnapshot& frame,
         MotionExecutionEpoch epoch,const MotionOwnerLease& owner,int sourcePC,
-        MotionExecutionIdentity& identity,MotionG76SphereAdmission* admission=nullptr) noexcept;
+        MotionExecutionIdentity& identity,MotionG76SphereAdmission* admission=nullptr,
+        const NCG76SphereGapProcess::Config* processShadow=nullptr,
+        const NCHoldRecovery::Config* holdConfig=nullptr,std::uint32_t declaredPreviousParents=0U,
+        std::uint32_t finishRequiredCount=0U) noexcept;
+    bool RevokeG76SphereProcessShadow(std::uint64_t session,const MotionExecutionIdentity& identity,
+        const MotionOwnerLease& owner) noexcept;
     bool ReadG76SphereFeedback(MotionG76SphereFeedback& out) const noexcept;
     bool BindG76SphereParent(std::uint64_t session,const MotionExecutionIdentity& identity,
         const MotionOwnerLease& owner,std::uint64_t dispatch,std::uint64_t commit) noexcept;
@@ -2705,6 +2719,15 @@ public:
         const MotionOwnerLease& owner,std::uint64_t holdSequence,std::uint64_t startFloor) noexcept;
     bool RequestG76SphereResume(std::uint64_t session,const MotionExecutionIdentity& identity,
         const MotionOwnerLease& owner,std::uint64_t holdSequence,std::uint64_t startSequence) noexcept;
+    // Administrative/physical M/T side effects fence only future borrowing.
+    // An active RT cycle keeps its already admitted immutable history alive.
+    void InvalidateHoldRecoveryContinuation() noexcept
+    {m_g76SphereHoldContinuationReleased.store(0ULL,std::memory_order_release);}
+    // Dedicated inspection jog retains the unfinished AUTO parent. It does not
+    // lend the generic MANUAL/MDI JOG owner or permit rotary-axis movement.
+    bool RequestG76SphereInspectionJog(std::uint64_t session,const MotionExecutionIdentity& identity,
+        const MotionOwnerLease& owner,std::uint64_t holdSequence,int axis,int direction,
+        std::uint64_t inspectionSequence) noexcept;
     bool RequestG76SphereResetCancellation(std::uint64_t session,const MotionExecutionIdentity& identity,
         const MotionOwnerLease& owner,std::uint64_t resetHoldProvenance) noexcept;
     bool CommitG76SphereCompletedEndpoint(std::uint64_t session,const MotionExecutionIdentity& identity,
@@ -4729,7 +4752,9 @@ private:
         sizeof(std::uint64_t);
 
     static_assert(
-        MOTION_STOP_SETTLE_PUBLICATION_WORD_COUNT <= 192U,
+        // Four internal profiles use 1768 bytes (221 words) on x64. This is
+        // a bounded private bank; the shared-memory snapshot ABI is unchanged.
+        MOTION_STOP_SETTLE_PUBLICATION_WORD_COUNT <= 224U,
         "J.5 settle publication must remain a small fixed RT payload.");
 
     struct MotionStopSettleAtomicBank
@@ -5413,6 +5438,7 @@ private:
         std::array<RotarySpindleBinding,3> binding{};
         std::array<std::uintptr_t,8> inputMapping{},outputMapping{};
         std::uint32_t axisMask=0U,slots=0U;
+        bool allowXYZFeed=false;
     };
     struct RotarySpindleSent
     {
@@ -5430,6 +5456,7 @@ private:
         MotionRotarySpindleFeedback feedback{};
         std::array<NCSpindleDispatch::Packet,3> packet{};
         std::array<MotionRotarySpindleProof::ReceiptWindow,3> window{};
+        std::array<MotionRotarySpindleProof::EncoderSpeedWindow,3> speedWindow{};
         std::array<RotarySpindleSent,3> sent{};
         std::array<MotionServoInputSnapshot,3> input{};
         std::array<std::uint32_t,3> previousRaw{};
@@ -5448,11 +5475,18 @@ private:
     std::array<EDM53::Channel<NCSpindleDispatch::Packet,512U>,3> m_rotarySpindleRequest{};
     EDM53::Channel<MotionRotarySpindleFeedback,4096U> m_rotarySpindleFeedback{};
     std::atomic<std::uint64_t> m_rotarySpindleClaim{0ULL},m_rotarySpindleRelease{0ULL};
+    // Published before claim; used only to contain the claimed CSV slots in
+    // the interval before the RT callback adopts its immutable record.
+    std::atomic<std::uint32_t> m_rotarySpindleAxisClaim{0U};
     std::uint64_t m_rotarySpindleProducerRun=0ULL;
     std::array<std::uint64_t,3> m_rotarySpindleProducerSequence{};
     RotarySpindleRuntime m_rotarySpindle{};
     bool IsRotarySpindleConfigurationCurrent(const RotarySpindleFrozen& frozen) const noexcept;
     bool IsRotarySpindleAuthorityCurrent(const RotarySpindleFrozen& frozen) const noexcept;
+    bool IsRotarySpindleXYZFeedCommandAllowed(const MotionCommand& command,
+        const RotarySpindleFrozen& frozen) const noexcept;
+    bool IsRotarySpindleXYZGroupAllowed() const noexcept;
+    bool IsRotarySpindleXYZQueueAllowed() const noexcept;
     void ObserveRotarySpindleRuntimeInput() noexcept;
     bool ApplyRotarySpindleAxis(AxisContext& axis,const MotionServoInputSnapshot& input,
         std::int32_t& hardwarePps) noexcept;
@@ -5548,8 +5582,59 @@ private:
         std::array<double,8U> pulsePerNative{};
         std::array<G76SphereAxisBinding,6U> axis{};
         std::uint32_t axisMask=0U;
+        bool signedMotionEnabled=false;
+        // Tail padding: independent pumps (1), final approach (2), initial
+        // slow retreat (4), and deep flush (8) stay immutable across SIM channels.
+        std::uint8_t flushFeatureFlags=0U;
+        std::uint8_t holdDeclaredPreviousParents=0U;
+        bool holdRecoveryEnabled=false;
+        std::uint8_t finishRequiredCount=0U;
     };
+    static_assert(sizeof(G76SphereFrozen)<=4096U,"P50 motion snapshot must fit the existing fixed channel.");
     EDM53::Channel<G76SphereFrozen,4096U> m_g76SphereRequests{};
+    // Independent optional process snapshot keeps the existing 3984-byte motion
+    // request below its unchanged 4096-byte channel fence. No motion authority.
+    struct G76SphereProcessFrozen
+    {
+        NCG76SphereGapProcess::Config config{};
+        MotionExecutionIdentity identity{};
+        MotionOwnerLease owner{};
+        std::uint64_t session=0ULL;
+    };
+    static_assert(sizeof(G76SphereProcessFrozen)<=512U,"P50 process snapshot must fit the independent fixed channel.");
+    EDM53::Channel<G76SphereProcessFrozen,512U> m_g76SphereProcessRequests{};
+    G76SphereProcessFrozen m_g76SphereProcessFrozen{};
+    G76SphereProcessFrozen m_g76SphereIncomingProcessFrozen{}; // RT-owned sidecar comparison scratch.
+    std::atomic<std::uint64_t> m_g76SphereContinuationReleased{0ULL}; // Exact completed endpoint/barrier receipt.
+    // Immutable data-only HOLD and per-parent finish settings use one scoped page.
+    // The 4096-byte motion image and MotionCommand ABI remain unchanged in size.
+    struct G76SphereHoldFrozen
+    {
+        NCHoldRecovery::Config config{};
+        MotionExecutionIdentity identity{};
+        MotionOwnerLease owner{};
+        std::uint64_t session=0ULL;
+        std::uint32_t declaredPreviousParents=0U;
+        std::uint32_t finishRequiredCount=0U;
+        bool enabled=false;
+    };
+    static_assert(sizeof(G76SphereHoldFrozen)<=256U,"HOLD settings remain a small independent page");
+    EDM53::Channel<G76SphereHoldFrozen,256U> m_g76SphereHoldRequests{};
+    G76SphereHoldFrozen m_g76SphereHoldFrozen{},m_g76SphereIncomingHoldFrozen{};
+    std::atomic<std::uint64_t> m_g76SphereHoldContinuationReleased{0ULL};
+    std::atomic<std::uint64_t> m_g76SphereHoldReleaseFeedbackSequence{0ULL};
+    std::array<NCG76SphereRuntimeGeometry::Geometry,15U> m_g76SphereHoldHistory{};
+    std::array<G76SphereAxisBinding,6U> m_g76SphereHoldHistoryBindings{};
+    NCTranslationSnapshot m_g76SphereHoldHistoryFrame{};
+    std::uint32_t m_g76SphereHoldHistoryCount=0U;
+    NCG76SphereCoordinates::Point8 m_g76SphereInspectionMinimum{},m_g76SphereInspectionMaximum{};
+    std::uint32_t m_g76SphereInspectionTravelMask=0U;
+    // This RT-owned history changes only after the old parent has completed and
+    // its exact NC endpoint/drain barrier has been released. A running Cycle
+    // borrows it without copying a geometry array onto the callback stack.
+    NCG76SphereGapProcess::Observer m_g76SphereProcess{};
+    std::atomic<std::uint64_t> m_g76SphereProcessRevokedSession{0ULL};
+    std::uint64_t m_g76SphereProcessSentTick=0ULL,m_g76SphereProcessSendSequence=0ULL,m_g76SphereProcessSendFrame=0ULL;
     EDM53::Channel<MotionG76SphereFeedback,2048U> m_g76SphereFeedback{};
     std::atomic<std::uint64_t> m_g76SphereClaim{0ULL},m_g76SphereEndpointCommitted{0ULL},m_g76SphereBarrier{0ULL};
     struct G76SphereControl
@@ -5561,6 +5646,25 @@ private:
     };
     FixedCapacitySpscRing<G76SphereControl,8U> m_g76SphereControls{};
     G76SphereControl m_g76SphereProducerControl{},m_g76SphereIncomingControl{};
+    struct G76SphereInspectionIntent
+    {
+        std::uint64_t session=0ULL,holdSequence=0ULL,sequence=0ULL;
+        MotionExecutionIdentity identity{};
+        MotionOwnerLease owner{};
+        int axis=-1,direction=0;
+    };
+    FixedCapacitySpscRing<G76SphereInspectionIntent,8U> m_g76SphereInspectionControls{};
+    G76SphereInspectionIntent m_g76SphereInspectionProducer{},m_g76SphereInspectionIncoming{};
+    std::uint64_t m_g76SphereInspectionConsumedSequence=0ULL;
+    // Fresh NC inspection commands refresh only an already admitted detour.
+    // Deadline is measured by the current RT input clock, never an HMI time.
+    EDM53::Channel<G76SphereInspectionIntent,128U> m_g76SphereInspectionLease{};
+    G76SphereInspectionIntent m_g76SphereInspectionLeaseIncoming{};
+    std::uint64_t m_g76SphereInspectionLeaseSeen=0ULL,m_g76SphereInspectionDeadlineUs=0ULL;
+    std::uint64_t m_g76SphereInspectionLeaseHold=0ULL;
+    int m_g76SphereInspectionLeaseAxis=-1,m_g76SphereInspectionLeaseDirection=0;
+    bool m_g76SphereInspectionBlocked=false;
+    std::atomic<bool> m_g76SphereInspectionProducerBlocked{false};
     struct G76SphereResetScope
     {
         std::uint64_t session=0ULL,previousProvenance=0ULL,expectedProvenance=0ULL;
@@ -5579,7 +5683,14 @@ private:
     std::atomic<std::uint64_t> m_g76SphereParentBound{0ULL};
     std::uint64_t m_g76SphereProducerHighWater=0ULL;
     G76SphereFrozen m_g76SphereFrozen{};
+    // RT-only pending source workspace. Keep the 3984-byte frozen value out
+    // of the nested source callback stack; never overwrite the active record.
+    G76SphereFrozen m_g76SpherePendingWorkspace{};
+    MotionG76SphereInputDiagnostic m_g76SphereInputObservation{};
     NCG76SphereCycle::Cycle m_g76SphereCycle{};
+    // EDM309: RT-owned predecessor scratch. Never enlarge a request/channel
+    // or materialize a Geometry on the nested PDO callback stack.
+    NCG76SphereRuntimeGeometry::Geometry m_g76SpherePreviousGeometry{};
     NCG76SphereCycle::Input m_g76SphereInput{};
     MotionExecutionIdentity m_g76SphereInputIdentity{};
     std::uint64_t m_g76SphereInputSession=0ULL,m_g76SphereZeroSentTick=0ULL;
@@ -5592,6 +5703,9 @@ private:
     bool IsG76SphereCommandAuthorized(const MotionCommand& command) const noexcept;
     bool LoadG76SphereCommand(const MotionCommand& command) noexcept;
     void ObserveG76SphereRuntimeInput() noexcept;
+    void SetG76SphereInputDiagnostic(MotionG76SphereInputStage stage,
+        MotionG76SphereInputGate gate,int axis=-1) noexcept;
+    void CaptureG76SphereInputFault() noexcept;
     void ObserveG76SphereSend(const MotionServoHandoffSample& sample) noexcept;
     bool StepG76SphereRuntime() noexcept;
     bool G76SphereDemandsZero(const AxisContext& axis) const noexcept;
@@ -5755,6 +5869,10 @@ private:
     bool TryRequeueMotionCommandFront(const MotionCommand& command) noexcept;
 
     bool HasExactExecutionDrainAcknowledgementImpl(
+        MotionExecutionEpoch executionEpoch,
+        const MotionOwnerLease& ownerLease,
+        bool ownsCommitReservation) const noexcept;
+    bool HasRotarySpindleXYZSettleAcknowledgementImpl(
         MotionExecutionEpoch executionEpoch,
         const MotionOwnerLease& ownerLease,
         bool ownsCommitReservation) const noexcept;

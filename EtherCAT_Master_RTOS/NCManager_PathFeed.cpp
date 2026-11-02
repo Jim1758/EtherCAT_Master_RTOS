@@ -1,5 +1,6 @@
 // BX / Path Core V2-01. G01 is a distinct feed producer, not a G00 override.
 #include "NCManager.h"
+#include "NCFinishPolicy.h"
 #include "NCG76StartDiagnostic.h"
 #include "NCG76DiagnosticPrint.h"
 #include "AlarmManager.h"
@@ -2372,6 +2373,13 @@ bool NCManager::CompletePathCoreFeedSameThread()
     }
     if (!m_pathFeed.bound || !m_pathFeed.completed || m_motion.HasPendingSafetyOrRecoveryRequests() ||
         !m_motion.IsGroupDone()) return false;
+    // EDM295: completion feedback ends the segment before the separate
+    // physical positional-lane dwell necessarily ends. Defer the callback
+    // until that exact proof is current, so the next G01 is not submitted
+    // early and rejected while C/U/V intentionally keep rotating.
+    if (IsRotarySpindleXYZProgramSameThread() && m_rotarySpindle.rtBegun &&
+        !m_motion.HasRotarySpindleXYZSettleAcknowledgement(
+            m_motion.GetCurrentExecutionEpoch(), m_programMotionLease)) return false;
     if (m_gapWindow.active && m_gapWindow.normalSource && !m_gapWindow.normalProven) return false;
     // FIX8: retain the completed EDM94 G1 and its correction authority until
     // the exact old Epoch is physically ready for the next ordinary command.
@@ -3729,7 +3737,7 @@ void NCManager::CaptureG76OrbitConfirmationSameThread(int pc,NCBlockDispatchId d
     NCBlock stop{},orbit{};
     if (!transaction.active || !transaction.fromMainProgram || transaction.sourcePC!=pc || transaction.dispatchId!=dispatch ||
         transaction.phase!=NCGMBlockTransactionPhase::READY_TO_FINALIZE || transaction.postAction!=NCGMBlockPostAction::PROGRAM_STOP_M00 ||
-        m_state!=NCState::RUN || m_mode!=NCOperationMode::MEMORY || !m_macroStack.empty() || m_isSingleBlockEnabled ||
+        m_state!=NCState::RUN || m_mode!=NCOperationMode::MEMORY || !m_macroStack.empty() ||
         m_edm94.latched || !dispatch || !m_pathCoreLiveBookkeeping.currentRunToken || AlarmManager::GetInstance().HasAlarm() ||
         !authored || !next || authored->parsedBlock.duplicateAddressMask || next->parsedBlock.duplicateAddressMask ||
         authored->parsedBlock.dependsOnMacroState || next->parsedBlock.dependsOnMacroState ||
@@ -3738,10 +3746,15 @@ void NCManager::CaptureG76OrbitConfirmationSameThread(int pc,NCBlockDispatchId d
         stop.gCount!=0 || stop.mCount!=1 || stop.mCode[0]!=0 || stop.isGoto || stop.isBlockSkip ||
         !IsEDM171AirProgramSameThread(pc+1)) return;
     for (char word='A';word<='Z';++word) if (stop.has(word) && word!='N') return;
+    // Analytic EDM parents use the existing completion-gated Single Block
+    // boundary. Legacy G76/P50 keeps its original continuous-only grant.
+    if (m_isSingleBlockEnabled &&
+        !(orbit.hasG && orbit.gCount==1 && orbit.mCount==0 &&
+            (orbit.gCode==1 || orbit.gCode==2 || orbit.gCode==3))) return;
     auto& c=m_g76Confirmation;
     c.run=m_pathCoreLiveBookkeeping.currentRunToken; c.cache=GetBaseProgramCache().GetGeneration();
     c.dispatch=dispatch; c.firstPC=pc+1; c.startRequests=m_startDiagnosticRequests; c.waiting=true;
-    RtPrintf("[EDM170] event=OPERATOR_CONFIRMATION result=WAIT_M00_START firstPC=%d run=%llu cache=%llu discharge=0\n",
+    RtPrintf("[EDM170] event=OPERATOR_CONFIRMATION result=WAIT_M00_START firstPC=%d run=%llu cache=%llu build=EDM309_FIX1 discharge=0\n",
         c.firstPC,static_cast<unsigned long long>(c.run),static_cast<unsigned long long>(c.cache));
 }
 
@@ -3750,7 +3763,7 @@ void NCManager::CommitG76OrbitConfirmationResumeSameThread() noexcept
 {
     auto& c=m_g76Confirmation;
     if (!c.waiting) return;
-    if (m_state!=NCState::RUN || m_mode!=NCOperationMode::MEMORY || !m_macroStack.empty() || m_isSingleBlockEnabled ||
+    if (m_state!=NCState::RUN || m_mode!=NCOperationMode::MEMORY || !m_macroStack.empty() ||
         c.run!=m_pathCoreLiveBookkeeping.currentRunToken || c.cache!=GetBaseProgramCache().GetGeneration() ||
         GetBasePC()!=c.firstPC || m_startDiagnosticRequests<=c.startRequests || m_waitCallback!=WaitForCycleStartCallback ||
         AlarmManager::GetInstance().HasAlarm() || m_motion.HasPendingSafetyOrRecoveryRequests() ||
@@ -3762,6 +3775,10 @@ void NCManager::CommitG76OrbitConfirmationResumeSameThread() noexcept
         !NCPreparedBlockQueueShadow::TryBuildLiteralBlock(next->parsedBlock,orbit) ||
         !IsEDM171AirProgramSameThread(c.firstPC))
     { c=G76Confirmation{}; return; }
+    if (m_isSingleBlockEnabled &&
+        !(orbit.hasG && orbit.gCount==1 && orbit.mCount==0 &&
+            (orbit.gCode==1 || orbit.gCode==2 || orbit.gCode==3)))
+    { c=G76Confirmation{}; return; }
     const auto speeds=GlobalConfig::GetInstance().GetG76CenterReturnSpeeds();
     if (!EDM171Config::ValidCenterReturnSpeeds(speeds)) {c=G76Confirmation{};return;}
     auto& a=*m_edm171Air;
@@ -3769,7 +3786,7 @@ void NCManager::CommitG76OrbitConfirmationResumeSameThread() noexcept
     a.configured=true; a.selected=a.bound=false;
     CaptureEDM171AirE6SameThread();
     c.waiting=false; c.confirmed=true; c.startRequests=m_startDiagnosticRequests;
-    RtPrintf("[EDM170] event=OPERATOR_CONFIRMATION result=START_CONFIRMED firstPC=%d run=%llu cache=%llu discharge=0\n",
+    RtPrintf("[EDM170] event=OPERATOR_CONFIRMATION result=START_CONFIRMED firstPC=%d run=%llu cache=%llu build=EDM309_FIX1 discharge=0\n",
         c.firstPC,static_cast<unsigned long long>(c.run),static_cast<unsigned long long>(c.cache));
 }
 
@@ -3784,14 +3801,17 @@ void NCManager::ResetG76OrbitStateSameThread() noexcept
 }
 
 NC_PATH_FEED_NOINLINE
-bool NCManager::IsEDM171AirGrantCurrentSameThread() const noexcept
+bool NCManager::IsEDM171AirGrantCurrentSameThread(bool processPathSingleBlock) const noexcept
 {
+    // Opt-in is reserved for the exact-source G01/G02/G03 parent. Existing
+    // callers retain the continuous-only P50/legacy grant by default.
     const auto& c=m_g76Confirmation; const auto& a=*m_edm171Air;
     return c.confirmed && !c.waiting && c.run!=0ULL && c.run==m_pathCoreLiveBookkeeping.currentRunToken &&
         c.cache!=0ULL && c.cache==GetBaseProgramCache().GetGeneration() && a.configured && a.run==c.run && a.cache==c.cache &&
         a.lease.Matches(m_programMotionLease) && m_motion.IsMotionOwnerLeaseCurrent(m_programMotionLease) &&
         !m_edm94.latched && m_mode==NCOperationMode::MEMORY && !Close_System_Com_flag && m_externalReadyInterlock &&
-        m_macroStack.empty() && !m_isG66Active && !m_isSingleBlockEnabled && !AlarmManager::GetInstance().HasAlarm();
+        m_macroStack.empty() && !m_isG66Active &&
+        (processPathSingleBlock || !m_isSingleBlockEnabled) && !AlarmManager::GetInstance().HasAlarm();
 }
 
 // Capture only at the already validated fresh M00 START. This is an immutable
@@ -3864,6 +3884,9 @@ bool NCManager::NormalizeEDM171AirBlockSameThread(const NCBlock& input,NCBlock& 
     // P50 has its own exact source/modal-B/frame/one-parent admission. It must
     // never be normalized into the legacy fixed-size G76 child batch.
     if(IsG76SphereBlock(input))return true;
+    // EDM307 retains real source words and B provenance for the analytic
+    // machining parent; it must not become the old geometric B2 batch.
+    if(IsEDMProcessPathCandidateSameThread(input))return true;
     // The existing live EDM/G180 modal-B family owns its unchanged decoder.
     if (m_edm94.latched) return true;
     const bool motion=NCGCodeSemantics::Contains(input,1) || NCGCodeSemantics::Contains(input,2) ||
@@ -4241,14 +4264,40 @@ bool NCManager::IsEDM171AirProgramSameThread(int firstPC) const noexcept
             for (char word='A';word<='Z';++word) if (b.has(word) && word!='N') return false;
             return offset!=0U && intent;
         }
+        // EDM309 FIX1: a later literal M00 pauses the already scoped main
+        // program; it is not its end. Validate every suffix row through M30
+        // before granting the FIRST M00/START, including rows after this stop.
+        // A stop alone cannot establish EDM intent or carry motion words.
+        if (b.gCount==0 && b.mCount==1 && b.mCode[0]==0)
+        {
+            if (offset==0U || !intent) return false;
+            for (char word='A';word<='Z';++word) if (b.has(word) && word!='N') return false;
+            continue;
+        }
+        if(NCGCodeSemantics::Contains(b,NCHoldPolicy::DeclarationCode)){
+            std::uint32_t ignored=0U;
+            if(!NCHoldPolicy::DecodeAuthored(parsed,b,ignored))return false;
+            continue;
+        }
         if (b.gCount!=1 || !b.hasG || b.mCount!=0 || b.isGoto ||
             (b.has('Q')&&!(b.gCode==76&&NCG76Mode::IsPolygon(FeedG76ModeValue273(b))))) return false;
+        // EDM335: L is metadata for this literal analytic EDM parent only.
+        // Validate its whole authored count before removing it from a LOCAL
+        // geometric copy; never widen the ordinary CNC address whitelist.
+        if((b.gCode==1||b.gCode==2||b.gCode==3)&&b.has(NCFinishPolicy::CountAddress)){
+            NCBlock geometry{};std::uint32_t finishCount=0U;
+            if(!NCFinishPolicy::StripValidated(parsed,b,geometry,finishCount))return false;
+            b=geometry;
+        }
         const bool orbit=b.gCode==76;
-        intent=intent || orbit || (b.has('B') && b.val('B')==2.0);
+        // EDM308: a literal B selector or a parameter-driven (no-F)
+        // G01/G02/G03 suffix is explicit EDM intent under this M00 grant.
+        intent=intent || orbit || b.has('B') ||
+            (!b.has('F')&&(b.gCode==1||b.gCode==2||b.gCode==3));
         if (b.has('B'))
         {
             const double mode=b.val('B');
-            if (!std::isfinite(mode) || !(mode==0.0 || mode==2.0 || (orbit && (mode==3.0 || mode==4.0)))) return false;
+            if (!std::isfinite(mode) || mode<0.0 || mode>4.0 || std::floor(mode)!=mode || (orbit&&mode==1.0)) return false;
             if (!orbit) {b.hasParam['B'-'A']=false;b.param['B'-'A']=0.0;}
         }
         if (orbit)
@@ -4260,14 +4309,13 @@ bool NCManager::IsEDM171AirProgramSameThread(int firstPC) const noexcept
                 // sound but MUST acquire actual committed provenance at dispatch.
                 // No fake modal receipt is manufactured by the program scanner.
                 if(CoordSys.isInchMode||
-                    (status!=NCG76SphereSource::Status::Ok&&status!=NCG76SphereSource::Status::UnresolvedModalB)||
-                    (b.has('B')&&b.val('B')!=0.0))return false;
+                    (status!=NCG76SphereSource::Status::Ok&&status!=NCG76SphereSource::Status::UnresolvedModalB))return false;
             }else if (!IsG76OrbitBlockShapeValid(b,true,CoordSys.isInchMode?20:21)) return false;
         }
         else if (b.gCode==1)
-        { if (!IsPathCoreFeedBlockShapeValid(b,true,CoordSys.isInchMode?20:21,false,17)) return false; }
+        { if (!IsPathCoreFeedBlockShapeValid(b,true,CoordSys.isInchMode?20:21,false,CoordSys.activePlane)) return false; }
         else if (b.gCode==2 || b.gCode==3)
-        { if (b.has('P') || !IsPathCoreArcBlockShapeValid(b,true,CoordSys.isInchMode?20:21,false,17)) return false; }
+        { if (b.has('P') || !IsPathCoreArcBlockShapeValid(b,true,CoordSys.isInchMode?20:21,false,CoordSys.activePlane)) return false; }
         else return false;
     }
     return false;

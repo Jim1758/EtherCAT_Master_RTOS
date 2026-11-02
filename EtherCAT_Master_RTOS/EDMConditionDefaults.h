@@ -1,5 +1,6 @@
 #pragma once
 #include "EDMRecipe.h"
+#include "EDMConditionUnits.h"
 #include <memory>
 #include <cstring>
 // EDM19 FIX4: exact schema-2 seed from the accepted 2026-10-05 user data.
@@ -1555,6 +1556,7 @@ inline std::unique_ptr<EDMRecipe::Catalog> MakeEmergencyCatalog(std::uint32_t ta
         field.id = seed.id; field.decimals = seed.decimals; field.enabled = seed.enabled; field.unitConfirmed = seed.confirmed;
         field.minimum = seed.minimum; field.maximum = seed.maximum;
         std::strcpy(field.semanticKey, seed.semantic); std::strcpy(field.name, seed.name); std::strcpy(field.unit, seed.unit);
+        EDMConditionUnits::NormalizeLegacyField(c->schemaVersion, c->profileId, field);
         c->fields.push_back(std::move(field));
     }
     for (const auto& seed : SeedStages) {

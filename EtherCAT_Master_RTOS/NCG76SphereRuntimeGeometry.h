@@ -20,6 +20,7 @@ namespace NCG76SphereRuntimeGeometry
 using Point3=NCG76Sphere::Point3;
 using Point8=NCG76SphereCoordinates::Point8;
 using RadiusLaw=NCG76Sphere::RadiusLaw;
+enum class Kind : std::uint8_t { Sphere, Line, Arc };
 constexpr unsigned Version=1U;
 constexpr double Pi=NCG76Sphere::Pi,TwoPi=2.0*Pi;
 constexpr double MaximumArithmeticErrorMm=1.e-9;
@@ -35,6 +36,11 @@ struct Geometry
     double arithmeticErrorBoundMm=0.0,coordinateErrorBoundMm=0.0;
     unsigned circleLayerCount=0U,version=0U;
     RadiusLaw radiusLaw=RadiusLaw::Linear;
+    // EDM307: explicit primitive source, never a fabricated P50 descriptor.
+    Point3 arcCenterMCS{},arcNormal{};
+    double arcSweepRad=0.0;
+    int arcDirection=0;
+    Kind kind=Kind::Sphere;
     bool valid=false;
 };
 struct Layer
@@ -168,7 +174,9 @@ inline bool Derive(const NCG76SphereCoordinates::NativePlan& source,Geometry& ou
 }
 inline bool SameGeometry(const Geometry& a,const Geometry& b) noexcept
 {
-    return a.valid==b.valid&&a.version==b.version&&a.circleLayerCount==b.circleLayerCount&&a.radiusLaw==b.radiusLaw&&
+    return a.kind==b.kind&&a.valid==b.valid&&a.version==b.version&&a.circleLayerCount==b.circleLayerCount&&a.radiusLaw==b.radiusLaw&&
+        Detail::Same(a.arcCenterMCS,b.arcCenterMCS)&&Detail::Same(a.arcNormal,b.arcNormal)&&
+        Detail::Bits(a.arcSweepRad,b.arcSweepRad)&&a.arcDirection==b.arcDirection&&
         NCG76SphereCoordinates::SameFrame(a.frame,b.frame)&&NCG76Sphere::SameDescriptor(a.descriptor,b.descriptor)&&
         Detail::Same(a.startMCS,b.startMCS)&&Detail::Same(a.endMCS,b.endMCS)&&
         Detail::Same(a.boundsMinMCS,b.boundsMinMCS)&&Detail::Same(a.boundsMaxMCS,b.boundsMaxMCS)&&
@@ -184,10 +192,185 @@ inline bool Build(const NCG76SphereCoordinates::NativePlan& input,Geometry& outp
     const NCG76SphereCoordinates::NativePlan source=input;output=Geometry{};
     return NCG76SphereCoordinates::Valid(source)&&Detail::Derive(source,output);
 }
+// Native G01/G02/G03 primitives share the cycle and condition configuration,
+// while retaining their own canonical source and a single nominal station.
+namespace Detail
+{
+inline Point3 Cross(const Point3& a,const Point3& b) noexcept
+{return Point3{{a[1]*b[2]-a[2]*b[1],a[2]*b[0]-a[0]*b[2],a[0]*b[1]-a[1]*b[0]}};}
+inline bool PrimitiveSource(const NCG76SphereCoordinates::FrozenFrame& frame,
+    const Point8& target,double feed,Geometry& g) noexcept
+{
+    if(!NCG76SphereCoordinates::ValidFrame(frame)||!Finite(target)||!Positive(feed)||feed>100000.0)return false;
+    for(unsigned a=3U;a<8U;++a)if(!Bits(frame.startMCS[a],target[a]))return false;
+    g.frame=frame;g.startMCS=frame.startMCS;g.endMCS=target;g.feedMmMin=feed;
+    return true;
+}
+inline bool PrimitiveBudget(Geometry& g,double feature,double envelope) noexcept
+{
+    g.arithmeticErrorBoundMm=std::nextafter(envelope*(64.0*std::numeric_limits<double>::epsilon()),
+        std::numeric_limits<double>::infinity());
+    if(!Positive(g.arithmeticErrorBoundMm)||g.arithmeticErrorBoundMm>MaximumArithmeticErrorMm||
+       !Positive(feature)||g.arithmeticErrorBoundMm>feature/64.0)return false;
+    g.coordinateErrorBoundMm=g.arithmeticErrorBoundMm;
+    return true;
+}
+inline bool ArcMappingEnvelope(const NCG76SphereCoordinates::FrozenFrame& frame,
+    double radius,double& envelope) noexcept
+{
+    // G90 endpoints pass through affine points, whereas IJK passes through
+    // vectors. Small native endpoints therefore do not bound cancellation at
+    // the point map's scale/mirror/rotation centres and fixed offsets. Trace
+    // absolute operand magnitudes through those same active stages. The L1
+    // envelope covers XYZ and the forward/inverse dependency paths remain
+    // inside PrimitiveBudget's existing 64-epsilon arithmetic allowance.
+    // G91 uses start + a vector; its local native envelope already applies.
+    if(frame.translation.distanceMode!=90)return true;
+    const auto& s=frame.translation;
+    const double span=2.0*radius+MaximumArithmeticErrorMm+
+        NCG76SphereCoordinates::MaximumMappingErrorMm;
+    // An admitted endpoint is within a native diameter, plus the two existing
+    // admission fences, of the accepted start. These fences bound the input
+    // domain only; they are not added to the resulting arithmetic tolerance.
+    Point3 magnitude{};
+    for(unsigned a=0U;a<3U;++a){
+        magnitude[a]=std::fabs(frame.programStart[a])+
+            span/(frame.fixedEccentric?1.0:frame.nativeScale);
+        if(frame.fixedEccentric){
+            magnitude[a]+=std::fabs(s.extOffsetMM[a])+std::fabs(s.wcsOffsetMM[a])+
+                std::fabs(frame.signedEccentricOffset[a]);
+        }else{
+            if(s.scalingMode==51&&s.scalingFactor!=1.0)
+                magnitude[a]=std::fabs(s.scalingCenterMM[a])+
+                    (magnitude[a]+std::fabs(s.scalingCenterMM[a]))*s.scalingFactor;
+            if((s.mirrorMask&(1U<<a))!=0U)
+                magnitude[a]+=2.0*std::fabs(s.mirrorCenterMM[a]);
+        }
+    }
+    if(!frame.fixedEccentric){
+        NCArcPlaneAxes plane{};if(!TryGetNCArcPlaneAxes(s.rotationPlane,plane))return false;
+        double cosine=1.0,sine=0.0;
+        NCTranslationRotationCoefficients(s,cosine,sine);
+        if(cosine!=1.0||sine!=0.0){
+            const double u=magnitude[plane.u]+std::fabs(s.rotationCenterMM[0]);
+            const double v=magnitude[plane.v]+std::fabs(s.rotationCenterMM[1]);
+            magnitude[plane.u]=std::fabs(cosine)*u+std::fabs(sine)*v+std::fabs(s.rotationCenterMM[0]);
+            magnitude[plane.v]=std::fabs(sine)*u+std::fabs(cosine)*v+std::fabs(s.rotationCenterMM[1]);
+        }
+        for(unsigned a=0U;a<3U;++a)
+            magnitude[a]+=std::fabs(s.extOffsetMM[a])+std::fabs(s.wcsOffsetMM[a])+
+                std::fabs(NCTranslationToolOffsetMM(s,a))+(s.workMode==168?std::fabs(s.workOffset[a]):0.0);
+        double angle=0.0;if(!TryGetNCTranslationWorkPlaneAngle(s,angle))return false;
+        NCTranslationPlanarCoefficients(angle,cosine,sine);
+        if(cosine!=1.0||sine!=0.0){
+            const double u=magnitude[plane.u]+std::fabs(s.workRotationCenterMM[0]);
+            const double v=magnitude[plane.v]+std::fabs(s.workRotationCenterMM[1]);
+            magnitude[plane.u]=std::fabs(cosine)*u+std::fabs(sine)*v+std::fabs(s.workRotationCenterMM[0]);
+            magnitude[plane.v]=std::fabs(sine)*u+std::fabs(cosine)*v+std::fabs(s.workRotationCenterMM[1]);
+        }
+    }
+    const double mapped=magnitude[0]+magnitude[1]+magnitude[2];
+    if(!Finite(magnitude)||!std::isfinite(mapped))return false;
+    envelope=(std::max)(envelope,mapped);return true;
+}
+inline bool DeriveLine(const NCG76SphereCoordinates::FrozenFrame& frame,
+    const Point8& target,double feed,Geometry& out) noexcept
+{
+    Geometry g{};g.kind=Kind::Line;
+    if(!PrimitiveSource(frame,target,feed,g))return false;
+    Point3 delta{};double envelope=0.0;
+    for(unsigned a=0U;a<3U;++a){delta[a]=target[a]-frame.startMCS[a];
+        envelope=(std::max)(envelope,(std::max)(std::fabs(target[a]),std::fabs(frame.startMCS[a])));}
+    g.travelMm=Norm(delta);
+    if(!Finite(delta)||!std::isfinite(g.travelMm))return false;
+    if(g.travelMm==0.0){
+        // An addressed G01 at the accepted endpoint is a real stationary
+        // parent. Preserve that accepted spelling; no tangent or positive
+        // path distance is fabricated and no flushing motion is generated.
+        if(!PrimitiveBudget(g,1.0,(std::max)(1.0,envelope)))return false;
+        g.endMCS=g.boundsMinMCS=g.boundsMaxMCS=g.startMCS;
+        g.version=Version;g.valid=true;out=g;return true;
+    }
+    if(!Positive(g.travelMm)||g.travelMm>10000.0||!PrimitiveBudget(g,g.travelMm,envelope))return false;
+    for(unsigned a=0U;a<3U;++a){g.axis[a]=delta[a]/g.travelMm;g.maxCircleTangentAbs[a]=std::fabs(g.axis[a]);}
+    g.boundsMinMCS=g.boundsMaxMCS=g.startMCS;
+    for(unsigned a=0U;a<3U;++a){
+        g.boundsMinMCS[a]=std::nextafter((std::min)(g.startMCS[a],g.endMCS[a])-g.coordinateErrorBoundMm,
+            -std::numeric_limits<double>::infinity());
+        g.boundsMaxMCS[a]=std::nextafter((std::max)(g.startMCS[a],g.endMCS[a])+g.coordinateErrorBoundMm,
+            std::numeric_limits<double>::infinity());}
+    g.version=Version;g.valid=true;out=g;return true;
+}
+inline bool DeriveArc(const NCG76SphereCoordinates::FrozenFrame& frame,const Point8& target,
+    const Point3& center,const Point3& normal,int direction,double feed,bool fullCircle,Geometry& out) noexcept
+{
+    Geometry g{};g.kind=Kind::Arc;
+    if(!PrimitiveSource(frame,target,feed,g)||!Finite(center)||!Finite(normal)||(direction!=1&&direction!=-1))return false;
+    const double normalLength=Norm(normal);
+    if(!Positive(normalLength)||std::fabs(normalLength-1.0)>OrthonormalTolerance)return false;
+    Point3 radial{},endRadial{},unitNormal{};double envelope=0.0;
+    for(unsigned a=0U;a<3U;++a){radial[a]=g.startMCS[a]-center[a];endRadial[a]=g.endMCS[a]-center[a];unitNormal[a]=normal[a]/normalLength;}
+    g.radiusMm=Norm(radial);
+    if(!Finite(radial)||!Finite(endRadial)||!Positive(g.radiusMm)||g.radiusMm>10000.0||!Positive(1.0/g.radiusMm))return false;
+    for(unsigned a=0U;a<3U;++a){g.u[a]=radial[a]/g.radiusMm;
+        envelope=(std::max)(envelope,(std::max)(std::fabs(g.startMCS[a]),std::fabs(center[a])+g.radiusMm));}
+    if(!fullCircle&&!ArcMappingEnvelope(frame,g.radiusMm,envelope))return false;
+    if(!PrimitiveBudget(g,g.radiusMm,envelope))return false;
+    if(std::fabs(Dot(radial,unitNormal))>g.arithmeticErrorBoundMm||
+       std::fabs(Dot(endRadial,unitNormal))>g.arithmeticErrorBoundMm||
+       std::fabs(Norm(endRadial)-g.radiusMm)>g.arithmeticErrorBoundMm)return false;
+    g.v=Cross(unitNormal,g.u);for(double& x:g.v)x*=static_cast<double>(direction);
+    if(std::fabs(Norm(g.v)-1.0)>OrthonormalTolerance||std::fabs(Dot(g.u,g.v))>OrthonormalTolerance)return false;
+    bool same=true;for(unsigned a=0U;a<3U;++a)same=same&&Bits(g.startMCS[a],g.endMCS[a]);
+    if(fullCircle!=same)return false;
+    double angle=fullCircle?TwoPi:std::atan2(Dot(endRadial,g.v),Dot(endRadial,g.u));
+    if(!fullCircle&&angle<=0.0)angle+=TwoPi;
+    if(!Positive(angle)||angle>TwoPi)return false;
+    g.arcSweepRad=angle;g.arcCenterMCS=center;g.arcNormal=normal;g.arcDirection=direction;g.axis=g.v;
+    g.travelMm=g.radiusMm*angle;g.minimumCircleRadiusMm=g.radiusMm;g.maximumCircleArcLengthMm=g.travelMm;
+    if(!Positive(g.travelMm)||g.travelMm>10000.0||g.arithmeticErrorBoundMm>g.travelMm/64.0)return false;
+    g.boundsMinMCS=g.boundsMaxMCS=g.startMCS;
+    for(unsigned a=0U;a<3U;++a){
+        const double amplitude=std::hypot(g.u[a],g.v[a]);
+        g.maxCircleTangentAbs[a]=amplitude==0.0?0.0:std::nextafter(amplitude*(1.0+16.0*std::numeric_limits<double>::epsilon()),
+            std::numeric_limits<double>::infinity());
+        g.maxCircleCurvatureAbs[a]=amplitude==0.0?0.0:std::nextafter(g.maxCircleTangentAbs[a]/g.radiusMm,
+            std::numeric_limits<double>::infinity());
+        double low=(std::min)(g.startMCS[a],g.endMCS[a]),high=(std::max)(g.startMCS[a],g.endMCS[a]);
+        double extreme=std::atan2(g.v[a],g.u[a]);if(extreme<0.0)extreme+=TwoPi;
+        for(unsigned k=0U;k<2U;++k){double q=extreme+static_cast<double>(k)*Pi;if(q>TwoPi)q-=TwoPi;
+            if(q<=angle){const double value=center[a]+g.radiusMm*(g.u[a]*std::cos(q)+g.v[a]*std::sin(q));
+                low=(std::min)(low,value);high=(std::max)(high,value);}}
+        g.boundsMinMCS[a]=std::nextafter(low-g.coordinateErrorBoundMm,-std::numeric_limits<double>::infinity());
+        g.boundsMaxMCS[a]=std::nextafter(high+g.coordinateErrorBoundMm,std::numeric_limits<double>::infinity());
+        if(!std::isfinite(g.maxCircleCurvatureAbs[a])||!std::isfinite(g.boundsMinMCS[a])||!std::isfinite(g.boundsMaxMCS[a]))return false;
+    }
+    g.version=Version;g.valid=true;out=g;return true;
+}
+}
+inline bool BuildLine(const NCG76SphereCoordinates::FrozenFrame& frame,const Point8& target,
+    double feed,Geometry& output) noexcept
+{
+    const auto frozenFrame=frame;const Point8 frozenTarget=target;output=Geometry{};
+    return Detail::DeriveLine(frozenFrame,frozenTarget,feed,output);
+}
+inline bool BuildArc(const NCG76SphereCoordinates::FrozenFrame& frame,const Point8& target,
+    const Point3& center,const Point3& normal,int direction,double feed,bool fullCircle,Geometry& output) noexcept
+{
+    const auto frozenFrame=frame;const Point8 frozenTarget=target;const Point3 frozenCenter=center,frozenNormal=normal;output=Geometry{};
+    return Detail::DeriveArc(frozenFrame,frozenTarget,frozenCenter,frozenNormal,direction,feed,fullCircle,output);
+}
 // Full admission check. Never call this from the periodic interpolation path.
 inline bool Valid(const Geometry& g) noexcept
 {
     if(!g.valid||g.version!=Version)return false;
+    if(g.kind!=Kind::Sphere){
+        Geometry expected{};
+        if(g.kind==Kind::Line)return Detail::DeriveLine(g.frame,g.endMCS,g.feedMmMin,expected)&&SameGeometry(g,expected);
+        if(g.kind!=Kind::Arc)return false;
+        bool full=true;for(unsigned a=0U;a<3U;++a)full=full&&Detail::Bits(g.startMCS[a],g.endMCS[a]);
+        return Detail::DeriveArc(g.frame,g.endMCS,g.arcCenterMCS,g.arcNormal,g.arcDirection,g.feedMmMin,full,expected)&&SameGeometry(g,expected);
+    }
     NCG76SphereCoordinates::NativePlan source{};Geometry expected{};
     return NCG76SphereCoordinates::BuildNative(g.frame,g.descriptor,source)==NCG76SphereCoordinates::Status::Ok&&
         Detail::Derive(source,expected)&&SameGeometry(g,expected);
@@ -197,8 +380,44 @@ inline bool LayerAt(const Geometry& g,unsigned index,Layer& output) noexcept
     if(Detail::Overlap(&g,sizeof(g),&output,sizeof(output)))return false;
     output=Layer{};
     if(!g.valid||g.version!=Version||index>g.circleLayerCount)return false;
+    if(g.kind==Kind::Line||g.kind==Kind::Arc){if(index!=0U)return false;output.center=g.endMCS;output.terminal=true;return true;}
+    if(g.kind!=Kind::Sphere)return false;
     Layer layer{};if(!Detail::RawLayer(g,index,layer))return false;
     output=layer;return true;
+}
+inline bool ArcAt(const Geometry& g,double angleRad,Point8& position,Point3& tangent,Point3& curvature) noexcept
+{
+    if(Detail::Overlap(&g,sizeof(g),&position,sizeof(position))||Detail::Overlap(&g,sizeof(g),&tangent,sizeof(tangent))||
+       Detail::Overlap(&g,sizeof(g),&curvature,sizeof(curvature))||Detail::Overlap(&position,sizeof(position),&tangent,sizeof(tangent))||
+       Detail::Overlap(&position,sizeof(position),&curvature,sizeof(curvature))||Detail::Overlap(&tangent,sizeof(tangent),&curvature,sizeof(curvature)))return false;
+    position=Point8{};tangent=Point3{};curvature=Point3{};
+    if(!g.valid||g.version!=Version||g.kind!=Kind::Arc||!std::isfinite(angleRad)||angleRad<0.0||angleRad>g.arcSweepRad)return false;
+    double sine=0.0,cosine=1.0;
+    if(angleRad==Pi*.5){sine=1.0;cosine=0.0;}
+    else if(angleRad==Pi){sine=0.0;cosine=-1.0;}
+    else if(angleRad==Pi*1.5){sine=-1.0;cosine=0.0;}
+    else if(angleRad!=0.0&&angleRad!=TwoPi){sine=std::sin(angleRad);cosine=std::cos(angleRad);}
+    position=g.startMCS;
+    for(unsigned a=0U;a<3U;++a){const double radial=g.u[a]*cosine+g.v[a]*sine;
+        position[a]=g.arcCenterMCS[a]+g.radiusMm*radial;
+        tangent[a]=-g.u[a]*sine+g.v[a]*cosine;curvature[a]=-radial/g.radiusMm;}
+    if(angleRad==0.0)position=g.startMCS;else if(angleRad==g.arcSweepRad)position=g.endMCS;
+    if(!Detail::Finite(position)||!Detail::Finite(tangent)||!Detail::Finite(curvature))return false;
+    for(unsigned a=0U;a<3U;++a)if(position[a]<g.boundsMinMCS[a]||position[a]>g.boundsMaxMCS[a])return false;
+    return true;
+}
+inline bool NominalAt(const Geometry& g,double fraction,Point8& position,Point3& tangent,Point3& curvature) noexcept
+{
+    if(Detail::Overlap(&g,sizeof(g),&position,sizeof(position))||Detail::Overlap(&g,sizeof(g),&tangent,sizeof(tangent))||
+       Detail::Overlap(&g,sizeof(g),&curvature,sizeof(curvature))||Detail::Overlap(&position,sizeof(position),&tangent,sizeof(tangent))||
+       Detail::Overlap(&position,sizeof(position),&curvature,sizeof(curvature))||Detail::Overlap(&tangent,sizeof(tangent),&curvature,sizeof(curvature)))return false;
+    position=Point8{};tangent=Point3{};curvature=Point3{};
+    if(!g.valid||g.version!=Version||!std::isfinite(fraction)||fraction<0.0||fraction>1.0)return false;
+    if(g.kind==Kind::Arc)return ArcAt(g,fraction==1.0?g.arcSweepRad:fraction*g.arcSweepRad,position,tangent,curvature);
+    if(g.kind!=Kind::Line||(g.travelMm==0.0&&fraction!=0.0))return false;
+    position=fraction==1.0?g.endMCS:g.startMCS;tangent=g.axis;curvature=Point3{};
+    if(fraction>0.0&&fraction<1.0)for(unsigned a=0U;a<3U;++a)position[a]=g.startMCS[a]+(g.endMCS[a]-g.startMCS[a])*fraction;
+    return Detail::Finite(position)&&Detail::Finite(tangent);
 }
 // Native analytic circle; tangent is dP/ds (unitless), curvature is dT/ds
 // (1/mm). Thus velocity=tangent*speed and acceleration=tangent*scalarAccel
@@ -213,6 +432,8 @@ inline bool CircleAt(const Geometry& g,unsigned layerIndex,double angleRad,Point
         Detail::Overlap(&tangent,sizeof(tangent),&curvature,sizeof(curvature)))return false;
     position=Point8{};tangent=Point3{};curvature=Point3{};
     if(!g.valid||g.version!=Version||!std::isfinite(angleRad)||angleRad<0.0||angleRad>TwoPi)return false;
+    if(g.kind==Kind::Arc)return layerIndex==0U&&ArcAt(g,angleRad,position,tangent,curvature);
+    if(g.kind!=Kind::Sphere)return false;
     Layer layer{};if(!LayerAt(g,layerIndex,layer)||layer.terminal)return false;
     double sine=0.0,cosine=1.0;
     if(angleRad==Pi*.5){sine=1.0;cosine=0.0;}

@@ -8,6 +8,7 @@
 
 #include "CompensationEngine.h"
 #include "EDM171G76Config.h"
+#include "HoldConfig.h"
 
 
 // ============================================================
@@ -141,6 +142,10 @@ public:
         std::vector<AxisContext>& axis,
         MotionCore& motion);
 
+    // Called during startup before NC/RT tasks; never creates or replaces a file.
+    bool LoadHoldRecoveryConfig(const std::string& filePath);
+    const NCHoldRecovery::Config& GetHoldRecoveryConfig() const noexcept {return m_holdRecoveryConfig;}
+
     const EDM171Config::G76CenterReturnSpeeds& GetG76CenterReturnSpeeds() const noexcept
     {
         return m_g76CenterReturnSpeeds;
@@ -202,6 +207,7 @@ public:
 private:
     // Loaded before NC startup; no runtime parameter or Motion callback I/O.
     EDM171Config::G76CenterReturnSpeeds m_g76CenterReturnSpeeds{};
+    NCHoldRecovery::Config m_holdRecoveryConfig{};
 
     // ========================================================
     // Singleton Protection

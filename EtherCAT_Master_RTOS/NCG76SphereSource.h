@@ -9,6 +9,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <string>
+#include <new>
 
 // EDM285: P50 source interpretation only. This header is deliberately separate
 // from the ordinary G76 mode registry, dispatch, recipes and Motion producers.
@@ -92,9 +93,19 @@ struct Receipt
     NCG76Sphere::Input input{}; // PROGRAM geometry. Map through frame exactly once.
     bool valid = false;
 };
+static_assert(std::is_trivially_destructible<Receipt>::value,
+    "P50 caller-storage receipt reset must have no destruction side effects");
 
 namespace Detail
 {
+// EDM293 FIX1: reset the caller-owned receipt in place, without a full receipt
+// temporary on the fixed RTSS stack. Placement construction allocates no
+// memory, and Build freezes aliased inputs first.
+inline void ClearReceipt(Receipt& receipt) noexcept
+{
+    receipt.~Receipt();
+    ::new (static_cast<void*>(&receipt)) Receipt{};
+}
 // The production literal resolver intentionally rounds G-code integers within
 // its compatibility tolerance. P50 additionally requires the authored G value
 // to be exactly 76, so a near-integer source cannot silently change identity.
@@ -196,23 +207,23 @@ inline Status Build(const NCParsedBlock& parsed, const NCTranslationSnapshot& sn
     const NCTranslationSnapshot frozenSnapshot = snapshot;
     const NCG76SphereCoordinates::Point8 frozenStart = acceptedStartMCS;
     const ModalB frozenModal = inherited;
-    output = Receipt{};
+    Detail::ClearReceipt(output);
     Words words{};
     const Status sourceStatus = Decode(parsed, frozenModal, words);
     if (sourceStatus != Status::Ok) return sourceStatus;
     if (words.inheritedB && frozenModal.current.run != frozenSnapshot.runToken)
         return Status::UnresolvedModalB;
     if (frozenSnapshot.unitsMode != 21) return Status::UnsupportedUnits;
-    Receipt candidate{};
-    if (NCG76SphereCoordinates::BuildFrame(frozenSnapshot, frozenStart, candidate.frame) !=
+    // The production caller owns this receipt in its heap workspace. Keep the
+    // nested coordinate output there instead of in another stack receipt.
+    if (NCG76SphereCoordinates::BuildFrame(frozenSnapshot, frozenStart, output.frame) !=
         NCG76SphereCoordinates::Status::Ok ||
-        NCG76SphereCoordinates::BuildInput(candidate.frame, words.authoredXYZ, words.targetMask,
+        NCG76SphereCoordinates::BuildInput(output.frame, words.authoredXYZ, words.targetMask,
             words.radiusMm, words.layerStepMm, words.feedMmMin, NCG76Sphere::RadiusLaw::Linear,
-            candidate.input) != NCG76SphereCoordinates::Status::Ok)
-        return Status::CoordinateRejected;
-    candidate.words = words;
-    candidate.valid = true;
-    output = candidate;
+            output.input) != NCG76SphereCoordinates::Status::Ok)
+    { Detail::ClearReceipt(output);return Status::CoordinateRejected; }
+    output.words = words;
+    output.valid = true;
     return Status::Ok;
 }
 

@@ -179,4 +179,90 @@ inline Status ValidateResolved(const NCParsedBlock& parsed,const NCBlock& block,
             std::memcmp(&block.param[i],&expected.param[i],sizeof(double))!=0)return Status::ResolvedMismatch;
     output=words;return Status::Ok;
 }
+
+// EDM295: bounded literal MEMORY program vocabulary for a disjoint XYZ feed
+// lane beside the configured C/U/V velocity lanes. This is source shape only;
+// the NC and RT owners must independently prove frame, axis mask and authority.
+enum class ProgramRowKind : unsigned char
+{ Invalid,Empty,Spindle,Dwell,Control,Setup,XYZFeed };
+inline bool NeutralProgramSetup(int g) noexcept
+{
+    switch(g){
+    case 21:case 90:case 91:case 17:case 15:case 40:case 49:
+    case 69:case 169:case 50:case 150:case 163:return true;
+    default:return false;
+    }
+}
+inline ProgramRowKind ClassifyProgramRow(const NCParsedBlock& row) noexcept
+{
+    if(row.error!=NCParseError::NONE||row.isBlockSkip||row.dependsOnMacroState||row.duplicateAddressMask||
+       row.controlType!=NCParsedControlType::NONE||row.assignment.prefix||!row.assignment.indexExpression.empty()||
+       !row.assignment.valueExpression.empty()||row.gotoStatement.conditional||
+       !row.gotoStatement.conditionExpression.empty()||!row.gotoStatement.targetExpression.empty())return ProgramRowKind::Invalid;
+    if(row.isEmpty){
+        if(row.gCount||row.mCount)return ProgramRowKind::Invalid;
+        for(const auto& expression:row.gExpressions)if(!expression.empty())return ProgramRowKind::Invalid;
+        for(const auto& expression:row.mExpressions)if(!expression.empty())return ProgramRowKind::Invalid;
+        for(char word='A';word<='Z';++word)
+            if(row.has(word)||!row.expression(word).empty())return ProgramRowKind::Invalid;
+        return ProgramRowKind::Empty;
+    }
+    if(HasReservedM(row)){
+        Words words{};return Decode(row,words)==Status::Ok?ProgramRowKind::Spindle:ProgramRowKind::Invalid;
+    }
+    if(row.gCount<0||row.gCount>1||row.mCount<0||row.mCount>1||(row.gCount&&row.mCount))return ProgramRowKind::Invalid;
+    for(unsigned i=0U;i<row.gExpressions.size();++i)
+        if(i>=static_cast<unsigned>(row.gCount)&&!row.gExpressions[i].empty())return ProgramRowKind::Invalid;
+    for(unsigned i=0U;i<row.mExpressions.size();++i)
+        if(i>=static_cast<unsigned>(row.mCount)&&!row.mExpressions[i].empty())return ProgramRowKind::Invalid;
+    int g=-1,m=-1;
+    if(row.gCount&&!Detail::Integer(row.gExpressions[0],g))return ProgramRowKind::Invalid;
+    if(row.mCount&&!Detail::Integer(row.mExpressions[0],m))return ProgramRowKind::Invalid;
+    ProgramRowKind kind=ProgramRowKind::Empty;
+    if(row.gCount){
+        kind=g==1?ProgramRowKind::XYZFeed:g==4?ProgramRowKind::Dwell:
+            NeutralProgramSetup(g)?ProgramRowKind::Setup:ProgramRowKind::Invalid;
+    }else if(row.mCount){
+        kind=(m==0||m==1||m==2||m==30)?ProgramRowKind::Control:ProgramRowKind::Invalid;
+    }
+    if(kind==ProgramRowKind::Invalid)return kind;
+    unsigned xyz=0U;bool feed=false;
+    for(char word='A';word<='Z';++word){
+        if(!row.has(word)){if(!row.expression(word).empty())return ProgramRowKind::Invalid;continue;}
+        if(word=='N'){
+            int n=0;if(!Detail::Integer(row.expression(word),n))return ProgramRowKind::Invalid;
+        }else if(kind==ProgramRowKind::XYZFeed&&(word=='X'||word=='Y'||word=='Z'||word=='F')){
+            double value=0.0;if(!Detail::Literal(row.expression(word),value))return ProgramRowKind::Invalid;
+            if(word=='F'){if(value<=0.0||value>100.0)return ProgramRowKind::Invalid;feed=true;}
+            else xyz|=1U<<static_cast<unsigned>(word-'X');
+        }else if(kind==ProgramRowKind::Dwell&&(word=='X'||word=='P')){
+            double duration=0.0;if(!Detail::Literal(row.expression(word),duration)||duration<0.0)return ProgramRowKind::Invalid;
+        }else return ProgramRowKind::Invalid;
+    }
+    if(kind==ProgramRowKind::XYZFeed&&(!xyz||!feed))return ProgramRowKind::Invalid;
+    if(kind==ProgramRowKind::Dwell&&row.has('X')&&row.has('P'))return ProgramRowKind::Invalid;
+    return kind;
+}
+inline bool ValidateProgramResolved(const NCParsedBlock& row,const NCBlock& block) noexcept
+{
+    const auto kind=ClassifyProgramRow(row);
+    if(kind==ProgramRowKind::Invalid)return false;
+    if(kind==ProgramRowKind::Spindle){Words words{};return ValidateResolved(row,block,words)==Status::Ok;}
+    NCBlock expected{};expected.isEmpty=row.isEmpty;
+    if(row.gCount){int g=0;if(!Detail::Integer(row.gExpressions[0],g))return false;
+        expected.hasG=true;expected.gCount=1;expected.gCode=g;expected.gCodes[0]=g;}
+    if(row.mCount){int m=0;if(!Detail::Integer(row.mExpressions[0],m))return false;
+        expected.mCount=1;expected.mCode[0]=m;}
+    for(char word='A';word<='Z';++word)if(row.has(word)){
+        double value=0.0;if(!Detail::Literal(row.expression(word),value))return false;
+        expected.hasParam[word-'A']=true;expected.param[word-'A']=value;
+    }
+    if(block.isEmpty!=expected.isEmpty||block.isBlockSkip||block.isGoto||block.gotoTarget!=expected.gotoTarget||
+       block.hasG!=expected.hasG||block.gCount!=expected.gCount||block.gCode!=expected.gCode||block.mCount!=expected.mCount)return false;
+    for(unsigned i=0U;i<NC_MAX_G_CODES_PER_BLOCK;++i)if(block.gCodes[i]!=expected.gCodes[i])return false;
+    for(unsigned i=0U;i<NC_MAX_M_CODES_PER_BLOCK;++i)if(block.mCode[i]!=expected.mCode[i])return false;
+    for(unsigned i=0U;i<26U;++i)if(block.hasParam[i]!=expected.hasParam[i]||
+        std::memcmp(&block.param[i],&expected.param[i],sizeof(double)))return false;
+    return true;
+}
 }

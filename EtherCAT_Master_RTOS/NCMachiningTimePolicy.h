@@ -10,18 +10,26 @@
 #include <string>
 
 // EDM340: D/H are nonmodal minutes only for an independently admitted EDM
-// G01/G02/G03, P50 or explicitly timed P11/P12/P13/P14/P15 parent. Pure syntax never grants
-// that runtime authority; untimed P11/P12/P13/P14/P15 retain the legacy interpretation.
+// G01/G02/G03, P50 or an explicitly opted-in contour parent. Pure syntax
+// never grants that runtime authority. EDM358 also admits P01-P07 L;
+// sources without D/H/L retain legacy routing.
 namespace NCMachiningTimePolicy
 {
 using Config=NCMachiningTime::Config;
 constexpr char TotalAddress='D',AdditionalAddress='H';
 constexpr std::uint64_t MillionthsPerMinute=1000000ULL,UsPerMillionthMinute=60ULL;
 inline bool IsProcessCode(int code) noexcept {return code==1||code==2||code==3||code==76;}
-inline bool AllowedAddress(int code,char a) noexcept
+inline bool FixedRadiusMode(double mode) noexcept
+{return mode>=1.0&&mode<=7.0&&std::floor(mode)==mode;}
+inline bool TimedContourMode(double mode) noexcept
+{return FixedRadiusMode(mode)||(mode>=11.0&&mode<=17.0&&std::floor(mode)==mode)||
+    (mode>=21.0&&mode<=27.0&&std::floor(mode)==mode);}
+inline bool PolygonMode(double mode) noexcept
+{return mode==6.0||mode==7.0||mode==16.0||mode==17.0||mode==26.0||mode==27.0;}
+inline bool AllowedAddress(int code,char a,double mode=0.0) noexcept
 {
     if(a=='N'||a=='F'||a=='B'||a==TotalAddress||a==AdditionalAddress||a=='X'||a=='Y'||a=='Z')return true;
-    return code==76?(a=='P'||a=='R'||a=='K'):
+    return code==76?(a=='L'||a=='P'||a=='R'||a=='K'||(a=='Q'&&PolygonMode(mode))):
         (a=='L'||((code==2||code==3)&&(a=='I'||a=='J'||a=='K'||a=='R')));
 }
 inline bool LiteralNumber(const std::string& expression,double& output) noexcept
@@ -79,15 +87,16 @@ template<class Block> inline bool LegacyOwner(const Block& block,char address) n
 // The full Decode below still rejects every mixed-G source.
 inline bool TimedP11Intent(const NCBlock& block) noexcept
 {
-    return Contains(block,76)&&block.has('P')&&(block.val('P')==11.0||block.val('P')==12.0||block.val('P')==13.0||block.val('P')==14.0||block.val('P')==15.0)&&
-        (block.has(TotalAddress)||block.has(AdditionalAddress));
+    return Contains(block,76)&&block.has('P')&&TimedContourMode(block.val('P'))&&
+        (block.has(TotalAddress)||block.has(AdditionalAddress)||block.has('L'));
 }
 inline bool TimedP11Intent(const NCParsedBlock& block) noexcept
 {
-    return Contains(block,76)&&block.has('P')&&(ExactIntegerLiteral(block.expression('P'),11U)||
-        ExactIntegerLiteral(block.expression('P'),12U)||ExactIntegerLiteral(block.expression('P'),13U)||
-        ExactIntegerLiteral(block.expression('P'),14U)||ExactIntegerLiteral(block.expression('P'),15U))&&
-        (block.has(TotalAddress)||block.has(AdditionalAddress));
+    if(!Contains(block,76)||!block.has('P')||
+       !(block.has(TotalAddress)||block.has(AdditionalAddress)||block.has('L')))return false;
+    for(unsigned mode:{1U,2U,3U,4U,5U,6U,7U,11U,12U,13U,14U,15U,16U,17U,21U,22U,23U,24U,25U,26U,27U})
+        if(ExactIntegerLiteral(block.expression('P'),mode))return true;
+    return false;
 }
 template<class Block> inline bool RequestsImpl(const Block& block) noexcept
 {
@@ -146,12 +155,16 @@ inline bool ResolvedOwner(const NCBlock& block) noexcept
     if(block.isEmpty||block.isBlockSkip||block.isGoto||!block.hasG||block.gCount!=1||
        block.gCodes[0]!=block.gCode||!IsProcessCode(block.gCode)||block.mCount!=0||block.gotoTarget!=-1||
        (block.gCode==76&&(!block.has('P')||(block.val('P')!=50.0&&
-           !((block.val('P')==11.0||block.val('P')==12.0||block.val('P')==13.0||block.val('P')==14.0||block.val('P')==15.0)&&
-             (block.has(TotalAddress)||block.has(AdditionalAddress)))))))return false;
+           !(TimedContourMode(block.val('P'))&&
+             (block.has(TotalAddress)||block.has(AdditionalAddress)||
+              block.has('L')))))))return false;
+    if(block.gCode==76&&PolygonMode(block.val('P'))&&(!block.has('Q')||!std::isfinite(block.val('Q'))||
+       block.val('Q')<3.0||block.val('Q')>12.0||std::floor(block.val('Q'))!=block.val('Q')))return false;
+    if(block.gCode==76&&block.has('L')&&(std::signbit(block.val('L'))||block.val('L')>99.0||std::floor(block.val('L'))!=block.val('L')))return false;
     for(std::size_t i=1U;i<NC_MAX_G_CODES_PER_BLOCK;++i)if(block.gCodes[i]!=0)return false;
     for(int value:block.mCode)if(value!=-1)return false;
     for(char a='A';a<='Z';++a){
-        if(block.has(a)){if(!AllowedAddress(block.gCode,a)||!std::isfinite(block.val(a)))return false;}
+        if(block.has(a)){if(!AllowedAddress(block.gCode,a,block.val('P'))||!std::isfinite(block.val(a)))return false;}
         else if(block.val(a)!=0.0||std::signbit(block.val(a)))return false;
     }
     std::uint64_t ignored=0ULL;
@@ -168,9 +181,12 @@ inline bool Decode(const NCParsedBlock& parsed,const NCBlock& block,Config& outp
     for(std::size_t i=1U;i<NC_MAX_G_CODES_PER_BLOCK;++i)if(block.gCodes[i]!=0)return false;
     for(int value:block.mCode)if(value!=-1)return false;
     double code=0.;if(!LiteralNumber(parsed.gExpressions[0],code)||code!=block.gCode)return false;
-    if(block.gCode==76&&(block.val('P')==11.0||block.val('P')==12.0||block.val('P')==13.0||block.val('P')==14.0||block.val('P')==15.0)&&
+    if(block.gCode==76&&TimedContourMode(block.val('P'))&&
         (!ExactIntegerLiteral(parsed.gExpressions[0],76U)||
          !ExactIntegerLiteral(parsed.expression('P'),static_cast<unsigned>(block.val('P')))))return false;
+    if(block.gCode==76&&PolygonMode(block.val('P'))&&
+       !ExactIntegerLiteral(parsed.expression('Q'),static_cast<unsigned>(block.val('Q'))))return false;
+    if(block.gCode==76&&block.has('L')&&!ExactIntegerLiteral(parsed.expression('L'),static_cast<unsigned>(block.val('L'))))return false;
     for(std::size_t i=1U;i<parsed.gExpressions.size();++i)if(!parsed.gExpressions[i].empty())return false;
     for(const auto& expression:parsed.mExpressions)if(!expression.empty())return false;
     for(char a='A';a<='Z';++a){

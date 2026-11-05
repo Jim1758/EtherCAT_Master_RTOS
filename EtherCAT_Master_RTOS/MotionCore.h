@@ -5618,6 +5618,10 @@ private:
         std::uint32_t declaredPreviousParents=0U;
         std::uint32_t finishRequiredCount=0U;
         NCMachiningTime::Config machiningTime{};
+        // Scoped copies protect completion settings independently of the
+        // main motion bank, just as machiningTime protects D/H.
+        std::uint32_t orbitInspectionRounds=0U,orbitThresholdScaled=0U;
+        std::uint8_t orbitRetryLimit=0U;
         bool enabled=false;
     };
     static_assert(sizeof(G76SphereHoldFrozen)<=256U,"HOLD settings remain a small independent page");

@@ -369,6 +369,41 @@ inline bool Valid(const Geometry& g) noexcept
     if(!g.valid||g.version!=Version)return false;
     if(g.kind==Kind::OrbitContour){
         Geometry expected{};
+        if(NCG76Mode::IsFixedRadius(NCG76OrbitContour::ModeP(g)))
+            return NCG76OrbitContour::BuildTimedFixedRadius(NCG76OrbitContour::ModeP(g),g.frame,
+                g.orbit.source.end,g.orbit.source.radiusMm,g.orbit.source.shapeAngleDeg,
+                g.orbit.source.feedMmMin,g.orbit.finishEnabled,expected,g.orbit.source.polygonSides)&&SameGeometry(g,expected);
+        if(NCG76OrbitContour::ModeP(g)==27U)
+            return NCG76OrbitContour::BuildTimedP27(g.frame,g.orbit.source.end,g.orbit.source.radiusMm,
+                g.orbit.source.shapeAngleDeg,g.orbit.source.feedMmMin,g.orbit.finishEnabled,
+                g.orbit.source.polygonSides,expected)&&SameGeometry(g,expected);
+        if(NCG76OrbitContour::ModeP(g)==26U)
+            return NCG76OrbitContour::BuildTimedP26(g.frame,g.orbit.source.end,g.orbit.source.radiusMm,
+                g.orbit.source.shapeAngleDeg,g.orbit.source.feedMmMin,g.orbit.finishEnabled,
+                g.orbit.source.polygonSides,expected)&&SameGeometry(g,expected);
+        if(NCG76OrbitContour::ModeP(g)==25U)
+            return NCG76OrbitContour::BuildTimedP25(g.frame,g.orbit.source.end,g.orbit.source.radiusMm,
+                g.orbit.source.shapeAngleDeg,g.orbit.source.feedMmMin,g.orbit.finishEnabled,expected)&&SameGeometry(g,expected);
+        if(NCG76OrbitContour::ModeP(g)==24U)
+            return NCG76OrbitContour::BuildTimedP24(g.frame,g.orbit.source.end,g.orbit.source.radiusMm,
+                g.orbit.source.shapeAngleDeg,g.orbit.source.feedMmMin,g.orbit.finishEnabled,expected)&&SameGeometry(g,expected);
+        if(NCG76OrbitContour::ModeP(g)==23U)
+            return NCG76OrbitContour::BuildTimedP23(g.frame,g.orbit.source.end,g.orbit.source.radiusMm,
+                g.orbit.source.shapeAngleDeg,g.orbit.source.feedMmMin,g.orbit.finishEnabled,expected)&&SameGeometry(g,expected);
+        if(NCG76OrbitContour::ModeP(g)==22U)
+            return NCG76OrbitContour::BuildTimedP22(g.frame,g.orbit.source.end,g.orbit.source.radiusMm,
+                g.orbit.source.shapeAngleDeg,g.orbit.source.feedMmMin,g.orbit.finishEnabled,expected)&&SameGeometry(g,expected);
+        if(NCG76OrbitContour::ModeP(g)==21U)
+            return NCG76OrbitContour::BuildTimedP21(g.frame,g.orbit.source.end,g.orbit.source.radiusMm,
+                g.orbit.source.shapeAngleDeg,g.orbit.source.feedMmMin,g.orbit.finishEnabled,expected)&&SameGeometry(g,expected);
+        if(NCG76OrbitContour::ModeP(g)==17U)
+            return NCG76OrbitContour::BuildTimedP17(g.frame,g.orbit.source.end,g.orbit.source.radiusMm,
+                g.orbit.source.shapeAngleDeg,g.orbit.source.feedMmMin,g.orbit.finishEnabled,
+                g.orbit.source.polygonSides,expected)&&SameGeometry(g,expected);
+        if(NCG76OrbitContour::ModeP(g)==16U)
+            return NCG76OrbitContour::BuildTimedP16(g.frame,g.orbit.source.end,g.orbit.source.radiusMm,
+                g.orbit.source.shapeAngleDeg,g.orbit.source.feedMmMin,g.orbit.finishEnabled,
+                g.orbit.source.polygonSides,expected)&&SameGeometry(g,expected);
         if(NCG76OrbitContour::ModeP(g)==15U)
             return NCG76OrbitContour::BuildTimedP15(g.frame,g.orbit.source.end,g.orbit.source.radiusMm,
                 g.orbit.source.shapeAngleDeg,g.orbit.source.feedMmMin,g.orbit.finishEnabled,expected)&&SameGeometry(g,expected);
@@ -403,7 +438,7 @@ inline bool LayerAt(const Geometry& g,unsigned index,Layer& output) noexcept
     if(!g.valid||g.version!=Version||index>g.circleLayerCount)return false;
     if(g.kind==Kind::Line||g.kind==Kind::Arc){if(index!=0U)return false;output.center=g.endMCS;output.terminal=true;return true;}
     if(g.kind==Kind::OrbitContour){
-        if(index!=0U||NCG76OrbitContour::ModeP(g)!=11U)return false;
+        if(index!=0U||!NCG76OrbitContour::IsCircleContour(g))return false;
         output.center=g.endMCS;output.radiusMm=g.radiusMm;output.arcLengthMm=TwoPi*g.radiusMm;
         return NCG76OrbitContour::FinishEnabled(g);
     }
@@ -482,24 +517,51 @@ namespace NCG76OrbitContour
 namespace Detail
 {
 inline unsigned RawMode(const Geometry& g) noexcept
-{return g.orbit.contourMode==0U?11U:g.orbit.contourMode==12U?12U:g.orbit.contourMode==13U?13U:g.orbit.contourMode==14U?14U:g.orbit.contourMode==15U?15U:0U;}
+{return (g.orbit.contourMode>=1U&&g.orbit.contourMode<=7U)?g.orbit.contourMode:g.orbit.contourMode==0U?11U:g.orbit.contourMode==12U?12U:g.orbit.contourMode==13U?13U:g.orbit.contourMode==14U?14U:g.orbit.contourMode==15U?15U:g.orbit.contourMode==16U?16U:g.orbit.contourMode==17U?17U:g.orbit.contourMode==21U?21U:g.orbit.contourMode==22U?22U:g.orbit.contourMode==23U?23U:g.orbit.contourMode==24U?24U:g.orbit.contourMode==25U?25U:g.orbit.contourMode==26U?26U:g.orbit.contourMode==27U?27U:0U;}
 inline bool Ready(const Geometry& g) noexcept
 {
     return g.kind==NCG76SphereRuntimeGeometry::Kind::OrbitContour&&g.valid&&
         g.version==NCG76SphereRuntimeGeometry::Version&&g.orbit.valid&&g.orbit.version==Version&&
         NCG76SphereRuntimeGeometry::Detail::Positive(g.radiusMm)&&
         NCG76SphereRuntimeGeometry::Detail::Positive(g.orbit.nominalLengthMm)&&
-        RawMode(g)!=0U&&g.orbit.source.targetAxis==(RawMode(g)!=11U);
+        RawMode(g)!=0U&&g.orbit.source.targetAxis==(RawMode(g)!=11U)&&
+        (NCG76Mode::IsPolygon(RawMode(g))?NCG76Mode::ValidPolygonSides(g.orbit.source.polygonSides):g.orbit.source.polygonSides==0U);
 }
 inline bool SameFixed(const Point8& a,const Point8& b) noexcept
 {for(unsigned i=3U;i<8U;++i)if(std::memcmp(&a[i],&b[i],sizeof(double))!=0)return false;return true;}
 inline bool NativeVertex(const Geometry& g,unsigned vertex,Point8& output) noexcept
 {
-    if(vertex>NominalLegCount)return false;
+    const bool expansion=RawMode(g)==21U||RawMode(g)==22U||RawMode(g)==23U||RawMode(g)==24U||RawMode(g)==25U||RawMode(g)==26U||RawMode(g)==27U;
+    const bool fixedRadius=NCG76Mode::IsFixedRadius(RawMode(g));
+    const unsigned count=expansion||fixedRadius?26U:NominalLegCount;
+    if(vertex>count)return false;
     if(vertex==0U){output=g.startMCS;return true;}
-    if(vertex==NominalLegCount){output=g.endMCS;return true;}
+    if(vertex==count||(expansion&&vertex==1U)){output=g.endMCS;return true;}
+    if(fixedRadius){
+        // Vertex 1 is the initial radial entry. The following 24 chords
+        // advance the center with constant R, then vertex 26 returns to center.
+        const unsigned k=vertex-1U;double x=0.0,y=0.0;
+        if(!NCG76Mode::UnitBoundary(RawMode(g),k,x,y,g.orbit.source.polygonSides))return false;
+        const double t=static_cast<double>(k)/24.0;
+        output=g.startMCS;
+        for(unsigned a=0U;a<3U;++a){
+            const double center=k==0U?g.orbit.centerStartMCS[a]:k==24U?g.orbit.centerEndMCS[a]:
+                g.orbit.centerStartMCS[a]+(g.orbit.centerEndMCS[a]-g.orbit.centerStartMCS[a])*t;
+            output[a]=center+g.radiusMm*(g.orbit.unitU[a]*x+g.orbit.unitV[a]*y);
+        }
+        return NCG76SphereRuntimeGeometry::Detail::Finite(output)&&SameFixed(output,g.startMCS);
+    }
+    if(expansion){
+        const unsigned k=vertex-1U;double x=0.0,y=0.0;
+        if(!NCG76Mode::UnitBoundary(RawMode(g),k,x,y,g.orbit.source.polygonSides))return false;
+        const double t=static_cast<double>(k)/24.0;
+        output=g.startMCS;
+        for(unsigned a=0U;a<3U;++a)
+            output[a]=g.orbit.centerEndMCS[a]+(g.radiusMm*t)*(g.orbit.unitU[a]*x+g.orbit.unitV[a]*y);
+        return NCG76SphereRuntimeGeometry::Detail::Finite(output)&&SameFixed(output,g.startMCS);
+    }
     double x=0.0,y=0.0;
-    if(!NCG76Mode::UnitBoundary(RawMode(g),vertex,x,y))return false;
+    if(!NCG76Mode::UnitBoundary(RawMode(g),vertex,x,y,g.orbit.source.polygonSides))return false;
     const double t=static_cast<double>(vertex)/24.0;
     output=g.startMCS;
     for(unsigned a=0U;a<3U;++a){
@@ -514,12 +576,15 @@ inline double Distance(const Point8& a,const Point8& b) noexcept
 inline bool NativeFinishVertex(const Geometry& g,unsigned vertex,Point8& output) noexcept
 {
     const unsigned mode=RawMode(g);
-    if((mode!=12U&&mode!=13U&&mode!=14U&&mode!=15U)||vertex>4U)return false;
+    const unsigned count=NCG76Mode::IsPolygon(mode)?g.orbit.source.polygonSides:4U;
+    const bool straight=NCG76Mode::IsRecognized(mode)&&NCG76Mode::CanonicalContourMode(mode)!=11U;
+    if(!straight||(NCG76Mode::IsPolygon(mode)&&!NCG76Mode::ValidPolygonSides(count))||vertex>count)return false;
     // Do not independently spell the seam; it is the exact released final
     // grow endpoint, including coordinate cancellation and signed zero bits.
-    if(vertex==0U||vertex==4U)return NativeVertex(g,24U,output);
+    if(vertex==0U||vertex==count)return NativeVertex(g,(NCG76Mode::IsFixedRadius(mode)||NCG76Mode::IsHoleExpansion(mode))?25U:24U,output);
     double x=0.0,y=0.0;
-    if(!NCG76Mode::UnitBoundary(mode,vertex*6U,x,y))return false;
+    if(NCG76Mode::IsPolygon(mode)){if(!NCG76Mode::PolygonVertex(count,vertex,x,y))return false;}
+    else if(!NCG76Mode::UnitBoundary(mode,vertex*6U,x,y))return false;
     output=g.startMCS;
     for(unsigned a=0U;a<3U;++a)
         output[a]=g.orbit.centerEndMCS[a]+g.radiusMm*(g.orbit.unitU[a]*x+g.orbit.unitV[a]*y);
@@ -535,8 +600,18 @@ inline bool Within(const Geometry& g,const Point8& p) noexcept
 
 inline unsigned ModeP(const Geometry& g) noexcept
 {return Detail::Ready(g)?Detail::RawMode(g):0U;}
+inline unsigned NominalLegCountFor(const Geometry& g) noexcept
+{const unsigned mode=ModeP(g);return NCG76Mode::IsFixedRadius(mode)||NCG76Mode::IsHoleExpansion(mode)?26U:mode?NominalLegCount:0U;}
+inline bool IsExpansionContour(const Geometry& g) noexcept
+{const unsigned mode=ModeP(g);return mode==21U||mode==22U||mode==23U||mode==24U||mode==25U||mode==26U||mode==27U;}
+inline bool IsFixedRadiusContour(const Geometry& g) noexcept
+{return NCG76Mode::IsFixedRadius(ModeP(g));}
+inline bool IsCircleContour(const Geometry& g) noexcept
+{const unsigned mode=ModeP(g);return mode!=0U&&NCG76Mode::CanonicalContourMode(mode)==11U;}
 inline bool IsFourSideContour(const Geometry& g) noexcept
-{const unsigned mode=ModeP(g);return mode==12U||mode==13U||mode==14U||mode==15U;}
+{const unsigned mode=ModeP(g);return mode!=0U&&(NCG76Mode::CanonicalContourMode(mode)==12U||NCG76Mode::CanonicalContourMode(mode)==13U);}
+inline bool IsStraightSideContour(const Geometry& g) noexcept
+{return IsFourSideContour(g)||NCG76Mode::IsPolygon(ModeP(g));}
 inline bool EndpointAt(const Geometry& g,unsigned vertex,Point8& output) noexcept
 {
     if(NCG76SphereRuntimeGeometry::Detail::Overlap(&g,sizeof(g),&output,sizeof(output)))return false;
@@ -547,7 +622,24 @@ inline bool NominalCenterAt(const Geometry& g,unsigned index,double fraction,Poi
 {
     if(NCG76SphereRuntimeGeometry::Detail::Overlap(&g,sizeof(g),&output,sizeof(output)))return false;
     output=Point8{};
-    if(!Detail::Ready(g)||index>=NominalLegCount||!std::isfinite(fraction)||fraction<0.0||fraction>1.0)return false;
+    if(!Detail::Ready(g)||index>=NominalLegCountFor(g)||!std::isfinite(fraction)||fraction<0.0||fraction>1.0)return false;
+    if(IsFixedRadiusContour(g)){
+        if(index==0U){output=g.startMCS;return true;}
+        if(index==25U){output=g.endMCS;return true;}
+        const double t=(static_cast<double>(index-1U)+fraction)/24.0;
+        output=g.startMCS;
+        for(unsigned a=0U;a<3U;++a)output[a]=t==0.0?g.orbit.centerStartMCS[a]:t==1.0?g.orbit.centerEndMCS[a]:
+            g.orbit.centerStartMCS[a]+(g.orbit.centerEndMCS[a]-g.orbit.centerStartMCS[a])*t;
+        return Detail::Within(g,output);
+    }
+    if(Detail::RawMode(g)==21U||Detail::RawMode(g)==22U||Detail::RawMode(g)==23U||Detail::RawMode(g)==24U||Detail::RawMode(g)==25U||Detail::RawMode(g)==26U||Detail::RawMode(g)==27U){
+        if(index!=0U||fraction==1.0){output=g.endMCS;return true;}
+        if(fraction==0.0){output=g.startMCS;return true;}
+        output=g.startMCS;
+        for(unsigned a=0U;a<3U;++a)output[a]=g.orbit.centerStartMCS[a]+
+            (g.orbit.centerEndMCS[a]-g.orbit.centerStartMCS[a])*fraction;
+        return Detail::Within(g,output);
+    }
     if(index==24U){output=g.endMCS;return true;}
     const double t=(static_cast<double>(index)+fraction)/24.0;
     output=g.startMCS;
@@ -566,7 +658,7 @@ inline bool NominalLegAt(const Geometry& g,unsigned index,Point8& begin,Point8& 
         for(unsigned b=0U;b<a;++b)if(Overlap(pointers[a],sizes[a],pointers[b],sizes[b]))return false;
     }
     begin=end=center=Point8{};length=prefix=0.0;
-    if(!Detail::Ready(g)||index>=NominalLegCount)return false;
+    if(!Detail::Ready(g)||index>=NominalLegCountFor(g))return false;
     const unsigned block=index/CoarseStride;
     prefix=g.orbit.coarsePrefix[block];
     if(!std::isfinite(prefix)||prefix<0.0)return false;
@@ -589,12 +681,12 @@ inline double NominalLength(const Geometry& g) noexcept
 inline bool FinishEnabled(const Geometry& g) noexcept
 {return Detail::Ready(g)&&g.orbit.finishEnabled;}
 inline unsigned FinishLegCount(const Geometry& g) noexcept
-{return IsFourSideContour(g)&&FinishEnabled(g)?4U:0U;}
+{return !FinishEnabled(g)?0U:NCG76Mode::IsPolygon(ModeP(g))?g.orbit.source.polygonSides:IsFourSideContour(g)?4U:0U;}
 inline bool FinishVertexAt(const Geometry& g,unsigned vertex,Point8& output) noexcept
 {
     if(NCG76SphereRuntimeGeometry::Detail::Overlap(&g,sizeof(g),&output,sizeof(output)))return false;
     output=Point8{};
-    return FinishLegCount(g)==4U&&Detail::NativeFinishVertex(g,vertex,output)&&Detail::Within(g,output);
+    return FinishLegCount(g)!=0U&&Detail::NativeFinishVertex(g,vertex,output)&&Detail::Within(g,output);
 }
 inline bool FinishLegAt(const Geometry& g,unsigned side,Point8& begin,Point8& end,
     Point8& center,double& length,double& prefix) noexcept
@@ -607,7 +699,8 @@ inline bool FinishLegAt(const Geometry& g,unsigned side,Point8& begin,Point8& en
         for(unsigned b=0U;b<a;++b)if(Overlap(pointers[a],sizes[a],pointers[b],sizes[b]))return false;
     }
     begin=end=center=Point8{};length=prefix=0.0;
-    if(FinishLegCount(g)!=4U||side>=4U)return false;
+    const unsigned count=FinishLegCount(g);
+    if(!count||side>=count)return false;
     Point8 previous{},next{};
     if(!Detail::NativeFinishVertex(g,0U,previous)||!Detail::Within(g,previous))return false;
     for(unsigned i=0U;i<=side;++i){
@@ -630,24 +723,28 @@ inline double FinishEntryLength(const Geometry& g) noexcept
 inline double FinishLength(const Geometry& g) noexcept
 {
     Point8 begin{},end{},center{};double length=0.0,prefix=0.0;
-    if(!FinishLegAt(g,3U,begin,end,center,length,prefix))return 0.0;
+    const unsigned count=FinishLegCount(g);
+    if(!count||!FinishLegAt(g,count-1U,begin,end,center,length,prefix))return 0.0;
     const double total=prefix+length;
     return std::isfinite(total)&&total>prefix?total:0.0;
 }
 
 inline bool BuildTimedContour(unsigned modeP,const NCG76SphereCoordinates::FrozenFrame& inputFrame,const Point3& programTarget,
-    double radiusMm,double shapeAngleDeg,double feedMmMin,bool finish,Geometry& output) noexcept
+    double radiusMm,double shapeAngleDeg,double feedMmMin,bool finish,Geometry& output,unsigned polygonSides=0U) noexcept
 {
     const auto frame=inputFrame;const Point3 target=programTarget;
+    const bool expansion=NCG76Mode::IsHoleExpansion(modeP),fixedRadius=NCG76Mode::IsFixedRadius(modeP);
+    const bool circle=NCG76Mode::CanonicalContourMode(modeP)==11U;
     output=Geometry{};
-    if((modeP!=11U&&modeP!=12U&&modeP!=13U&&modeP!=14U&&modeP!=15U)||!NCG76SphereCoordinates::ValidFrame(frame)||frame.translation.rotationPlane!=17||
+    if(!NCG76Mode::IsRecognized(modeP)||
+        (NCG76Mode::IsPolygon(modeP)?!NCG76Mode::ValidPolygonSides(polygonSides):polygonSides!=0U)||!NCG76SphereCoordinates::ValidFrame(frame)||frame.translation.rotationPlane!=17||
         !NCG76::ValidShapeAngle(shapeAngleDeg)||!std::isfinite(radiusMm)||radiusMm<=0.0||radiusMm>NCG76::MaximumRadiusMm||
         !std::isfinite(feedMmMin)||feedMmMin<=0.0||feedMmMin>NCG76::MaximumFeedMmMin||
         !NCG76SphereRuntimeGeometry::Detail::Finite(target))return false;
     NCG76::PlanInput source{};
     for(unsigned a=0U;a<3U;++a){source.start[a]=frame.programStart[a];source.end[a]=target[a];}
     source.radiusMm=radiusMm;source.feedMmMin=feedMmMin;source.shapeAngleDeg=shapeAngleDeg;
-    source.targetAxis=modeP!=11U;
+    source.targetAxis=modeP!=11U;source.polygonSides=polygonSides;
     Point3 sourceDelta{};double sourceEnvelope=0.0;
     if(!NCG76::Detail::ValidInput(source,sourceDelta,sourceEnvelope))return false;
     NCG76::Detail::OrbitBasis basis{};
@@ -687,9 +784,9 @@ inline bool BuildTimedContour(unsigned modeP,const NCG76SphereCoordinates::Froze
     for(unsigned a=0U;a<3U;++a){
         const double amplitude=std::hypot(g.u[a],g.v[a]);
         envelope=(std::max)(envelope,(std::max)(std::fabs(g.startMCS[a]),std::fabs(g.endMCS[a]))+g.radiusMm*amplitude);
-        g.maxCircleTangentAbs[a]=modeP!=11U||amplitude==0.0?0.0:std::nextafter(amplitude*(1.0+16.0*std::numeric_limits<double>::epsilon()),
+        g.maxCircleTangentAbs[a]=!circle||amplitude==0.0?0.0:std::nextafter(amplitude*(1.0+16.0*std::numeric_limits<double>::epsilon()),
             std::numeric_limits<double>::infinity());
-        g.maxCircleCurvatureAbs[a]=modeP!=11U||amplitude==0.0?0.0:g.maxCircleTangentAbs[a]/g.radiusMm;
+        g.maxCircleCurvatureAbs[a]=!circle||amplitude==0.0?0.0:g.maxCircleTangentAbs[a]/g.radiusMm;
     }
     g.arithmeticErrorBoundMm=std::nextafter(envelope*(64.0*std::numeric_limits<double>::epsilon()),
         std::numeric_limits<double>::infinity());
@@ -712,13 +809,27 @@ inline bool BuildTimedContour(unsigned modeP,const NCG76SphereCoordinates::Froze
     // sample and frozen point mapping. No 6168-byte NativePlan is materialized
     // on the nested RT admission stack. Per-tick evaluation uses native data.
     Point8 previous=g.startMCS,current{},mapped{};double total=0.0,minimum=g.radiusMm;
-    for(unsigned i=0U;i<NominalLegCount;++i){
+    const unsigned nominalCount=expansion||fixedRadius?26U:NominalLegCount;
+    for(unsigned i=0U;i<nominalCount;++i){
         if(i%CoarseStride==0U)g.orbit.coarsePrefix[i/CoarseStride]=total;
         if(!Detail::NativeVertex(g,i+1U,current)||!Detail::Within(g,current))return false;
         Point3 program=target;
-        if(i<24U){
+        if(fixedRadius&&i<25U){
+            const unsigned k=i;const double t=static_cast<double>(k)/24.0;double x=0.0,y=0.0;
+            if(!NCG76Mode::UnitBoundary(modeP,k,x,y,polygonSides))return false;
+            const auto orbit=NCG76::Detail::OrbitOffset(Point3{{radiusMm*x,radiusMm*y,0.0}},shapeAngleDeg,basis);
+            for(unsigned a=0U;a<3U;++a){
+                const double center=k==0U?source.start[a]:k==24U?target[a]:source.start[a]+sourceDelta[a]*t;
+                program[a]=center+orbit[a];
+            }
+        }else if(expansion&&i>0U&&i<25U){
+            const unsigned k=i;const double t=static_cast<double>(k)/24.0;double x=0.0,y=0.0;
+            if(!NCG76Mode::UnitBoundary(modeP,k,x,y,polygonSides))return false;
+            const auto orbit=NCG76::Detail::OrbitOffset(Point3{{radiusMm*t*x,radiusMm*t*y,0.0}},shapeAngleDeg,basis);
+            for(unsigned a=0U;a<3U;++a)program[a]=target[a]+orbit[a];
+        }else if(!expansion&&!fixedRadius&&i<24U){
             const unsigned k=i+1U;const double t=static_cast<double>(k)/24.0;double x=0.0,y=0.0;
-            if(!NCG76Mode::UnitBoundary(modeP,k,x,y))return false;
+            if(!NCG76Mode::UnitBoundary(modeP,k,x,y,polygonSides))return false;
             const auto orbit=NCG76::Detail::OrbitOffset(Point3{{radiusMm*t*x,radiusMm*t*y,0.0}},shapeAngleDeg,basis);
             for(unsigned a=0U;a<3U;++a)program[a]=(k==24U?target[a]:source.start[a]+sourceDelta[a]*t)+orbit[a];
         }
@@ -731,19 +842,25 @@ inline bool BuildTimedContour(unsigned modeP,const NCG76SphereCoordinates::Froze
     }
     if(g.coordinateErrorBoundMm>minimum/64.0)return false;
     g.travelMm=g.orbit.nominalLengthMm=total;g.orbit.valid=true;
-    g.minimumCircleRadiusMm=modeP==11U?g.radiusMm:0.0;
-    g.maximumCircleArcLengthMm=modeP==11U?NCG76SphereRuntimeGeometry::TwoPi*g.radiusMm:0.0;
+    g.minimumCircleRadiusMm=circle?g.radiusMm:0.0;
+    g.maximumCircleArcLengthMm=circle?NCG76SphereRuntimeGeometry::TwoPi*g.radiusMm:0.0;
     g.version=NCG76SphereRuntimeGeometry::Version;g.valid=true;
-    if(modeP==11U&&(!std::isfinite(g.maximumCircleArcLengthMm)||g.maximumCircleArcLengthMm<=0.0))return false;
-    if(modeP!=11U&&finish){
+    if(circle&&(!std::isfinite(g.maximumCircleArcLengthMm)||g.maximumCircleArcLengthMm<=0.0))return false;
+    if(!circle&&finish){
         const double entry=FinishEntryLength(g),perimeter=FinishLength(g);
         if(!(entry>0.0)||!(perimeter>0.0)||g.coordinateErrorBoundMm>entry/64.0)return false;
-        for(unsigned side=0U;side<4U;++side){
+        for(unsigned side=0U;side<FinishLegCount(g);++side){
             Point8 begin{},end{},center{};double length=0.0,prefix=0.0;
             if(!FinishLegAt(g,side,begin,end,center,length,prefix)||g.coordinateErrorBoundMm>length/64.0)return false;
         }
     }
     output=g;return true;
+}
+inline bool BuildTimedFixedRadius(unsigned modeP,const NCG76SphereCoordinates::FrozenFrame& frame,const Point3& target,
+    double radiusMm,double shapeAngleDeg,double feedMmMin,bool finish,Geometry& output,unsigned polygonSides) noexcept
+{
+    if(!NCG76Mode::IsFixedRadius(modeP)){output=Geometry{};return false;}
+    return BuildTimedContour(modeP,frame,target,radiusMm,shapeAngleDeg,feedMmMin,finish,output,polygonSides);
 }
 inline bool BuildTimedP11(const NCG76SphereCoordinates::FrozenFrame& frame,const Point3& target,
     double radiusMm,double shapeAngleDeg,double feedMmMin,bool finish,Geometry& output) noexcept
@@ -760,4 +877,38 @@ inline bool BuildTimedP14(const NCG76SphereCoordinates::FrozenFrame& frame,const
 inline bool BuildTimedP15(const NCG76SphereCoordinates::FrozenFrame& frame,const Point3& target,
     double radiusMm,double shapeAngleDeg,double feedMmMin,bool finish,Geometry& output) noexcept
 {return BuildTimedContour(15U,frame,target,radiusMm,shapeAngleDeg,feedMmMin,finish,output);}
+inline bool BuildTimedP16(const NCG76SphereCoordinates::FrozenFrame& frame,const Point3& target,
+    double radiusMm,double shapeAngleDeg,double feedMmMin,bool finish,unsigned polygonSides,Geometry& output) noexcept
+{return BuildTimedContour(16U,frame,target,radiusMm,shapeAngleDeg,feedMmMin,finish,output,polygonSides);}
+inline bool BuildTimedP17(const NCG76SphereCoordinates::FrozenFrame& frame,const Point3& target,
+    double radiusMm,double shapeAngleDeg,double feedMmMin,bool finish,unsigned polygonSides,Geometry& output) noexcept
+{return BuildTimedContour(17U,frame,target,radiusMm,shapeAngleDeg,feedMmMin,finish,output,polygonSides);}
+inline bool BuildTimedP21(const NCG76SphereCoordinates::FrozenFrame& frame,const Point3& target,
+    double radiusMm,double shapeAngleDeg,double feedMmMin,bool finish,Geometry& output) noexcept
+{return BuildTimedContour(21U,frame,target,radiusMm,shapeAngleDeg,feedMmMin,finish,output);}
+inline bool BuildTimedP22(const NCG76SphereCoordinates::FrozenFrame& frame,const Point3& target,
+    double radiusMm,double shapeAngleDeg,double feedMmMin,bool finish,Geometry& output) noexcept
+{return BuildTimedContour(22U,frame,target,radiusMm,shapeAngleDeg,feedMmMin,finish,output);}
+
+inline bool BuildTimedP23(const NCG76SphereCoordinates::FrozenFrame& frame,const Point3& target,
+    double radiusMm,double shapeAngleDeg,double feedMmMin,bool finish,Geometry& output) noexcept
+{return BuildTimedContour(23U,frame,target,radiusMm,shapeAngleDeg,feedMmMin,finish,output);}
+
+inline bool BuildTimedP24(const NCG76SphereCoordinates::FrozenFrame& frame,const Point3& target,
+    double radiusMm,double shapeAngleDeg,double feedMmMin,bool finish,Geometry& output) noexcept
+{return BuildTimedContour(24U,frame,target,radiusMm,shapeAngleDeg,feedMmMin,finish,output);}
+
+inline bool BuildTimedP25(const NCG76SphereCoordinates::FrozenFrame& frame,const Point3& target,
+    double radiusMm,double shapeAngleDeg,double feedMmMin,bool finish,Geometry& output) noexcept
+{return BuildTimedContour(25U,frame,target,radiusMm,shapeAngleDeg,feedMmMin,finish,output);}
+
+inline bool BuildTimedP26(const NCG76SphereCoordinates::FrozenFrame& frame,const Point3& target,
+    double radiusMm,double shapeAngleDeg,double feedMmMin,bool finish,unsigned polygonSides,Geometry& output) noexcept
+{return BuildTimedContour(26U,frame,target,radiusMm,shapeAngleDeg,feedMmMin,finish,output,polygonSides);}
+
+inline bool BuildTimedP27(const NCG76SphereCoordinates::FrozenFrame& frame,const Point3& target,
+    double radiusMm,double shapeAngleDeg,double feedMmMin,bool finish,unsigned polygonSides,Geometry& output) noexcept
+{return BuildTimedContour(27U,frame,target,radiusMm,shapeAngleDeg,feedMmMin,finish,output,polygonSides);}
+
 }
+

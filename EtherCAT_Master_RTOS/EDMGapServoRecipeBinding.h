@@ -2,6 +2,7 @@
 
 #include "EDMRecipe.h"
 #include "EDMProcessProfile.h"
+#include "EDMSpecialGapGainBinding.h"
 #include <cmath>
 #include <cstdint>
 
@@ -220,7 +221,13 @@ inline Binding BindPhysicalServoRecipe(const EDMRecipe::Controller& controller,
     if(!table || table->revision!=before.tableRevision || !table->rowPresent[before.eCode-1U])
     {out.error=BindingError::InvalidIdentity;return out;}
     Recipe candidate{};
-    candidate.curve=installedProcessProfile.servo;
+    const auto sourceCurve=installedProcessProfile.servo;
+    const auto specialGain=EDMSpecialGapGainBinding::Capture(controller,installedProcessProfile.machineProfileId);
+    if(!specialGain.ready){out.error=EDMSpecialGapGainBinding::ErrorCode<BindingError>(specialGain.reason);
+        out.failedFieldId=specialGain.failedFieldId;return out;}
+    candidate.curve=sourceCurve;
+    if(!EDMSpecialGapGainBinding::Apply(specialGain,candidate.curve))
+    {out.error=BindingError::InvalidRecipe;return out;}
     auto& identity=candidate.binding;
     identity.catalogRevision=before.catalogRevision;identity.definitionRevision=before.definitionRevision;
     identity.profileId=before.profileId;identity.tableId=before.tableId;identity.tableRevision=before.tableRevision;
@@ -237,7 +244,9 @@ inline Binding BindPhysicalServoRecipe(const EDMRecipe::Controller& controller,
     candidate.referenceV=static_cast<double>(referenceValue)/static_cast<double>(EDMRecipe::Scale);
     out.error=BindingDetail::CheckCurve(candidate);
     if(out.error!=BindingError::None) return out;
-    if(controller.GetCatalog()!=catalog || !BindingDetail::SameSelection(before,controller.Current()))
+    if(controller.GetCatalog()!=catalog || !BindingDetail::SameSelection(before,controller.Current())||
+       !EDMSpecialGapGainBinding::IsCurrent(specialGain,controller,installedProcessProfile.machineProfileId)||
+       !SameCurve(sourceCurve,installedProcessProfile.servo))
     {out.error=BindingError::CaptureChanged;return out;}
     if(!ValidateRecipe(candidate)) {out.error=BindingError::InvalidRecipe;return out;}
     out.recipe=candidate;out.error=BindingError::None;out.ready=true;return out;

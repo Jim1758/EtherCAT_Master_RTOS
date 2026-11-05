@@ -31,7 +31,7 @@ inline bool ContourTotal(const Geometry& g,double& total) noexcept
     const double base=NCG76OrbitContour::NominalLength(g);
     if(!std::isfinite(base)||base<=0.0)return false;
     total=base;
-    if(NCG76OrbitContour::FinishEnabled(g)&&NCG76OrbitContour::IsFourSideContour(g)){
+    if(NCG76OrbitContour::FinishEnabled(g)&&NCG76OrbitContour::IsStraightSideContour(g)){
         const double radial=NCG76OrbitContour::FinishEntryLength(g);
         const double entry=base+radial,perimeter=entry+NCG76OrbitContour::FinishLength(g);
         total=perimeter+radial;
@@ -52,9 +52,9 @@ inline bool ContourSpan(const Geometry& g,Stage stage,unsigned index,Span& out) 
     const double base=NCG76OrbitContour::NominalLength(g);
     if(stage==Stage::ContourNominal){
         Point8 begin{},end{},center{};double length=0.0,prefix=0.0;
-        if(index>=25U||!NCG76OrbitContour::NominalLegAt(g,index,begin,end,center,length,prefix))return false;
-        out.start=prefix;out.end=index==24U?base:prefix+length;out.length=length;
-    }else if(NCG76OrbitContour::IsFourSideContour(g)){
+        if(index>=NCG76OrbitContour::NominalLegCountFor(g)||!NCG76OrbitContour::NominalLegAt(g,index,begin,end,center,length,prefix))return false;
+        out.start=prefix;out.end=index+1U==NCG76OrbitContour::NominalLegCountFor(g)?base:prefix+length;out.length=length;
+    }else if(NCG76OrbitContour::IsStraightSideContour(g)){
         if(!NCG76OrbitContour::FinishEnabled(g))return false;
         const double radial=NCG76OrbitContour::FinishEntryLength(g),entry=base+radial;
         const double perimeter=entry+NCG76OrbitContour::FinishLength(g);
@@ -92,14 +92,14 @@ inline bool ContourLocate(const Geometry& g,double station,bool reverse,Span& ou
             const unsigned middle=low+(high-low)/2U;
             if(probe<g.orbit.coarsePrefix[middle])high=middle;else low=middle;
         }
-        const unsigned limit=(std::min)(25U,low*4U+4U);
+        const unsigned limit=(std::min)(NCG76OrbitContour::NominalLegCountFor(g),low*4U+4U);
         for(unsigned index=low*4U;index<limit;++index){
             Span span{};if(!ContourSpan(g,Stage::ContourNominal,index,span))return false;
             if(probe>=span.start&&probe<span.end){out=span;return station>=span.start&&station<=span.end;}
         }
         return false;
     }
-    if(NCG76OrbitContour::IsFourSideContour(g)){
+    if(NCG76OrbitContour::IsStraightSideContour(g)){
         Span span{};
         if(!ContourSpan(g,Stage::CircleEntry,0U,span))return false;
         if(probe>=span.start&&probe<span.end){out=span;return station>=span.start&&station<=span.end;}
@@ -169,13 +169,13 @@ inline bool MaximumFlushStation(const Geometry& g,double& station) noexcept
 {
     Span span{};
     if(g.kind==NCG76SphereRuntimeGeometry::Kind::OrbitContour){
-        if(NCG76OrbitContour::FinishEnabled(g)&&NCG76OrbitContour::IsFourSideContour(g)){
+        if(NCG76OrbitContour::FinishEnabled(g)&&NCG76OrbitContour::IsStraightSideContour(g)){
             const unsigned count=NCG76OrbitContour::FinishLegCount(g);
             if(!count||!GetSpan(g,Stage::ContourFinish,count-1U,span))return false;
             station=span.end;return true;
         }
         if(!GetSpan(g,NCG76OrbitContour::FinishEnabled(g)?Stage::Orbit:Stage::ContourNominal,
-            NCG76OrbitContour::FinishEnabled(g)?0U:23U,span))return false;
+            NCG76OrbitContour::FinishEnabled(g)?0U:NCG76OrbitContour::NominalLegCountFor(g)-2U,span))return false;
         station=span.end;return true;
     }
     const bool single=g.kind!=NCG76SphereRuntimeGeometry::Kind::Sphere;
@@ -221,7 +221,7 @@ inline bool Evaluate(const Geometry& g,const Span& span,double fraction,Point8& 
             double length=0.0,prefix=0.0;
             if(!NCG76OrbitContour::NominalLegAt(g,span.layer,begin,end,center,length,prefix)||
                !NCG76OrbitContour::NominalCenterAt(g,span.layer,fraction,center))return false;
-        }else if(NCG76OrbitContour::IsFourSideContour(g)){
+        }else if(NCG76OrbitContour::IsStraightSideContour(g)){
             center=g.endMCS;
             if(span.stage==Stage::ContourFinish){
                 double length=0.0,prefix=0.0;

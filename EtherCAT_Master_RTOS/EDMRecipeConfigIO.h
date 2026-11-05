@@ -2,6 +2,8 @@
 
 #include "EDMRecipe.h"
 #include "EDMConditionUnits.h"
+#include "EDMOrbitCompletionRetryOptIn.h"
+#include "EDMSpecialGapGainOptIn.h"
 #include <algorithm>
 #include <array>
 #include <cstddef>
@@ -479,6 +481,25 @@ namespace EDMRecipeConfigIO
             if (!End(reader)) return false;
             for (auto& field : catalog.fields)
                 std::sort(field.stages.begin(), field.stages.end(), [](const EDMRecipe::Stage& a, const EDMRecipe::Stage& b) { return a.id < b.id; });
+            const auto retryOptIn=EDMOrbitCompletionRetryOptIn::Read(directory,catalog);
+            if(retryOptIn==EDMOrbitCompletionRetryOptIn::State::Invalid)
+                return Fail(d,Error::Profile,EDMOrbitCompletionRetryOptIn::Filename,0U,"RETRY_OPT_IN");
+            if(retryOptIn==EDMOrbitCompletionRetryOptIn::State::Ready)
+                for(auto& field:catalog.fields)
+                    EDMConditionUnits::NormalizeLegacyOrbitRetryField(catalog.schemaVersion,catalog.profileId,field);
+            const auto specialOptIn=EDMSpecialGapGainOptIn::Read(directory,catalog);
+            if(specialOptIn==EDMSpecialGapGainOptIn::State::Invalid)
+                return Fail(d,Error::Profile,EDMSpecialGapGainOptIn::Filename,0U,"SPECIAL_GAIN_OPT_IN");
+            if(catalog.schemaVersion==2U&&catalog.profileId==1U){
+                std::array<std::size_t,EDMSpecialGapGainDefinition::FieldCount> indices{};
+                const auto group=EDMSpecialGapGainDefinition::Inspect(catalog,indices);
+                if(group==EDMSpecialGapGainDefinition::Group::Invalid||
+                   (group==EDMSpecialGapGainDefinition::Group::Missing&&specialOptIn==EDMSpecialGapGainOptIn::State::Ready))
+                    return Fail(d,Error::Profile,"Fields.csv",0U,"SPECIAL_GAIN_DEFINITION");
+                if(group==EDMSpecialGapGainDefinition::Group::Legacy&&specialOptIn==EDMSpecialGapGainOptIn::State::Ready)
+                    for(const auto index:indices)
+                        EDMSpecialGapGainDefinition::Normalize(catalog.schemaVersion,catalog.profileId,catalog.fields[index]);
+            }
             return true;
         }
 
@@ -606,8 +627,22 @@ namespace EDMRecipeConfigIO
                 for (std::size_t column = 0U; column < fields; ++column) {
                     const std::size_t index = mapping[column]; const auto& field = catalog.fields[index];
                     char* token = columns.values[column + 1U]; auto& cell = table.cells[r * fields + index];
-                    if (*token == '\0') continue;
-                    if (!field.enabled) return reader.Reject(Error::Profile, "DISABLED_FIELD");
+                    if (*token == '\0') {
+                        (void)EDMOrbitCompletionRetryDefinition::DefaultCell(field,cell);
+                        (void)EDMSpecialGapGainDefinition::DefaultCell(field,cell);
+                        continue;
+                    }
+                    if (!field.enabled) {
+                        // Before the first explicit opt-in, only the exact former
+                        // disabled zero-only field may contain a literal V:0.
+                        if(catalog.schemaVersion==2U&&catalog.profileId==1U&&
+                           (EDMOrbitCompletionRetryDefinition::Legacy(field)||EDMSpecialGapGainDefinition::Legacy(field))&&token[0]=='V'&&token[1]==':') {
+                            EDMRecipe::Value zero=0LL;
+                            if(!FieldValue(reader,token+2,field,zero,"LegacyRetryZero")||zero!=0LL)return false;
+                            continue; // Remains Unset until the complete catalog validates.
+                        }
+                        return reader.Reject(Error::Profile,"DISABLED_FIELD");
+                    }
                     if (token[0] == 'V' && token[1] == ':') {
                         cell.kind = EDMRecipe::CellKind::Direct;
                         if (!FieldValue(reader, token + 2, field, cell.value, "CellValue")) return false;
@@ -715,6 +750,66 @@ namespace EDMRecipeConfigIO
         }
     }
 
+    // Shared by clean startup and background reload. Prove the entire old
+    // catalog before a one-time, persistent semantic opt-in is created.
+    inline bool FinalizeOrbitRetryCompatibility(const std::string& directory,
+        EDMRecipe::Catalog& catalog,Diagnostic& diagnostic,bool allowPersistence=true) noexcept
+    {
+        EDMRecipe::Validation validation;
+        if(!EDMRecipe::ValidateCatalog(catalog,validation))
+            return Detail::Fail(diagnostic,Error::Profile,"CATALOG",0U,EDMRecipe::ErrorName(validation.error));
+        if(catalog.schemaVersion!=2U||catalog.profileId!=1U)return true;
+        std::size_t index=catalog.fields.size();
+        for(std::size_t i=0U;i<catalog.fields.size();++i)
+            if(EDMOrbitCompletionRetryDefinition::Legacy(catalog.fields[i]))index=i;
+        if(index==catalog.fields.size()||!allowPersistence)return true;
+        for(const auto& table:catalog.tables)for(std::size_t row=0U;row<EDMRecipe::RowsPerTable;++row){
+            const auto& cell=table.cells[row*catalog.fields.size()+index];
+            if(cell.kind!=EDMRecipe::CellKind::Unset||cell.value!=0LL||cell.stageId||cell.overridePresent)
+                return Detail::Fail(diagnostic,Error::Profile,"COND",0U,"LEGACY_RETRY_NONZERO");
+        }
+        (void)EDMConditionUnits::NormalizeLegacyOrbitRetryField(catalog.schemaVersion,catalog.profileId,catalog.fields[index]);
+        for(auto& table:catalog.tables)for(std::size_t row=0U;row<EDMRecipe::RowsPerTable;++row)
+            (void)EDMOrbitCompletionRetryDefinition::DefaultCell(catalog.fields[index],table.cells[row*catalog.fields.size()+index]);
+        if(!EDMRecipe::ValidateCatalog(catalog,validation))
+            return Detail::Fail(diagnostic,Error::Profile,"CATALOG",0U,EDMRecipe::ErrorName(validation.error));
+        if(!EDMOrbitCompletionRetryOptIn::Ensure(directory,catalog))
+            return Detail::Fail(diagnostic,Error::Open,EDMOrbitCompletionRetryOptIn::Filename,0U,"RETRY_OPT_IN");
+        return true;
+    }
+
+    // EDM368: prove every old reserved cell in all seven fields before a
+    // create-only opt-in permits those same columns to carry gain semantics.
+    inline bool FinalizeSpecialGapGainCompatibility(const std::string& directory,
+        EDMRecipe::Catalog& catalog,Diagnostic& diagnostic,bool allowPersistence=true) noexcept
+    {
+        EDMRecipe::Validation validation;
+        if(!EDMRecipe::ValidateCatalog(catalog,validation))
+            return Detail::Fail(diagnostic,Error::Profile,"CATALOG",0U,EDMRecipe::ErrorName(validation.error));
+        if(catalog.schemaVersion!=2U||catalog.profileId!=1U)return true;
+        std::array<std::size_t,EDMSpecialGapGainDefinition::FieldCount> indices{};
+        const auto group=EDMSpecialGapGainDefinition::Inspect(catalog,indices);
+        if(group==EDMSpecialGapGainDefinition::Group::Invalid)
+            return Detail::Fail(diagnostic,Error::Profile,"Fields.csv",0U,"SPECIAL_GAIN_DEFINITION");
+        if(group!=EDMSpecialGapGainDefinition::Group::Legacy||!allowPersistence)return true;
+        for(const auto& table:catalog.tables)for(std::size_t row=0U;row<EDMRecipe::RowsPerTable;++row)
+            for(const auto index:indices){
+                const auto& cell=table.cells[row*catalog.fields.size()+index];
+                if(cell.kind!=EDMRecipe::CellKind::Unset||cell.value!=0LL||cell.stageId||cell.overridePresent)
+                    return Detail::Fail(diagnostic,Error::Profile,"COND",0U,"LEGACY_SPECIAL_GAIN_NONZERO");
+            }
+        for(const auto index:indices){
+            (void)EDMSpecialGapGainDefinition::Normalize(catalog.schemaVersion,catalog.profileId,catalog.fields[index]);
+            for(auto& table:catalog.tables)for(std::size_t row=0U;row<EDMRecipe::RowsPerTable;++row)
+                (void)EDMSpecialGapGainDefinition::DefaultCell(catalog.fields[index],table.cells[row*catalog.fields.size()+index]);
+        }
+        if(!EDMRecipe::ValidateCatalog(catalog,validation))
+            return Detail::Fail(diagnostic,Error::Profile,"CATALOG",0U,EDMRecipe::ErrorName(validation.error));
+        if(!EDMSpecialGapGainOptIn::Ensure(directory,catalog))
+            return Detail::Fail(diagnostic,Error::Open,EDMSpecialGapGainOptIn::Filename,0U,"SPECIAL_GAIN_OPT_IN");
+        return true;
+    }
+
     inline bool LoadDirectory(const char* directory, std::unique_ptr<EDMRecipe::Catalog>& result,
         Diagnostic& diagnostic) noexcept
     {
@@ -733,9 +828,8 @@ namespace EDMRecipeConfigIO
                 for (auto& table : candidate->tables)
                     if (!Detail::ReadTable(base, *candidate, table, diagnostic)) return false;
             } else if (!Detail::ReadConditions(base, *candidate, diagnostic)) return false;
-            EDMRecipe::Validation validation;
-            if (!EDMRecipe::ValidateCatalog(*candidate, validation))
-                return Detail::Fail(diagnostic, Error::Profile, "CATALOG", 0U, EDMRecipe::ErrorName(validation.error));
+            if(!FinalizeOrbitRetryCompatibility(base,*candidate,diagnostic)||
+               !FinalizeSpecialGapGainCompatibility(base,*candidate,diagnostic))return false;
             result = std::move(candidate);
             diagnostic = Diagnostic{};
             return true;

@@ -2,15 +2,17 @@
 
 #include "NCG76SphereSource.h"
 #include "NCMachiningTimePolicy.h"
+#include "NCOrbitCompletionPolicy.h"
 
-// EDM345: source/provenance for explicitly timed G76 P11/P12/P13/P14/P15. No omitted
+// EDM358: source/provenance for P01-P07 D/H/L and the released contours. No omitted
 // timer word, numeric default, or shape-only result grants this common parent.
 // R remains program radius and K remains the legacy contour angle in degrees.
 // Native radius/travel/frame limits belong to the separate geometry builder.
 namespace NCG76TimedP11Source
 {
 constexpr unsigned ModeP=11U;
-inline bool SupportedMode(double mode) noexcept {return mode==11.0||mode==12.0||mode==13.0||mode==14.0||mode==15.0;}
+inline bool SupportedMode(double mode) noexcept {return NCMachiningTimePolicy::TimedContourMode(mode);}
+
 enum class Status : unsigned char
 {
     Ok=0U,InvalidSource,NonLiteral,UnsupportedBlock,InvalidScalar,
@@ -20,7 +22,7 @@ struct Words
 {
     NCBlock authored{};
     NCG76Sphere::Point3 authoredXYZ{};
-    unsigned targetMask=0U;
+    unsigned targetMask=0U,polygonSides=0U,inspectionRounds=0U;
     double radiusProgramMm=0.0,contourAngleDeg=0.0,feedMmMin=0.0;
     unsigned requestedB=0U;
     bool explicitB=false,inheritedB=false;
@@ -28,11 +30,13 @@ struct Words
     bool valid=false;
 };
 // Dispatch must still prove the complete authored source and current frame.
-// In particular, absent D AND H does not acquire this implementation.
+// An authored D, H or L selects this parent. Absence retains legacy execution;
+// the complete literal, E-condition and runtime checks still follow.
 inline bool IsOptIn(const NCBlock& block) noexcept
 {
     return block.hasG&&block.gCode==76&&block.has('P')&&SupportedMode(block.val('P'))&&
-        (block.has(NCMachiningTimePolicy::TotalAddress)||block.has(NCMachiningTimePolicy::AdditionalAddress));
+        (block.has(NCMachiningTimePolicy::TotalAddress)||block.has(NCMachiningTimePolicy::AdditionalAddress)||
+         block.has('L'));
 }
 inline Status Decode(const NCParsedBlock& parsed,const NCBlock& resolved,
     const NCG76SphereSource::ModalB& inherited,Words& output) noexcept
@@ -43,6 +47,8 @@ inline Status Decode(const NCParsedBlock& parsed,const NCBlock& resolved,
     const NCG76SphereSource::ModalB modal=inherited;
     output=Words{};
     if(!IsOptIn(frozen))return Status::UnsupportedBlock;
+    std::uint32_t inspectionRounds=0U;
+    if(!NCOrbitCompletionPolicy::Decode(parsed,frozen,inspectionRounds))return Status::InvalidSource;
     NCMachiningTime::Config timing{};
     if(!NCMachiningTimePolicy::Decode(parsed,frozen,timing))return Status::InvalidSource;
     NCBlock literal{};
@@ -68,11 +74,12 @@ inline Status Decode(const NCParsedBlock& parsed,const NCBlock& resolved,
     if(!explicitB&&!NCG76SphereSource::ValidModalB(modal))return Status::UnresolvedModalB;
     if(!explicitB&&modal.value!=0U&&modal.value!=2U)return Status::InvalidProcessOption;
     Words candidate{};
-    candidate.authored=frozen;
+    candidate.authored=frozen;candidate.inspectionRounds=inspectionRounds;
     for(unsigned axis=0U;axis<3U;++axis){
         const char address=static_cast<char>('X'+axis);
         if(frozen.has(address)){candidate.targetMask|=1U<<axis;candidate.authoredXYZ[axis]=frozen.val(address);}
     }
+    candidate.polygonSides=NCMachiningTimePolicy::PolygonMode(frozen.val('P'))?static_cast<unsigned>(frozen.val('Q')):0U;
     candidate.radiusProgramMm=frozen.val('R');
     candidate.contourAngleDeg=frozen.has('K')?frozen.val('K'):0.0;
     candidate.feedMmMin=frozen.val('F');

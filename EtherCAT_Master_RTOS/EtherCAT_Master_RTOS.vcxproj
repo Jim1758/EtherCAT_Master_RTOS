@@ -132,6 +132,9 @@
     <ClInclude Include="NCG76OrbitContourGeometry.h" />
     <ClInclude Include="NCG76TimedP11Source.h" />
     <ClInclude Include="NCG76SphereMachiningTime.h" />
+    <ClInclude Include="NCG76OrbitCompletion.h" />
+    <ClInclude Include="NCOrbitCompletionPolicy.h" />
+    <ClInclude Include="NCOrbitCompletionBinding.h" />
     <ClInclude Include="NCMachiningTelemetry.h" />
     <ClInclude Include="NCG76SphereFinishVerification.h" />
     <ClInclude Include="NCG76SphereHoldRecovery.h" />

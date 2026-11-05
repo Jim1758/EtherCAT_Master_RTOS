@@ -54,9 +54,13 @@ inline bool NominalStage(NCG76SphereCycle::Phase phase,NCG76SpherePath::Stage& s
 inline bool Observe(const NCG76SpherePath::Descriptor& path,
     const NCG76SphereCycle::Feedback& feedback,Envelope& output) noexcept
 {
+    // EDM359: the D-completion return has its own exact endpoint proof; it
+    // is not the authored nominal end station used by this display envelope.
+
     if(NCG76SpherePath::Detail::Overlap(&path,sizeof(path),&output,sizeof(output))||
        NCG76SpherePath::Detail::Overlap(&feedback,sizeof(feedback),&output,sizeof(output)))return false;
     output=Envelope{};
+    if(feedback.timeLimitReached||feedback.timedCompletion)return false;
     using P=NCG76SphereCycle::Phase;using S=NCG76SpherePath::Stage;
     if(!NCG76SpherePath::Detail::Shape(path)||!feedback.session||!feedback.tick||
        feedback.fault!=NCG76SphereCycle::Fault::None||feedback.completedLayers>path.layerCount)return false;
@@ -135,13 +139,12 @@ inline bool Observe(const NCG76SpherePath::Descriptor& path,
         const bool sphere=path.geometry.kind==NCG76SphereRuntimeGeometry::Kind::Sphere;
         const bool contour=path.geometry.kind==NCG76SphereRuntimeGeometry::Kind::OrbitContour;
         if(!NominalStage(feedback.nominalPhase,stage))return false;
-        const unsigned contourP=contour?NCG76OrbitContour::ModeP(path.geometry):0U;
         const bool contourStage=stage==S::ContourNominal?
-            feedback.layerIndex<NCG76OrbitContour::NominalLegCount:
-            stage==S::ContourFinish?NCG76OrbitContour::IsFourSideContour(path.geometry)&&
+            feedback.layerIndex<NCG76OrbitContour::NominalLegCountFor(path.geometry):
+            stage==S::ContourFinish?NCG76OrbitContour::IsStraightSideContour(path.geometry)&&
                 feedback.layerIndex<NCG76OrbitContour::FinishLegCount(path.geometry):
             feedback.layerIndex==0U&&(stage==S::CircleEntry||stage==S::ReturnCenter||
-                (contourP==11U&&stage==S::Orbit));
+                (NCG76OrbitContour::IsCircleContour(path.geometry)&&stage==S::Orbit));
         if((sphere?feedback.layerIndex>=path.layerCount:contour?
                (feedback.completedLayers!=0U||!contourStage):
                (feedback.layerIndex!=0U||stage!=S::InitialDepth||feedback.completedLayers!=0U))||
@@ -160,6 +163,13 @@ inline bool Observe(const NCG76SpherePath::Descriptor& path,
             const bool zeroSpeed=feedback.speedMmS==0.0&&feedback.signedSpeedMmS==0.0;
             const bool stoppedNominal=zeroSpeed&&!feedback.holdActive&&!feedback.held&&!feedback.flushActive&&
                 (NCG76SphereCycle::Detail::IsNominal(feedback.phase)||feedback.phase==P::Settle);
+            // E5 can stop one scalar ULP before an endpoint while the physical
+            // settle proof is still pending. Observe that stopped nominal
+            // point without treating it as an already captured checkpoint.
+            const bool stoppedBeforeFlushCapture=zeroSpeed&&feedback.phase==P::FlushSettle&&
+                feedback.flushActive&&!feedback.flushCheckpointSaved&&!feedback.holdActive&&!feedback.held&&
+                feedback.phaseProgressMm==feedback.nominalProgressMm&&
+                feedback.phaseLengthMm==feedback.nominalLengthMm;
             const bool holdPhase=feedback.phase==P::RecoveryBrake||feedback.phase==P::RecoverySettle||
                 feedback.phase==P::RecoveryMove||feedback.phase==P::HeldAtStart||
                 feedback.phase==P::InspectionJog||feedback.phase==P::InspectionJogBrake||
@@ -172,7 +182,7 @@ inline bool Observe(const NCG76SpherePath::Descriptor& path,
             const bool capturedFlush=feedback.flushActive&&feedback.flushCheckpointSaved&&flushPhase;
             if(cursorStatus!=NCG76SpherePath::Status::PrecisionLoss||feedback.gapHistoryActive||
                !std::isfinite(feedback.speedMmS)||!std::isfinite(feedback.signedSpeedMmS)||
-               !(stoppedNominal||capturedHold||capturedFlush))return false;
+               !(stoppedNominal||stoppedBeforeFlushCapture||capturedHold||capturedFlush))return false;
             const auto retreatStage=NCG76SphereCycle::RecoveryNominalStage(feedback.nominalPhase);
             NCG76SphereRetreat::Span span{};NCG76SpherePath::Point8 canonical{},center{};double station=0.0;
             if(!NCG76SphereRetreat::GetSpan(path.geometry,retreatStage,feedback.layerIndex,span)||

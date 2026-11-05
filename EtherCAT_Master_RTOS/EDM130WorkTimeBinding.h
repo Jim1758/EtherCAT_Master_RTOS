@@ -3,6 +3,7 @@
 #include "EDMFlushRecipeBinding.h"
 #include "EDMProcessProfile.h"
 #include "EDM137ConfirmedUnits.h"
+#include "EDMSpecialGapGainBinding.h"
 
 // Owner-thread adapters. EDM130 binds DischargeWorkTime only; the explicit
 // EDM131 additionally freezes JumpSpeedOverride; the explicit EDM132 adapter
@@ -16,6 +17,21 @@ struct Binding
     std::uint16_t failedFieldId=0U;
     bool ready=false;
 };
+inline bool CaptureEffectiveCurve(const EDMRecipe::Controller& controller,const EDM20::ProcessProfile& process,
+    std::uint64_t tuningGeneration,Curve& curve,Binding& error) noexcept
+{
+    const auto special=EDMSpecialGapGainBinding::Capture(controller,process.machineProfileId);
+    if(!special.ready){error.error=EDMSpecialGapGainBinding::ErrorCode<EDM58::BindingError>(special.reason);
+        error.failedFieldId=special.failedFieldId;return false;}
+    auto effective=process.servo;
+    if(!EDMSpecialGapGainBinding::Apply(special,effective))
+    {error.error=EDM58::BindingError::InvalidRecipe;return false;}
+    curve=Curve{};curve.processRevision=process.revision;curve.machineProfileId=process.machineProfileId;
+    curve.tuningGeneration=tuningGeneration;curve.deadbandV=effective.deadbandV;
+    for(unsigned i=0U;i<3U;++i){curve.positiveGain[i]=effective.positiveGain[i];curve.negativeGain[i]=effective.negativeGain[i];}
+    for(unsigned i=0U;i<2U;++i){curve.positiveBreakV[i]=effective.positiveBreakV[i];curve.negativeBreakV[i]=effective.negativeBreakV[i];}
+    return true;
+}
 inline Binding BindWorkTime(const EDMRecipe::Controller& controller,std::uint32_t expectedProfileId) noexcept
 {
     static_assert(EDMRecipe::Scale==1000000LL,"Fixed-point seconds must be exact microseconds.");
@@ -189,10 +205,8 @@ inline Binding BindWorkTimeHeightSpeedDeepMachiningReferenceAndCurve(const EDMRe
     {out.error=EDM58::BindingError::InvalidRecipe;return out;}
     if(!expectedProfileId||process.machineProfileId!=expectedProfileId)
     {out.error=EDM58::BindingError::ProfileMismatch;return out;}
-    Curve curve{};curve.processRevision=process.revision;curve.machineProfileId=process.machineProfileId;
-    curve.tuningGeneration=tuningGeneration;curve.deadbandV=process.servo.deadbandV;
-    for(unsigned i=0U;i<3U;++i){curve.positiveGain[i]=process.servo.positiveGain[i];curve.negativeGain[i]=process.servo.negativeGain[i];}
-    for(unsigned i=0U;i<2U;++i){curve.positiveBreakV[i]=process.servo.positiveBreakV[i];curve.negativeBreakV[i]=process.servo.negativeBreakV[i];}
+    const auto sourceServo=process.servo;
+    Curve curve{};if(!CaptureEffectiveCurve(controller,process,tuningGeneration,curve,out))return out;
     const Binding base=BindWorkTimeHeightSpeedDeepMachiningAndReference(controller,expectedProfileId,commissioningProfile);
     if(!base.ready)return base;
     if(!catalog||controller.GetCatalog()!=catalog||!EDM58::BindingDetail::SameSelection(before,controller.Current())||
@@ -205,10 +219,9 @@ inline Binding BindWorkTimeHeightSpeedDeepMachiningReferenceAndCurve(const EDMRe
         process.servo.revision!=curve.processRevision||
         CurveDoubleBits(process.servo.deadbandV)!=CurveDoubleBits(curve.deadbandV))
     {out.error=EDM58::BindingError::CaptureChanged;return out;}
-    for(unsigned i=0U;i<3U;++i)
-        if(CurveDoubleBits(process.servo.positiveGain[i])!=CurveDoubleBits(curve.positiveGain[i])||
-            CurveDoubleBits(process.servo.negativeGain[i])!=CurveDoubleBits(curve.negativeGain[i]))
-        {out.error=EDM58::BindingError::CaptureChanged;return out;}
+    Curve after{};if(!CaptureEffectiveCurve(controller,process,tuningGeneration,after,out))return out;
+    if(!SameCurve(after,curve)||!EDMSpecialGapGainBinding::SameProfile(sourceServo,process.servo))
+    {out.error=EDM58::BindingError::CaptureChanged;return out;}
     for(unsigned i=0U;i<2U;++i)
         if(CurveDoubleBits(process.servo.positiveBreakV[i])!=CurveDoubleBits(curve.positiveBreakV[i])||
             CurveDoubleBits(process.servo.negativeBreakV[i])!=CurveDoubleBits(curve.negativeBreakV[i]))
@@ -248,10 +261,7 @@ inline Binding BindWorkTimeHeightSpeedDeepMachiningReferenceCurveAndFlushStages(
     }
     if(controller.GetCatalog()!=catalog||!EDM58::BindingDetail::SameSelection(before,controller.Current()))
     {out.error=EDM58::BindingError::CaptureChanged;return out;}
-    Curve after{};after.processRevision=process.revision;after.machineProfileId=process.machineProfileId;
-    after.tuningGeneration=tuningGeneration;after.deadbandV=process.servo.deadbandV;
-    for(unsigned i=0U;i<3U;++i){after.positiveGain[i]=process.servo.positiveGain[i];after.negativeGain[i]=process.servo.negativeGain[i];}
-    for(unsigned i=0U;i<2U;++i){after.positiveBreakV[i]=process.servo.positiveBreakV[i];after.negativeBreakV[i]=process.servo.negativeBreakV[i];}
+    Curve after{};if(!CaptureEffectiveCurve(controller,process,tuningGeneration,after,out))return out;
     if(!EDM20::ValidateProcessProfile(process)||!SameCurve(after,base.recipe.curve)||
         CurveDoubleBits(process.flush.finalApproachMmPerMin)!=CurveDoubleBits(finalBase)||
         CurveDoubleBits(process.flush.initialSlowMmPerMin)!=CurveDoubleBits(initialBase))
@@ -325,10 +335,8 @@ inline Binding BindG76GapProfile175(const EDMRecipe::Controller& controller,std:
     if(!expectedProfileId||process.machineProfileId!=expectedProfileId)
     {out.error=EDM58::BindingError::ProfileMismatch;return out;}
     const double finalBase=process.flush.finalApproachMmPerMin,initialBase=process.flush.initialSlowMmPerMin;
-    Curve curve{};curve.processRevision=process.revision;curve.machineProfileId=process.machineProfileId;
-    curve.tuningGeneration=tuningGeneration;curve.deadbandV=process.servo.deadbandV;
-    for(unsigned i=0U;i<3U;++i){curve.positiveGain[i]=process.servo.positiveGain[i];curve.negativeGain[i]=process.servo.negativeGain[i];}
-    for(unsigned i=0U;i<2U;++i){curve.positiveBreakV[i]=process.servo.positiveBreakV[i];curve.negativeBreakV[i]=process.servo.negativeBreakV[i];}
+    const auto sourceServo=process.servo;
+    Curve curve{};if(!CaptureEffectiveCurve(controller,process,tuningGeneration,curve,out))return out;
     const Binding base=BindWorkTimeAndSpeed(controller,expectedProfileId);
     if(!base.ready)return base;
     if(!catalog||controller.GetCatalog()!=catalog||!EDM58::BindingDetail::SameSelection(before,controller.Current())||
@@ -364,11 +372,9 @@ inline Binding BindG76GapProfile175(const EDMRecipe::Controller& controller,std:
     }
     if(controller.GetCatalog()!=catalog||!EDM58::BindingDetail::SameSelection(before,controller.Current()))
     {out.error=EDM58::BindingError::CaptureChanged;return out;}
-    Curve after{};after.processRevision=process.revision;after.machineProfileId=process.machineProfileId;
-    after.tuningGeneration=tuningGeneration;after.deadbandV=process.servo.deadbandV;
-    for(unsigned i=0U;i<3U;++i){after.positiveGain[i]=process.servo.positiveGain[i];after.negativeGain[i]=process.servo.negativeGain[i];}
-    for(unsigned i=0U;i<2U;++i){after.positiveBreakV[i]=process.servo.positiveBreakV[i];after.negativeBreakV[i]=process.servo.negativeBreakV[i];}
+    Curve after{};if(!CaptureEffectiveCurve(controller,process,tuningGeneration,after,out))return out;
     if(!EDM20::ValidateProcessProfile(process)||!SameCurve(after,curve)||
+        !EDMSpecialGapGainBinding::SameProfile(sourceServo,process.servo)||
         CurveDoubleBits(process.flush.finalApproachMmPerMin)!=CurveDoubleBits(finalBase)||
         CurveDoubleBits(process.flush.initialSlowMmPerMin)!=CurveDoubleBits(initialBase))
     {out.error=EDM58::BindingError::CaptureChanged;return out;}

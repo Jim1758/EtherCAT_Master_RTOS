@@ -224,14 +224,14 @@ inline Status Build(const Geometry& source,Descriptor& output) noexcept
         p.stationErrorBoundMm=ulp*32.0;
         if(!Detail::Positive(p.stationErrorBoundMm)||p.stationErrorBoundMm>MaximumStationErrorMm)return Status::PrecisionLoss;
         double previousEnd=0.0;
-        for(unsigned i=0U;i<25U;++i){
+        for(unsigned i=0U;i<NCG76OrbitContour::NominalLegCountFor(geometry);++i){
             Span span{};const auto status=Detail::SpanUnchecked(p,Stage::ContourNominal,i,span);
             if(status!=Status::Ok)return status;
             if(!Detail::Bits(span.startMm,previousEnd)||span.lengthMm<=p.stationErrorBoundMm*64.0||
                std::fabs((span.endMm-span.startMm)-span.lengthMm)>p.stationErrorBoundMm)return Status::PrecisionLoss;
             previousEnd=span.endMm;
         }
-        if(NCG76OrbitContour::FinishEnabled(geometry)&&NCG76OrbitContour::IsFourSideContour(geometry)){
+        if(NCG76OrbitContour::FinishEnabled(geometry)&&NCG76OrbitContour::IsStraightSideContour(geometry)){
             const unsigned count=NCG76OrbitContour::FinishLegCount(geometry);
             for(unsigned i=0U;i<count+2U;++i){
                 const Stage stage=i==0U?Stage::CircleEntry:i==count+1U?Stage::ReturnCenter:Stage::ContourFinish;
@@ -405,7 +405,7 @@ inline Status Evaluate(const Descriptor& p,const Cursor& cursor,Sample& output) 
             Point8 begin{},end{},center{};double length=0.0,prefix=0.0;
             if(stage==Stage::ContourNominal){
                 if(!NCG76OrbitContour::NominalLegAt(p.geometry,cursor.span.layerIndex,begin,end,center,length,prefix))return Status::InvalidGeometry;
-            }else if(NCG76OrbitContour::IsFourSideContour(p.geometry)){
+            }else if(NCG76OrbitContour::IsStraightSideContour(p.geometry)){
                 if(stage==Stage::ContourFinish){
                     if(!NCG76OrbitContour::FinishLegAt(p.geometry,cursor.span.layerIndex,begin,end,center,length,prefix))
                         return Status::InvalidGeometry;

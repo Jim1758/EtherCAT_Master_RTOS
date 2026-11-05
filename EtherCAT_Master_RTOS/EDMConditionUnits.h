@@ -1,6 +1,8 @@
 #pragma once
 
 #include "EDMRecipe.h"
+#include "EDMOrbitCompletionRetryDefinition.h"
+#include "EDMSpecialGapGainDefinition.h"
 
 // EDM304: the machine owner confirmed percent for E11/E19 and mm for every
 // distance field. Interpret only this machine profile's exact former seed
@@ -37,4 +39,9 @@ inline bool NormalizeLegacyField(std::uint32_t schemaVersion, std::uint32_t prof
     field.unitConfirmed = true;
     return true;
 }
+// Run only after stages have been loaded, so a custom reserved field with
+// stages cannot be mistaken for the exact old zero-only seed.
+inline bool NormalizeLegacyOrbitRetryField(std::uint32_t schemaVersion,std::uint32_t profileId,
+    EDMRecipe::FieldDefinition& field) noexcept
+{return EDMOrbitCompletionRetryDefinition::Normalize(schemaVersion,profileId,field);}
 }

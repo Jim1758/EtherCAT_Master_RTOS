@@ -613,6 +613,9 @@
     <ClInclude Include="NCG76OrbitContourGeometry.h"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="NCG76TimedP11Source.h"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="NCG76SphereMachiningTime.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="NCG76OrbitCompletion.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="NCOrbitCompletionPolicy.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="NCOrbitCompletionBinding.h"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="NCMachiningTelemetry.h"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="NCG76SphereFinishVerification.h"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="NCG76SphereHoldRecovery.h"><Filter>Header Files</Filter></ClInclude>

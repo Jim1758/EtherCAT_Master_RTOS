@@ -4,6 +4,7 @@
 #include "EDMProcessProfile.h"
 #include "EDMAutomaticFlushRecipe.h"
 #include "EDMLiveAutomaticFlush.h"
+#include "EDMSpecialGapGainBinding.h"
 
 // EDM26 owner-thread adapter. Only EDM25::ProcessCoordinator evolves virtual
 // state. No clock reads, allocations, Motion/PID calls, I/O or physical permits.
@@ -54,7 +55,16 @@ namespace EDM26
         if (!EDM23::MakeAutomaticFlushCycleConfig(binding, installedProfile.flush,
             installedProfile.revision, explicitVirtualRequest, candidate.flush))
         { output.error = EDM23::RecipeBindingError::EngineeringRange; return output; }
+        const auto specialGain = EDMSpecialGapGainBinding::Capture(controller, installedProfile.machineProfileId);
+        if (!specialGain.ready || specialGain.selection.generation != binding.generation ||
+            specialGain.selection.tableId != binding.tableId || specialGain.selection.eCode != binding.eCode)
+        { output.error = specialGain.ready ? EDM23::RecipeBindingError::InvalidIdentity :
+              EDMSpecialGapGainBinding::ErrorCode<EDM23::RecipeBindingError>(specialGain.reason);
+          output.failedFieldId = specialGain.failedFieldId; return output; }
         candidate.servo = installedProfile.servo;
+        if (!EDMSpecialGapGainBinding::Apply(specialGain, candidate.servo) ||
+            !EDMSpecialGapGainBinding::IsCurrent(specialGain, controller, installedProfile.machineProfileId))
+        { output.error = EDM23::RecipeBindingError::InvalidIdentity; return output; }
         candidate.machiningOverridePercent = static_cast<double>(overrideValue) / static_cast<double>(EDMRecipe::Scale);
         candidate.referenceV = static_cast<double>(referenceValue) / static_cast<double>(EDMRecipe::Scale);
         candidate.maximumSampleAgeMs = gap.maxAgeMs;

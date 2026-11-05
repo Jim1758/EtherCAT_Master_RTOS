@@ -350,15 +350,16 @@ class Observer
 {
 public:
     bool Begin(const Config& config,std::uint64_t session,const Continuation* continuation=nullptr,
-        SimulationMode mode=SimulationMode::Wave) noexcept
+        SimulationMode mode=SimulationMode::Wave,
+        const NCG76SphereRuntimeGeometry::Geometry* polygonGeometry=nullptr) noexcept
     {
         qualifier_.Cancel();active_=false;feedback_=Feedback{};work_=EDM130::WorkEvidence{};
         frame_=EDM88::Frame{};lastTick_=lastUs_=firstUs_=0ULL;haveClock_=false;
         requestHighWater_=workBaseUs_=0ULL;
         probeElapsedUs_=0ULL;probeLengthMm_=0.0;probeSeeded_=probeEntered_=false;
-        feedback_.simulationMode=mode;
+        feedback_.simulationMode=mode;finishLegCount_=4U;nominalLegCount_=25U;nominalWorkEndIndex_=24U;
         if(Disabled(config)&&!config.flushMotionEnabled&&!config.signedMotionEnabled){
-            if(!Valid(config)||continuation||mode!=SimulationMode::Wave){Withdraw(Reason::Configuration);return false;}
+            if(!Valid(config)||continuation||mode!=SimulationMode::Wave||polygonGeometry){Withdraw(Reason::Configuration);return false;}
             return true;
         }
         feedback_.enabled=config.enabled;feedback_.session=session;feedback_.recipeGeneration=config.recipeGeneration;
@@ -371,6 +372,38 @@ public:
         {Withdraw(Reason::Configuration);return false;}
         if(!Valid(config)||(continuation&&!ValidContinuation(config,*continuation)))
         {Withdraw(Reason::Configuration);return false;}
+        // The RT admission owner may bind validated P01-P07/P16/P17/P21-P27 geometry once.
+        // Capture its bounded leg counts only; no geometry pointer enters the
+        // periodic observer. Legacy callers retain 25/24/4 and their lifecycle.
+        if(polygonGeometry){
+            if(continuation||mode!=SimulationMode::Wave||
+               polygonGeometry->kind!=NCG76SphereRuntimeGeometry::Kind::OrbitContour||
+               (!NCG76OrbitContour::IsFixedRadiusContour(*polygonGeometry)&&
+                NCG76OrbitContour::ModeP(*polygonGeometry)!=16U&&
+                NCG76OrbitContour::ModeP(*polygonGeometry)!=17U&&
+                NCG76OrbitContour::ModeP(*polygonGeometry)!=21U&&
+                NCG76OrbitContour::ModeP(*polygonGeometry)!=22U&&
+                NCG76OrbitContour::ModeP(*polygonGeometry)!=23U&&
+                NCG76OrbitContour::ModeP(*polygonGeometry)!=24U&&
+                NCG76OrbitContour::ModeP(*polygonGeometry)!=25U&&
+                NCG76OrbitContour::ModeP(*polygonGeometry)!=26U&&
+                NCG76OrbitContour::ModeP(*polygonGeometry)!=27U)||
+               !NCG76SphereRuntimeGeometry::Valid(*polygonGeometry))
+            {Withdraw(Reason::Configuration);return false;}
+            const unsigned count=NCG76OrbitContour::FinishLegCount(*polygonGeometry);
+            const bool circle=NCG76OrbitContour::IsCircleContour(*polygonGeometry);
+            const bool fourSide=NCG76OrbitContour::IsFourSideContour(*polygonGeometry);
+            if((circle&&count!=0U)||(!circle&&NCG76OrbitContour::FinishEnabled(*polygonGeometry)&&
+                ((fourSide&&count!=4U)||(!fourSide&&
+                    (count<3U||count>12U||count!=polygonGeometry->orbit.source.polygonSides))))||
+               (!NCG76OrbitContour::FinishEnabled(*polygonGeometry)&&count!=0U))
+            {Withdraw(Reason::Configuration);return false;}
+            nominalLegCount_=NCG76OrbitContour::NominalLegCountFor(*polygonGeometry);
+            if(nominalLegCount_!=((NCG76OrbitContour::IsExpansionContour(*polygonGeometry)||
+                NCG76OrbitContour::IsFixedRadiusContour(*polygonGeometry))?26U:25U))
+            {Withdraw(Reason::Configuration);return false;}
+            nominalWorkEndIndex_=nominalLegCount_-1U;finishLegCount_=count;
+        }
         config_=config;
         if(mode==SimulationMode::PreviousParentProbe){
             const auto reverse=EDMGapServo::Evaluate(config.curve,config.referenceV-10.0,
@@ -580,27 +613,53 @@ private:
     }
     static bool FinitePoint(const Point8& p) noexcept
     {for(double value:p)if(!std::isfinite(value))return false;return true;}
-    static bool IsWorkPhase(NCG76SphereCycle::Phase phase,unsigned layer) noexcept
+    bool IsWorkPhase(NCG76SphereCycle::Phase phase,unsigned layer) const noexcept
     {
         using P=NCG76SphereCycle::Phase;
         // Return/advance power policy is intentionally not released by this
         // first simulation stage. HOLD/resume/initial retreat never accrue E5.
         return phase==P::InitialDepth||phase==P::CircleEntry||phase==P::Orbit||
-            (phase==P::ContourNominal&&layer<24U)||(phase==P::ContourFinish&&layer<4U);
+            (phase==P::ContourNominal&&layer<nominalWorkEndIndex_)||(phase==P::ContourFinish&&layer<finishLegCount_);
     }
     static bool IsTimeLimitStopping(const NCG76SphereCycle::Feedback& n) noexcept
     {
         using P=NCG76SphereCycle::Phase;
+        if(n.timeLimitReached||n.timedCompletion)return IsTimedCompletionFinishing(n);
         return (n.phase==P::TimeLimitBrake||n.phase==P::TimeLimitSettle)&&
             n.fault==NCG76SphereCycle::Fault::None&&n.totalLimitUs!=0ULL&&
             n.totalElapsedUs>=n.totalLimitUs&&
             n.totalTimerState==static_cast<std::uint8_t>(NCMachiningTime::TimerState::Expired)&&
             n.timePhase==static_cast<std::uint8_t>(NCMachiningTime::TimePhase::TimedOut);
     }
-    static bool ValidNominal(const NCG76SphereCycle::Feedback& n,bool stationary) noexcept
+    // EDM359: a reached D ends this parent normally after its admitted drain
+    // and stopped center return. It remains an observation, never a new GAP
+    // machining interval or a completion/position authority for this observer.
+    static bool IsTimedCompletionFinishing(const NCG76SphereCycle::Feedback& n) noexcept
+    {
+        using P=NCG76SphereCycle::Phase;
+        if(!n.timeLimitReached||n.fault!=NCG76SphereCycle::Fault::None||!n.totalLimitUs||
+           !NCMachiningTime::ValidConfig({n.totalLimitUs,n.additionalUs})||
+           n.totalElapsedUs!=n.totalLimitUs||n.additionalElapsedUs>n.additionalUs||
+           n.totalTimerState!=static_cast<std::uint8_t>(NCMachiningTime::TimerState::Completed)||
+           n.totalPauseReason!=static_cast<std::uint8_t>(NCMachiningTime::PauseReason::None))return false;
+        if(n.timedCompletion)return n.phase==P::Complete&&
+            n.timePhase==static_cast<std::uint8_t>(NCMachiningTime::TimePhase::Completed)&&
+            !n.holdActive&&!n.held&&!n.flushActive&&!n.gapHistoryActive&&!n.gapApplied&&
+            n.speedMmS==0.0&&n.signedSpeedMmS==0.0;
+        if(n.timePhase!=static_cast<std::uint8_t>(NCMachiningTime::TimePhase::TimedFinishing))return false;
+        if(n.phase==P::TimeLimitBrake||n.phase==P::TimeLimitSettle)return !n.flushActive;
+        if(n.phase==P::TimedHistoryReturn)return n.gapHistoryActive&&!n.flushActive&&!n.holdActive;
+        if(n.phase==P::TimedReturnCenter)return !n.gapHistoryActive&&!n.flushActive&&!n.holdActive;
+        if(n.phase==P::HoldBrake||n.phase==P::HoldSettle||n.phase==P::HeldAtStart)return n.holdActive;
+        if(n.flushActive&&(n.phase==P::FlushBrake||n.phase==P::FlushSettle||
+           n.phase==P::FlushHoldBrake||NCG76SphereCycle::Detail::IsFlushMotionPhase(n.phase)))return true;
+        return n.gapHistoryActive&&(n.phase==P::GapHistory||n.phase==P::GapHistorySettle);
+    }
+    bool ValidNominal(const NCG76SphereCycle::Feedback& n,bool stationary) const noexcept
     {
         using P=NCG76SphereCycle::Phase;
         const bool timeLimitStop=IsTimeLimitStopping(n);
+        if((n.timeLimitReached||n.timedCompletion)&&!timeLimitStop)return false;
         if(stationary){
             if(n.holdRecoveryEnabled&&n.holdActive&&
                (NCG76SphereCycle::Detail::IsRecovery(n.phase)||n.phase==P::HeldAtStart))
@@ -617,12 +676,12 @@ private:
         }
         return n.fault==NCG76SphereCycle::Fault::None&&
             (static_cast<unsigned>(n.phase)<=static_cast<unsigned>(P::InspectionJogReturn)||timeLimitStop||
-                (n.phase==P::ContourNominal&&n.layerIndex<25U)||
-                (n.phase==P::ContourFinish&&n.layerIndex<4U))&&
+                (n.phase==P::ContourNominal&&n.layerIndex<nominalLegCount_)||
+                (n.phase==P::ContourFinish&&n.layerIndex<finishLegCount_))&&
             (!NCG76SphereCycle::Detail::IsRecovery(n.phase)||(n.holdRecoveryEnabled&&n.holdActive))&&
             ((n.nominalPhase>=P::InitialDepth&&n.nominalPhase<=P::AdvanceCenter)||
-                (n.nominalPhase==P::ContourNominal&&n.layerIndex<25U&&n.completedLayers==0U)||
-                (n.nominalPhase==P::ContourFinish&&n.layerIndex<4U&&n.completedLayers==0U))&&
+                (n.nominalPhase==P::ContourNominal&&n.layerIndex<nominalLegCount_&&n.completedLayers==0U)||
+                (n.nominalPhase==P::ContourFinish&&n.layerIndex<finishLegCount_&&n.completedLayers==0U))&&
             std::isfinite(n.speedMmS)&&n.speedMmS>=0.0&&std::isfinite(n.nominalProgressMm)&&
             (!n.gapMotionEnabled||(std::isfinite(n.signedSpeedMmS)&&
                 n.speedMmS==std::fabs(n.signedSpeedMmS)))&&
@@ -641,6 +700,7 @@ private:
         feedback_.candidateMCS=Point8{};feedback_.nominalPhase=NCG76SphereCycle::Phase::Idle;
         feedback_.layerIndex=0U;feedback_.nominalProgressMm=feedback_.nominalLengthMm=0.0;
     }
+    unsigned finishLegCount_=4U,nominalLegCount_=25U,nominalWorkEndIndex_=24U;
     Config config_{};Feedback feedback_{};EDM130::WorkEvidence work_{};
     EDM88::Qualifier qualifier_{};EDM88::Frame frame_{};
     std::uint64_t sessionHighWater_=0ULL,lastTick_=0ULL,lastUs_=0ULL,firstUs_=0ULL;

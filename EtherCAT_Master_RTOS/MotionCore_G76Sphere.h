@@ -144,14 +144,132 @@ inline NCMachiningTime::Config Config(const NCG76SphereCycle::Request& request) 
 {NCMachiningTime::Config value{};value.totalLimitUs=request.totalLimitUs;value.additionalUs=request.additionalUs;return value;}
 inline bool Matches(const NCMachiningTime::Config& value,const NCG76SphereCycle::Request& request) noexcept
 {return NCMachiningTime::ValidConfig(value)&&NCMachiningTime::SameConfig(value,Config(request));}
-inline bool TerminalQualified(const NCG76SphereCycle::Feedback& feedback,const NCG76SphereCycle::Request& request) noexcept
+// A finite E29 budget cannot publish another live/Passed/D outcome after its
+// last allowed rejected sweep. Zero retains the released unlimited contract.
+// Current coverage may belong to the next partial sweep; only Passed must
+// expose the same final percentage as the retained completed-sweep decision.
+inline bool RetryBudgetEvidenceQualified(const NCG76SphereCycle::Feedback& f,
+    unsigned rounds,std::uint32_t threshold,unsigned retryLimit) noexcept
+{
+    if(!retryLimit)return true;
+    const auto& e=f.orbitEvaluation;
+    if(!NCG76OrbitCompletion::ValidConfig(rounds,threshold,retryLimit)||
+       f.orbitRetryLimit!=retryLimit||f.orbitRequiredPasses!=rounds||f.orbitTargetPercentScaled!=threshold||
+       f.orbitCompletionState==static_cast<std::uint8_t>(NCG76OrbitCompletion::State::RetryExhausted)||
+       e.failedAttempts>retryLimit||
+       !NCG76OrbitCompletion::ValidAttemptEvidence(e,f.orbitAttemptCount,rounds,threshold,f.orbitQualifiedPasses))return false;
+    return f.orbitCompletionState!=static_cast<std::uint8_t>(NCG76OrbitCompletion::State::Passed)||
+        (e.lastAvailable&&e.lastAccepted&&f.orbitPercentAvailable&&e.lastPercentScaled==f.orbitPercentScaled);
+}
+// EDM366: process failure is a distinct, physically completed whole-sweep
+// outcome. This is not a Passed inspection, a D endpoint or a runtime fault.
+inline bool RetryExhaustionStateQualified(const NCG76SphereCycle::Feedback& f,
+    unsigned rounds,std::uint32_t threshold,unsigned retryLimit) noexcept
 {
     using namespace NCMachiningTime;
+    const auto& e=f.orbitEvaluation;
+    if(!rounds||!retryLimit||!NCG76OrbitCompletion::ValidConfig(rounds,threshold,retryLimit)||
+       !f.session||!f.tick||f.orbitRetryLimit!=retryLimit||
+       f.orbitRequiredPasses!=rounds||f.orbitTargetPercentScaled!=threshold||
+       f.orbitCompletionState!=static_cast<std::uint8_t>(NCG76OrbitCompletion::State::RetryExhausted)||
+       f.phase!=NCG76SphereCycle::Phase::Complete||f.fault!=NCG76SphereCycle::Fault::None||
+       f.timeLimitReached||f.timedCompletion||f.held||f.holdActive||f.flushActive||
+       f.gapHistoryActive||f.inspectionJogActive||f.orbitCompletionActive||
+       !f.orbitPercentAvailable||f.orbitPercentScaled>=threshold||f.orbitQualifiedPasses!=0U||
+       !e.lastAvailable||e.lastAccepted||e.failedAttempts!=static_cast<std::uint64_t>(retryLimit)+1ULL||
+       e.lastPercentScaled!=f.orbitPercentScaled||
+       !NCG76OrbitCompletion::ValidAttemptEvidence(e,f.orbitAttemptCount,rounds,threshold,0U)||
+       !ValidConfig({f.totalLimitUs,f.additionalUs})||f.totalElapsedUs>f.totalLimitUs||
+       f.additionalElapsedUs!=f.additionalUs||f.totalPauseReason||f.additionalPauseReason||
+       f.timePhase!=static_cast<std::uint8_t>(TimePhase::Completed))return false;
+    if(f.totalLimitUs?(f.totalElapsedUs>=f.totalLimitUs||
+        f.totalTimerState!=static_cast<std::uint8_t>(TimerState::Completed)):f.totalTimerState!=0U)return false;
+    if(f.additionalUs?f.additionalTimerState!=static_cast<std::uint8_t>(TimerState::Completed):
+        f.additionalTimerState!=0U)return false;
+    return f.finishRequiredCount==0U&&f.finishVerifiedCount==0U&&f.finishAttemptCount==0ULL&&
+        f.finishForcedCompletedCount==0ULL&&f.finishReworkCount==0ULL&&f.finishPhase==0U&&!f.finishActive;
+}
+inline bool RetryExhaustionQualified(const NCG76SphereCycle::Feedback& f,
+    const NCG76SphereCycle::Request& r) noexcept
+{
+    return RetryExhaustionStateQualified(f,r.orbitInspectionRounds,r.orbitThresholdScaled,r.orbitRetryLimit)&&
+        r.session&&f.session==r.session&&f.totalLimitUs==r.totalLimitUs&&f.additionalUs==r.additionalUs&&
+        r.geometry.valid&&(r.geometry.kind==NCG76SphereRuntimeGeometry::Kind::Sphere||
+            r.geometry.kind==NCG76SphereRuntimeGeometry::Kind::OrbitContour)&&
+        f.completedLayers==r.geometry.circleLayerCount;
+}
+// EDM359: D is a successful timed end, independently identified from a
+// fulfilled H/L finish. The original admitted geometry is never rewritten.
+inline bool TimeLimitReachedQualified(const NCG76SphereCycle::Feedback& f,
+    const NCG76SphereCycle::Request& r) noexcept
+{
+    using namespace NCMachiningTime;
+    if(!f.timeLimitReached||!r.session||f.session!=r.session||!f.tick||
+       !r.totalLimitUs||!ValidConfig(Config(r))||f.fault!=NCG76SphereCycle::Fault::None||
+       f.totalLimitUs!=r.totalLimitUs||f.totalElapsedUs!=r.totalLimitUs||
+       f.totalTimerState!=static_cast<std::uint8_t>(TimerState::Completed)||f.totalPauseReason!=0U||
+       f.additionalUs!=r.additionalUs||f.additionalElapsedUs>r.additionalUs||
+       (f.timePhase!=static_cast<std::uint8_t>(TimePhase::TimedFinishing)&&
+        f.timePhase!=static_cast<std::uint8_t>(TimePhase::Completed)))return false;
+    if(!r.additionalUs){
+        if(f.additionalElapsedUs||f.additionalTimerState||f.additionalPauseReason)return false;
+    }else if(f.additionalElapsedUs==r.additionalUs){
+        if(f.additionalTimerState!=static_cast<std::uint8_t>(TimerState::Completed)||f.additionalPauseReason)return false;
+    }else if(f.additionalTimerState!=static_cast<std::uint8_t>(TimerState::Paused)||
+             f.additionalPauseReason!=static_cast<std::uint8_t>(PauseReason::Fault))return false;
+    if(!NCG76OrbitCompletion::ValidConfig(r.orbitInspectionRounds,r.orbitThresholdScaled,r.orbitRetryLimit)||
+       f.orbitRetryLimit!=r.orbitRetryLimit||
+       !RetryBudgetEvidenceQualified(f,r.orbitInspectionRounds,r.orbitThresholdScaled,r.orbitRetryLimit)||
+       f.orbitRequiredPasses!=r.orbitInspectionRounds||f.orbitTargetPercentScaled!=r.orbitThresholdScaled||
+       f.orbitCompletionActive||f.orbitPercentAvailable||f.orbitPercentScaled||
+       f.orbitQualifiedPasses>r.orbitInspectionRounds||f.orbitAttemptCount<f.orbitQualifiedPasses)return false;
+    if(r.orbitInspectionRounds){
+        if(f.orbitCompletionState!=static_cast<std::uint8_t>(NCG76OrbitCompletion::State::StoppedByTime))return false;
+    }else if(f.orbitCompletionState||f.orbitQualifiedPasses||f.orbitAttemptCount)return false;
+    if(f.finishRequiredCount>99U||f.finishVerifiedCount>f.finishRequiredCount||
+       f.finishForcedCompletedCount>f.finishAttemptCount||f.finishVerifiedCount>f.finishForcedCompletedCount||
+       f.finishActive)return false;
+    if(f.finishRequiredCount){
+        if(f.finishPhase!=static_cast<std::uint8_t>(NCG76SphereCycle::FinishPhase::StoppedByTime))return false;
+    }else if(f.finishPhase||f.finishVerifiedCount||f.finishAttemptCount||
+             f.finishForcedCompletedCount||f.finishReworkCount)return false;
+    return true;
+}
+inline bool TimedCompletionQualified(const NCG76SphereCycle::Feedback& f,
+    const NCG76SphereCycle::Request& r) noexcept
+{
+    return f.timedCompletion&&TimeLimitReachedQualified(f,r)&&
+        f.phase==NCG76SphereCycle::Phase::Complete&&
+        f.timePhase==static_cast<std::uint8_t>(NCMachiningTime::TimePhase::Completed)&&
+        !f.held&&!f.holdActive&&!f.flushActive&&!f.gapHistoryActive&&!f.inspectionJogActive;
+}
+inline bool TerminalQualified(const NCG76SphereCycle::Feedback& feedback,const NCG76SphereCycle::Request& request) noexcept
+{
+    if(!NCG76OrbitCompletion::ValidConfig(request.orbitInspectionRounds,request.orbitThresholdScaled,request.orbitRetryLimit)||
+       feedback.orbitRetryLimit!=request.orbitRetryLimit)return false;
+    if(feedback.orbitCompletionState==static_cast<std::uint8_t>(NCG76OrbitCompletion::State::RetryExhausted))
+        return RetryExhaustionQualified(feedback,request);
+    if(!RetryBudgetEvidenceQualified(feedback,request.orbitInspectionRounds,
+        request.orbitThresholdScaled,request.orbitRetryLimit))return false;
+    if(feedback.timeLimitReached||feedback.timedCompletion)
+        return TimedCompletionQualified(feedback,request);
+    using namespace NCMachiningTime;
+    if(feedback.orbitRequiredPasses!=request.orbitInspectionRounds||
+       feedback.orbitTargetPercentScaled!=request.orbitThresholdScaled)return false;
+    if(request.orbitInspectionRounds){
+        if(request.orbitInspectionRounds>99U||request.orbitThresholdScaled<10000000U||request.orbitThresholdScaled>100000000U||
+           feedback.orbitCompletionState!=4U||feedback.orbitCompletionActive||!feedback.orbitPercentAvailable||
+           feedback.orbitQualifiedPasses!=request.orbitInspectionRounds||
+           feedback.orbitAttemptCount<feedback.orbitQualifiedPasses||
+           feedback.orbitPercentScaled<request.orbitThresholdScaled||feedback.orbitPercentScaled>100000000U)return false;
+    }else if(request.orbitThresholdScaled||feedback.orbitCompletionState||feedback.orbitCompletionActive||
+        feedback.orbitPercentAvailable||feedback.orbitPercentScaled||feedback.orbitQualifiedPasses||feedback.orbitAttemptCount)return false;
     if(feedback.totalLimitUs!=request.totalLimitUs||feedback.additionalUs!=request.additionalUs||
        feedback.totalElapsedUs>request.totalLimitUs||feedback.additionalElapsedUs>request.additionalUs)return false;
     if(!request.totalLimitUs&&!request.additionalUs)
         return feedback.totalElapsedUs==0ULL&&feedback.additionalElapsedUs==0ULL&&
-            feedback.totalTimerState==0U&&feedback.additionalTimerState==0U&&feedback.timePhase==0U;
+            feedback.totalTimerState==0U&&feedback.additionalTimerState==0U&&
+            feedback.timePhase==(request.orbitInspectionRounds?static_cast<std::uint8_t>(TimePhase::Completed):0U);
     if(feedback.timePhase!=static_cast<std::uint8_t>(TimePhase::Completed))return false;
     if(request.totalLimitUs?(feedback.totalTimerState!=static_cast<std::uint8_t>(TimerState::Completed)||
         feedback.totalElapsedUs>=request.totalLimitUs):feedback.totalTimerState!=0U)return false;
@@ -260,6 +378,9 @@ struct MotionG76SphereFeedback
     MotionExecutionIdentity identity{};
     MotionOwnerLease owner{};
     std::array<double,8U> endpointMCS{},commandMCS{},velocityNative{},actualMCS{};
+    // EDM359: separately published RT completion goal; the admitted source
+    // target remains immutable even when D ends before reaching that target.
+    std::array<double,8U> timedCompletionEndpoint{};
     std::array<double,8U> holdRetreatAnchorMCS{},holdProcessPointMCS{};
     bool holdInspectionJogReady=false,holdRecoveryResumeReady=false;
     std::uint32_t holdInspectionAxisMask=0U;
@@ -287,6 +408,45 @@ static_assert(sizeof(MotionG76SphereFeedback)<=2048U,"P50 diagnostics must fit t
 
 namespace MotionG76SphereMachiningTime
 {
+// Bind the successful D receipt to the actual final commanded endpoint.
+// This adds no authority: callers still prove identity/owner/epoch, fresh
+// physical zero settlement, the terminal ledger and exact drain/barrier.
+inline bool TimedCompletionEndpointMatches(const MotionG76SphereFeedback& report,
+    const NCG76SphereCycle::Request& request) noexcept
+{
+    return TimedCompletionQualified(report.cycle,request)&&
+        std::memcmp(report.endpointMCS.data(),report.timedCompletionEndpoint.data(),
+            sizeof(report.endpointMCS))==0;
+}
+inline bool CompletedEndpointQualified(const MotionG76SphereFeedback& report,
+    const NCG76SphereCycle::Request& request) noexcept
+{
+    const auto& f=report.cycle;const auto& g=request.geometry;
+    if(!request.session||report.session!=request.session||f.session!=request.session||!f.tick||
+       !report.accepted||!report.started||!report.terminal||!report.completed||report.runtimeFault||
+       !report.identity.IsAssigned()||!report.owner.IsValid()||report.timeLimitStopped||f.phase!=NCG76SphereCycle::Phase::Complete||
+       f.fault!=NCG76SphereCycle::Fault::None||f.held||f.holdActive||f.flushActive||
+       f.gapHistoryActive||f.inspectionJogActive||!g.valid||report.nominalKind!=g.kind||
+       report.translationGeneration!=g.frame.translation.generation||
+       !NCMachiningTime::ValidConfig(Config(request))||!TerminalQualified(f,request))return false;
+    if(f.timedCompletion){
+        if(!TimedCompletionEndpointMatches(report,request)||f.completedLayers>g.circleLayerCount)return false;
+    }else if(f.completedLayers!=g.circleLayerCount||
+        std::memcmp(report.endpointMCS.data(),g.endMCS.data(),sizeof(report.endpointMCS))!=0)return false;
+    for(unsigned a=0U;a<8U;++a){
+        const double endpoint=report.endpointMCS[a],actual=report.actualMCS[a];
+        if(!std::isfinite(endpoint)||!std::isfinite(actual)||
+           !MotionG76SphereFixedAxes::SameBits(endpoint,report.commandMCS[a])||report.velocityNative[a]!=0.0||
+           !std::isfinite(g.boundsMinMCS[a])||!std::isfinite(g.boundsMaxMCS[a])||
+           g.boundsMinMCS[a]>g.boundsMaxMCS[a]||endpoint<g.boundsMinMCS[a]||endpoint>g.boundsMaxMCS[a])return false;
+        if((request.travelMask&(1U<<a))&&(!std::isfinite(request.travelMin[a])||!std::isfinite(request.travelMax[a])||
+           request.travelMin[a]>request.travelMax[a]||endpoint<request.travelMin[a]||endpoint>request.travelMax[a]))return false;
+        if(a>=3U&&!MotionG76SphereFixedAxes::SameBits(endpoint,g.startMCS[a]))return false;
+        const double tolerance=a<3U?request.positionToleranceMm:request.rotaryToleranceDeg;
+        if(!std::isfinite(tolerance)||tolerance<=0.0||std::fabs(actual-endpoint)>tolerance)return false;
+    }
+    return true;
+}
 inline bool TimeLimitStoppedQualified(const MotionG76SphereFeedback& report,const NCG76SphereCycle::Request& request) noexcept
 {
     using namespace NCMachiningTime;

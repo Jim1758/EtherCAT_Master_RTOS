@@ -1328,6 +1328,7 @@ void NCManager::Reset()
         m_g76Sphere->owner:MotionOwnerLease{};
     CancelG76SphereSameThread("RESET");
     ClearMachiningTimeTelemetrySameThread();
+    if(m_g76Sphere)m_g76Sphere->dhBatch.Clear(); // EDM366 RESET clears only passive run results.
     m_g76Confirmation = G76Confirmation{}; m_g76Modal = G76ModalState{};
     m_edm149Confirmation = EDM149Confirmation{};
     ForceEDMPLCOutputsOffSameThread("RESET");
@@ -4922,6 +4923,18 @@ void NCManager::ProcessExecutionEngine()
             return;
         }
 
+        // EDM355: G76 L cannot be consumed by a macro/tool/ordinary CNC owner.
+        if(NCOrbitCompletionPolicy::Requests(parsedBlock)){
+            NCBlock literal{};std::uint32_t rounds=0U;
+            if(!NCPreparedBlockQueueShadow::TryBuildLiteralBlock(parsedBlock,literal)||
+               !NCOrbitCompletionPolicy::Decode(parsedBlock,literal,rounds)||!IsG76SphereBlock(literal)){
+                markDispatchFailed(static_cast<std::uint32_t>(AlarmManager::G_Code_Invalid_parameter));
+                RtPrintf("[ORBIT_COMPLETION] build=EDM355 event=SOURCE_REJECT pc=%d line=%d beforeResolve=1 reason=L_REQUIRES_LITERAL_G76_NATIVE_0_TO_99\n",currentPC,sourceLineNumber);
+                AlarmManager::GetInstance().Trigger(AlarmManager::G_Code_Invalid_parameter,sourceLineNumber);
+                ChangeState(NCState::HOLD);return;
+            }
+        }
+
         // EDM340: time metadata belongs only to a literal, explicitly
         // admitted analytic EDM parent. Reject before resolution and settings.
         if(NCMachiningTimePolicy::Requests(parsedBlock)){
@@ -5645,6 +5658,15 @@ void NCManager::ProcessExecutionEngine()
                 }
             }
 
+            if(NCOrbitCompletionPolicy::Requests(block)){
+                std::uint32_t rounds=0U;
+                if(!NCOrbitCompletionPolicy::Decode(parsedBlock,block,rounds)||!IsG76SphereBlock(block)){
+                    markDispatchFailed(static_cast<std::uint32_t>(AlarmManager::G_Code_Invalid_parameter));
+                    RtPrintf("[ORBIT_COMPLETION] build=EDM355 event=SOURCE_REJECT pc=%d line=%d beforeFrame=1 reason=L_REQUIRES_LITERAL_G76_NATIVE_0_TO_99\n",currentPC,sourceLineNumber);
+                    AlarmManager::GetInstance().Trigger(AlarmManager::G_Code_Invalid_parameter,sourceLineNumber);
+                    ChangeState(NCState::HOLD);return;
+                }
+            }
             // EDM340: the resolved row cannot turn computed G/D/H into an
             // implicit time declaration or pass it to an ordinary CNC lane.
             if(NCMachiningTimePolicy::Requests(block)){
@@ -7235,6 +7257,16 @@ void NCManager::ExecuteBlock(
     NCBlockDispatchId dispatchId)
 {
     m_waitCallback = nullptr;
+    // EDM355: retain the exact inspection declaration before any side effect.
+    if(NCOrbitCompletionPolicy::Requests(inputBlock)){
+        const auto* source=GetBaseProgramCache().TryGetLine(sourcePC);std::uint32_t rounds=0U;
+        if(!source||(sourceLineNumber&&source->sourceLineNumber!=sourceLineNumber)||
+           !NCOrbitCompletionPolicy::Decode(source->parsedBlock,inputBlock,rounds)||!IsG76SphereBlock(inputBlock)){
+            RtPrintf("[ORBIT_COMPLETION] build=EDM355 event=SOURCE_REJECT pc=%d line=%d beforeSideEffects=1 reason=L_REQUIRES_LITERAL_G76_NATIVE_0_TO_99\n",sourcePC,sourceLineNumber);
+            AlarmManager::GetInstance().Trigger(AlarmManager::G_Code_Invalid_parameter,sourceLineNumber);
+            ChangeState(NCState::HOLD);return;
+        }
+    }
     // EDM340: retain the authored time owner before every M/T/E/frame effect.
     if(NCMachiningTimePolicy::Requests(inputBlock)){
         const auto* timeSource=GetBaseProgramCache().TryGetLine(sourcePC);
@@ -9085,6 +9117,7 @@ void NCManager::FinalizeProgramEnd()
     FinalizePathCoreFeedSameThread(); // BX-FEED: original End gate already finalized.
     FinalizePathCoreArcSameThread(); // BY-ARC: current run summary only.
     FinalizePathCoreReplaySameThread(); // BZ-REPLAY
+    FinalizeG76OrbitCompletionSummarySameThread(); // EDM366 after original successful MarkFinalized only.
     RetireFixedTranslationSameThread();
     InvalidatePathCoreHoldSameThread(); // CB: program end closes any unused arm.
 // BQ-END

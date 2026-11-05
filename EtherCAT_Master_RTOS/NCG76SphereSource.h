@@ -4,6 +4,7 @@
 #include "NCG76SphereCoordinates.h"
 #include "MotionExecutionContract.h"
 #include "NCMachiningTimePolicy.h"
+#include "NCOrbitCompletionPolicy.h"
 
 #include <array>
 #include <cerrno>
@@ -127,7 +128,7 @@ inline bool AllowedAddress(char word) noexcept
 {
     return word == 'N' || word == 'P' || word == 'R' || word == 'K' ||
         word == 'F' || word == 'B' || word == 'X' || word == 'Y' || word == 'Z' ||
-        word == NCMachiningTimePolicy::TotalAddress || word == NCMachiningTimePolicy::AdditionalAddress;
+        word == 'L' || word == NCMachiningTimePolicy::TotalAddress || word == NCMachiningTimePolicy::AdditionalAddress;
 }
 }
 
@@ -165,6 +166,8 @@ inline Status Decode(const NCParsedBlock& parsed, const ModalB& inherited, Words
         !literal.has('R') || !literal.has('K') || !literal.has('F') ||
         !(literal.has('X') || literal.has('Y') || literal.has('Z')))
         return Status::UnsupportedBlock;
+    std::uint32_t inspectionRounds=0U;
+    if(!NCOrbitCompletionPolicy::Decode(parsed,literal,inspectionRounds))return Status::InvalidProcessOption;
     NCMachiningTime::Config timing{};
     if(!NCMachiningTimePolicy::Decode(parsed,literal,timing))return Status::InvalidProcessOption;
     if (!(literal.val('R') > 0.0) || !(literal.val('K') > 0.0) || !(literal.val('F') > 0.0))

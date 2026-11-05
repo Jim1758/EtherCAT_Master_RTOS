@@ -25,6 +25,48 @@ bool SpherePowerOff() noexcept
 constexpr std::uint32_t SphereRuntimeAlarm=AlarmManager::MOTION_GROUP_MAPPING_INTEGRITY;
 constexpr std::uint32_t SphereTimeLimitRuntimeFault=10U;
 constexpr std::uint32_t SphereTimeLimitAlarm=AlarmManager::EDM_MACHINING_TIME_LIMIT;
+bool SphereOrbitCompletionConfigValid(std::uint32_t rounds,std::uint32_t threshold,unsigned retryLimit=0U) noexcept
+{
+    return NCG76OrbitCompletion::ValidConfig(rounds,threshold,retryLimit);
+}
+bool SphereOrbitCompletionFeedbackMatches(const NCG76SphereCycle::Feedback& feedback,
+    std::uint32_t rounds,std::uint32_t threshold,bool terminal=false,unsigned retryLimit=0U) noexcept
+{
+    if(!SphereOrbitCompletionConfigValid(rounds,threshold,retryLimit)||feedback.orbitRetryLimit!=retryLimit||
+       feedback.orbitRequiredPasses!=rounds||feedback.orbitTargetPercentScaled!=threshold)return false;
+    if(!rounds)return feedback.orbitCompletionState==0U&&!feedback.orbitCompletionActive&&
+        !feedback.orbitPercentAvailable&&feedback.orbitPercentScaled==0U&&
+        feedback.orbitQualifiedPasses==0U&&feedback.orbitAttemptCount==0ULL;
+    if(feedback.orbitCompletionState==7U)
+        return MotionG76SphereMachiningTime::RetryExhaustionStateQualified(feedback,rounds,threshold,retryLimit);
+    if(!MotionG76SphereMachiningTime::RetryBudgetEvidenceQualified(feedback,rounds,threshold,retryLimit))return false;
+    if(feedback.orbitCompletionState==6U)return feedback.timeLimitReached&&
+        feedback.totalLimitUs&&feedback.totalElapsedUs==feedback.totalLimitUs&&
+        feedback.totalTimerState==static_cast<std::uint8_t>(NCMachiningTime::TimerState::Completed)&&
+        feedback.orbitQualifiedPasses<=rounds&&feedback.orbitAttemptCount>=feedback.orbitQualifiedPasses&&
+        !feedback.orbitCompletionActive&&!feedback.orbitPercentAvailable&&!feedback.orbitPercentScaled&&
+        (!terminal||feedback.timedCompletion);
+    if(feedback.orbitCompletionState<1U||feedback.orbitCompletionState>5U||
+       feedback.orbitPercentScaled>100000000U||
+       (!feedback.orbitPercentAvailable&&feedback.orbitPercentScaled!=0U)||
+       feedback.orbitQualifiedPasses>rounds||feedback.orbitAttemptCount<feedback.orbitQualifiedPasses)return false;
+    if(feedback.orbitCompletionActive!=(feedback.orbitCompletionState==2U||feedback.orbitCompletionState==3U))return false;
+    if(feedback.orbitCompletionState==1U&&(feedback.orbitPercentAvailable||feedback.orbitQualifiedPasses||feedback.orbitAttemptCount))return false;
+    if(feedback.orbitCompletionState==5U&&(feedback.orbitPercentAvailable||feedback.orbitPercentScaled))return false;
+    if(feedback.orbitCompletionState!=4U&&feedback.orbitQualifiedPasses==rounds)return false;
+    if(feedback.orbitCompletionState==4U){
+        if(feedback.orbitCompletionActive||!feedback.orbitPercentAvailable||
+           feedback.orbitQualifiedPasses!=rounds||feedback.orbitPercentScaled<threshold)return false;
+    }else if(terminal)return false;
+    return true;
+}
+void SphereWithdrawOrbitCompletion(NCG76SphereCycle::Feedback& feedback) noexcept
+{
+    if(feedback.orbitRequiredPasses){
+        feedback.orbitCompletionState=5U;feedback.orbitCompletionActive=false;
+        feedback.orbitPercentAvailable=false;feedback.orbitPercentScaled=0U;feedback.orbitQualifiedPasses=0U;
+    }
+}
 }
 
 bool MotionCore::ReadG76SphereFeedback(MotionG76SphereFeedback& out) const noexcept
@@ -34,8 +76,10 @@ bool MotionCore::ReadG76SphereFeedback(MotionG76SphereFeedback& out) const noexc
     if(m_g76SphereInspectionProducerBlocked.load(std::memory_order_acquire)){
         out.holdInspectionJogReady=false;out.holdRecoveryResumeReady=false;
     }
-    if(m_g76SphereProcessRevokedSession.load(std::memory_order_acquire)==out.session)
+    if(m_g76SphereProcessRevokedSession.load(std::memory_order_acquire)==out.session){
         out.processShadow=NCG76SphereGapProcess::Feedback{};
+        SphereWithdrawOrbitCompletion(out.cycle);
+    }
     return true;
 }
 
@@ -82,6 +126,9 @@ bool MotionCore::TryG76SphereMove(const NCG76SphereCycle::Request& requested,
     hold.declaredPreviousParents=declaredPreviousParents;
     hold.finishRequiredCount=finishRequiredCount;
     hold.machiningTime=MotionG76SphereMachiningTime::Config(requested);
+    hold.orbitInspectionRounds=requested.orbitInspectionRounds;
+    hold.orbitThresholdScaled=requested.orbitThresholdScaled;
+    hold.orbitRetryLimit=requested.orbitRetryLimit;
     if(holdConfig)hold.config=*holdConfig;
     G76SphereFrozen frozen{};frozen.request=requested;
     frozen.holdRecoveryEnabled=hold.enabled;
@@ -122,6 +169,9 @@ bool MotionCore::TryG76SphereMove(const NCG76SphereCycle::Request& requested,
     // The explicit common G01/G02/G03 lane is an E-aware SIM parent even in
     // B0. It may not silently become ordinary AIR when its sidecar is absent.
     if(commonProcess&&(!process.config.enabled||!frozen.signedMotionEnabled))
+        return reject(MotionG76SphereAdmissionGate::FlushEnvelope);
+    if(request.orbitInspectionRounds&&(!process.config.enabled||!frozen.signedMotionEnabled||
+       !frozen.orbitFeedsEnabled||finishRequiredCount!=0U))
         return reject(MotionG76SphereAdmissionGate::FlushEnvelope);
     // EDM301: an explicit process mode must never silently become a B0 AIR
     // parent when its recipe or independent SIM sidecar is unavailable.
@@ -304,6 +354,10 @@ bool MotionCore::IsG76SphereCommandAuthorized(const MotionCommand& command) cons
        !SphereIdentity(hold.identity,command.execution)||!hold.owner.Matches(command.ownerLease)||
        hold.enabled!=frozen.holdRecoveryEnabled||hold.declaredPreviousParents!=frozen.holdDeclaredPreviousParents||
        hold.finishRequiredCount!=frozen.finishRequiredCount||hold.finishRequiredCount>99U||
+       hold.orbitInspectionRounds!=frozen.request.orbitInspectionRounds||
+       hold.orbitThresholdScaled!=frozen.request.orbitThresholdScaled||
+       hold.orbitRetryLimit!=frozen.request.orbitRetryLimit||
+       !SphereOrbitCompletionConfigValid(hold.orbitInspectionRounds,hold.orbitThresholdScaled,hold.orbitRetryLimit)||
        (hold.enabled&&!NCHoldRecovery::Valid(hold.config))||
        !MotionG76SphereMachiningTime::Matches(hold.machiningTime,frozen.request))return false;
     const auto kind=frozen.request.geometry.kind;
@@ -318,6 +372,9 @@ bool MotionCore::IsG76SphereCommandAuthorized(const MotionCommand& command) cons
         kind!=NCG76SphereRuntimeGeometry::Kind::Arc&&kind!=NCG76SphereRuntimeGeometry::Kind::OrbitContour)||
         (kind!=NCG76SphereRuntimeGeometry::Kind::Sphere&&!frozen.signedMotionEnabled))return false;
     const auto& request=frozen.request;
+    if(request.orbitInspectionRounds&&(!frozen.signedMotionEnabled||!frozen.orbitFeedsEnabled||
+       (kind!=NCG76SphereRuntimeGeometry::Kind::Sphere&&kind!=NCG76SphereRuntimeGeometry::Kind::OrbitContour)||
+       hold.finishRequiredCount!=0U))return false;
     if(hold.finishRequiredCount!=0U&&(kind==NCG76SphereRuntimeGeometry::Kind::Sphere||
        kind==NCG76SphereRuntimeGeometry::Kind::OrbitContour||
        !std::isfinite(request.geometry.travelMm)||request.geometry.travelMm<=0.0||
@@ -333,8 +390,14 @@ bool MotionCore::IsG76SphereCommandAuthorized(const MotionCommand& command) cons
         if(active.parameterFeeds!=request.parameterFeeds||active.geometry.kind!=kind||
            (kind==NCG76SphereRuntimeGeometry::Kind::OrbitContour&&
             NCG76OrbitContour::ModeP(active.geometry)!=NCG76OrbitContour::ModeP(request.geometry))||
+           (kind==NCG76SphereRuntimeGeometry::Kind::OrbitContour&&
+            NCG76Mode::IsPolygon(NCG76OrbitContour::ModeP(request.geometry))&&
+            active.geometry.orbit.source.polygonSides!=request.geometry.orbit.source.polygonSides)||
            frozen.orbitFeedsEnabled!=m_g76SphereFrozen.orbitFeedsEnabled||
            active.totalLimitUs!=request.totalLimitUs||active.additionalUs!=request.additionalUs||
+           active.orbitInspectionRounds!=request.orbitInspectionRounds||
+           active.orbitThresholdScaled!=request.orbitThresholdScaled||
+           active.orbitRetryLimit!=request.orbitRetryLimit||
            !NCMachiningTime::SameConfig(hold.machiningTime,m_g76SphereHoldFrozen.machiningTime)||
            !MotionG76SphereFixedAxes::SameBits(active.nominalFeedCapMmMin,request.nominalFeedCapMmMin)||
            !MotionG76SphereFixedAxes::SameBits(active.feedMmMin,request.feedMmMin)||
@@ -342,6 +405,7 @@ bool MotionCore::IsG76SphereCommandAuthorized(const MotionCommand& command) cons
            hold.enabled!=m_g76SphereHoldFrozen.enabled||
            hold.declaredPreviousParents!=m_g76SphereHoldFrozen.declaredPreviousParents||
            hold.finishRequiredCount!=m_g76SphereHoldFrozen.finishRequiredCount||
+           hold.orbitRetryLimit!=m_g76SphereHoldFrozen.orbitRetryLimit||
            (hold.enabled&&!NCHoldRecovery::SameConfig(hold.config,m_g76SphereHoldFrozen.config)))return false;
     }
     for(unsigned i=0U;i<6U;++i){
@@ -728,7 +792,7 @@ bool MotionCore::LoadG76SphereCommand(const MotionCommand& front) noexcept
     const auto holdRelease=m_g76SphereHoldContinuationReleased.load(std::memory_order_acquire);
     bool keepHoldHistory=holdRead&&incomingHold.enabled&&m_g76SphereHoldFrozen.enabled&&
         !IsResetSafetyOutputHoldEstablished()&&previous.session&&holdRelease==previous.session&&
-        previous.session<nextRequest.session&&previous.completed&&previous.terminal&&!previous.runtimeFault&&
+        previous.session<nextRequest.session&&previous.completed&&previous.terminal&&!previous.runtimeFault&&!previous.cycle.timedCompletion&&
         previous.cycle.phase==NCG76SphereCycle::Phase::Complete&&previous.cycle.fault==NCG76SphereCycle::Fault::None&&
         !previous.cycle.holdActive&&!previous.cycle.held&&previous.identity.source==MotionCommandSource::NC_MEMORY&&
         previous.identity.epoch==command.execution.epoch&&previous.owner.Matches(command.ownerLease)&&
@@ -791,7 +855,7 @@ bool MotionCore::LoadG76SphereCommand(const MotionCommand& front) noexcept
         previous.nominalKind==NCG76SphereRuntimeGeometry::Kind::Arc;
     const bool nextSingle=nextKind==NCG76SphereRuntimeGeometry::Kind::Line||nextKind==NCG76SphereRuntimeGeometry::Kind::Arc;
     const bool continuationScope=!IsResetSafetyOutputHoldEstablished()&&previousSingle&&nextSingle&&previous.session&&
-        previous.session<m_g76SphereFrozen.request.session&&previous.completed&&previous.terminal&&
+        previous.session<m_g76SphereFrozen.request.session&&previous.completed&&previous.terminal&&!previous.cycle.timedCompletion&&
         !previous.runtimeFault&&previous.cycle.phase==NCG76SphereCycle::Phase::Complete&&
         previous.cycle.fault==NCG76SphereCycle::Fault::None&&!previous.cycle.holdActive&&
         !previous.cycle.held&&previous.identity.source==MotionCommandSource::NC_MEMORY&&
@@ -870,7 +934,17 @@ bool MotionCore::LoadG76SphereCommand(const MotionCommand& front) noexcept
         previousParentReady&&processScope&&process.config.parameterFeeds?
         NCG76SphereGapProcess::SimulationMode::PreviousParentProbe:NCG76SphereGapProcess::SimulationMode::Wave;
     const bool processReady=m_g76SphereProcess.Begin(processScope?process.config:NCG76SphereGapProcess::Config{},
-        m_g76SphereFrozen.request.session,continueProcess?&continuation:nullptr,simulationMode);
+        m_g76SphereFrozen.request.session,continueProcess?&continuation:nullptr,simulationMode,
+        (NCG76OrbitContour::IsFixedRadiusContour(m_g76SphereFrozen.request.geometry)||
+         NCG76OrbitContour::ModeP(m_g76SphereFrozen.request.geometry)==16U||
+         NCG76OrbitContour::ModeP(m_g76SphereFrozen.request.geometry)==17U||
+         NCG76OrbitContour::ModeP(m_g76SphereFrozen.request.geometry)==21U||
+         NCG76OrbitContour::ModeP(m_g76SphereFrozen.request.geometry)==22U||
+         NCG76OrbitContour::ModeP(m_g76SphereFrozen.request.geometry)==23U||
+         NCG76OrbitContour::ModeP(m_g76SphereFrozen.request.geometry)==24U||
+         NCG76OrbitContour::ModeP(m_g76SphereFrozen.request.geometry)==25U||
+         NCG76OrbitContour::ModeP(m_g76SphereFrozen.request.geometry)==26U||
+         NCG76OrbitContour::ModeP(m_g76SphereFrozen.request.geometry)==27U)?&m_g76SphereFrozen.request.geometry:nullptr);
     NCG76SphereCycle::FlushConfig flush{};
     if(!holdRead||m_g76SphereHoldFrozen.session!=m_g76SphereFrozen.request.session||
        !SphereIdentity(m_g76SphereHoldFrozen.identity,command.execution)||
@@ -879,6 +953,14 @@ bool MotionCore::LoadG76SphereCommand(const MotionCommand& front) noexcept
        m_g76SphereHoldFrozen.declaredPreviousParents!=m_g76SphereFrozen.holdDeclaredPreviousParents||
        m_g76SphereHoldFrozen.finishRequiredCount!=m_g76SphereFrozen.finishRequiredCount||
        m_g76SphereHoldFrozen.finishRequiredCount>99U||
+       m_g76SphereHoldFrozen.orbitInspectionRounds!=m_g76SphereFrozen.request.orbitInspectionRounds||
+       m_g76SphereHoldFrozen.orbitThresholdScaled!=m_g76SphereFrozen.request.orbitThresholdScaled||
+       m_g76SphereHoldFrozen.orbitRetryLimit!=m_g76SphereFrozen.request.orbitRetryLimit||
+       !SphereOrbitCompletionConfigValid(m_g76SphereHoldFrozen.orbitInspectionRounds,m_g76SphereHoldFrozen.orbitThresholdScaled,
+            m_g76SphereHoldFrozen.orbitRetryLimit)||
+       (m_g76SphereFrozen.request.orbitInspectionRounds&&
+        (!processScope||!processReady||!process.config.enabled||!process.config.signedMotionEnabled||
+         !process.config.orbitFeedsEnabled||m_g76SphereHoldFrozen.finishRequiredCount!=0U))||
        !MotionG76SphereMachiningTime::Matches(m_g76SphereHoldFrozen.machiningTime,m_g76SphereFrozen.request)||
        (m_g76SphereHoldFrozen.enabled&&!NCHoldRecovery::Valid(m_g76SphereHoldFrozen.config))||
        process.config.orbitFeedsEnabled!=m_g76SphereFrozen.orbitFeedsEnabled||
@@ -1135,6 +1217,7 @@ bool MotionCore::RetireG76SphereForResetSafetyBatch(MotionExecutionEpoch resetEp
     m_g76SphereCurrent.cycle.phase=NCG76SphereCycle::Phase::Fault;m_g76SphereCurrent.cycle.fault=NCG76SphereCycle::Fault::Cancelled;
     m_g76SphereCurrent.cycle.finishActive=false;
     m_g76SphereCurrent.cycle.finishPhase=m_g76SphereCurrent.cycle.finishRequiredCount?5U:0U;
+    SphereWithdrawOrbitCompletion(m_g76SphereCurrent.cycle);
     m_g76SphereCurrent.cycle.tick=m_ncSettleRuntimeCycleTick;m_g76SphereCurrent.cycle.held=false;
     m_g76SphereCurrent.cycle.flushActive=false;m_g76SphereCurrent.cycle.flushCheckpointSaved=false;
     m_g76SphereCurrent.commandMCS=m_g76SphereCycle.Command().commandMCS;
@@ -1331,7 +1414,13 @@ bool MotionCore::StepG76SphereRuntime() noexcept
     if(!MotionG76SphereMachiningTime::Matches(m_g76SphereHoldFrozen.machiningTime,m_g76SphereFrozen.request)||
        previousNominal.totalLimitUs!=m_g76SphereFrozen.request.totalLimitUs||
        previousNominal.additionalUs!=m_g76SphereFrozen.request.additionalUs||
+       (previousNominal.timeLimitReached&&!MotionG76SphereMachiningTime::TimeLimitReachedQualified(previousNominal,m_g76SphereFrozen.request))||
        previousNominal.finishRequiredCount!=m_g76SphereHoldFrozen.finishRequiredCount||
+       m_g76SphereHoldFrozen.orbitInspectionRounds!=m_g76SphereFrozen.request.orbitInspectionRounds||
+       m_g76SphereHoldFrozen.orbitThresholdScaled!=m_g76SphereFrozen.request.orbitThresholdScaled||
+       m_g76SphereHoldFrozen.orbitRetryLimit!=m_g76SphereFrozen.request.orbitRetryLimit||
+       !SphereOrbitCompletionFeedbackMatches(previousNominal,m_g76SphereFrozen.request.orbitInspectionRounds,
+            m_g76SphereFrozen.request.orbitThresholdScaled,false,m_g76SphereFrozen.request.orbitRetryLimit)||
        (m_g76SphereHoldFrozen.finishRequiredCount!=0U&&
         (!processFrozen.config.enabled||!processFrozen.config.signedMotionEnabled||!processFrozen.config.flushMotionEnabled))){
         guardedFail(9U,true);return true;
@@ -1433,6 +1522,7 @@ bool MotionCore::StepG76SphereRuntime() noexcept
         previousNominal.flushActive||currentNominal.flushActive||
         previousNominal.gapHistoryActive||currentNominal.gapHistoryActive||
         previousNominal.finishActive||currentNominal.finishActive||
+        currentNominal.timeLimitReached||
         currentNominal.timePhase==static_cast<std::uint8_t>(NCMachiningTime::TimePhase::TimedOut);
     processInput.terminal=output.complete;processInput.cancel=input.cancel;
     processInput.completedFlushSequence=currentNominal.flushCompletedSequence;
@@ -1488,7 +1578,14 @@ bool MotionCore::StepG76SphereRuntime() noexcept
         if(!MotionG76SphereMachiningTime::TerminalQualified(finish,m_g76SphereFrozen.request)){
             guardedFail(3U,true);return true;
         }
-        if(m_g76SphereHoldFrozen.finishRequiredCount!=0U&&
+        if(!SphereOrbitCompletionFeedbackMatches(finish,m_g76SphereFrozen.request.orbitInspectionRounds,
+            m_g76SphereFrozen.request.orbitThresholdScaled,true,m_g76SphereFrozen.request.orbitRetryLimit)){
+            guardedFail(3U,true);return true;
+        }
+        if(finish.timedCompletion&&output.commandMCS!=m_g76SphereCycle.TimedCompletionEndpoint()){
+            guardedFail(3U,true);return true;
+        }
+        if(!finish.timedCompletion&&m_g76SphereHoldFrozen.finishRequiredCount!=0U&&
            (finish.finishActive||finish.finishPhase!=4U||
             finish.finishVerifiedCount!=m_g76SphereHoldFrozen.finishRequiredCount||
             finish.finishForcedCompletedCount<finish.finishVerifiedCount)){
@@ -1545,6 +1642,9 @@ bool MotionCore::G76SphereDemandsZero(const AxisContext& axis) const noexcept
 void MotionCore::PublishG76SphereRuntime() noexcept
 {
     m_g76SphereCurrent.cycle=m_g76SphereCycle.Current();
+    m_g76SphereCurrent.timedCompletionEndpoint=m_g76SphereCycle.TimedCompletionEndpoint();
+    if(m_g76SphereCurrent.terminal&&!m_g76SphereCurrent.completed)
+        SphereWithdrawOrbitCompletion(m_g76SphereCurrent.cycle);
     m_g76SphereCurrent.holdRetreatAnchorMCS=m_g76SphereCycle.HoldRetreatAnchor();
     m_g76SphereCurrent.holdInspectionAxisMask=m_g76SphereInspectionTravelMask;
     m_g76SphereCurrent.holdProcessPointMCS=m_g76SphereCycle.HoldProcessPoint();
@@ -1597,7 +1697,9 @@ bool MotionCore::CommitG76SphereCompletedEndpoint(std::uint64_t session,const Mo
         !SphereIdentity(frozen.command.execution,identity)||!frozen.command.ownerLease.Matches(owner)||
         !IsG76SphereCommandAuthorized(frozen.command)||report.runtimeFault||
         report.cycle.phase!=NCG76SphereCycle::Phase::Complete||report.cycle.fault!=NCG76SphereCycle::Fault::None||
-        report.endpointMCS!=frozen.request.geometry.endMCS||
+        !MotionG76SphereMachiningTime::CompletedEndpointQualified(report,frozen.request)||
+        !SphereOrbitCompletionFeedbackMatches(report.cycle,frozen.request.orbitInspectionRounds,
+            frozen.request.orbitThresholdScaled,true,frozen.request.orbitRetryLimit)||
         !MotionG76SphereMachiningTime::TerminalQualified(report.cycle,frozen.request))return false;
     std::array<double,6U> endpointPulse{};
     for(unsigned i=0U;i<6U;++i){
@@ -1634,6 +1736,12 @@ bool MotionCore::ReleaseG76SphereBarrier(std::uint64_t session,const MotionExecu
     if(!ReadG76SphereFeedback(report)||!report.completed||!report.terminal||!report.endpointCommitted||
         report.session!=session||!SphereIdentity(report.identity,identity)||!report.owner.Matches(owner)||
         !HasExactExecutionDrainAcknowledgement(identity.epoch,owner))return false;
+    G76SphereHoldFrozen hold{};
+    if(!m_g76SphereHoldRequests.Read(hold).Ready()||hold.session!=session||
+       !SphereIdentity(hold.identity,identity)||!hold.owner.Matches(owner)||
+       !SphereOrbitCompletionFeedbackMatches(report.cycle,hold.orbitInspectionRounds,hold.orbitThresholdScaled,true,
+            hold.orbitRetryLimit)||report.cycle.totalLimitUs!=hold.machiningTime.totalLimitUs||
+       report.cycle.additionalUs!=hold.machiningTime.additionalUs)return false;
     LifecycleCommitReservationGuard reservation(*this,identity);
     if(!reservation.IsAcquired()||!HasExactExecutionDrainAcknowledgementImpl(identity.epoch,owner,true))return false;
     auto expected=session;

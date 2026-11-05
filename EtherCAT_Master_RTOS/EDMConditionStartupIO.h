@@ -150,7 +150,9 @@ namespace EDMConditionStartupIO
                 if (!f.enabled) continue;
                 if (!f.stages.empty()) defaults += "S:" + std::to_string(f.stages.front().id);
                 else {
-                    const EDMRecipe::Value value = f.minimum > 0LL ? f.minimum : (f.maximum < 0LL ? f.maximum : 0LL);
+                    const EDMRecipe::Value value = EDMSpecialGapGainDefinition::Exact(f)?
+                        EDMSpecialGapGainDefinition::DefaultValue(f):
+                        (f.minimum > 0LL ? f.minimum : (f.maximum < 0LL ? f.maximum : 0LL));
                     char text[48]{}; EDMRecipe::FormatValue(value, text, sizeof(text)); defaults += std::string("V:") + text;
                 }
             }
@@ -311,8 +313,10 @@ namespace EDMConditionStartupIO
                     for (std::size_t f = 0U; f < candidate->fields.size(); ++f) if (t.cells[f].kind != EDMRecipe::CellKind::Unset) configured = true;
                     if (!t.rowPresent[0] || !configured) return Detail::Fail(state.diagnostic, Error::Missing, selectedLeaf.c_str(), 0U, "E1_EMPTY");
                 }
-                EDMRecipe::Validation validation;
-                if (!EDMRecipe::ValidateCatalog(*candidate, validation)) return Detail::Fail(state.diagnostic, Error::Profile, "CATALOG", 0U, EDMRecipe::ErrorName(validation.error));
+                if(!EDMRecipeConfigIO::FinalizeOrbitRetryCompatibility(base,*candidate,state.diagnostic,
+                    state.allowPersistence&&!state.emergencyDisplay))return false;
+                if(!EDMRecipeConfigIO::FinalizeSpecialGapGainCompatibility(base,*candidate,state.diagnostic,
+                    state.allowPersistence&&!state.emergencyDisplay))return false;
                 if ((!goodIndex || indexedNames != loadedNames) && state.allowPersistence) {
                     const std::string indexPath = Detail::Join(base, "ConditionIndex.csv");
                     // Startup is not cyclic. Preserve the previous valid index before replacing it.

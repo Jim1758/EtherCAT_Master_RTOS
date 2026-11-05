@@ -1,6 +1,7 @@
 #include "NCManager.h"
 #include "EDMProcessTuningCodec.h"
 #include "EDMAutomaticFlushRecipe.h"
+#include "EDMSpecialGapGainBinding.h"
 #include "AlarmManager.h"
 #include <cmath>
 #include <cstdio>
@@ -229,6 +230,9 @@ void NCManager::ObserveEDMProcessShadowSameThread(const EDMGapInput::Snapshot& g
     next.tableId = summary.tableId; next.eCode = summary.eCode;
     next.recipeGeneration = summary.generation;
     const EDMRecipe::Catalog* catalog = m_recipe.GetCatalog();
+    const auto specialGain = EDMSpecialGapGainBinding::Capture(m_recipe, m_edmProcessProfile.machineProfileId);
+    auto effectiveServo = m_edmProcessProfile.servo;
+    const bool gainReady = EDMSpecialGapGainBinding::Apply(specialGain, effectiveServo);
     const bool clockValid = gap.ownerClockValid &&
         (!m_edmProcessHaveClock || gap.observedAtMs >= m_edmProcessLastObservedMs);
     if (clockValid)
@@ -273,11 +277,11 @@ void NCManager::ObserveEDMProcessShadowSameThread(const EDMGapInput::Snapshot& g
             next.voltageV = static_cast<double>(gap.voltageMv) / 1000.0;
             next.referenceV = static_cast<double>(referenceValue.actualValue) / EDMRecipe::Scale;
             next.overridePercent = static_cast<double>(servoValue.actualValue) / EDMRecipe::Scale;
-            if (next.referenceV < 0.0 || next.referenceV > 1000.0)
+            if (!gainReady || next.referenceV < 0.0 || next.referenceV > 1000.0)
                 next.reason = ShadowReason::CurveInvalid;
             else
             {
-                next.curve = EDMGapServo::Evaluate(m_edmProcessProfile.servo,
+                next.curve = EDMGapServo::Evaluate(effectiveServo,
                     next.voltageV, next.referenceV, next.overridePercent);
                 if (!next.curve.valid) next.reason = ShadowReason::CurveInvalid;
             }
@@ -297,6 +301,20 @@ void NCManager::ObserveEDMProcessShadowSameThread(const EDMGapInput::Snapshot& g
 
     const bool sourceChanged = !m_edmProcessHaveGap || !EDM20SameSource(gap, m_edmProcessLastGap);
     const bool recipeChanged = m_edmProcessLastRecipeGeneration != summary.generation;
+    if ((firstObservation || recipeChanged) && m_edmProcessReady)
+    {
+        // RTSS RtPrintf receives text only; the CRT formats all numeric values.
+        char gainLine[512]{};
+        const int gainLength = std::snprintf(gainLine, sizeof(gainLine),
+            "[EDM368] event=GAP_GAIN_PREVIEW_CONFIG ready=%u source=%s E=%u generation=%llu reason=%s field=%u P1=%.6f P2=%.6f P3=%.6f N1=%.6f N2=%.6f N3=%.6f discharge=0\n",
+            gainReady ? 1U : 0U, !gainReady ? "UNAVAILABLE" : specialGain.enabled ? "E_SPECIAL" : "PARAMETER_FILE", unsigned(summary.eCode),
+            static_cast<unsigned long long>(summary.generation), EDMSpecialGapGainBinding::ReasonName(specialGain.reason),
+            unsigned(specialGain.failedFieldId), effectiveServo.positiveGain[0], effectiveServo.positiveGain[1],
+            effectiveServo.positiveGain[2], effectiveServo.negativeGain[0], effectiveServo.negativeGain[1], effectiveServo.negativeGain[2]);
+        if (gainLength >= 0 && static_cast<std::size_t>(gainLength) < sizeof(gainLine))
+            RtPrintf("%s", gainLine);
+        else RtPrintf("[EDM368] event=GAP_GAIN_PREVIEW_FORMAT_ERROR ready=0 discharge=0\n");
+    }
     const bool serviceGap = !sourceChanged && m_edmProcessHaveGap &&
         ((gap.sampledAtMs > m_edmProcessLastGap.sampledAtMs &&
             gap.sampledAtMs - m_edmProcessLastGap.sampledAtMs > gap.maxAgeMs) ||

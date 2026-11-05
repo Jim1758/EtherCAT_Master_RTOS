@@ -4297,6 +4297,10 @@ bool NCManager::IsEDM171AirProgramSameThread(int firstPC) const noexcept
             if(!NCFinishPolicy::Decode(parsed,b,finishCount))return false;
             geometry.hasParam['L'-'A']=false;geometry.param['L'-'A']=0.0;
         }
+        if(b.gCode==76&&b.has('L')){
+            std::uint32_t rounds=0U;if(!NCOrbitCompletionPolicy::Decode(parsed,b,rounds))return false;
+            geometry.hasParam['L'-'A']=false;geometry.param['L'-'A']=0.0;
+        }
         b=geometry;
         const bool orbit=b.gCode==76;
         // EDM308: a literal B selector or a parameter-driven (no-F)

@@ -2,6 +2,7 @@
 
 #include "NCG76SphereGapProcess.h"
 #include "EDM130WorkTimeBinding.h"
+#include "EDMSpecialGapGainBinding.h"
 #include <array>
 #include <cmath>
 #include <cstring>
@@ -66,6 +67,10 @@ struct ApproachFieldSnapshot
 struct Binding
 {
     NCG76SphereGapProcess::Config config{};
+    // NC-only provenance: keep the file curve distinct from the effective
+    // E-selected curve; even dormant file edits revoke an existing parent.
+    EDMSpecialGapGainBinding::Binding specialGain{};
+    EDMGapServo::Profile sourceServo{};
     EDMRecipe::Summary selection{};
     const EDMRecipe::Catalog* catalog=nullptr;
     std::array<EDMRecipe::Value,5U> values{};
@@ -401,13 +406,19 @@ inline Binding Capture(const EDMRecipe::Controller& controller,const EDM20::Proc
             out.failedFieldId=out.orbitField;return out;
         }
     }
+    out.specialGain=EDMSpecialGapGainBinding::Capture(controller,profile);
+    if(!out.specialGain.ready){out.reason=Reason::FieldRejected;out.error=EDM58::BindingError::InvalidRecipe;
+        out.failedFieldId=out.specialGain.failedFieldId;return out;}
     if(controller.GetCatalog()!=catalog||!EDM58::BindingDetail::SameSelection(before,controller.Current())||
        !EDM20::ValidateProcessProfile(process)||process.revision!=revision||process.machineProfileId!=profile||
        !SameServoProfile(servo,process.servo)||!SameFlushProfile(flushProfile,process.flush)||
        (orbitFeeds&&!SameDouble(orbitScale,process.orbitScaleMmPerVoltMin))){
         out.reason=Reason::CaptureChanged;out.error=EDM58::BindingError::CaptureChanged;return out;
     }
-    out.config.curve=servo;out.config.workTimeUs=timed.recipe.workTimeUs;
+    out.sourceServo=servo;out.config.curve=servo;
+    if(!EDMSpecialGapGainBinding::Apply(out.specialGain,out.config.curve)){
+        out.reason=Reason::FieldRejected;out.error=EDM58::BindingError::InvalidRecipe;return out;}
+    out.config.workTimeUs=timed.recipe.workTimeUs;
     out.config.recipeGeneration=before.generation;out.config.tuningGeneration=tuningGeneration;
     out.config.jumpHeightMm=static_cast<double>(out.values[1])/EDMRecipe::Scale;
     out.config.jumpSpeedPercent=static_cast<double>(out.values[2])/EDMRecipe::Scale;
@@ -439,6 +450,7 @@ inline Binding Capture(const EDMRecipe::Controller& controller,const EDM20::Proc
     if(controller.GetCatalog()!=catalog||!EDM58::BindingDetail::SameSelection(before,controller.Current())||
        !EDM20::ValidateProcessProfile(process)||process.revision!=revision||process.machineProfileId!=profile||
        !SameServoProfile(servo,process.servo)||!SameFlushProfile(flushProfile,process.flush)||
+       !EDMSpecialGapGainBinding::IsCurrent(out.specialGain,controller,profile)||
        (orbitFeeds&&!SameDouble(orbitScale,process.orbitScaleMmPerVoltMin))){
         out.config=NCG76SphereGapProcess::Config{};
         out.reason=Reason::CaptureChanged;out.error=EDM58::BindingError::CaptureChanged;return out;
@@ -459,12 +471,13 @@ inline bool IsCurrent(const Binding& b,const EDMRecipe::Controller& controller,
     if(!b.ready||!b.config.enabled||!processReady||b.parameterFeeds!=b.config.parameterFeeds||
        b.orbitFeeds!=b.config.orbitFeedsEnabled||controller.GetCatalog()!=b.catalog||
        tuningGeneration!=b.config.tuningGeneration||process.revision!=b.processRevision||
-       process.machineProfileId!=b.machineProfileId||!SameServoProfile(process.servo,b.config.curve)||
+       process.machineProfileId!=b.machineProfileId||!SameServoProfile(process.servo,b.sourceServo)||
        !SameFlushProfile(process.flush,b.config.flushProfile)||
        (b.orbitFeeds&&!SameDouble(process.orbitScaleMmPerVoltMin,b.config.orbitScaleMmPerVoltMin))||
        !EDM58::BindingDetail::SameSelection(b.selection,controller.Current()))return false;
     const auto current=Capture(controller,process,tuningGeneration,processReady,b.parameterFeeds,b.orbitFeeds);
     return current.ready&&current.parameterFeeds==b.parameterFeeds&&current.config.parameterFeeds==b.config.parameterFeeds&&
+        EDMSpecialGapGainBinding::Same(current.specialGain,b.specialGain)&&SameServoProfile(current.sourceServo,b.sourceServo)&&
         current.orbitFeeds==b.orbitFeeds&&current.config.orbitFeedsEnabled==b.config.orbitFeedsEnabled&&
         current.orbitValue==b.orbitValue&&current.orbitField==b.orbitField&&
         SameDouble(current.config.orbitScaleMmPerVoltMin,b.config.orbitScaleMmPerVoltMin)&&

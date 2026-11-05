@@ -1,6 +1,8 @@
 ﻿#pragma once
 #include "NC_Types.h"
 #include "NCHoldPolicy.h"
+#include "NCOrbitCompletionBinding.h"
+#include "NCG76DHBatchDiagnostic.h" // NC-only retained D/H terminal observations.
 #include "NCAuxiliaryHandshake.h"
 #include "RotarySpindleConfig.h"
 #include "NCSpindleDispatch.h"
@@ -605,6 +607,7 @@ public:
     void ExportHoldRecoveryTelemetrySameThread(NCHoldTelemetry::Image&) const noexcept;
     void ExportMachiningTelemetrySameThread(NCMachiningTelemetry::Image&) const noexcept;
     void ClearMachiningTimeTelemetrySameThread() noexcept;
+    void FinalizeG76OrbitCompletionSummarySameThread() noexcept; // EDM366 passive finalized-run observation
     // EDM333 display-only committed parent PC; never grants motion or resume.
     bool TryGetCommittedProcessParentDisplayPCSameThread(int& pc) const noexcept;
     bool TryG76SphereInspectionJogSameThread(int axis,int direction);
@@ -2729,6 +2732,12 @@ private:
         NCG76SpherePath::Descriptor path{};
         NCG76SphereProcess::Envelope process{};
         NCG76SphereGapBinding::Binding gapBinding{};
+        NCOrbitCompletionBinding::Binding orbitCompletionBinding{};
+        NCBlock orbitCompletionSource{}; // Original metadata+geometry, NC owner only.
+        std::uint64_t orbitLoggedAttempt=0ULL;
+        std::uint32_t orbitLoggedPercent=0U,orbitLoggedQualified=0U;
+        std::uint8_t orbitLoggedState=0U;unsigned orbitDiagnosticEvents=0U;
+        bool orbitLogInitialized=false;
         NCG76SphereGapProcess::Feedback gapShadow{};
         std::uint64_t gapRequestLogged=0ULL;
         std::uint64_t flushAcceptedLogged=0ULL,flushCompletedLogged=0ULL,flushAbandonedLogged=0ULL;
@@ -2754,6 +2763,7 @@ private:
         NCBlock pathSource{}; // EDM307 exact authored G01/G02/G03, never a synthetic P50.
         double processMotionCeiling=0.0; // EDM308 native parameter envelope; never a fabricated modal F.
         NCMachiningTime::Config machiningTime{};
+        NCG76DHBatchDiagnostic::Batch dhBatch{}; // EDM357: bounded same-run result summary.
         std::uint64_t timeLoggedSecond=0ULL;
         std::uint8_t timeLoggedPhase=0U,timeLoggedTotalState=0U,timeLoggedAdditionalState=0U;
         unsigned timeDiagnosticEvents=0U;

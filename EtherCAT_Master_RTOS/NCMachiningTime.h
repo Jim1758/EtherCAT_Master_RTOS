@@ -11,7 +11,7 @@ enum class TimerState : std::uint8_t
 { Disabled=0U,Waiting=1U,Running=2U,Paused=3U,Expired=4U,Completed=5U };
 enum class TimePhase : std::uint8_t
 { Disabled=0U,Machining=1U,Additional=2U,Finishing=3U,Verification=4U,
-  TimedOut=5U,Completed=6U,Fault=7U };
+  TimedOut=5U,Completed=6U,Fault=7U,TimedFinishing=8U };
 enum class PauseReason : std::uint8_t
 { None=0U,Hold=1U,Flush=2U,Gap=3U,Returning=4U,Fault=5U,
   Qualification=6U,Waiting=7U };

@@ -3601,7 +3601,8 @@ bool NCManager::IsFixedTranslationBlockAllowedSameThread(const NCBlock& block)
     // full drain; it does not inherit generic neutral-frame permission.
     if(block.mCount==1&&block.mCode[0]==30&&m_g76Sphere->completed&&
        ((m_g76Sphere->sourceG>=1&&m_g76Sphere->sourceG<=3)||
-        (m_g76Sphere->sourceG==76&&(m_g76Sphere->sourceP==11U||m_g76Sphere->sourceP==12U||m_g76Sphere->sourceP==13U||m_g76Sphere->sourceP==14U||m_g76Sphere->sourceP==15U)))&&
+        (m_g76Sphere->sourceG==76&&(m_g76Sphere->sourceP==11U||m_g76Sphere->sourceP==12U||m_g76Sphere->sourceP==13U||m_g76Sphere->sourceP==14U||m_g76Sphere->sourceP==15U||m_g76Sphere->sourceP==16U||m_g76Sphere->sourceP==17U||m_g76Sphere->sourceP==21U||m_g76Sphere->sourceP==22U||m_g76Sphere->sourceP==23U||m_g76Sphere->sourceP==24U||m_g76Sphere->sourceP==25U||m_g76Sphere->sourceP==26U||m_g76Sphere->sourceP==27U||
+            (m_g76Sphere->sourceP==50U&&m_g76Sphere->request.orbitInspectionRounds!=0U))))&&
        m_g76Sphere->run==m_pathCoreLiveBookkeeping.currentRunToken&&
        m_g76Sphere->cache==GetBaseProgramCache().GetGeneration()){
         if(IsCompletedEDMProcessPathTerminalAllowedSameThread(block))return true;

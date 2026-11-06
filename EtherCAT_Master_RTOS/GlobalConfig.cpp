@@ -33,6 +33,7 @@
 #include "EDMProcessConfigIO.h"
 #include "EDMToolHeadProfileIO.h"
 #include "EDM165FlushPidConfig.h"
+#include "EDMManualGapZConfig.h"
 
 
 namespace
@@ -1558,6 +1559,22 @@ bool GlobalConfig::InitSystemParameters(EtherCatMaster& master)
                 static_cast<int>(gapProfile.boardMvAtMin), static_cast<int>(gapProfile.boardMvAtMax),
                 static_cast<unsigned>(gapProfile.zeroClampBoardUv), static_cast<long long>(gapProfile.voltageGainMillionths),
                 static_cast<int>(gapProfile.voltageOffsetMv));
+    }
+
+    // EDM382: immutable opt-in motion-only mode; external generator has no
+    // core enable/Ready/Alarm contract in this commissioning lane.
+    {
+        const std::string path = GlobalConfig::GetInstance().ParameterDir + "EDMManualGapZConfig.txt";
+        EDM382::Config config{}; std::string error;
+        bool loaded = false;
+        try { loaded = EDM382::LoadFile(path.c_str(), config, error); }
+        catch (...) { config = EDM382::Config{}; error = "EXCEPTION"; }
+        if (!loaded) { config = EDM382::Config{}; config.configurationInvalid = error != "FILE_MISSING"; }
+        const bool installed = EDM382::InstallBeforeStart(config);
+        RtPrintf("[EDM382] event=CONFIG enabled=%u installed=%u blocked=%u manualExternalPower=%u requiredE=%u file=%.160s reason=%.80s feeds=NORMAL_PARAMETER_E_ROW generatorControl=EXTERNAL S92=INHIBITED S93=INHIBITED\n",
+            loaded && installed && config.enabled ? 1U : 0U, installed ? 1U : 0U,
+            EDM382::Current().configurationInvalid ? 1U : 0U, config.manualExternalPower ? 1U : 0U, config.requiredECode,
+            path.c_str(), loaded ? "OK" : error.c_str());
     }
 
     // EDM15 optional boot profile: strict parsing, no fallback and no runtime I/O.

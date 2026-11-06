@@ -1,6 +1,9 @@
 #pragma once
 #include <windows.h>
 
+// EDM374: P50-only bounded compact DC reader; no control or ABI change.
+void PrintDcRuntimeCompactDiagnostics();
+
 // =============================================================
 // DC-RX.3F - deterministic test-only fault injection
 //
@@ -122,6 +125,13 @@ g_dcDriftCalibrationBaselinePpb;
 
 extern volatile LONG
 g_dcDriftCalibrationLockCount;
+
+// EDM376: same calibration seqlock; diagnostic readers have no write authority.
+extern volatile LONG g_dcDriftCalibrationRejectMask;
+extern volatile LONG g_dcDriftRecalibrationBlockMask;
+extern volatile LONG g_dcDriftRecalibrationPending;
+extern volatile LONG g_dcDriftRecalibrationGoodWindows;
+extern volatile LONG g_dcDriftRecalibrationCount;
 
 // =============================================================
 // PDO RT Diagnostic Snapshot

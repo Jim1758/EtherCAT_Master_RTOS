@@ -123,7 +123,8 @@ inline bool SameFlushProfile(const EDM20::FlushProfile& a,const EDM20::FlushProf
         SameDouble(a.centerReturnMmPerMin,b.centerReturnMmPerMin)&&SameDouble(a.mainReturnMmPerMin,b.mainReturnMmPerMin)&&
         SameDouble(a.pathRetractMmPerMin,b.pathRetractMmPerMin)&&SameDouble(a.initialSlowMmPerMin,b.initialSlowMmPerMin)&&
         SameDouble(a.manualReturnMmPerMin,b.manualReturnMmPerMin)&&SameDouble(a.finalApproachDistanceMm,b.finalApproachDistanceMm)&&
-        SameDouble(a.pathDistanceMm,b.pathDistanceMm)&&SameDouble(a.initialSlowDistanceMm,b.initialSlowDistanceMm);
+        SameDouble(a.pathDistanceMm,b.pathDistanceMm)&&SameDouble(a.initialSlowDistanceMm,b.initialSlowDistanceMm)&&
+        SameDouble(a.accelerationTimeSeconds,b.accelerationTimeSeconds)&&SameDouble(a.decelerationTimeSeconds,b.decelerationTimeSeconds);
 }
 inline bool SameApproachSnapshots(const Binding& a,const Binding& b) noexcept
 {

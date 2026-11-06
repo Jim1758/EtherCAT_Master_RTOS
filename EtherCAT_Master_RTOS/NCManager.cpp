@@ -1,4 +1,5 @@
-﻿#include "PositionPidService.h"
+﻿#include "EDMManualGapZConfig.h"
+#include "PositionPidService.h"
 #include "NCManager.h"
 #include "NCFinishPolicy.h"
 #include "NCMachiningTimePolicy.h"
@@ -84,6 +85,25 @@ namespace GCodeHandlers
 
 namespace
 {
+    // EDM382 capability assertion is deliberately distinct from HOLD history.
+    // It changes no source grant, Motion frame, feed, E row or generator output.
+    bool ManualGapZAssertion382(const NCParsedBlock& parsed,const NCBlock& block) noexcept
+    {
+        if(block.isEmpty||block.isBlockSkip||block.isGoto||!block.hasG||block.gCode!=181||
+           block.gCount!=1||block.gCodes[0]!=181||block.mCount!=0||!block.has('P')||block.val('P')!=382.0||
+           parsed.error!=NCParseError::NONE||parsed.controlType!=NCParsedControlType::NONE||parsed.isEmpty||
+           parsed.isBlockSkip||parsed.dependsOnMacroState||parsed.duplicateAddressMask||parsed.gCount!=1||parsed.mCount!=0)return false;
+        double code=0.0;if(!NCHoldPolicy::LiteralNumber(parsed.gExpressions[0],code)||code!=181.0)return false;
+        for(char address='A';address<='Z';++address){
+            if(parsed.has(address)!=block.has(address))return false;
+            if(!block.has(address))continue;
+            if(address!='P'&&address!='N')return false;
+            double value=0.0;
+            if(!NCHoldPolicy::LiteralNumber(parsed.expression(address),value)||value!=block.val(address)||
+               (address=='N'&&(value<0.0||std::floor(value)!=value)))return false;
+        }
+        return true;
+    }
     MotionCommandSource GetMotionCommandSourceForMode(
         NCOperationMode mode)
     {
@@ -5696,9 +5716,9 @@ void NCManager::ProcessExecutionEngine()
             // not lookahead; only ExecuteBlock below commits the declaration.
             if(NCGCodeSemantics::Contains(block,NCHoldPolicy::DeclarationCode)){
                 std::uint32_t ignored=0U;
-                if(!NCHoldPolicy::DecodeAuthored(parsedBlock,block,ignored)){
+                if(!NCHoldPolicy::DecodeAuthored(parsedBlock,block,ignored)&&!ManualGapZAssertion382(parsedBlock,block)){
                     markDispatchFailed(static_cast<std::uint32_t>(AlarmManager::G_Code_Invalid_parameter));
-                    RtPrintf("[HOLD] build=EDM332 event=DECLARATION_REJECT pc=%d line=%d reason=STANDALONE_LITERAL_G181_P0_TO_15 beforeFrame=1\n",currentPC,sourceLineNumber);
+                    RtPrintf("[HOLD] build=EDM332 event=DECLARATION_REJECT pc=%d line=%d reason=STANDALONE_LITERAL_G181_P0_TO_15_OR_P382 beforeFrame=1\n",currentPC,sourceLineNumber);
                     AlarmManager::GetInstance().Trigger(AlarmManager::G_Code_Invalid_parameter,sourceLineNumber);
                     ChangeState(NCState::HOLD);return;
                 }
@@ -7076,6 +7096,28 @@ bool NCManager::ValidateHoldPolicyBlockSameThread(const NCBlock& block,int pc,in
 
 bool NCManager::CommitHoldPolicySameThread(const NCBlock& block,int pc,int line)
 {
+    if(block.has('P')&&block.val('P')==382.0){
+        const NCProgramCache* program=m_macroStack.empty()?&GetBaseProgramCache():m_macroStack.back().program;
+        const auto* source=program?program->TryGetLine(pc):nullptr;
+        unsigned axes=0U;
+        for(unsigned axis=0U;axis<8U;++axis)
+            if(m_motion.GetAxisContext(static_cast<int>(axis)).isExist)axes|=1U<<axis;
+        const auto& config=EDM382::Current();
+        const bool sourceValid=m_state==NCState::RUN&&m_mode==NCOperationMode::MEMORY&&
+            m_currentExecutingBlockDispatchId!=NC_BLOCK_DISPATCH_ID_INVALID&&source&&
+            source->sourceLineNumber==line&&ManualGapZAssertion382(source->parsedBlock,block);
+        if(!sourceValid||!EDM382::AssertionReady(config,m_recipe.Current().eCode,axes)){
+            RtPrintf("[EDM382] event=ASSERT_REJECT pc=%d line=%d source=%u enabled=%u invalid=%u manualExternalPower=%u E=%u requiredE=%u axisMask=%u motionSubmitted=0 generatorAuthority=NONE\n",
+                pc,line,sourceValid?1U:0U,config.enabled?1U:0U,config.configurationInvalid?1U:0U,
+                config.manualExternalPower?1U:0U,static_cast<unsigned>(m_recipe.Current().eCode),
+                config.requiredECode,axes);
+            AlarmManager::GetInstance().Trigger(AlarmManager::EDM_PROCESS_CONFIG_INVALID,line);
+            ChangeState(NCState::HOLD);return false;
+        }
+        RtPrintf("[EDM382] event=ASSERT_ACCEPT pc=%d line=%d E=%u axisMask=%u feeds=NORMAL_PARAMETER_E_ROW motionSubmitted=0 sourceGrant=UNCHANGED generatorAuthority=NONE externalPowerOff=UNCONFIRMED\n",
+            pc,line,static_cast<unsigned>(m_recipe.Current().eCode),axes);
+        return true;
+    }
     if(!ValidateHoldPolicyBlockSameThread(block,pc,line))return false;
     std::uint32_t count=0U;
     if(!NCHoldPolicy::Decode(block,count)||!m_holdPolicy.Commit(count))return false;
@@ -7102,6 +7144,13 @@ WaitConditionFunc NCManager::DispatchSingleGCode(
     }
     block.gCodes[0] = gCode;
 
+    // EDM382 manual-external-power mode must never silently fall back to
+    // fixed-feed CNC/SIM when its confirmed physical-GAP source is absent.
+    if(EDM382::SelectedOrInvalid()&&(gCode==1||gCode==2||gCode==3||gCode==76)&&
+       (EDM382::Current().configurationInvalid||gCode!=1||!IsEDMProcessPathCandidateSameThread(block))){
+        RejectG76SphereSameThread("PHYSICAL_Z_REQUIRES_M00_START_G01_E210",AlarmManager::PATH_EXECUTION_NOT_READY);
+        return nullptr;
+    }
     NCGCodeDescriptor edm137Descriptor{};
     if (gCode != 1 && gCode != 2 && gCode != 3 && gCode != 180 && gCode != 38 && gCode != 39 &&
         NCGCodeSemantics::TryGetDescriptor(gCode, edm137Descriptor) &&

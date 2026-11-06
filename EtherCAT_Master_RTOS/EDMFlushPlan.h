@@ -25,6 +25,12 @@ namespace EDM20
         double pathDistanceMm = 0.0;           // Pump_Path_Dist
         // Distance not supplied by the machine owner: zero disables it.
         double initialSlowDistanceMm = 0.0;
+        // E5 flush trajectory only. Zero inherits that direction's frozen
+        // parent ramp; positive seconds request a ramp to the active leg's
+        // target speed. The independent axis budget can require more time.
+        // Short moves can finish before reaching target speed. No authority.
+        double accelerationTimeSeconds = 0.0;
+        double decelerationTimeSeconds = 0.0;
     };
 
     enum class FlushMode : std::uint8_t
@@ -119,6 +125,8 @@ namespace EDM20
             value.pathDistanceMm, value.initialSlowDistanceMm };
         for (double distance : distances)
             if (!std::isfinite(distance) || distance < 0.0) return false;
+        if (!std::isfinite(value.accelerationTimeSeconds) || value.accelerationTimeSeconds < 0.0 ||
+            !std::isfinite(value.decelerationTimeSeconds) || value.decelerationTimeSeconds < 0.0) return false;
         return true;
     }
 

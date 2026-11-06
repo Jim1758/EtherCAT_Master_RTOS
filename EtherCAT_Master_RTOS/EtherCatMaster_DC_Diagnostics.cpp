@@ -1,6 +1,7 @@
 ﻿#include "EtherCatMaster.h"
 #include "EtherCatMaster_DC_Internal.h"
 #include "EtherCatMaster_DC_Tuning.h"
+#include "EtherCatDcAutoCalibration.h"
 #include "NicDriver.h"
 #include "EtherCatRxForensics.h"
 #include <windows.h>
@@ -754,6 +755,151 @@ namespace
             "Snapshot:BUSY => RESULT:CHECK\n");
     }
 }
+
+// EDM374: P50 supervisory reader only; at most four short lines per second.
+// Groups have independent seqlocks and are NOT one atomic cross-group snapshot.
+// One read attempt per group; collisions report coherent=0 without field values.
+#if defined(_MSC_VER)
+__declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+__attribute__((noinline))
+#endif
+void PrintDcRuntimeCompactDiagnostics()
+{
+    static LONGLONG frequency = 0;
+    if (frequency <= 0)
+    {
+        LARGE_INTEGER value{};
+        if (!RtQueryPerformanceFrequency(&value) || value.QuadPart <= 0) return;
+        frequency = value.QuadPart;
+    }
+    LARGE_INTEGER counter{};
+    if (!RtQueryPerformanceCounter(&counter) || counter.QuadPart < 0) return;
+    static LONGLONG lastTicks = 0;
+    static bool havePrinted = false;
+    if (havePrinted && counter.QuadPart < lastTicks)
+    {
+        lastTicks = counter.QuadPart;
+        return;
+    }
+    if (havePrinted && counter.QuadPart - lastTicks < frequency) return;
+    lastTicks = counter.QuadPart;
+    havePrinted = true;
+    static unsigned long long sample = 0;
+    ++sample;
+
+    {
+        const LONG before = g_dcDriftCalibrationDiagSequence;
+        LONG after = before;
+        LONG mode=0, state=0, good=0, required=0, candidate=0;
+        LONG reject=0, block=0, rebase=0, reGood=0, reCount=0;
+        LONGLONG raw=0, median=0, mad=0, baseline=0;
+        bool coherent = false;
+        if (before != 0 && (before & 1) == 0)
+        {
+            MemoryBarrier();
+            mode=g_dcDriftCalibrationMode; state=g_dcDriftCalibrationState;
+            good=g_dcDriftCalibrationGoodWindows; required=g_dcDriftCalibrationRequiredWindows;
+            candidate=g_dcDriftCalibrationCandidateGood;
+            raw=g_dcDriftCalibrationRawPpb; median=g_dcDriftCalibrationMedianPpb;
+            mad=g_dcDriftCalibrationMadPpb; baseline=g_dcDriftCalibrationBaselinePpb;
+            reject=g_dcDriftCalibrationRejectMask; block=g_dcDriftRecalibrationBlockMask;
+            rebase=g_dcDriftRecalibrationPending; reGood=g_dcDriftRecalibrationGoodWindows;
+            reCount=g_dcDriftRecalibrationCount;
+            MemoryBarrier();
+            after=g_dcDriftCalibrationDiagSequence;
+            coherent=before == after && (after & 1) == 0;
+        }
+        if (coherent)
+            RtPrintf("[EDM374-DC] n=%llu group=CAL coherent=1 seq=%ld mode=%ld state=%ld candidate=%ld good=%ld/%ld rawPpb=%lld medianPpb=%lld madPpb=%lld baselinePpb=%lld reject=0x%lX why=%s rebase=%ld reGood=%ld/%ld reCount=%ld block=0x%lX blockWhy=%s\n",
+                sample,(long)after,(long)mode,(long)state,(long)candidate,(long)good,(long)required,
+                (long long)raw,(long long)median,(long long)mad,(long long)baseline,
+                (unsigned long)reject,EDM376DcCal::PrimaryReason(static_cast<std::uint32_t>(reject)),
+                (long)rebase,(long)reGood,(long)EtherCatDcTuning::DriftRecalibrationGoodWindows,(long)reCount,
+                (unsigned long)block,EDM376DcCal::PrimaryReason(static_cast<std::uint32_t>(block)));
+        else
+            RtPrintf("[EDM374-DC] n=%llu group=CAL coherent=0 seqBefore=%ld seqAfter=%ld\n",sample,(long)before,(long)after);
+    }
+    {
+        const LONG before=g_qpcRealFfV0Seq;
+        LONG after=before;
+        LONG state=0, good=0, clean=0, required=0, hold=0, trip=0, reject=0;
+        LONGLONG applied=0, recommended=0;
+        bool coherent=false;
+        if (before != 0 && (before & 1) == 0)
+        {
+            MemoryBarrier();
+            state=g_qpcRealFfV0State; good=g_qpcRealFfV0PhaseGood;
+            clean=g_qpcRealFfV0CleanCycles; required=g_qpcRealFfV0CleanCyclesRequired;
+            hold=g_qpcRealFfV0HoldMask; trip=g_qpcRealFfV0TripMask;
+            reject=g_qpcRealFfV0PhaseRejectMask;
+            applied=g_qpcRealFfV0AppliedPpb; recommended=g_qpcRealFfV0RecommendedPpb;
+            MemoryBarrier();
+            after=g_qpcRealFfV0Seq;
+            coherent=before == after && (after & 1) == 0;
+        }
+        if (coherent)
+            RtPrintf("[EDM374-DC] n=%llu group=FF coherent=1 seq=%ld state=%ld phaseGood=%ld clean=%ld/%ld hold=0x%lX trip=0x%lX reject=0x%lX appliedPpb=%lld recommendedPpb=%lld\n",
+                sample,(long)after,(long)state,(long)good,(long)clean,(long)required,
+                (unsigned long)hold,(unsigned long)trip,(unsigned long)reject,(long long)applied,(long long)recommended);
+        else
+            RtPrintf("[EDM374-DC] n=%llu group=FF coherent=0 seqBefore=%ld seqAfter=%ld\n",sample,(long)before,(long)after);
+    }
+    {
+        const LONG before=g_qpcPhasePActV0Seq;
+        LONG after=before;
+        LONG state=0, gate=0, commandSat=0, offsetSat=0;
+        LONGLONG actual=0, wrapped=0, offset=0;
+        bool coherent=false;
+        if (before != 0 && (before & 1) == 0)
+        {
+            MemoryBarrier();
+            state=g_qpcPhasePActV0State; gate=g_qpcPhasePActV0GateGood;
+            actual=g_qpcPhasePActV0ActualErrNs; wrapped=g_qpcPhasePActV0WrappedErrNs;
+            offset=g_qpcPhasePActV0OffsetNs;
+            commandSat=g_qpcPhasePActV0CommandSat; offsetSat=g_qpcPhasePActV0OffsetSat;
+            MemoryBarrier();
+            after=g_qpcPhasePActV0Seq;
+            coherent=before == after && (after & 1) == 0;
+        }
+        if (coherent)
+            RtPrintf("[EDM374-DC] n=%llu group=PHASE coherent=1 seq=%ld state=%ld gate=%ld actualNs=%lld wrappedNs=%lld offsetNs=%lld commandSat=%ld offsetSat=%ld\n",
+                sample,(long)after,(long)state,(long)gate,(long long)actual,(long long)wrapped,
+                (long long)offset,(long)commandSat,(long)offsetSat);
+        else
+            RtPrintf("[EDM374-DC] n=%llu group=PHASE coherent=0 seqBefore=%ld seqAfter=%ld\n",sample,(long)before,(long)after);
+    }
+    {
+        const LONG before=g_pdoRtDiagSequence;
+        LONG after=before;
+        LONG lrw=0, dc=0, dcRef=0, pdoValid=0, dcValid=0, state=0, qualified=0, reason=0;
+        LONG mapGood=0, jump=0, rttState=0, rttAccepted=0;
+        LONGLONG mapAge=0;
+        bool coherent=false;
+        if (before != 0 && (before & 1) == 0)
+        {
+            MemoryBarrier();
+            lrw=g_pdoRtLrwWkc; dc=g_pdoRtDcWkc; dcRef=g_pdoRtDcReferencePresent;
+            pdoValid=g_pdoRtProcessDataValid; dcValid=g_pdoRtDcTransportValid;
+            state=g_pdoRtDcSampleGuardState; qualified=g_pdoRtDcSampleQualified;
+            reason=g_pdoRtDcSampleGuardReasonMask;
+            mapGood=g_pdoRtDcPhaseMapAgeGood; mapAge=g_pdoRtDcPhaseMapAgeNs;
+            jump=g_pdoRtDcPhaseJumpGuardActive;
+            rttState=g_pdoRtDcRttGuardState; rttAccepted=g_pdoRtDcRttGuardAccepted;
+            MemoryBarrier();
+            after=g_pdoRtDiagSequence;
+            coherent=before == after && (after & 1) == 0;
+        }
+        if (coherent)
+            RtPrintf("[EDM374-DC] n=%llu group=PDO coherent=1 seq=%ld lrw=%ld dc=%ld dcRef=%ld pdoValid=%ld dcValid=%ld sampleState=%ld qualified=%ld reason=0x%lX mapGood=%ld mapAgeNs=%lld jump=%ld rttState=%ld rttAccepted=%ld\n",
+                sample,(long)after,(long)lrw,(long)dc,(long)dcRef,(long)pdoValid,(long)dcValid,
+                (long)state,(long)qualified,(unsigned long)reason,(long)mapGood,(long long)mapAge,
+                (long)jump,(long)rttState,(long)rttAccepted);
+        else
+            RtPrintf("[EDM374-DC] n=%llu group=PDO coherent=0 seqBefore=%ld seqAfter=%ld\n",sample,(long)before,(long)after);
+    }
+}
+
 
 void EtherCatMaster::PrintDcRuntimeDiagnostics()
 {

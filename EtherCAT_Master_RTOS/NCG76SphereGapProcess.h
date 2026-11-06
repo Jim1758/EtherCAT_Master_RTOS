@@ -12,7 +12,8 @@
 #include <limits>
 #include <type_traits>
 
-// EDM293: live RT, simulation-only process observation. This observer never
+// EDM293/382: live RT process observation, SIM by default; explicit physical
+// Z mode consumes a qualified ADC frame. This observer never
 // commands motion, changes a PID bank, writes PLC outputs or permits discharge.
 // Its E5 counters are SIMULATED eligible work, never actual discharge time.
 // A due request is a candidate checkpoint, not a stopped anchor or completion.
@@ -53,6 +54,9 @@ struct Config
     // these fields canonical zero and retain their original E8 curve.
     double orbitScaleMmPerVoltMin=0.0,orbitOverridePercent=0.0;
     bool orbitFeedsEnabled=false;
+    // Manual external generator: these limits grant axis motion only.
+    bool physicalZManual=false;
+
 };
 inline bool Disabled(const Config& c) noexcept{return !c.enabled;}
 enum class FeedRole : std::uint8_t { Unavailable, Cutting, Orbit };
@@ -99,6 +103,7 @@ inline bool ProfileCeiling(const Config& c,double& ceiling) noexcept
 }
 inline bool Valid(const Config& c) noexcept
 {
+    if(c.physicalZManual&&(!c.enabled||!c.signedMotionEnabled||!c.parameterFeeds||c.orbitFeedsEnabled))return false;
     if(c.orbitFeedsEnabled){
         if(!c.enabled||!c.signedMotionEnabled||c.parameterFeeds||
            !std::isfinite(c.orbitScaleMmPerVoltMin)||c.orbitScaleMmPerVoltMin<0.001||
@@ -191,7 +196,9 @@ inline bool SameCurve(const EDMGapServo::Profile& a,const EDMGapServo::Profile& 
 }
 inline bool SameFlush(const EDM20::FlushProfile& a,const EDM20::FlushProfile& b) noexcept
 {
-    return SameDouble(a.finalApproachMmPerMin,b.finalApproachMmPerMin)&&
+    return SameDouble(a.accelerationTimeSeconds,b.accelerationTimeSeconds)&&
+        SameDouble(a.decelerationTimeSeconds,b.decelerationTimeSeconds)&&
+        SameDouble(a.finalApproachMmPerMin,b.finalApproachMmPerMin)&&
         SameDouble(a.centerRetractMmPerMin,b.centerRetractMmPerMin)&&SameDouble(a.mainRetractMmPerMin,b.mainRetractMmPerMin)&&
         SameDouble(a.centerReturnMmPerMin,b.centerReturnMmPerMin)&&SameDouble(a.mainReturnMmPerMin,b.mainReturnMmPerMin)&&
         SameDouble(a.pathRetractMmPerMin,b.pathRetractMmPerMin)&&SameDouble(a.initialSlowMmPerMin,b.initialSlowMmPerMin)&&
@@ -207,6 +214,7 @@ inline bool EquivalentForContinuation(const Config& a,const Config& b) noexcept
         a.workTimeUs==b.workTimeUs&&a.recipeGeneration==b.recipeGeneration&&a.tuningGeneration==b.tuningGeneration&&
         a.enabled==b.enabled&&a.flushMotionEnabled==b.flushMotionEnabled&&a.signedMotionEnabled==b.signedMotionEnabled&&
         a.parameterFeeds==b.parameterFeeds&&a.orbitFeedsEnabled==b.orbitFeedsEnabled&&
+        a.physicalZManual==b.physicalZManual&&
         SameDouble(a.orbitScaleMmPerVoltMin,b.orbitScaleMmPerVoltMin)&&
         SameDouble(a.orbitOverridePercent,b.orbitOverridePercent)&&
         a.independentFeedsEnabled==b.independentFeedsEnabled&&a.finalApproachEnabled==b.finalApproachEnabled&&
@@ -237,6 +245,8 @@ inline bool BuildFlushConfig(const Config& config,double feedMmMin,
     const double feed=(std::min)(feedMmMin,feedMmMin*(config.jumpSpeedPercent/100.0));
     if(!std::isfinite(feed)||feed<=0.0||feed/60.0<=0.0)return false;
     output.heightMm=config.jumpHeightMm;output.feedMmMin=feed;output.enabled=true;
+    output.accelerationTimeSeconds=config.flushProfile.accelerationTimeSeconds;
+    output.decelerationTimeSeconds=config.flushProfile.decelerationTimeSeconds;
     if(!config.independentFeedsEnabled)return true;
     const double ratio=config.jumpSpeedPercent/100.0;
     const auto cap=[&](double native,double overrideRatio,double& value) noexcept {
@@ -325,6 +335,7 @@ struct Input
     // matching PRE-step parent and the current positive GAP sample again.
     bool additionalEndpointQualified=false;
     bool sourceValid=false,powerInhibited=false,suspended=false,terminal=false,cancel=false;
+    EDM88::Frame physicalFrame{}; // Actual immutable PDO receipt, never synthetic.
 };
 struct Feedback
 {
@@ -351,9 +362,11 @@ class Observer
 public:
     bool Begin(const Config& config,std::uint64_t session,const Continuation* continuation=nullptr,
         SimulationMode mode=SimulationMode::Wave,
-        const NCG76SphereRuntimeGeometry::Geometry* polygonGeometry=nullptr) noexcept
+        const NCG76SphereRuntimeGeometry::Geometry* polygonGeometry=nullptr,
+        const EDM88::SourceConfig* physicalSource=nullptr) noexcept
     {
         qualifier_.Cancel();active_=false;feedback_=Feedback{};work_=EDM130::WorkEvidence{};
+        physicalShort_.Reset();physicalShortResult_=EDMGapServo::ShortResult{};physicalShortSequence_=0ULL;
         frame_=EDM88::Frame{};lastTick_=lastUs_=firstUs_=0ULL;haveClock_=false;
         requestHighWater_=workBaseUs_=0ULL;
         probeElapsedUs_=0ULL;probeLengthMm_=0.0;probeSeeded_=probeEntered_=false;
@@ -364,6 +377,9 @@ public:
         }
         feedback_.enabled=config.enabled;feedback_.session=session;feedback_.recipeGeneration=config.recipeGeneration;
         feedback_.tuningGeneration=config.tuningGeneration;feedback_.workTimeUs=config.workTimeUs;
+        if(config.physicalZManual!=(physicalSource!=nullptr)||
+           (physicalSource&&(!EDM88::ValidPhysical(*physicalSource)||mode!=SimulationMode::Wave)))
+        {Withdraw(Reason::Configuration);return false;}
         if(!session||session<=sessionHighWater_){Withdraw(Reason::Lifecycle);return false;}
         sessionHighWater_=session; // Even failed/withdrawn attempts cannot rearm this identity.
         if((mode!=SimulationMode::Wave&&mode!=SimulationMode::PreviousParentProbe)||
@@ -417,7 +433,8 @@ public:
         // 1 ms conversion plus legal 50..1000 us observer cadence may expose
         // an old conversion up to <2 ms before the next conversion is captured.
         source.maxAgeUs=MaximumSourceAgeUs;
-        if(!qualifier_.Begin(source)||!EDM130::BeginWork(work_,config.workTimeUs))
+        const bool sourceReady=physicalSource?qualifier_.BeginPhysical(*physicalSource,session):qualifier_.Begin(source);
+        if(!sourceReady||!EDM130::BeginWork(work_,config.workTimeUs))
         {Withdraw(Reason::Configuration);return false;}
         if(continuation){
             // The interval may already be saturated when the previous path
@@ -432,7 +449,7 @@ public:
             feedback_.abortedFlushes=continuation->abortedFlushes;
             if(!EDM130::ValidWorkEvidence(work_)){Withdraw(Reason::Configuration);return false;}
         }
-        frame_.identity=source.identity;feedback_.reason=Reason::None;feedback_.sourceReason=EDM88::Reason::None;
+        frame_.identity=physicalSource?physicalSource->identity:source.identity;feedback_.reason=Reason::None;feedback_.sourceReason=EDM88::Reason::None;
         active_=true;return true;
     }
     const Feedback& Step(const Input& input) noexcept
@@ -463,7 +480,8 @@ public:
         if(!ValidNominal(input.nominal,input.stationaryNominal)||!FinitePoint(input.candidateMCS))
         {Withdraw(Reason::Input);return feedback_;}
         UpdateProbe(input,delta);
-        if(!frame_.sequence||input.nowUs-frame_.capturedAtUs>=SamplePeriodUs){
+        if(config_.physicalZManual)frame_=input.physicalFrame;
+        else if(!frame_.sequence||input.nowUs-frame_.capturedAtUs>=SamplePeriodUs){
             if(frame_.sequence==(std::numeric_limits<std::uint64_t>::max)())
             {Withdraw(Reason::Source);return feedback_;}
             ++frame_.sequence;frame_.capturedAtUs=input.nowUs;frame_.valid=true;
@@ -483,13 +501,30 @@ public:
         const auto gap=EDMGapServo::Evaluate(selectedCurve,frame_.voltageV,
             config_.referenceV,selection.overridePercent);
         if(!gap.valid){Withdraw(Reason::Configuration);return feedback_;}
+        double signedGapSpeed=gap.limitedSpeedMmPerMin;
+        if(config_.physicalZManual){
+            if(frame_.sequence!=physicalShortSequence_){
+                EDMGapServo::Sample sample{};sample.valid=true;sample.voltage=frame_.voltageV;
+                sample.nowMs=frame_.capturedAtUs/1000ULL;sample.sequence=frame_.sequence;
+                physicalShortResult_=physicalShort_.Step(selectedCurve,sample,true);
+                physicalShortSequence_=frame_.sequence;
+            }
+            if(!physicalShortResult_.valid){Withdraw(Reason::Source);return feedback_;}
+            if(physicalShortResult_.shortActive){
+                const auto retreat=EDMGapServo::EvaluateShortRetreat(selectedCurve,gap);
+                if(!retreat.valid){Withdraw(Reason::Configuration);return feedback_;}
+                signedGapSpeed=retreat.signedSpeedMmPerMin;
+                if(!retreat.usingCurve)signedGapSpeed*=selection.overridePercent/100.0;
+            }else if(physicalShortResult_.feedInhibited&&signedGapSpeed>0.0)signedGapSpeed=0.0;
+            if(!std::isfinite(signedGapSpeed)){Withdraw(Reason::Configuration);return feedback_;}
+        }
         if(config_.orbitFeedsEnabled){
             feedback_.selectedFeedRole=selection.role;
             feedback_.selectedScaleMmPerVoltMin=selection.scaleMmPerVoltMin;
             feedback_.selectedOverridePercent=selection.overridePercent;
         }
         feedback_.sourceSequence=frame_.sequence;feedback_.sourceCapturedAtUs=frame_.capturedAtUs;
-        feedback_.voltageV=frame_.voltageV;feedback_.signedGapSpeedMmMin=gap.limitedSpeedMmPerMin;
+        feedback_.voltageV=frame_.voltageV;feedback_.signedGapSpeedMmMin=signedGapSpeed;
         bool acknowledged=false;
         if(!ApplyFlushAcknowledgement(input,acknowledged)){Withdraw(Reason::Input);return feedback_;}
         // EDM300: historical retreat and replay are an excursion from the
@@ -516,7 +551,7 @@ public:
         const bool eligible=!input.stationaryNominal&&!seed&&!acknowledged&&!feedback_.suspended&&
             (movingWork||additionalEndpoint)&&
             input.acceptedSendTick!=0ULL&&input.acceptedSendTick==input.tick-1ULL&&
-            gap.limitedSpeedMmPerMin>0.0;
+            signedGapSpeed>0.0;
         feedback_.eligible=eligible&&!feedback_.pending;
         if(!feedback_.pending){
             if(!EDM130::AccrueWork(work_,delta,eligible)){Withdraw(Reason::Input);return feedback_;}
@@ -703,6 +738,8 @@ private:
     unsigned finishLegCount_=4U,nominalLegCount_=25U,nominalWorkEndIndex_=24U;
     Config config_{};Feedback feedback_{};EDM130::WorkEvidence work_{};
     EDM88::Qualifier qualifier_{};EDM88::Frame frame_{};
+    EDMGapServo::ShortDetector physicalShort_{};EDMGapServo::ShortResult physicalShortResult_{};
+    std::uint64_t physicalShortSequence_=0ULL;
     std::uint64_t sessionHighWater_=0ULL,lastTick_=0ULL,lastUs_=0ULL,firstUs_=0ULL;
     std::uint64_t requestHighWater_=0ULL,workBaseUs_=0ULL;
     std::uint64_t probeElapsedUs_=0ULL;
@@ -711,7 +748,7 @@ private:
     bool active_=false,haveClock_=false;
 };
 static_assert(std::is_trivially_copyable<Config>::value,"P50 SIM config is an immutable value");
-static_assert(sizeof(Config)<=432U,"Role-selected P50 feed config remains bounded");
+static_assert(sizeof(Config)<=448U,"Role-selected P50 feed config remains bounded");
 static_assert(std::is_trivially_copyable<Feedback>::value&&sizeof(Feedback)<=256U,"P50 SIM feedback stays bounded");
 static_assert(!MotionExecutionReleased&&!DischargeExecutionReleased,"P50 SIM observer cannot authorize outputs");
 }

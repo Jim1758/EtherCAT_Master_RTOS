@@ -83,6 +83,7 @@ struct Request
     // envelope. An authored F is optional and caps nominal GAP motion only;
     // it never slows an independent flushing or return pump.
     bool parameterFeeds = false;
+    bool physicalZManual = false; // EDM382: explicit physical-GAP/manual-power Z lane.
     // Packed into existing Request padding; no publication size increase.
     std::uint8_t orbitInspectionRounds=0U;
     // EDM366: E29 retries after the first rejected complete sweep;0 is unlimited.
@@ -202,6 +203,8 @@ static_assert(sizeof(Feedback) <= 512U, "P50 pure-cycle feedback remains bounded
 struct FlushConfig
 {
     double heightMm = 0.0, feedMmMin = 0.0;
+    // Independent E5 excursion ramp seconds; zero inherits the frozen axis budget.
+    double accelerationTimeSeconds=0.0,decelerationTimeSeconds=0.0;
     // Cooked native mm/min: the NC recipe binder applies percentages once.
     double centerRetreatFeedMmMin = 0.0, axisRetreatFeedMmMin = 0.0;
     double centerReturnFeedMmMin = 0.0, axisReturnFeedMmMin = 0.0, pathRetreatFeedMmMin = 0.0;
@@ -296,6 +299,7 @@ private:
         double length=0.0, initialSpeed=0.0, finalSpeed=0.0, peak=0.0;
         double accelerationTime=0.0, cruiseTime=0.0, decelerationTime=0.0;
         double accelerationDistance=0.0, duration=0.0;
+        double acceleration=0.0,deceleration=0.0; // Each staged target owns its ramp.
     };
     struct Leg
     {
@@ -324,7 +328,10 @@ private:
     bool FlushOutboundStartDistance(Phase phase,double& distance) const noexcept;
     double FlushFeed(Phase phase) const noexcept;
     bool EvaluateProfilePart(const ProfilePart& part,double elapsed,double& position,double& speed,double& acceleration) const noexcept;
-    bool StartLine(const Point8& end,Phase phase,double feed) noexcept;
+    bool StartLine(const Point8& end,Phase phase,double feed,
+        double acceleration=0.0,double deceleration=0.0) noexcept;
+    double FlushAcceleration(double targetSpeed,bool circle=false) const noexcept;
+    double FlushDeceleration(double targetSpeed,bool circle=false) const noexcept;
     bool StartNominal(Phase phase) noexcept;
     bool EvaluateLeg() noexcept;
     bool AdvanceLeg(double dt,bool brake,bool& finished) noexcept;
@@ -570,6 +577,10 @@ inline bool ResolveStoppedFlushStation(const Geometry& geometry,NCG76SphereRetre
 
 inline bool ValidateRequest(const Request& r) noexcept
 {
+    if(r.physicalZManual!=r.geometry.frame.physicalZManual)return false;
+    if(r.physicalZManual&&(r.geometry.kind!=NCG76SphereRuntimeGeometry::Kind::Line||r.retreatMode!=0U||
+       r.orbitInspectionRounds||r.orbitRetryLimit||r.orbitThresholdScaled||
+       r.geometry.travelMm<=0.0))return false;
     if(!NCMachiningTime::ValidConfig({r.totalLimitUs,r.additionalUs}))return false;
     if(!NCG76OrbitCompletion::ValidConfig(r.orbitInspectionRounds,r.orbitThresholdScaled,r.orbitRetryLimit)||
        (r.orbitInspectionRounds&&r.geometry.kind!=NCG76SphereRuntimeGeometry::Kind::Sphere&&
@@ -677,6 +688,8 @@ inline bool ValidateFlushHeight(const Request& r,double height) noexcept
 
 inline bool ValidateFlushConfig(const Request& r,const FlushConfig& config) noexcept
 {
+    if(!std::isfinite(config.accelerationTimeSeconds)||config.accelerationTimeSeconds<0.0||
+       !std::isfinite(config.decelerationTimeSeconds)||config.decelerationTimeSeconds<0.0)return false;
     const double maximumHeight=MaximumFlushHeightMm(r);
     if(!config.enabled)return !config.independentFeedsEnabled&&!config.finalApproachEnabled&&!config.initialSlowEnabled&&!config.deepFlushEnabled&&
         config.deepFlushCycleInterval==0U&&config.deepFlushHeightMm==0.0&&
@@ -848,6 +861,7 @@ inline bool Cycle::BuildProfilePart(double length,double startSpeed,double endSp
     double acceleration,double deceleration,ProfilePart& part) noexcept
 {
     part=ProfilePart{};part.length=length;part.initialSpeed=startSpeed;part.finalSpeed=endSpeed;
+    part.acceleration=acceleration;part.deceleration=deceleration;
     if(!std::isfinite(length)||length<0.0||!std::isfinite(startSpeed)||startSpeed<0.0||
        !std::isfinite(endSpeed)||endSpeed<0.0||!Detail::Positive(speedLimit)||
        !Detail::Positive(acceleration)||!Detail::Positive(deceleration)||startSpeed>speedLimit||endSpeed>speedLimit)return false;
@@ -877,15 +891,15 @@ inline bool Cycle::EvaluateProfilePart(const ProfilePart& part,double elapsed,do
     if(!std::isfinite(elapsed)||elapsed<0.0)return false;
     if(elapsed>=part.duration){position=part.length;speed=part.finalSpeed;acceleration=0.0;return true;}
     if(elapsed<part.accelerationTime){
-        position=part.initialSpeed*elapsed+0.5*leg_.acceleration*elapsed*elapsed;
-        speed=part.initialSpeed+leg_.acceleration*elapsed;acceleration=leg_.acceleration;
+        position=part.initialSpeed*elapsed+0.5*part.acceleration*elapsed*elapsed;
+        speed=part.initialSpeed+part.acceleration*elapsed;acceleration=part.acceleration;
     }else if(elapsed<part.accelerationTime+part.cruiseTime){
         position=part.accelerationDistance+part.peak*(elapsed-part.accelerationTime);
         speed=part.peak;acceleration=0.0;
     }else{
         const double remaining=part.duration-elapsed;
-        position=part.length-part.finalSpeed*remaining-0.5*leg_.deceleration*remaining*remaining;
-        speed=part.finalSpeed+leg_.deceleration*remaining;acceleration=-leg_.deceleration;
+        position=part.length-part.finalSpeed*remaining-0.5*part.deceleration*remaining*remaining;
+        speed=part.finalSpeed+part.deceleration*remaining;acceleration=-part.deceleration;
     }
     return std::isfinite(position)&&std::isfinite(speed)&&std::isfinite(acceleration);
 }
@@ -914,6 +928,16 @@ inline bool Cycle::FlushOutboundStartDistance(Phase phase,double& distance) cons
 }
 inline bool Cycle::ConfigureFlushProfile(Phase phase) noexcept
 {
+    // A manual HOLD brake uses the existing safety budget. On an explicit
+    // resume, restore this still-frozen E5 ramp before rebuilding its profile.
+    if(Detail::IsFlushMotionPhase(phase)&&(flush_.accelerationTimeSeconds>0.0||flush_.decelerationTimeSeconds>0.0)){
+        const double a=FlushAcceleration(leg_.speedLimit,leg_.circle);
+        const double d=FlushDeceleration(leg_.speedLimit,leg_.circle);
+        if(leg_.acceleration!=a||leg_.deceleration!=d){
+            leg_.acceleration=a;leg_.deceleration=d;
+            if(!StartProfile(leg_)){Fail(Fault::Numeric);return false;}
+        }
+    }
     const bool outward=phase==Phase::FlushLift||phase==Phase::FlushToCenter||phase==Phase::FlushPathRetreat;
     const bool initial=outward&&flush_.initialSlowEnabled&&flush_.initialSlowDistanceMm>0.0;
     const bool final=Detail::IsFlushReturnPhase(phase)&&flush_.finalApproachEnabled&&flush_.finalApproachDistanceMm>0.0;
@@ -946,15 +970,18 @@ inline bool Cycle::ConfigureFlushProfile(Phase phase) noexcept
     leg_.approachStart=leg_.position+prefix;leg_.approachSpeed=slow;
     if((initial?prefix==0.0:prefix==remaining)||slow>=leg_.speedLimit)return true;
     const double tail=remaining-prefix;
-    const double boundary=(std::min)(slow,(std::min)(std::sqrt(leg_.acceleration)*std::sqrt(2.0*prefix),
-        std::sqrt(leg_.deceleration)*std::sqrt(2.0*tail)));
-    if(!BuildProfilePart(prefix,0.0,boundary,initial?slow:leg_.speedLimit,leg_.acceleration,leg_.deceleration,leg_.approachPrefix)||
-       !BuildProfilePart(tail,boundary,0.0,initial?leg_.speedLimit:slow,leg_.acceleration,leg_.deceleration,leg_.approachTail)||
+    const double prefixSpeed=initial?slow:leg_.speedLimit,tailSpeed=initial?leg_.speedLimit:slow;
+    const double prefixA=FlushAcceleration(prefixSpeed,leg_.circle),prefixD=FlushDeceleration(prefixSpeed,leg_.circle);
+    const double tailA=FlushAcceleration(tailSpeed,leg_.circle),tailD=FlushDeceleration(tailSpeed,leg_.circle);
+    const double boundary=(std::min)(slow,(std::min)(std::sqrt(prefixA)*std::sqrt(2.0*prefix),
+        std::sqrt(tailD)*std::sqrt(2.0*tail)));
+    if(!BuildProfilePart(prefix,0.0,boundary,prefixSpeed,prefixA,prefixD,leg_.approachPrefix)||
+       !BuildProfilePart(tail,boundary,0.0,tailSpeed,tailA,tailD,leg_.approachTail)||
        leg_.approachPrefix.duration+leg_.approachTail.duration>request_.maximumCycleSeconds)
     {Fail(Fault::Numeric);return false;}
     leg_.approachProfile=true;return true;
 }
-inline bool Cycle::StartLine(const Point8& end,Phase phase,double feed) noexcept
+inline bool Cycle::StartLine(const Point8& end,Phase phase,double feed,double acceleration,double deceleration) noexcept
 {
     if(!InsideTravel(end)) {Fail(Fault::TravelLimit);return false;}
     Leg next{};next.start=output_.commandMCS;next.end=end;
@@ -966,7 +993,8 @@ inline bool Cycle::StartLine(const Point8& end,Phase phase,double feed) noexcept
     if(!std::isfinite(next.length)) {Fail(Fault::Numeric);return false;}
     if(next.length>0.0)for(double& value:next.direction)value/=next.length;
     next.speedLimit=(std::min)(feed/60.0,request_.velocityCapMmS);
-    next.acceleration=request_.accelerationMmS2;next.deceleration=request_.decelerationMmS2;
+    next.acceleration=acceleration>0.0?(std::min)(acceleration,request_.accelerationMmS2):request_.accelerationMmS2;
+    next.deceleration=deceleration>0.0?(std::min)(deceleration,request_.decelerationMmS2):request_.decelerationMmS2;
     if(!Detail::Positive(next.speedLimit) || !StartProfile(next)) {Fail(Fault::Numeric);return false;}
     leg_=next;feedback_.phase=phase;
     output_.velocityNative.fill(0.0);output_.accelerationNative.fill(0.0);
@@ -1258,6 +1286,14 @@ inline bool Cycle::AdvanceGap(double dt,double signedTarget,bool& finished) noex
 }
 inline bool Cycle::StartBrake(Phase phase) noexcept
 {
+    // HOLD cancels the E5 excursion. Its brake retains the original axis
+    // budget rather than inheriting a deliberately slow flush-only ramp.
+    const bool holdFromFlush=phase==Phase::FlushHoldBrake||
+        (phase==Phase::RecoveryBrake&&feedback_.flushActive&&Detail::IsFlushMotionPhase(feedback_.phase));
+    if(holdFromFlush&&(flush_.accelerationTimeSeconds>0.0||flush_.decelerationTimeSeconds>0.0)){
+        leg_.acceleration=request_.accelerationMmS2;leg_.deceleration=request_.decelerationMmS2;
+        if(leg_.circle)leg_.acceleration=leg_.deceleration=0.5*(std::min)(request_.accelerationMmS2,request_.decelerationMmS2);
+    }
     const double stopTime=std::fabs(leg_.speed)/leg_.deceleration;
     double stopPosition=leg_.position+0.5*stopTime*leg_.speed;
     const double tolerance=(std::max)(8.0*LegCoordinateError(),
@@ -1456,11 +1492,24 @@ inline bool Cycle::FlushDistanceAvailable() const noexcept
     return NCG76SphereRetreat::Station(request_.geometry,stage,feedback_.layerIndex,
         leg_.position/leg_.length,station)&&station>=height;
 }
+inline double Cycle::FlushAcceleration(double targetSpeed,bool circle) const noexcept
+{
+    const double budget=circle?0.5*(std::min)(request_.accelerationMmS2,request_.decelerationMmS2):request_.accelerationMmS2;
+    return flush_.accelerationTimeSeconds>0.0?(std::min)(targetSpeed/flush_.accelerationTimeSeconds,budget):budget;
+}
+inline double Cycle::FlushDeceleration(double targetSpeed,bool circle) const noexcept
+{
+    const double budget=circle?0.5*(std::min)(request_.accelerationMmS2,request_.decelerationMmS2):request_.decelerationMmS2;
+    return flush_.decelerationTimeSeconds>0.0?(std::min)(targetSpeed/flush_.decelerationTimeSeconds,budget):budget;
+}
 inline bool Cycle::StartFlushLine(const Point8& end,Phase phase) noexcept
 {
     if(feedback_.flushLegSequence==(std::numeric_limits<std::uint64_t>::max)())
     {Fail(Fault::Numeric);return false;}
-    if(!StartLine(end,phase,FlushFeed(phase))||!ConfigureFlushProfile(phase))return false;
+    const double targetSpeed=(std::min)(FlushFeed(phase)/60.0,request_.velocityCapMmS);
+    const double a=FlushAcceleration(targetSpeed),d=FlushDeceleration(targetSpeed);
+    if(!Detail::Positive(a)||!Detail::Positive(d)){Fail(Fault::Numeric);return false;}
+    if(!StartLine(end,phase,FlushFeed(phase),a,d)||!ConfigureFlushProfile(phase))return false;
     if(leg_.length>0.0)++feedback_.flushLegSequence;
     return true;
 }
@@ -1490,9 +1539,10 @@ inline bool Cycle::StartFlushPathLeg(bool reverse) noexcept
     next.center=center;next.circleStartAngle=from*arcAngle;
     next.circleEndAngle=to*arcAngle;
     next.length=std::fabs(to-from)*span.length;
-    next.acceleration=next.deceleration=0.5*(std::min)(request_.accelerationMmS2,request_.decelerationMmS2);
-    const double radialSpeed=std::sqrt(next.acceleration)*std::sqrt(arcRadius);
+    const double legacyBudget=0.5*(std::min)(request_.accelerationMmS2,request_.decelerationMmS2);
+    const double radialSpeed=std::sqrt(legacyBudget)*std::sqrt(arcRadius);
     next.speedLimit=(std::min)((std::min)(FlushFeed(phase)/60.0,request_.velocityCapMmS),radialSpeed);
+    next.acceleration=FlushAcceleration(next.speedLimit,true);next.deceleration=FlushDeceleration(next.speedLimit,true);
     if(!Detail::Positive(next.length)||!Detail::Positive(next.speedLimit)||!StartProfile(next)||
        feedback_.flushLegSequence==(std::numeric_limits<std::uint64_t>::max)())
     {Fail(Fault::Numeric);return false;}

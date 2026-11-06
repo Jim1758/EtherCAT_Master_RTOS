@@ -1,6 +1,7 @@
 // EDM267 FIX1: independent NC compilation unit; original function bodies preserved.
 #include "EtherCatMaster.h"
 #include "NCManager_GapInternal.h"
+#include "EDMRuntimeLogPolicy.h"
 
 using namespace NCGapDetail;
 
@@ -708,6 +709,7 @@ bool NCManager::InstallEDMGapInputBeforeStart(const EDMGapInput::Profile& profil
     (void)m_edmGapPhysicalShadow.Initialize(profile); // Frozen configured calibration; observer only.
     (void)master->ConfigureGapPhysicalRTShadowBeforeStart(profile); // PDO-owned diagnostic only; SIM result unchanged.
     (void)m_motion.BindEDMPhysicalSourceBeforeStart(master); // Separate source binding; no legacy motion permit.
+    (void)m_motion.ConfigureManualGapZInputBeforeStart(profile); // EDM382 immutable calibration; no power output.
     return initialized;
 }
 
@@ -774,7 +776,15 @@ EDMGapInput::Snapshot NCManager::ReadEDMGapInputSnapshotSameThread() noexcept
     const EDMGapInput::Snapshot value = m_edmGapChannel.Observe(input, nowMs, clockValid);
     if (!m_edmGapLogSeen || (clockValid && nowMs >= m_edmGapLastLogMs && nowMs - m_edmGapLastLogMs >= 1000ULL))
     {
-        if (!IsEDMZFixtureDiagnosticQuietSameThread() && !IsEDM173DiagnosticQuietSameThread())
+        // Keep the first/current input-status transition; suppress the healthy
+        // repeating voltage sample. Input observation and its clock still run.
+        const bool inputStatusChanged = !m_edmGapLogSeen || value.inputStatus != m_edmGapLastLogStatus;
+        const auto& logConfig = EDMRuntimeLogPolicy::Current();
+        static EDMRuntimeLogPolicy::RateGate gapLogRate{}, shadowLogRate{};
+        const bool gapSampleDue = logConfig.GapSamples && clockValid &&
+            gapLogRate.Due(nowMs, logConfig.DetailIntervalSec);
+        if ((gapSampleDue || inputStatusChanged) &&
+            !IsEDMZFixtureDiagnosticQuietSameThread() && !IsEDM173DiagnosticQuietSameThread())
             RtPrintf("[EDM18] event=GAP_INPUT source=%s AD=%u device=%u raw=%d rawAvailable=%u boardMv=%d boardValid=%u zeroClamped=%u gapMv=%d liveValid=%u calibration=%u status=%s quality=%s band=%s seq=%llu ageMs=%llu physicalPermit=0 discharge=0\n",
                 EDMGap::SourceName(value.configuredSource), static_cast<unsigned>(value.adIndex), static_cast<unsigned>(value.deviceId),
                 static_cast<int>(value.rawCode), value.rawAvailable ? 1U : 0U, static_cast<int>(value.boardVoltageMv), value.boardVoltageValid ? 1U : 0U,
@@ -783,7 +793,9 @@ EDMGapInput::Snapshot NCManager::ReadEDMGapInputSnapshotSameThread() noexcept
                 static_cast<unsigned long long>(value.sampleSequence), static_cast<unsigned long long>(value.ageMs));
         // Logging remains on the existing cadence. A READY-only shadow line
         // adds no console IO to running, holding, or stopping NC motion.
-        if (!IsEDMZFixtureDiagnosticQuietSameThread() && m_state.load(std::memory_order_relaxed) == NCState::READY)
+        if (logConfig.ShadowDetail && clockValid &&
+            shadowLogRate.Due(nowMs, logConfig.DetailIntervalSec) &&
+            !IsEDMZFixtureDiagnosticQuietSameThread() && m_state.load(std::memory_order_relaxed) == NCState::READY)
         {
             char line[896]{};
             const int length = std::snprintf(line, sizeof(line),

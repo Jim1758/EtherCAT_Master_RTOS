@@ -1,5 +1,11 @@
 ﻿// 檔案：EtherCatMaster_Run.cpp
 #include "EtherCatMaster.h"
+#include "EDMRuntimeLogPolicy.h"
+#include "EDMRuntimeLogConfig.h"
+#include "MachiningScopeContract.h"
+#include "DriverAlarm381.h"
+#include <fstream>
+#include <cstdio>
 #include "GlobalConfig.h" // 如果你有用到 DEBUG_PRINT 等功能
 #include <windows.h> 
 #include <rtapi.h> 
@@ -2966,6 +2972,10 @@ namespace
         return diag.LastAbortCode;
     }
 
+    // Defined with the P50 health publisher below. Scheduling and deadlines
+    // must share the validated RTX QPC clock, never a Windows tick fallback.
+    bool RuntimeLogNowMs(std::uint64_t& nowMs) noexcept;
+
     OSCARMAX_DIAG_NOINLINE void ProcessEtherCatEngineeringService(
         EtherCatMaster* masterCore)
     {
@@ -2988,9 +2998,27 @@ namespace
         static uint32_t activeTimeoutMs = 1000u;
         static ULONGLONG activeStartMs = 0ULL;
         static bool drainingTimedOutCommand = false;
+        static bool clockObserved = false;
+        static std::uint64_t lastClockMs = 0ULL;
+        std::uint64_t serviceNowMs = 0ULL;
+        const bool serviceClockValid = RuntimeLogNowMs(serviceNowMs) &&
+            (!clockObserved || serviceNowMs >= lastClockMs);
+        if (serviceClockValid)
+        {
+            clockObserved = true;
+            lastClockMs = serviceNowMs;
+        }
 
         // Heartbeat is supervisory only; wraparound is harmless.
         service->ServerHeartbeat++;
+
+        // The background monitor drains its own terminal response before this
+        // bridge may accept/reclaim anything. New engineering requests stay queued.
+        if (DriverAlarm381::OwnsCommand())
+        {
+            service->ServerState = SHM_ECAT_SERVICE_SERVER_PROCESSING;
+            return;
+        }
 
         const EtherCatRuntimeSnapshot runtime =
             masterCore->GetRuntimeSnapshot();
@@ -3008,7 +3036,7 @@ namespace
                 "Name:OSCARMAX_ECAT_SERVICE | Cadence:10ms | "
                 "SDORead:YES | SDOWrite:YES_SAFE_GATE | "
                 "Bridge:P50_NONBLOCKING | MailboxOwner:P64_PDO | "
-                "OneOutstanding:YES\n");
+                "OneOutstanding:YES | Clock:RTX_QPC\n");
         }
 
         // -----------------------------------------------------------------
@@ -3092,9 +3120,9 @@ namespace
                     activeRequestId;
 
                 const uint32_t durationUs =
-                    EcatServiceDurationUs(
+                    serviceClockValid ? EcatServiceDurationUs(
                         activeStartMs,
-                        GetTickCount64());
+                        serviceNowMs) : 0u;
 
                 int32_t resultCode =
                     SHM_ECAT_SERVICE_RESULT_SUCCESS;
@@ -3168,14 +3196,14 @@ namespace
             }
 
             const ULONGLONG nowMs =
-                GetTickCount64();
+                serviceNowMs;
 
             const ULONGLONG elapsedMs =
                 (nowMs >= activeStartMs)
                 ? (nowMs - activeStartMs)
                 : 0ULL;
 
-            if (elapsedMs > activeTimeoutMs)
+            if (!serviceClockValid || elapsedMs > activeTimeoutMs)
             {
                 const uint32_t timedOutRequestId =
                     activeRequestId;
@@ -3183,12 +3211,14 @@ namespace
                 PublishEcatServiceResponse(
                     service,
                     timedOutRequestId,
-                    SHM_ECAT_SERVICE_RESULT_TIMEOUT,
+                    serviceClockValid
+                        ? SHM_ECAT_SERVICE_RESULT_TIMEOUT
+                        : SHM_ECAT_SERVICE_RESULT_RUNTIME_NOT_READY,
                     0,
                     0u,
                     0u,
                     0u,
-                    EcatServiceDurationUs(activeStartMs, nowMs));
+                    serviceClockValid ? EcatServiceDurationUs(activeStartMs, nowMs) : 0u);
 
                 service->ErrorCount++;
 
@@ -3235,6 +3265,7 @@ namespace
         if (requestIdBefore == 0u ||
             requestIdBefore == service->LastProcessedRequestId)
         {
+            DriverAlarm381::TrySubmitBackground(masterCore);
             return;
         }
 
@@ -3278,7 +3309,7 @@ namespace
         service->DurationUs = 0u;
 
         const ULONGLONG requestStartMs =
-            GetTickCount64();
+            serviceNowMs;
 
         auto rejectRequest =
             [&](int32_t resultCode)
@@ -3293,16 +3324,16 @@ namespace
                 0u,
                 0u,
                 0u,
-                EcatServiceDurationUs(
+                serviceClockValid ? EcatServiceDurationUs(
                     requestStartMs,
-                    GetTickCount64()));
+                    serviceNowMs) : 0u);
 
             service->ServerState = runtimeReady
                 ? SHM_ECAT_SERVICE_SERVER_READY
                 : SHM_ECAT_SERVICE_SERVER_OFFLINE;
         };
 
-        if (!runtimeReady)
+        if (!serviceClockValid || !runtimeReady)
         {
             rejectRequest(
                 SHM_ECAT_SERVICE_RESULT_RUNTIME_NOT_READY);
@@ -5724,6 +5755,236 @@ namespace
 }
 
 
+namespace
+{
+    // Written once by the P50 startup owner, before cyclic timers are created.
+    EDMRuntimeLogPolicy::Config g_runtimeLogConfiguration{};
+
+    OSCARMAX_DIAG_NOINLINE void LoadRuntimeLogConfigurationBeforeStart(
+        const std::string& dataDirectory) noexcept
+    {
+        static bool loaded = false;
+        if (loaded) return;
+        loaded = true;
+        const char* source = "DEFAULT_MISSING";
+        EDMRuntimeLogPolicy::ParseResult parsed{};
+        try
+        {
+            std::string path = dataDirectory;
+            if (!path.empty() && path.back() != '\\' && path.back() != '/') path += '\\';
+            path += "RuntimeLogConfig.txt";
+            std::ifstream input(path.c_str(), std::ios::binary);
+            if (input.is_open())
+            {
+                EDMRuntimeLogPolicy::ConfigParser parser{};
+                char line[EDMRuntimeLogPolicy::MaximumLineBytes + 2U]{};
+                std::uint32_t lineNumber = 0U;
+                bool stoppedForParseError = false;
+                while (input.getline(line, sizeof(line)))
+                {
+                    ++lineNumber;
+                    const std::streamsize count = input.gcount();
+                    const std::size_t length = static_cast<std::size_t>(
+                        count - (input.eof() ? 0 : 1));
+                    if (!parser.AddLine(line, length, lineNumber))
+                    {
+                        stoppedForParseError = true;
+                        break;
+                    }
+                }
+                if (!stoppedForParseError && !input.eof())
+                    parser.Reject(input.gcount() > static_cast<std::streamsize>(EDMRuntimeLogPolicy::MaximumLineBytes)
+                        ? EDMRuntimeLogPolicy::ConfigError::LineTooLong
+                        : EDMRuntimeLogPolicy::ConfigError::IoError, lineNumber + 1U);
+                parsed = parser.Finish();
+                source = parsed.Valid() ? "FILE" : "DEFAULT_INVALID";
+            }
+        }
+        catch (...)
+        {
+            parsed = EDMRuntimeLogPolicy::ParseResult{};
+            parsed.error = EDMRuntimeLogPolicy::ConfigError::IoError;
+            source = "DEFAULT_IO_ERROR";
+        }
+        g_runtimeLogConfiguration = parsed.config;
+        const auto& c = g_runtimeLogConfiguration;
+        RtPrintf("[EDM378-LOG] source=%s file=RuntimeLogConfig.txt error=%s line=%lu "
+            "health=%u/%lus dc=%u timing=%u gap=%u preview=%u shadow=%u detailSec=%lu "
+            "critical=RETAINED reload=RESTART_ONLY\n",
+            source, EDMRuntimeLogPolicy::ConfigErrorName(parsed.error),
+            static_cast<unsigned long>(parsed.line), c.HealthSummary ? 1U : 0U,
+            static_cast<unsigned long>(c.HealthSummaryIntervalSec), c.DcDetail ? 1U : 0U,
+            c.TimingDetail ? 1U : 0U, c.GapSamples ? 1U : 0U, c.ProcessPreview ? 1U : 0U,
+            c.ShadowDetail ? 1U : 0U, static_cast<unsigned long>(c.DetailIntervalSec));
+    }
+
+    // Sequence advancement is observed each second, independently of text rate.
+    // A first coherent sample has unknown age until its publication advances.
+    struct RuntimeLogFreshness
+    {
+        enum class State { Unavailable, Checking, Fresh, Stale };
+        LONG sequence = 0;
+        std::uint64_t advancedAtMs = 0ULL, observedAtMs = 0ULL;
+        bool seen = false, advanced = false;
+        State Observe(LONG value, bool coherent, std::uint64_t nowMs) noexcept
+        {
+            if (!coherent || value == 0 || (value & 1) != 0) return State::Unavailable;
+            if (!seen || nowMs < observedAtMs || nowMs - observedAtMs > 2500ULL)
+            {
+                // A paused reader cannot prove when an unseen publication was
+                // produced. Rebind and require a later observed advancement.
+                sequence = value; advancedAtMs = observedAtMs = nowMs;
+                seen = true; advanced = false;
+                return State::Checking;
+            }
+            observedAtMs = nowMs;
+            if (value != sequence)
+            {
+                sequence = value; advancedAtMs = nowMs; advanced = true;
+                return State::Fresh;
+            }
+            if (nowMs - advancedAtMs > 2500ULL) return State::Stale;
+            return advanced ? State::Fresh : State::Checking;
+        }
+    };
+
+    const char* RuntimeLogFreshnessName(RuntimeLogFreshness::State state) noexcept
+    {
+        switch (state)
+        {
+        case RuntimeLogFreshness::State::Checking: return "CHECKING";
+        case RuntimeLogFreshness::State::Stale: return "STALE";
+        default: return "UNAVAILABLE";
+        }
+    }
+
+    const char* RuntimeLogControllerState(LONG state) noexcept
+    {
+        switch (state)
+        {
+        case 0: return "WAIT";
+        case 1: return "ARM";
+        case 2: return "ACTIVE";
+        case 3: return "HOLD";
+        case 4: return "TRIP";
+        default: return "UNKNOWN";
+        }
+    }
+
+    bool RuntimeLogNowMs(std::uint64_t& nowMs) noexcept
+    {
+        static std::uint64_t frequency = 0ULL;
+        if (frequency == 0ULL)
+        {
+            LARGE_INTEGER value{};
+            if (!RtQueryPerformanceFrequency(&value) || value.QuadPart <= 0) return false;
+            frequency = static_cast<std::uint64_t>(value.QuadPart);
+        }
+        LARGE_INTEGER value{};
+        if (!RtQueryPerformanceCounter(&value) || value.QuadPart < 0) return false;
+        const std::uint64_t ticks = static_cast<std::uint64_t>(value.QuadPart);
+        const std::uint64_t seconds = ticks / frequency, remainder = ticks % frequency;
+        if (seconds > 0xFFFFFFFFFFFFFFFFULL / 1000ULL || remainder > 0xFFFFFFFFFFFFFFFFULL / 1000ULL)
+            return false;
+        const std::uint64_t whole = seconds * 1000ULL, fraction = remainder * 1000ULL / frequency;
+        if (whole > 0xFFFFFFFFFFFFFFFFULL - fraction) return false;
+        nowMs = whole + fraction;
+        return true;
+    }
+
+    OSCARMAX_DIAG_NOINLINE void ServiceRuntimeLogOutput(NCManager* nc, MotionCore* motion) noexcept
+    {
+        const auto& c = EDMRuntimeLogPolicy::Current();
+        if (!c.HealthSummary && !c.DcDetail && !c.TimingDetail) return;
+        std::uint64_t nowMs = 0ULL;
+        if (!RuntimeLogNowMs(nowMs))
+        {
+            static bool reported = false;
+            if (!reported)
+            {
+                RtPrintf("[RUNTIME-HEALTH] source=UNAVAILABLE reason=LOG_CLOCK\n");
+                reported = true;
+            }
+            return;
+        }
+
+        if (c.HealthSummary)
+        {
+            // Each group uses one bounded read. They are not one atomic whole.
+            LONG pdoSeq = g_pdoRtDiagSequence, lrw = 0, dc = 0, valid = 0;
+            bool pdoCoherent = false;
+            if (pdoSeq != 0 && (pdoSeq & 1) == 0)
+            {
+                MemoryBarrier();
+                lrw = g_pdoRtLrwWkc; dc = g_pdoRtDcWkc; valid = g_pdoRtProcessDataValid;
+                MemoryBarrier();
+                pdoCoherent = pdoSeq == g_pdoRtDiagSequence && (pdoSeq & 1) == 0;
+            }
+            LONG ffSeq = g_qpcRealFfV0Seq, ffState = 0, trip = 0;
+            bool ffCoherent = false;
+            if (ffSeq != 0 && (ffSeq & 1) == 0)
+            {
+                MemoryBarrier(); ffState = g_qpcRealFfV0State; trip = g_qpcRealFfV0TripMask;
+                MemoryBarrier(); ffCoherent = ffSeq == g_qpcRealFfV0Seq && (ffSeq & 1) == 0;
+            }
+            LONG phaseSeq = g_qpcPhasePActV0Seq, phaseState = 0, gate = 0;
+            LONGLONG phaseNs = 0;
+            bool phaseCoherent = false;
+            if (phaseSeq != 0 && (phaseSeq & 1) == 0)
+            {
+                MemoryBarrier(); phaseState = g_qpcPhasePActV0State;
+                gate = g_qpcPhasePActV0GateGood; phaseNs = g_qpcPhasePActV0WrappedErrNs;
+                MemoryBarrier(); phaseCoherent = phaseSeq == g_qpcPhasePActV0Seq && (phaseSeq & 1) == 0;
+            }
+            static RuntimeLogFreshness pdoFreshness{}, ffFreshness{}, phaseFreshness{};
+            const auto pdoFresh = pdoFreshness.Observe(pdoSeq, pdoCoherent, nowMs);
+            const auto ffFresh = ffFreshness.Observe(ffSeq, ffCoherent, nowMs);
+            const auto phaseFresh = phaseFreshness.Observe(phaseSeq, phaseCoherent, nowMs);
+            static EDMRuntimeLogPolicy::RateGate summaryRate{};
+            if (summaryRate.Due(nowMs, c.HealthSummaryIntervalSec) &&
+                (nc == nullptr || !nc->IsEDM173DiagnosticQuietSameThread()))
+            {
+                char pdoText[96]{}, ffText[72]{}, phaseText[112]{};
+                if (pdoFresh == RuntimeLogFreshness::State::Fresh)
+                    std::snprintf(pdoText, sizeof(pdoText), "pdo=%s lrw=%ld dcWkc=%ld",
+                        valid != 0 ? "VALID" : "INVALID", static_cast<long>(lrw), static_cast<long>(dc));
+                else std::snprintf(pdoText, sizeof(pdoText), "pdo=%s", RuntimeLogFreshnessName(pdoFresh));
+                if (ffFresh == RuntimeLogFreshness::State::Fresh)
+                    std::snprintf(ffText, sizeof(ffText), "ff=%s trip=0x%lX",
+                        RuntimeLogControllerState(ffState), static_cast<unsigned long>(trip));
+                else std::snprintf(ffText, sizeof(ffText), "ff=%s", RuntimeLogFreshnessName(ffFresh));
+                if (phaseFresh == RuntimeLogFreshness::State::Fresh)
+                    std::snprintf(phaseText, sizeof(phaseText), "phase=%s gate=%ld phaseNs=%lld",
+                        RuntimeLogControllerState(phaseState), static_cast<long>(gate), static_cast<long long>(phaseNs));
+                else std::snprintf(phaseText, sizeof(phaseText), "phase=%s", RuntimeLogFreshnessName(phaseFresh));
+                RtPrintf("[RUNTIME-HEALTH] nc=%u alarm=%u %s %s %s\n",
+                    nc != nullptr ? static_cast<unsigned>(nc->GetState()) : 0xFFFFFFFFU,
+                    AlarmManager::GetInstance().HasAlarm() ? 1U : 0U, pdoText, ffText, phaseText);
+            }
+        }
+        static EDMRuntimeLogPolicy::RateGate detailRate{};
+        if ((c.DcDetail || c.TimingDetail) && detailRate.Due(nowMs, c.DetailIntervalSec) &&
+            nc != nullptr && !nc->IsEDM173DiagnosticQuietSameThread())
+        {
+            if (c.DcDetail) PrintDcRuntimeCompactDiagnostics();
+            if (c.TimingDetail)
+            {
+                PrintEDM142PdoTiming(nc, motion);
+                PrintEDM144RuntimeTiming();
+                PrintEDM173Fix19AxesTiming();
+            }
+        }
+    }
+}
+
+const EDMRuntimeLogPolicy::Config& EDMRuntimeLogPolicy::Current() noexcept
+{
+    return g_runtimeLogConfiguration;
+}
+
+
+#include "DriverAlarm381Runtime.inl"
+
 int EtherCatMaster::RunRealTimeCycle_EDM_SINKER_MODE()//主要程式迴圈執行 EDM模式
 {
     DEBUG_PRINT(
@@ -5731,6 +5992,7 @@ int EtherCatMaster::RunRealTimeCycle_EDM_SINKER_MODE()//主要程式迴圈執行
 
 
     GlobalConfig& globalConfig = GlobalConfig::GetInstance();
+    LoadRuntimeLogConfigurationBeforeStart(globalConfig.BaseDataDir);
 
 
     // =========================================================
@@ -5910,7 +6172,13 @@ int EtherCatMaster::RunRealTimeCycle_EDM_SINKER_MODE()//主要程式迴圈執行
     // RUNNING
     // =========================================================
 
+    const bool scopeTelemetryReady = MachiningScope379::Initialize();
+    RtPrintf("[EDM379-SCOPE] state=%s periodDefaultUs=1000 capacity=8192 leaseMs=2000 authority=TELEMETRY_ONLY disabledUntilRequested=1\n",
+        scopeTelemetryReady ? "READY" : "UNAVAILABLE");
+
     MarkRuntimeRunning();
+    DriverAlarm381::Initialize(this);
+    RtPrintf("[EDM378] logConfig=RuntimeLogConfig.txt critical=RETAINED followingErrorProtection=UNCHANGED\n");
 
 
     //主控迴圈-------------------------------------------------------------
@@ -5922,6 +6190,8 @@ int EtherCatMaster::RunRealTimeCycle_EDM_SINKER_MODE()//主要程式迴圈執行
             MarkRuntimeStopping();
             // Freeze callback-owned state before persistence and resource release.
             StopCyclicRuntime();
+            MachiningScope379::ShutdownAfterCallbacksStopped();
+            DriverAlarm381::Shutdown();
 
 
             m_NC->CoordSys.SaveAllParameters();//儲存座標系統相關參數
@@ -5952,7 +6222,13 @@ int EtherCatMaster::RunRealTimeCycle_EDM_SINKER_MODE()//主要程式迴圈執行
 
         // Stage 12F.3B.3 - non-blocking CoE/SDO engineering service bridge.
         // It only submits/polls the existing PDO-owner async command slot.
+        DriverAlarm381::Tick(this);
         ProcessEtherCatEngineeringService(this);
+        // On-demand telemetry lease: no time read or request copy without a
+        // claimed client. Reuses this existing P50 loop; no new worker/timer.
+        const std::uint64_t scopeNowNs=MachiningScope379::ClientClaimed()?GetCurrentMasterTimeNs():0ULL;
+        if(scopeNowNs) MachiningScope379::PublishNcState(static_cast<std::uint32_t>(m_NC->GetState()),scopeNowNs);
+        MachiningScope379::Service(static_cast<std::uint32_t>(m_Axes.size()),scopeNowNs);
         PrintEDM174CommunicationTrace();
         // EDM231 FIX4: keep first-fault communication evidence immediate;
         // defer periodic text only. RT collectors continue unchanged.
@@ -6015,12 +6291,7 @@ int EtherCatMaster::RunRealTimeCycle_EDM_SINKER_MODE()//主要程式迴圈執行
             timer_1000ms_Count += 1;
             // Recheck after ProcessTask: fault/reset/completion can reopen
             // diagnostics in this same supervisory iteration.
-            if (!m_NC->IsEDM173DiagnosticQuietSameThread())
-            {
-                PrintEDM142PdoTiming(m_NC, &m_Motion);
-                PrintEDM144RuntimeTiming();
-                PrintEDM173Fix19AxesTiming();
-            }
+            ServiceRuntimeLogOutput(m_NC, &m_Motion); // P50 only; no runtime file access.
             HMI_Bridge::ProcessTask_1000ms(m_NC); // 呼叫 1000ms 任務
 
             // HOME 成功時 HomingManager 只 Queue 記憶體資料。

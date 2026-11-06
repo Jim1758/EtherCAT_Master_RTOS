@@ -194,6 +194,54 @@ static void LoadDcDriftCalibrationConfig()
 }
 
 
+// EDM376: log the loaded topology on every fresh start. No learned baseline is
+// reused across starts, even if two identical model/ordering signatures match.
+static void PrintDcAutoCalibrationTopology(EtherCatMaster* master)
+{
+    if (master == nullptr || master->m_pEni == nullptr) return;
+    const auto& slaves = master->m_pEni->GetSlaves();
+    uint64_t signature = 14695981039346656037ULL;
+    const auto mix = [&signature](uint64_t value)
+    {
+        for (unsigned byte = 0; byte < 8U; ++byte)
+        {
+            signature ^= value & 0xFFULL;
+            signature *= 1099511628211ULL;
+            value >>= 8;
+        }
+    };
+    const int reference = GetDcReferenceSlaveIndex();
+    mix((uint64_t)slaves.size());
+    mix((uint64_t)(int64_t)reference);
+    mix((uint64_t)EtherCatDcTuning::PdoCycleNs);
+    mix((uint64_t)master->EXPECTED_WKC_PDO);
+    for (const auto& slave : slaves)
+    {
+        mix(slave.vendorId); mix(slave.productCode); mix(slave.revision);
+        mix(slave.hasRevision ? 1ULL : 0ULL);
+        mix(slave.configuredAddress); mix(slave.hasConfiguredAddress ? 1ULL : 0ULL);
+        mix(slave.inputBitLength); mix(slave.outputBitLength);
+        mix(slave.runtimeDc.present ? 1ULL : 0ULL);
+        mix(slave.runtimeDc.cycleTimeNs); mix((uint64_t)slave.runtimeDc.shiftTimeNs);
+        mix(slave.runtimeDc.referenceClock ? 1ULL : 0ULL);
+    }
+    const unsigned referenceAddress = reference >= 0 && (size_t)reference < slaves.size()
+        ? (unsigned)slaves[(size_t)reference].configuredAddress : 0U;
+    RtPrintf("[EDM376-DC-AUTO] topology=%016llX slaves=%lu ref=S%d/0x%04X "
+        "mode=%s baseline=%s capture=%+lld..%+lldppb idleRebase=%s "
+        "deviation=%lldppb windows=%lu spread=%lldppb hotReload=NO\n",
+        (unsigned long long)signature, (unsigned long)slaves.size(), reference, referenceAddress,
+        g_dcDriftConfiguredMode == 0 ? "AUTO" : "FIXED",
+        g_dcDriftConfiguredMode == 0 ? "MEASURE_EACH_START" : "CONFIGURED_FIXED",
+        (long long)EtherCatDcTuning::DriftCalibrationMinimumPpb,
+        (long long)EtherCatDcTuning::DriftCalibrationMaximumPpb,
+        g_dcDriftConfiguredMode == 0 ? "QUALIFIED" : "OFF",
+        (long long)EtherCatDcTuning::DriftRecalibrationMinimumDeviationPpb,
+        (unsigned long)EtherCatDcTuning::DriftRecalibrationGoodWindows,
+        (long long)EtherCatDcTuning::DriftRecalibrationMaximumSpreadPpb);
+}
+
+
 // ============================================================================
 // DC-RX.3F deterministic test-only fault injection configuration
 //
@@ -1637,6 +1685,7 @@ int EtherCatMaster::StartDcPdoRuntime()
 
     // Drift 設定必須在建立正式 PDO timer 前固定；Runtime 只讀取記憶體快照。
     LoadDcDriftCalibrationConfig();
+    PrintDcAutoCalibrationTopology(this);
 
     // DC-RX.3F: configuration is loaded once before the real PDO timer exists.
     LoadDcRx3fFaultInjectionConfig();

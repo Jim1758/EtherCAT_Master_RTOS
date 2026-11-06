@@ -41,7 +41,7 @@ struct FrozenFrame
     Point8 startMCS{},programStart{};
     Point3 signedEccentricOffset{};
     double nativeScale=0.0;
-    bool fixedEccentric=false,valid=false;
+    bool fixedEccentric=false,valid=false,physicalZManual=false;
 };
 static_assert(std::is_trivially_destructible<FrozenFrame>::value,
     "P50 caller-storage reset must have no destruction side effects");
@@ -86,7 +86,7 @@ inline bool PreservesVector(const Point3& actual,const Point3& expected) noexcep
     return std::isfinite(length)&&std::isfinite(actualLength)&&std::isfinite(error)&&
         error<=MaximumMappingErrorMm&&(length==0.0?actualLength==0.0:actualLength>0.0&&error<=length/64.0);
 }
-inline Status Supported(const NCTranslationSnapshot& s) noexcept
+inline Status Supported(const NCTranslationSnapshot& s,bool physicalZManual=false) noexcept
 {
     if(s.axisIdentity.eccentricEnabled==1U&&s.toolLengthMode!=49){
         unsigned role=8U;
@@ -100,7 +100,12 @@ inline Status Supported(const NCTranslationSnapshot& s) noexcept
     double workAngle=0.0;
     if(!TryGetNCTranslationWorkPlaneAngle(s,workAngle))return Status::UnsupportedWorkRotation;
     if(!IsNCTranslationSnapshotValid(s))return Status::InvalidSnapshot;
-    if(!IsNCXYZCUVFeedAxisScopeValid(s.axisIdentity)||s.axisIdentity.exists[6]!=0||s.axisIdentity.exists[7]!=0)
+    if(physicalZManual){
+        if(!IsNCAxisIdentitySnapshotValid(s.axisIdentity)||s.axisIdentity.eccentricEnabled)return Status::UnsupportedAxisScope;
+        for(unsigned axis=0U;axis<3U;++axis)if(s.axisIdentity.exists[axis]!=1U||
+            s.axisIdentity.axisType[axis]!=0U||s.axisIdentity.address[axis]!="XYZ"[axis])return Status::UnsupportedAxisScope;
+        for(unsigned axis=3U;axis<8U;++axis)if(s.axisIdentity.exists[axis])return Status::UnsupportedAxisScope;
+    }else if(!IsNCXYZCUVFeedAxisScopeValid(s.axisIdentity)||s.axisIdentity.exists[6]!=0||s.axisIdentity.exists[7]!=0)
         return Status::UnsupportedAxisScope;
     return Status::Ok;
 }
@@ -132,18 +137,19 @@ inline bool RawForward(const FrozenFrame& frame,const Point3& point,Point8& outp
 }
 inline bool SameFrame(const FrozenFrame& a,const FrozenFrame& b) noexcept
 {
-    return a.valid==b.valid&&a.fixedEccentric==b.fixedEccentric&&
+    return a.valid==b.valid&&a.fixedEccentric==b.fixedEccentric&&a.physicalZManual==b.physicalZManual&&
         SameNCTranslationSnapshot(a.translation,b.translation)&&Detail::Same(a.startMCS,b.startMCS)&&
         Detail::Same(a.programStart,b.programStart)&&Detail::Same(a.signedEccentricOffset,b.signedEccentricOffset)&&
         Detail::Bits(a.nativeScale,b.nativeScale);
 }
-inline Status BuildFrame(const NCTranslationSnapshot& source,const Point8& acceptedStart,FrozenFrame& output) noexcept
+inline Status BuildFrame(const NCTranslationSnapshot& source,const Point8& acceptedStart,FrozenFrame& output,
+    bool physicalZManual=false) noexcept
 {
     // Copy inputs before clearing output, including callers rebuilding in place.
     const NCTranslationSnapshot frozen=source;const Point8 initial=acceptedStart;Detail::ClearFrame(output);
-    const auto status=Detail::Supported(frozen);if(status!=Status::Ok)return status;
+    const auto status=Detail::Supported(frozen,physicalZManual);if(status!=Status::Ok)return status;
     if(!Detail::Finite(initial))return Status::InvalidStart;
-    auto& frame=output;frame.translation=frozen;frame.startMCS=initial;frame.nativeScale=frozen.scalingFactor;
+    auto& frame=output;frame.physicalZManual=physicalZManual;frame.translation=frozen;frame.startMCS=initial;frame.nativeScale=frozen.scalingFactor;
     frame.fixedEccentric=frozen.axisIdentity.eccentricEnabled==1U&&frozen.toolLengthMode!=49;
     if(frame.fixedEccentric&&!NCEccentricCDetail::Offset(frozen,initial[3],frame.signedEccentricOffset))
         { Detail::ClearFrame(output);return Status::UnsupportedEccentric; }
@@ -164,7 +170,7 @@ inline Status BuildFrame(const NCTranslationSnapshot& source,const Point8& accep
 }
 inline bool ValidFrame(const FrozenFrame& frame) noexcept
 {
-    FrozenFrame expected{};return frame.valid&&BuildFrame(frame.translation,frame.startMCS,expected)==Status::Ok&&SameFrame(frame,expected);
+    FrozenFrame expected{};return frame.valid&&BuildFrame(frame.translation,frame.startMCS,expected,frame.physicalZManual)==Status::Ok&&SameFrame(frame,expected);
 }
 inline Status MapVector(const FrozenFrame& inputFrame,const Point3& vector,Point3& output) noexcept
 {

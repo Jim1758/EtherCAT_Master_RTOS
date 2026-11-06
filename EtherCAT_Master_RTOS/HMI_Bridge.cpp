@@ -11,6 +11,7 @@
 #include "RotarySpindleTelemetry.h"
 #include "NCHoldTelemetry.h"
 #include "NCMachiningTelemetry.h"
+#include "EDMRuntimeLogPolicy.h"
 #include "NCHoldInspectionCommand.h"
 
 #include <cmath>
@@ -518,6 +519,7 @@ namespace HMI_Bridge
         HMI_DIAG_NOINLINE void DrainPbcXSendDiagnostics(MotionCore& motion)
         {
             static MotionPbcXSendEvent event{};
+            static EDMRuntimeLogPolicy::RateGate sampleTextRate{};
             static std::uint32_t lastDropped = 0U;
             static bool announced = false;
             if (!announced)
@@ -529,6 +531,11 @@ namespace HMI_Bridge
             for (std::size_t n = 0U; n < MotionPbcXSendAudit::DrainBudget; ++n)
             {
                 if (!motion.TryPopPbcXSendDiagnostic(event)) break;
+                // EDM378: drain every record. ISSUE text bypasses the optional
+                // sample category/rate; no new clock read is needed for samples.
+                const auto& logConfig = EDMRuntimeLogPolicy::Current();
+                if (event.kind != 2U && (!logConfig.ShadowDetail ||
+                    !sampleTextRate.Due(event.sample.identity.tick / 4ULL, logConfig.DetailIntervalSec))) continue;
                 const MotionPbcXSendSample& s = event.sample;
                 const char* result = s.result == pbc::SendResult::HandoffAccepted ? "SHADOW_OK" :
                     s.result == pbc::SendResult::FenceAccepted ? "FENCE_OK" :

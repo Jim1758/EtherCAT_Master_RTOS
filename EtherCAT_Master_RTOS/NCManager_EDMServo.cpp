@@ -2,6 +2,8 @@
 #include "EDMProcessTuningCodec.h"
 #include "EDMAutomaticFlushRecipe.h"
 #include "EDMSpecialGapGainBinding.h"
+#include "EDMRuntimeLogPolicy.h"
+#include "EDMManualGapZConfig.h"
 #include "AlarmManager.h"
 #include <cmath>
 #include <cstdio>
@@ -19,6 +21,20 @@ namespace
 {
     using ShadowReason = NCManager::EDMProcessShadowReason;
 
+
+    bool SameManualGapZAxisGains382(const EDM20::AxisGainProfiles& a,
+        const EDM20::AxisGainProfiles& b) noexcept
+    {
+        for(unsigned axis=0U;axis<8U;++axis){
+            const EDM20::AxisGainProfile* left[]={&a.discharge[axis],&a.flush[axis]};
+            const EDM20::AxisGainProfile* right[]={&b.discharge[axis],&b.flush[axis]};
+            for(unsigned bank=0U;bank<2U;++bank)
+                if(left[bank]->inheritCnc!=right[bank]->inheritCnc||
+                   left[bank]->custom.Kp!=right[bank]->custom.Kp||left[bank]->custom.Ki!=right[bank]->custom.Ki||
+                   left[bank]->custom.Kd!=right[bank]->custom.Kd||left[bank]->custom.Kvff!=right[bank]->custom.Kvff)return false;
+        }
+        return true;
+    }
 
     bool SameCollisionThresholds(const EDMGapServo::Profile& a,
         const EDMGapServo::Profile& b) noexcept
@@ -195,6 +211,10 @@ bool NCManager::InstallEDMProcessProfileBeforeStart(const EDM20::ProcessProfile&
         if (discharge[axis].status != EDM20::GainResolveStatus::Ready ||
             flush[axis].status != EDM20::GainResolveStatus::Ready) return false;
     }
+    // EDM382 freezes the normally resolved INI/CNC banks once at startup.
+    // No gain is applied until the RT owner enters this physical-only parent.
+    if(EDM382::Current().enabled&&
+       !m_motion.ConfigureManualGapZAxisGainsBeforeStart(discharge,flush))return false;
     if (!m_motion.ConfigureCollisionProtection(profile.servo, true)) return false;
     m_edmProcessProfile = profile;
     m_edmDischargeGains = discharge; m_edmFlushGains = flush;
@@ -398,9 +418,12 @@ void NCManager::ObserveEDMProcessShadowSameThread(const EDMGapInput::Snapshot& g
     EDM21LogShadowGateTransition(m_edmProcessShadow, next);
     m_edmProcessShadow = next;
     if (firstObservation) RtPrintf("[EDM20_FIX1][BOOT] phase=SHADOW_FIRST_EXIT reason=%u\n", static_cast<unsigned>(next.reason));
-    if (!IsEDMZFixtureDiagnosticQuietSameThread() && !IsEDM173DiagnosticQuietSameThread() &&
+    const auto& logConfig = EDMRuntimeLogPolicy::Current();
+    if (logConfig.ProcessPreview &&
+        !IsEDMZFixtureDiagnosticQuietSameThread() && !IsEDM173DiagnosticQuietSameThread() &&
         (!m_edmProcessLogSeen || (next.observedAtMs >= m_edmProcessLastLogMs &&
-            next.observedAtMs - m_edmProcessLastLogMs >= 1000ULL)))
+            next.observedAtMs - m_edmProcessLastLogMs >=
+                static_cast<std::uint64_t>(logConfig.DetailIntervalSec) * 1000ULL)))
         EDM23LogAutomaticRecipe(m_recipe, next.machineProfileId, next.configRevision);
     LogEDMProcessShadowSameThread();
 }
@@ -409,8 +432,12 @@ void NCManager::LogEDMProcessShadowSameThread() noexcept
 {
     if (IsEDMZFixtureDiagnosticQuietSameThread() || IsEDM173DiagnosticQuietSameThread()) return;
     const EDMProcessShadowSnapshot& s = m_edmProcessShadow;
+    const auto& logConfig = EDMRuntimeLogPolicy::Current();
     if (m_edmProcessLogSeen && (s.observedAtMs < m_edmProcessLastLogMs ||
-        s.observedAtMs - m_edmProcessLastLogMs < 1000ULL)) return;
+        s.observedAtMs - m_edmProcessLastLogMs <
+            static_cast<std::uint64_t>(logConfig.DetailIntervalSec) * 1000ULL)) return;
+    if (logConfig.ProcessPreview)
+    {
     // Three independently bounded records retain the same observation identity.
     // Nine significant digits keep even extreme finite doubles compact; CRT
     // also represents nonfinite diagnostic values without unbounded expansion.
@@ -437,6 +464,7 @@ void NCManager::LogEDMProcessShadowSameThread() noexcept
         s.shortRetreatPreview.signedSpeedMmPerMin, static_cast<unsigned>(s.curve.segment),
         s.curve.saturated ? 1U : 0U, s.curve.limitsConfirmed ? 1U : 0U);
     EDM20PrintShadowLine(line, length);
+    }
     m_edmProcessLogSeen = true;
     m_edmProcessLastLogMs = s.observedAtMs;
 }
@@ -468,6 +496,15 @@ EDMProcessTuningStatus NCManager::ApplyEDMProcessTuningSameThread(
     EDM20::ProcessProfile candidate{};
     if (!EDMProcessTuning::DecodeSelected(request, m_edmProcessProfile, candidate))
         return EDMProcessTuningStatus::DomainRejected;
+    // Physical parent gains are immutable boot banks. Do not acknowledge a
+    // changed HMI profile while RT would still hold its previous bank. Other
+    // process values and exact no-op gain submissions retain normal tuning.
+    if(EDM382::Current().enabled&&
+       !SameManualGapZAxisGains382(candidate.axisGains,m_edmProcessProfile.axisGains)){
+        RtPrintf("[EDM382] event=TUNING_REJECT reason=PHYSICAL_AXIS_GAIN_RESTART_REQUIRED generation=%llu applied=0 source=EDMDischargeAxisGain.ini_EDMFlushAxisGain.ini\n",
+            static_cast<unsigned long long>(m_edmProcessTuningGeneration));
+        return EDMProcessTuningStatus::NotAllowed;
+    }
     const bool collisionThresholdsChanged =
         !SameCollisionThresholds(candidate.servo, m_edmProcessProfile.servo);
     if (collisionThresholdsChanged) {

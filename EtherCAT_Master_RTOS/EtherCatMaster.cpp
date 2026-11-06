@@ -1,4 +1,5 @@
 ﻿#include "EtherCatMaster.h"
+#include "MachiningScopeContract.h"
 #include <windows.h> 
 #include <rtapi.h> 
 #include <rtssapi.h> 
@@ -4075,6 +4076,7 @@ bool EtherCatMaster::ReadGapAnalogInputSnapshot(EDMAnalogInput::Snapshot& snapsh
 // failure does not change the existing SIM source or its admission result.
 bool EtherCatMaster::ConfigureGapPhysicalRTShadowBeforeStart(const EDMGapInput::Profile& profile) noexcept
 {
+    MachiningScope379::ConfigureGapBeforeStart(profile); // immutable telemetry calibration only
     return m_gapPhysicalRTShadow.InitializeBeforeStart(profile);
 }
 

@@ -56,16 +56,16 @@ namespace MotionG76SphereProcessSend
 {
 inline bool ExactNonzeroSend(const MotionServoHandoffSample& sample,
     MotionExecutionEpoch epoch,const MotionOwnerLease& owner,std::uint32_t mask,
-    std::uint64_t tick) noexcept
+    std::uint64_t tick,bool physicalZManual=false) noexcept
 {
-    if(!epoch||!owner.IsValid()||mask!=0x3FU||!tick||!sample.sequence||!sample.frameGeneration||
+    if(!epoch||!owner.IsValid()||mask!=(physicalZManual?0x07U:0x3FU)||!tick||!sample.sequence||!sample.frameGeneration||
        sample.sourceTick!=tick||sample.epoch!=epoch||sample.owner!=static_cast<std::uint32_t>(owner.owner)||
        sample.ownerGeneration!=owner.generation||sample.idleScope||sample.scrubbed||
        !sample.finalChecked||!sample.attempted||!sample.apiAccepted||
        sample.slotMask!=mask||(sample.observedMask&mask)!=mask||
        (sample.sourceInputMask&mask)!=mask)return false;
     bool nonzero=false;
-    for(unsigned axis=0U;axis<6U;++axis){
+    for(unsigned axis=0U;axis<(physicalZManual?3U:6U);++axis){
         if((sample.sourceStatusWord[axis]&0x006FU)!=0x0027U||sample.sourceMode[axis]!=9||
            sample.proposedVelocity[axis]!=sample.copiedVelocity[axis])return false;
         if(axis<3U)nonzero=nonzero||sample.copiedVelocity[axis]!=0;
@@ -118,6 +118,7 @@ namespace MotionG76SphereParameterFeeds
 inline bool Matches(const NCG76SphereCycle::Request& request,
     const NCG76SphereGapProcess::Config& config) noexcept
 {
+    if(request.physicalZManual!=config.physicalZManual)return false;
     if(config.orbitFeedsEnabled&&((request.geometry.kind!=NCG76SphereRuntimeGeometry::Kind::Sphere&&
         request.geometry.kind!=NCG76SphereRuntimeGeometry::Kind::OrbitContour)||
        request.parameterFeeds||!NCG76SphereGapProcess::Valid(config)))return false;

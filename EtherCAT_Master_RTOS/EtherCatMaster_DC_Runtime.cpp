@@ -1,8 +1,11 @@
 ﻿#include "EtherCatMaster.h"
 #include "PdoTimerStackPolicy.h"
+#include "DriverAlarm381.h"
 #include "EtherCatMaster_DC_Internal.h"
 #include "EtherCatMaster_DC_Topology.h"
 #include "EtherCatMaster_DC_Tuning.h"
+#include "EtherCatDcAutoCalibration.h"
+#include "PositionPidService.h"
 #include "EtherCatPdoRuntimeInvalidCorrelation.h"
 #include "EtherCatPdoSafetyStopDebounce.h"
 #include "EtherCatRxForensics.h"
@@ -21,6 +24,7 @@
 #include "GlobalConfig.h"
 #include "PLCManager.h" // 🌟 1. 記得 include PLCManager 標頭檔
 #define MAX_MBX_SIZE 1024
+#include "MachiningScopeRuntime.inl" // EDM379: bounded on-demand telemetry only
 
 #if defined(_MSC_VER)
 #define OSCARMAX_P64_DIAG_NOINLINE __declspec(noinline)
@@ -251,6 +255,8 @@ namespace
         {
             return;
         }
+
+        DriverAlarm381::CaptureRt(pMaster,currentLrwWkc,currentDcWkc,processDataValid);
 
         const uint64_t costStartNs =
             pMaster->GetCurrentMasterTimeNs();
@@ -3901,6 +3907,11 @@ volatile LONGLONG g_dcDriftCalibrationRawMedianDeviationPpb = 0;
 volatile LONGLONG g_dcDriftCalibrationBaselinePpb =
 EtherCatDcTuning::SchedulerBootstrapDriftPpb;
 volatile LONG g_dcDriftCalibrationLockCount = 0;
+volatile LONG g_dcDriftCalibrationRejectMask = 0;
+volatile LONG g_dcDriftRecalibrationBlockMask = 0;
+volatile LONG g_dcDriftRecalibrationPending = 0;
+volatile LONG g_dcDriftRecalibrationGoodWindows = 0;
+volatile LONG g_dcDriftRecalibrationCount = 0;
 
 // =============================================================
 // DC-RX.3F test-only immutable startup config
@@ -6046,8 +6057,8 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
     static int64_t phasePActV0OffsetNs = 0;
     static int64_t phasePActV0LastStepNs = 0;
 
-    // 啟動校正只在本次 process 執行一次。AUTO 以五個連續合格 Robust
-    // median 的平均值鎖定；FIXED 在第一個有效 callback 直接鎖定指定值。
+    // AUTO 以五個連續合格 Robust median 鎖定啟動基準；之後只有穩定待機
+    // 且取得精確提交保留時可重校。FIXED 仍維持本次 process 的指定值。
     static bool driftCalibrationInitialized = false;
     static bool driftCalibrationLocked = false;
     static LONG driftCalibrationMode = 0;
@@ -6057,6 +6068,13 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
     static int64_t driftBaselinePpb =
         EtherCatDcTuning::SchedulerBootstrapDriftPpb;
     static uint32_t driftCalibrationLockCount = 0;
+    static uint32_t driftRecalibrationGoodWindows = 0;
+    static int64_t driftRecalibrationMedianSumPpb = 0;
+    static int64_t driftRecalibrationMinimumPpb = 0;
+    static int64_t driftRecalibrationMaximumPpb = 0;
+    static bool driftRecalibrationPending = false;
+    static uint64_t driftRecalibrationOwnerGeneration = 0;
+    static uint64_t driftRecalibrationExecutionEpoch = 0;
 
 
     // =============================================================
@@ -6832,6 +6850,10 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
     // ---------------------------------------------------------------------
     bool driftCalibrationPublish = false;
     bool driftCalibrationLockedThisCycle = false;
+    bool driftRecalibrationCommittedThisCycle = false;
+    uint32_t driftCalibrationRejectMask = 0;
+    uint32_t driftRecalibrationBlockMask = 0;
+    MotionCore::DcRecalibrationIdleReservation driftRecalibrationReservation{};
     bool driftCalibrationCandidateGood = false;
     LONG driftCalibrationRobustSequence = 0;
     int64_t driftCalibrationRawPpb = 0;
@@ -6873,8 +6895,7 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
         driftCalibrationInitialized = true;
     }
 
-    if (driftCalibrationMode == 0 &&
-        !driftCalibrationLocked)
+    if (driftCalibrationMode == 0)
     {
         LONG robustSequenceBefore =
             g_qpcDcRobustDiagSequence;
@@ -6917,30 +6938,23 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
                 driftCalibrationRobustSequence =
                     robustSequenceAfter;
 
+                const uint64_t rawMedianDistance = EDM376DcCal::AbsoluteDifference(
+                    driftCalibrationRawPpb, driftCalibrationMedianPpb);
+                const int64_t boundedRawMedianDistance = (int64_t)(
+                    rawMedianDistance <= 0x7FFFFFFFFFFFFFFFULL
+                    ? rawMedianDistance : 0x7FFFFFFFFFFFFFFFULL);
                 driftCalibrationRawMedianDeviationPpb =
-                    driftCalibrationRawPpb -
-                    driftCalibrationMedianPpb;
+                    driftCalibrationRawPpb >= driftCalibrationMedianPpb
+                    ? boundedRawMedianDistance : -boundedRawMedianDistance;
+                driftCalibrationRejectMask = EDM376DcCal::QualityRejectMask(
+                    driftCalibrationRawPpb, driftCalibrationMedianPpb,
+                    driftCalibrationMadPpb, robustCurrentAccepted != 0,
+                    robustLocked != 0,
+                    robustBufferCount >= 0 ? (uint32_t)robustBufferCount : 0U,
+                    IsRealFfV0CleanRecoveryReady());
+                driftCalibrationCandidateGood = driftCalibrationRejectMask == 0U;
 
-                int64_t rawMedianAbsPpb =
-                    driftCalibrationRawMedianDeviationPpb >= 0
-                    ? driftCalibrationRawMedianDeviationPpb
-                    : -driftCalibrationRawMedianDeviationPpb;
-
-                driftCalibrationCandidateGood =
-                    robustCurrentAccepted != 0 &&
-                    robustLocked != 0 &&
-                    robustBufferCount >= 9 &&
-                    driftCalibrationMedianPpb >=
-                    EtherCatDcTuning::DriftCalibrationMinimumPpb &&
-                    driftCalibrationMedianPpb <=
-                    EtherCatDcTuning::DriftCalibrationMaximumPpb &&
-                    driftCalibrationMadPpb <=
-                    EtherCatDcTuning::DriftCalibrationMaximumMadPpb &&
-                    rawMedianAbsPpb <=
-                    EtherCatDcTuning::DriftCalibrationMaximumRawMedianDeviationPpb &&
-                    IsRealFfV0CleanRecoveryReady();
-
-                if (driftCalibrationCandidateGood)
+                if (!driftCalibrationLocked && driftCalibrationCandidateGood)
                 {
                     driftCalibrationMedianSumPpb +=
                         driftCalibrationMedianPpb;
@@ -6981,10 +6995,113 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
                         driftCalibrationLockedThisCycle = true;
                     }
                 }
-                else
+                else if (!driftCalibrationLocked)
                 {
                     driftCalibrationGoodWindows = 0;
                     driftCalibrationMedianSumPpb = 0;
+                }
+
+                // EDM376: the startup baseline remains active while a replacement
+                // is qualified. No scheduler/phase state is changed while waiting.
+                if (driftCalibrationLocked && !driftCalibrationLockedThisCycle)
+                {
+                    const uint64_t absoluteDeviation = EDM376DcCal::AbsoluteDifference(
+                        driftCalibrationMedianPpb, driftBaselinePpb);
+                    driftRecalibrationPending = absoluteDeviation >= (uint64_t)
+                        EtherCatDcTuning::DriftRecalibrationMinimumDeviationPpb;
+                    if (driftRecalibrationPending)
+                    {
+                        if ((realFfV0TripMask & REAL_FF_V0_HARD_TRIP_MASK) != 0)
+                            driftRecalibrationBlockMask |= EDM376DcCal::HardTrip;
+                        if (!PositionPidNcIdleNow())
+                            driftRecalibrationBlockMask |= EDM376DcCal::NcBusy;
+                        else if (!pMaster->m_Motion.IsDcRecalibrationIdleSameThread())
+                            driftRecalibrationBlockMask |= EDM376DcCal::MotionBusy;
+                    }
+
+                    if (!driftRecalibrationPending || driftCalibrationRejectMask != 0U ||
+                        driftRecalibrationBlockMask != 0U)
+                    {
+                        driftRecalibrationGoodWindows = 0;
+                        driftRecalibrationMedianSumPpb = 0;
+                    }
+                    else
+                    {
+                        const uint64_t ownerGeneration = (uint64_t)
+                            pMaster->m_Motion.GetMotionOwnerLease().generation;
+                        const uint64_t executionEpoch = (uint64_t)
+                            pMaster->m_Motion.GetCurrentExecutionEpoch();
+                        if (driftRecalibrationGoodWindows != 0U &&
+                            (ownerGeneration != driftRecalibrationOwnerGeneration ||
+                                executionEpoch != driftRecalibrationExecutionEpoch))
+                        {
+                            // A completed JOG/NC operation between observations
+                            // invalidates the earlier idle qualification as well.
+                            driftRecalibrationGoodWindows = 0;
+                            driftRecalibrationMedianSumPpb = 0;
+                            driftRecalibrationBlockMask |= EDM376DcCal::IdleIdentityChanged;
+                        }
+                        driftRecalibrationOwnerGeneration = ownerGeneration;
+                        driftRecalibrationExecutionEpoch = executionEpoch;
+                        if (driftRecalibrationGoodWindows == 0U)
+                        {
+                            driftRecalibrationMinimumPpb = driftCalibrationMedianPpb;
+                            driftRecalibrationMaximumPpb = driftCalibrationMedianPpb;
+                        }
+                        if (driftCalibrationMedianPpb < driftRecalibrationMinimumPpb)
+                            driftRecalibrationMinimumPpb = driftCalibrationMedianPpb;
+                        if (driftCalibrationMedianPpb > driftRecalibrationMaximumPpb)
+                            driftRecalibrationMaximumPpb = driftCalibrationMedianPpb;
+                        if (driftRecalibrationMaximumPpb - driftRecalibrationMinimumPpb >
+                            EtherCatDcTuning::DriftRecalibrationMaximumSpreadPpb)
+                        {
+                            driftRecalibrationGoodWindows = 0;
+                            driftRecalibrationMedianSumPpb = 0;
+                            driftRecalibrationMinimumPpb = driftCalibrationMedianPpb;
+                            driftRecalibrationMaximumPpb = driftCalibrationMedianPpb;
+                            driftRecalibrationBlockMask |= EDM376DcCal::UnstableWindows;
+                        }
+                        driftRecalibrationMedianSumPpb += driftCalibrationMedianPpb;
+                        ++driftRecalibrationGoodWindows;
+                        if (driftRecalibrationGoodWindows >=
+                            EtherCatDcTuning::DriftRecalibrationGoodWindows)
+                        {
+                            // The short commit reserves actual NC/Motion admission,
+                            // not merely an old diagnostic standstill snapshot.
+                            if (pMaster->m_Motion.TryBeginDcRecalibrationIdleCommit(
+                                driftRecalibrationReservation))
+                            {
+                                const bool sameIdleIdentity = ownerGeneration == (uint64_t)
+                                    pMaster->m_Motion.GetMotionOwnerLease().generation &&
+                                    executionEpoch == (uint64_t)
+                                    pMaster->m_Motion.GetCurrentExecutionEpoch();
+                                if (sameIdleIdentity)
+                                {
+                                    const int64_t divisor =
+                                        (int64_t)EtherCatDcTuning::DriftRecalibrationGoodWindows;
+                                    driftBaselinePpb = driftRecalibrationMedianSumPpb >= 0
+                                        ? (driftRecalibrationMedianSumPpb + divisor / 2LL) / divisor
+                                        : (driftRecalibrationMedianSumPpb - divisor / 2LL) / divisor;
+                                    ++driftCalibrationLockCount;
+                                    driftCalibrationLockedThisCycle = true;
+                                    driftRecalibrationCommittedThisCycle = true;
+                                    driftRecalibrationPending = false;
+                                }
+                                else
+                                {
+                                    driftRecalibrationBlockMask |= EDM376DcCal::IdleIdentityChanged;
+                                    (void)pMaster->m_Motion.EndDcRecalibrationIdleCommit(
+                                        driftRecalibrationReservation);
+                                }
+                            }
+                            else
+                            {
+                                driftRecalibrationBlockMask |= EDM376DcCal::PublicationBusy;
+                            }
+                            driftRecalibrationGoodWindows = 0;
+                            driftRecalibrationMedianSumPpb = 0;
+                        }
+                    }
                 }
 
                 driftCalibrationPublish = true;
@@ -6994,17 +7111,24 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
 
     if (driftCalibrationLockedThisCycle)
     {
-        realFfV0State = 0;
+        realFfV0State = driftRecalibrationCommittedThisCycle && realFfV0TripMask != 0 ? 4 : 0;
         realFfV0ArmGood = 0;
-        realFfV0LastPhaseSeq = 0;
+        realFfV0LastPhaseSeq = driftRecalibrationCommittedThisCycle
+            ? g_qpcPhaseFfV2DiagSequence : 0;
         realFfV0DesiredPpb = driftBaselinePpb;
         realFfV0AppliedPpb = driftBaselinePpb;
         realFfV0LastStepPpb = 0;
-        realFfV0TripMask = 0;
+        // Initial lock retains the original startup reset. An idle rebase may
+        // never erase hard trips or the session's history of quality failures.
+        if (!driftRecalibrationCommittedThisCycle)
+        {
+            realFfV0TripMask = 0;
+            realFfV0HistoryMask = 0;
+        }
         realFfV0TransientHoldReasonMask = 0;
-        realFfV0HistoryMask = 0;
-        realFfV0RecoveryObserverSeqFloor = 0;
-        realFfV0FreshObserverRequired = false;
+        realFfV0RecoveryObserverSeqFloor = driftRecalibrationCommittedThisCycle
+            ? g_qpcDcPhaseResidualV1ADiagSequence : 0;
+        realFfV0FreshObserverRequired = driftRecalibrationCommittedThisCycle;
         realFfV0HoldGood = 0;
         realFfV0HoldBad = 0;
         realFfV0SoftRearmGood = 0;
@@ -7012,7 +7136,10 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
         phasePActV0State = 0;
         phasePActV0ArmGood = 0;
         phasePActV0HoldGood = 0;
-        phasePActV0OffsetNs = 0;
+        // Preserve the applied phase and every scheduler target/remainder.
+        // Clearing this offset after startup would create a phase step.
+        if (!driftRecalibrationCommittedThisCycle)
+            phasePActV0OffsetNs = 0;
         phasePActV0LastStepNs = 0;
         phasePRecoveryJumpGuardActive = false;
         phasePRecoveryJumpReferenceValid = false;
@@ -7020,7 +7147,8 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
             DC_RX3C_PHASE_JUMP_GOOD_WINDOWS;
         phasePActV0LastObservedWrappedValid = false;
         phasePActV0LastObservedWrappedNs = 0;
-        phasePActV0LastSeenPhaseMapSeq = 0;
+        phasePActV0LastSeenPhaseMapSeq = driftRecalibrationCommittedThisCycle
+            ? g_qpcLiveFfDcPhaseDiagSequence : 0;
         phasePActV0LastAcceptedPhaseMapSeq = 0;
         phasePActV0AcceptedPhaseMapValid = false;
         phasePActV0AcceptedFixedUnwrappedErrorNs = 0;
@@ -7036,7 +7164,8 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
         qpcPhaseFfV2DesiredPpb = driftBaselinePpb;
         qpcPhaseFfV2AppliedPpb = driftBaselinePpb;
         qpcPhaseFfV2LastAppliedStepPpb = 0;
-        qpcPhaseFfV2LastObserverSequence = 0;
+        qpcPhaseFfV2LastObserverSequence = driftRecalibrationCommittedThisCycle
+            ? g_qpcDcPhaseResidualV1ADiagSequence : 0;
         qpcPhaseFfV2WarmupGoodCount = 0;
         qpcPhaseFfV2BadCount = 0;
         qpcPhaseFfV2RecoveryGoodCount = 0;
@@ -7061,6 +7190,16 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
         qpcLiveFfTrustedCyclesWindow = 0;
         qpcLiveFfFallbackCyclesWindow = 0;
         qpcLiveFfModeSwitchesWindow = 0;
+        if (driftRecalibrationCommittedThisCycle)
+            ArmPhasePRecoveryJumpGuard(false);
+    }
+
+    if (driftRecalibrationCommittedThisCycle &&
+        !pMaster->m_Motion.EndDcRecalibrationIdleCommit(driftRecalibrationReservation))
+    {
+        // Overlapping Safety remains authoritative; its publication is retained
+        // by the established release paths, and the new observers must requalify.
+        driftRecalibrationBlockMask |= EDM376DcCal::PublicationBusy;
     }
 
     if (driftCalibrationPublish)
@@ -7105,6 +7244,12 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
 
         g_dcDriftCalibrationLockCount =
             (LONG)driftCalibrationLockCount;
+        g_dcDriftCalibrationRejectMask = (LONG)driftCalibrationRejectMask;
+        g_dcDriftRecalibrationBlockMask = (LONG)driftRecalibrationBlockMask;
+        g_dcDriftRecalibrationPending = driftRecalibrationPending ? 1L : 0L;
+        g_dcDriftRecalibrationGoodWindows = (LONG)driftRecalibrationGoodWindows;
+        g_dcDriftRecalibrationCount = driftCalibrationMode == 0 && driftCalibrationLockCount > 0U
+            ? (LONG)(driftCalibrationLockCount - 1U) : 0L;
 
         MemoryBarrier();
 
@@ -7117,7 +7262,7 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
     //
     // QPC_SCHEDULER_ASSUMED_DRIFT_PPB 是啟動、Trip 與觀測不可信時的安全基準。
     // Real FF 必須連續 3 個合格觀測窗才能 ACTIVE；ACTIVE 每窗最多走 10 ppb，
-    // 並限制在 -16000..-5000 ppb，避免單一估測異常直接改變週期。
+    // 並限制在 Tuning 的正負捕獲範圍，避免單一估測異常直接改變週期。
     // Phase-P 每次使用 wrapped phase error 的 1/8；小於 500 ns 不動作；
     // command、step、累積 offset 各有獨立飽和，防止相位迴路突跳。
     // ---------------------------------------------------------------------
@@ -7339,6 +7484,7 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
             }
         }
 
+        if (driftRecalibrationCommittedThisCycle) phaseReject |= 0x100;
         realFfV0PhaseRejectMask = phaseReject;
         bool realPhaseGood = phaseReject == 0;
 
@@ -14577,7 +14723,7 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
 
                             const int64_t
                                 QPC_DC_ROBUST_MAX_ABS_DRIFT_PPB =
-                                30000LL;
+                                EtherCatDcTuning::RobustMaximumAbsoluteDriftPpb;
 
                             const uint64_t
                                 QPC_DC_ROBUST_MAX_RTT_AVG_NS =
@@ -14607,6 +14753,7 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
                             static bool
                                 qpcDcTrustedCalibrationBound =
                                 false;
+                            static uint32_t qpcDcTrustedCalibrationGeneration = 0U;
 
                             static bool
                                 qpcDcTrustedValid =
@@ -17635,7 +17782,8 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
                                         // Calibration 鎖定後只綁定一次新 Baseline；先前以
                                         // Bootstrap 建立的 WARMUP/HOLD 狀態不得沿用。
                                         if (driftCalibrationLocked &&
-                                            !qpcDcTrustedCalibrationBound)
+                                            (!qpcDcTrustedCalibrationBound ||
+                                                qpcDcTrustedCalibrationGeneration != driftCalibrationLockCount))
                                         {
                                             qpcDcTrustedDriftPpb =
                                                 driftBaselinePpb;
@@ -17648,6 +17796,7 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
                                             qpcDcTrustedLastTransitionTrustedPpb =
                                                 driftBaselinePpb;
                                             qpcDcTrustedCalibrationBound = true;
+                                            qpcDcTrustedCalibrationGeneration = driftCalibrationLockCount;
                                         }
 
                                         // =====================================================
@@ -19212,6 +19361,13 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
                                 pMaster->
                                 GetCurrentMasterTimeNs();
 
+
+                            // EDM379: current input and completed Motion values from this
+                            // callback only; staged commands are not drive-send ACKs.
+                            if (MachiningScope379::Enabled())
+                                MachiningScope379::CaptureFromPdo(pMaster, pMaster->tickCount_PDO,
+                                    qpcDcAfterValid ? qpcDcAfter.QuadPart : -1LL,
+                                    stageMotionEndNs, processDataValid);
 
                             uint64_t motionNs =
                                 0;

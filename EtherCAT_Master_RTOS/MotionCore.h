@@ -1,4 +1,5 @@
 ﻿#pragma once
+#include "MachiningScopeContract.h" // EDM380 read-only scope phase vocabulary
 #include <vector>
 #include <memory>
 #include <new>
@@ -95,6 +96,8 @@ struct MotionEccentricCProducerWorkspace;
 #include "EDMSixAxisGapTuning.h"
 #include "EDMSixAxisGapContinuous.h"
 #include "EDM129PhysicalSource.h"
+#include "EDMManualGapZPhysicalSource.h"
+#include "EDMManualGapZAxisGains.h"
 #include "EDM130WorkTimer.h"
 #include "EDM139GapStimulus.h"
 #include "EDM149VoltageMotion.h"
@@ -2962,6 +2965,61 @@ public:
         const EDM97::Tuning& tuning, const EDM114::Source& previousSource,
         std::uint64_t completionCommit, std::uint64_t completionTick, const EDM116::Policy& policy) noexcept;
     bool ReadEDM128Feedback(EDM128::MotionFeedback& feedback) const noexcept;
+    // PDO owner only, after its existing Motion pass. This reads the actual
+    // committed coordinator, never a virtual EDM25/26 preview or NC fields.
+    bool ReadMachiningScopeProcessFromOwner(std::uint32_t& phase,std::uint32_t& flags) const noexcept
+    {
+        using P=MachiningScope379::ProcessPhase;
+        phase=0U;flags=0U;
+        const auto finish=[&](P value,std::uint32_t source) noexcept {
+            phase=static_cast<std::uint32_t>(value);flags=MachiningScope379::ProcessValid|source;return true;
+        };
+        if(m_edm94.Active())
+        {
+            const auto& status=m_edm94.Current();
+            const auto source=MachiningScope379::ProcessSourceRt;
+            if(status.faulted)return finish(P::Fault,source);
+            if(status.cancelled)return finish(P::Stopping,source);
+            const auto pause=m_edm157Pause.Current().phase;
+            if(pause==EDM157::Phase::Held)return finish(P::Held,source);
+            if(pause==EDM157::Phase::Returning||pause==EDM157::Phase::ReturnQualifying||pause==EDM157::Phase::Resuming)
+                return finish(P::ReturningToWork,source);
+            if(EDM157::Holding(pause))return finish(P::HoldRetreat,source);
+            if(status.stopped||status.forceZero)return finish(P::Stopping,source);
+            if(pause==EDM157::Phase::Rejected)return finish(P::ProgramRun,source);
+            if(status.state==EDM94::State::Armed)return finish(P::Waiting,source);
+            if(m_edm128Profile&&m_edm128.Active())
+            {
+                const auto& state=m_edm128.Evidence();
+                const auto mode=MachiningScope379::ProcessSourceMode;
+                switch(state.phase) {
+                case EDM128::Phase::Gap:return finish(P::Machining,mode);
+                case EDM128::Phase::Brake:return finish(P::FlushBrake,mode);
+                case EDM128::Phase::AnchorDwell:return finish(P::FlushAnchorDwell,mode);
+                case EDM128::Phase::Outbound:return finish(P::FlushOutbound,mode);
+                case EDM128::Phase::TopDwell:return finish(P::FlushTopDwell,mode);
+                case EDM128::Phase::Returning:
+                    return finish(state.speedStage==EDM128::SpeedStage::FinalApproach?P::FlushFinalApproach:P::FlushReturning,mode);
+                case EDM128::Phase::ReturnDwell:case EDM128::Phase::CenterReturnDwell:return finish(P::FlushReturnDwell,mode);
+                case EDM128::Phase::Resume:return finish(P::FlushResume,mode);
+                case EDM128::Phase::ToCenter:return finish(P::ToCenter,mode);
+                case EDM128::Phase::CenterDwell:return finish(P::CenterDwell,mode);
+                case EDM128::Phase::ToAnchor:return finish(P::ToAnchor,mode);
+                case EDM128::Phase::Stopping:case EDM128::Phase::Stopped:return finish(P::Stopping,mode);
+                case EDM128::Phase::Fault:return finish(P::Fault,mode);
+                }
+                return false;
+            }
+            if(status.state==EDM94::State::Running||status.state==EDM94::State::Finishing)
+                return finish(P::ProgramRun,source);
+            return finish(P::Waiting,source);
+        }
+        const auto owner=GetMotionOwnerLease().owner;
+        if(owner==MotionOwner::JOG||owner==MotionOwner::MPG||owner==MotionOwner::HOME)
+            return finish(P::RapidOrJog,MachiningScope379::ProcessSourceRt);
+        return false;
+    }
+
     bool RequestEDM157Hold(const EDM157::Scope& scope, std::uint64_t holdSequence,
         std::uint64_t startFloor) noexcept;
     bool RequestEDM157Resume(const EDM157::Scope& scope, std::uint64_t holdSequence,
@@ -3071,6 +3129,9 @@ public:
     // Boot thread only, once before the PDO callback starts. This binding
     // is independent of structured servo input/output qualification.
     bool BindEDMPhysicalSourceBeforeStart(EtherCatMaster* master) noexcept;
+    bool ConfigureManualGapZInputBeforeStart(const EDMGapInput::Profile& profile) noexcept;
+    bool ConfigureManualGapZAxisGainsBeforeStart(const std::array<EDM20::GainResolution,8U>& discharge,
+        const std::array<EDM20::GainResolution,8U>& flush) noexcept;
     bool StartEDMPhysicalServoRT(const EDM69::Request& request) noexcept;
     bool TouchEDMPhysicalServoRT(std::uint64_t session, std::uint64_t nowUs) noexcept;
     void CancelEDMPhysicalServoRT(std::uint64_t session) noexcept;
@@ -3691,6 +3752,21 @@ public:
 
     // 🌟 [新增]：檢查群組是否「完全靜止」(包含煞車滑行結束)
     bool IsGroupStandstill() const;
+
+    // EDM376: PDO-owner-only, short scalar DC baseline commit. The caller must
+    // end a successful reservation in the same callback, before any I/O/wait.
+    // These tokens grant no motion, PID, coordinate or safety-reset authority.
+    struct DcRecalibrationIdleReservation
+    {
+        AlarmManager::MotionAdmissionReservation alarm{};
+        std::uint64_t ownerToken = 0ULL, epochToken = 0ULL, serial = 0ULL;
+        bool ownerHeld = false, epochHeld = false, acquired = false;
+    };
+    static_assert(std::is_trivially_copyable<DcRecalibrationIdleReservation>::value,
+        "DC idle commit reservation must remain a fixed value.");
+    bool IsDcRecalibrationIdleSameThread() const noexcept;
+    bool TryBeginDcRecalibrationIdleCommit(DcRecalibrationIdleReservation& reservation) noexcept;
+    bool EndDcRecalibrationIdleCommit(DcRecalibrationIdleReservation& reservation) noexcept;
 
     // Stage NC-0.2I.2：Feed Hold 保留目前 Segment 與 Future Queue，
     // 因此使用速度型停止快照，不要求 IsGroupDone()。
@@ -5639,6 +5715,14 @@ private:
     // its exact NC endpoint/drain barrier has been released. A running Cycle
     // borrows it without copying a geometry array onto the callback stack.
     NCG76SphereGapProcess::Observer m_g76SphereProcess{};
+    EDM382Source::Source m_g76SpherePhysicalSource{};
+    EDM382Gains::BootBanks m_g76SphereGainBanks{};
+    std::atomic<std::uint64_t> m_g76SpherePhysicalClaim{0ULL}; // No raw-source service for legacy SIM parents.
+    std::array<EDM382Gains::Bank,3U> m_g76SphereGainBank{};
+    bool SelectManualGapZGains(AxisContext& axis) noexcept;
+    EDMGapInput::Profile m_g76SpherePhysicalProfile{}; // Boot-installed, immutable during all parents.
+    EDMAnalogInput::Snapshot m_g76SphereAnalogInput{};
+    bool m_g76SpherePhysicalProfileConfigured=false,m_g76SphereAnalogRead=false;
     std::atomic<std::uint64_t> m_g76SphereProcessRevokedSession{0ULL};
     std::uint64_t m_g76SphereProcessSentTick=0ULL,m_g76SphereProcessSendSequence=0ULL,m_g76SphereProcessSendFrame=0ULL;
     EDM53::Channel<MotionG76SphereFeedback,2048U> m_g76SphereFeedback{};
@@ -6243,6 +6327,11 @@ private:
     std::uint64_t m_positionPidGeneration=1ULL, m_positionPidLastCycle=0ULL, m_positionPidPublishedCycle=0ULL;
     std::array<std::uint32_t,6U> m_positionPidSettle{};
     std::array<double,6U> m_positionPidCommand{},m_positionPidActualMin{},m_positionPidActualMax{};
+
+    // EDM376 uses the existing 200-cycle settled observation, never a second
+    // axis observer. These serials belong exclusively to the PDO owner.
+    bool IsDcRecalibrationIdleDataSameThread() const noexcept;
+    std::uint64_t m_dcIdleCommitNextSerial = 0ULL, m_dcIdleCommitActiveSerial = 0ULL;
 
 
     IdleHoldDiagnostics m_idleHoldDiagnostics{};

@@ -2156,6 +2156,19 @@ bool MotionCore::BindEDMPhysicalSourceBeforeStart(EtherCatMaster* master) noexce
     return true;
 }
 
+bool MotionCore::ConfigureManualGapZInputBeforeStart(const EDMGapInput::Profile& profile) noexcept
+{
+    if(m_g76SpherePhysicalProfileConfigured||!EDM63::ValidProfile(profile))return false;
+    m_g76SpherePhysicalProfile=profile;m_g76SpherePhysicalProfileConfigured=true;return true;
+}
+
+bool MotionCore::ConfigureManualGapZAxisGainsBeforeStart(
+    const std::array<EDM20::GainResolution,8U>& discharge,
+    const std::array<EDM20::GainResolution,8U>& flush) noexcept
+{
+    return m_g76SphereGainBanks.Configure(discharge,flush);
+}
+
 bool MotionCore::StartEDMPhysicalServoRT(const EDM69::Request& request) noexcept
 {
     return m_edmPhysicalServoRT.ControlStart(request);
@@ -10261,6 +10274,13 @@ void MotionCore::ObserveNCSettleRuntimeCycle(
     if (m_pEDMPhysicalSourceMaster != nullptr)
         physicalStamp = m_pEDMPhysicalSourceMaster->ReadGapPhysicalRTShadow(physical);
     m_edm129Physical=physical; m_edm129PhysicalStamp=physicalStamp;
+    // EDM382 raw ADC acquisition precedes QPC and is only serviced while an
+    // analytic parent is claimed. It is independent of diagnostic shadow output.
+    m_g76SphereAnalogRead=false;
+    const auto physicalParent=m_g76SpherePhysicalClaim.load(std::memory_order_acquire);
+    if(m_g76SpherePhysicalProfileConfigured&&physicalParent&&
+       physicalParent==m_g76SphereClaim.load(std::memory_order_acquire)&&m_pEDMPhysicalSourceMaster!=nullptr)
+        m_g76SphereAnalogRead=m_pEDMPhysicalSourceMaster->ReadGapAnalogInputSnapshot(m_g76SphereAnalogInput);
     ObserveEDMZFixtureRuntimeClock(runtimeCycleTick, pdoCycleValid, adjacentToPrevious);
     ObserveCollisionProtectionRuntime(); // Always physical, including HOLD/Reset/invalid-PDO callbacks.
     ObserveG80RuntimeInput();
@@ -23359,6 +23379,136 @@ void MotionCore::UpdateAllMotion()//更新全部軸狀態 逐步激磁
     ServicePositionPidRuntime(motionInputComplete);
 }
 
+// EDM376: observation and exact admission for a scalar DC baseline change.
+// All AxisContext reads are by their existing PDO owner. No new observation is
+// added to the normal motion pass; the 50 ms settled history already exists.
+bool MotionCore::IsDcRecalibrationIdleDataSameThread() const noexcept
+{
+    if (!PositionPidNcIdleNow() || PositionAutoTune::Capture().Active() ||
+        PositionAutoTune::JobBusy() || !m_pContexts || !m_pDrives ||
+        m_pContexts->empty() || m_pContexts->size() != m_pDrives->size() ||
+        m_pContexts->size() > m_positionPidSettle.size() ||
+        !m_ncSettleRuntimeObserved || !m_ncSettleRuntimeCycleValid ||
+        !m_ncSettleRuntimeCycleContiguous || !m_ncSettleRuntimeCycleTick ||
+        m_positionPidLastCycle != m_ncSettleRuntimeCycleTick ||
+        AlarmManager::GetInstance().HasAlarm() || HasPendingSafetyOrRecoveryRequests() ||
+        HasUnacknowledgedSafetyMotionRequest()) return false;
+
+    const auto owner = GetMotionOwnerLease();
+    if ((owner.owner != MotionOwner::NONE && owner.owner != MotionOwner::IDLE_HOLD) ||
+        m_Group.isActive || !m_Group.cmdQueue.empty() || GetAxisCommandMailboxDepth() != 0U ||
+        IsRotarySpindleSessionClaimed() || m_edmZPolicy.Snapshot().capHeld || m_edm94.Active() ||
+        m_pbcXRetainRecoveryRequired.load(std::memory_order_acquire) ||
+        HasPbcXUnresolvedActiveOutput()) return false;
+    if (owner.owner == MotionOwner::IDLE_HOLD &&
+        !IsIdlePositionHoldImageCurrent(m_motionOwnerState.load(std::memory_order_acquire),
+            m_executionEpochPublication.load(std::memory_order_acquire))) return false;
+
+    bool havePhysicalAxis = false;
+    for (std::size_t i = 0U; i < m_pContexts->size(); ++i)
+    {
+        const auto& axis = (*m_pContexts)[i];
+        if (!axis.isExist) continue;
+        havePhysicalAxis = true;
+        const std::uint32_t bit = 1U << static_cast<unsigned>(i);
+        if (axis.axisIndex != static_cast<int>(i) || axis.isVirtualAxis || !axis.isServoOn ||
+            (m_servoSourceInputMask & bit) == 0U ||
+            (m_servoSourceStatusWord[i] & 0x006fU) != 0x0027U || m_servoSourceMode[i] != 9 ||
+            axis.isFault || axis.isLagAlarm || axis.resetRequest || axis.homeRuntime.active ||
+            axis.hardLimitPositive || axis.hardLimitNegative ||
+            axis.positiveTravelBlocked || axis.negativeTravelBlocked ||
+            axis.state != MotionState::MotionState_IDLE || axis.currentCmdVel != 0.0 ||
+            axis.logicalCmdVel != 0.0 || !std::isfinite(axis.currentActVel) ||
+            std::fabs(axis.currentActVel) > 1.0 / CYCLE_TIME_SEC ||
+            !std::isfinite(axis.currentCmdPos) || !std::isfinite(axis.currentActPos) ||
+            !std::isfinite(axis.inPositionWindow_Pulse) || axis.inPositionWindow_Pulse <= 0.0 ||
+            !axis.inPosition || std::fabs(axis.currentCmdPos - axis.currentActPos) > axis.inPositionWindow_Pulse ||
+            m_positionPidSettle[i] < 200U || axis.currentCmdPos != m_positionPidCommand[i] ||
+            !std::isfinite(m_positionPidActualMin[i]) || !std::isfinite(m_positionPidActualMax[i]) ||
+            m_positionPidActualMax[i] - m_positionPidActualMin[i] > axis.inPositionWindow_Pulse)
+            return false;
+    }
+    return havePhysicalAxis;
+}
+
+bool MotionCore::IsDcRecalibrationIdleSameThread() const noexcept
+{
+    const std::uint64_t owner = m_motionOwnerState.load(std::memory_order_acquire);
+    const std::uint64_t epoch = m_executionEpochPublication.load(std::memory_order_acquire);
+    if (m_dcIdleCommitActiveSerial || UnpackMotionOwnerSafetyHandshake(owner) ||
+        UnpackMotionOwnerSafetyActionPending(owner) ||
+        (owner & MOTION_OWNER_ANY_OUTPUT_RESERVATION) != 0ULL ||
+        (epoch & (EXECUTION_EPOCH_PUBLICATION_PENDING | EXECUTION_EPOCH_PUBLICATION_COMMIT_RESERVED)) != 0ULL ||
+        UnpackMotionOwnerSafetyRequestTicket(owner) !=
+            m_safetyRequestAcknowledgedTicket.load(std::memory_order_acquire) ||
+        !IsDcRecalibrationIdleDataSameThread()) return false;
+    return owner == m_motionOwnerState.load(std::memory_order_acquire) &&
+        epoch == m_executionEpochPublication.load(std::memory_order_acquire);
+}
+
+bool MotionCore::TryBeginDcRecalibrationIdleCommit(DcRecalibrationIdleReservation& reservation) noexcept
+{
+    // Never overwrite a live caller token. One serial also rejects an old copied
+    // token after a later same-owner/epoch transaction has begun.
+    if (reservation.serial || reservation.ownerHeld || reservation.epochHeld ||
+        reservation.acquired || reservation.alarm.acquired || m_dcIdleCommitActiveSerial ||
+        m_dcIdleCommitNextSerial == UINT64_MAX || !IsDcRecalibrationIdleSameThread()) return false;
+    reservation = DcRecalibrationIdleReservation{};
+    AlarmManager& alarms = AlarmManager::GetInstance();
+    if (!alarms.BeginMotionAdmission(alarms.GetUpdateCount(), reservation.alarm)) return false;
+    reservation.serial = ++m_dcIdleCommitNextSerial;
+    m_dcIdleCommitActiveSerial = reservation.serial;
+    const auto fail = [this, &reservation]() noexcept
+    { (void)EndDcRecalibrationIdleCommit(reservation); return false; };
+
+    std::uint64_t owner = m_motionOwnerState.load(std::memory_order_acquire);
+    std::uint64_t epoch = m_executionEpochPublication.load(std::memory_order_acquire);
+    const auto lease = UnpackMotionOwnerState(owner);
+    if ((lease.owner != MotionOwner::NONE && lease.owner != MotionOwner::IDLE_HOLD) ||
+        UnpackMotionOwnerSafetyHandshake(owner) || UnpackMotionOwnerSafetyActionPending(owner) ||
+        (owner & MOTION_OWNER_ANY_OUTPUT_RESERVATION) != 0ULL ||
+        (epoch & (EXECUTION_EPOCH_PUBLICATION_PENDING | EXECUTION_EPOCH_PUBLICATION_COMMIT_RESERVED)) != 0ULL ||
+        UnpackMotionOwnerSafetyRequestTicket(owner) !=
+            m_safetyRequestAcknowledgedTicket.load(std::memory_order_acquire)) return fail();
+    reservation.ownerToken = owner | MOTION_OWNER_EPOCH_COMMIT_RESERVED;
+    if (!m_motionOwnerState.compare_exchange_strong(owner, reservation.ownerToken,
+        std::memory_order_acq_rel, std::memory_order_acquire)) return fail();
+    reservation.ownerHeld = true;
+    reservation.epochToken = epoch | EXECUTION_EPOCH_PUBLICATION_COMMIT_RESERVED;
+    if (!m_executionEpochPublication.compare_exchange_strong(epoch, reservation.epochToken,
+        std::memory_order_acq_rel, std::memory_order_acquire)) return fail();
+    reservation.epochHeld = true;
+    if (!alarms.IsMotionAdmissionCurrent(reservation.alarm) ||
+        !IsDcRecalibrationIdleDataSameThread() ||
+        m_motionOwnerState.load(std::memory_order_acquire) != reservation.ownerToken ||
+        m_executionEpochPublication.load(std::memory_order_acquire) != reservation.epochToken)
+        return fail();
+    reservation.acquired = true;
+    return true;
+}
+
+bool MotionCore::EndDcRecalibrationIdleCommit(DcRecalibrationIdleReservation& reservation) noexcept
+{
+    if (!reservation.serial || reservation.serial != m_dcIdleCommitActiveSerial)
+    {
+        reservation = DcRecalibrationIdleReservation{};
+        return false;
+    }
+    AlarmManager& alarms = AlarmManager::GetInstance();
+    const bool current = reservation.acquired && reservation.ownerHeld && reservation.epochHeld &&
+        alarms.IsMotionAdmissionCurrent(reservation.alarm) && !HasPendingSafetyOrRecoveryRequests() &&
+        m_motionOwnerState.load(std::memory_order_acquire) == reservation.ownerToken &&
+        m_executionEpochPublication.load(std::memory_order_acquire) == reservation.epochToken;
+    // Reuse the established release paths: preserve any overlapping Safety
+    // publication, and never leave a reservation bit blocking its admission.
+    if (reservation.epochHeld) ReleaseLifecycleCommitReservation(reservation.epochToken);
+    if (reservation.ownerHeld) ReleaseExactResetNCSettleReservation(reservation.ownerToken);
+    const bool alarmEnded = !reservation.alarm.acquired || alarms.EndMotionAdmission(reservation.alarm);
+    m_dcIdleCommitActiveSerial = 0ULL;
+    reservation = DcRecalibrationIdleReservation{};
+    return current && alarmEnded;
+}
+
 // TUNE15: RT owner is the only writer of live bank gains and PID history.
 // The NC service sees a separate atomic image and never reads these structs.
 void MotionCore::ServicePositionPidRuntime(bool completedInputPass) noexcept
@@ -26529,6 +26679,7 @@ bool MotionCore::IsEDM165FlushGainActive(const AxisContext& axis, EDM174Leaf::Sa
 void MotionCore::DetermineActiveGainSet(AxisContext& axis, bool* physicalFixtureIntegralHold, EDM174Leaf::Sample* edm174Trace)// PID 依照狀態切換
 {
     const bool edm165Flush=IsEDM165FlushGainActive(axis,edm174Trace);
+    if(axis.axisIndex>=0&&axis.axisIndex<3)m_g76SphereGainBank[static_cast<unsigned>(axis.axisIndex)]=EDM382Gains::Bank::None;
     axis.edmFlushGainSelected=false;
     if (physicalFixtureIntegralHold != nullptr) *physicalFixtureIntegralHold = false;
     // =========================================================
@@ -26630,6 +26781,8 @@ void MotionCore::DetermineActiveGainSet(AxisContext& axis, bool* physicalFixture
         return;
     }
     // EDM165_FLUSH_GAIN_SELECT_END
+
+    if(SelectManualGapZGains(axis))return; // EDM382 boot-resolved physical banks only.
 
     // EDM59 FIX2: qualify a bound SIM return using the same existing hold
     // gains that the following formal Stop/IDLE will use. A PDO correction
@@ -27019,6 +27172,8 @@ void MotionCore::Run_Servo_Loop(DriveType& servo, AxisContext& axis, const AxisC
     // FIX10_GAIN_EDGE_BEGIN: capture before the configured gain selector.
     const double edm94KiBefore = axis.pid.Ki;
     const bool edm165HadFlushGains=axis.edmFlushGainSelected;
+    const auto edm382BankBefore=axis.axisIndex>=0&&axis.axisIndex<3?
+        m_g76SphereGainBank[static_cast<unsigned>(axis.axisIndex)]:EDM382Gains::Bank::None;
     const bool edm94HadMotionGains = m_edm94.Active() &&
         ((axis.pid.Kp == axis.Pid_G00.Kp && axis.pid.Ki == axis.Pid_G00.Ki &&
         axis.pid.Kd == axis.Pid_G00.Kd && axis.pid.Kvff == axis.Pid_G00.Kvff)||
@@ -27028,6 +27183,19 @@ void MotionCore::Run_Servo_Loop(DriveType& servo, AxisContext& axis, const AxisC
     bool edmPhysicalIntegralHold = false;
     DetermineActiveGainSet(axis, &edmPhysicalIntegralHold,
         edm174Trace?edm174Trace->ForSite(EDM174Leaf::GainAuth):nullptr); // PID 依照狀態切換
+    // Preserve bounded I output at a physical382 bank edge, including return
+    // to the existing CNC/HOLD/IDLE bank. No legacy bank or limit is rewritten.
+    const auto edm382BankAfter=axis.axisIndex>=0&&axis.axisIndex<3?
+        m_g76SphereGainBank[static_cast<unsigned>(axis.axisIndex)]:EDM382Gains::Bank::None;
+    if(edm382BankBefore!=edm382BankAfter&&edm94KiBefore!=axis.pid.Ki){
+        double transferred=axis.pid.integralAcc;
+        if(!EDM94::TransferEndpointIntegral(edm94KiBefore,axis.pid.Ki,
+            axis.pid.integralAcc,axis.pid.MaxIntegral,transferred)){
+            if(m_g76SphereRunning&&m_g76SphereFrozen.request.physicalZManual)FailG76SphereRuntime(9U,true);
+            WriteServoTargetVelocityCommand(servo.pOutput,axis.axisIndex,0);return;
+        }
+        axis.pid.integralAcc=transferred;
+    }
 
         // =========================================================
         // 🌟 1. [Feedback Selection] 雙回授處理

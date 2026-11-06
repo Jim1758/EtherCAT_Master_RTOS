@@ -172,6 +172,8 @@ namespace EDMProcessConfigIO
             AddReal(rules, "Flush.FinalApproachDistanceMm", profile.flush.finalApproachDistanceMm);
             AddReal(rules, "Flush.PathDistanceMm", profile.flush.pathDistanceMm);
             AddReal(rules, "Flush.InitialSlowDistanceMm", profile.flush.initialSlowDistanceMm);
+            AddReal(rules, "Flush.AccelerationTimeSeconds", profile.flush.accelerationTimeSeconds);
+            AddReal(rules, "Flush.DecelerationTimeSeconds", profile.flush.decelerationTimeSeconds);
             return rules;
         }
 
@@ -318,12 +320,28 @@ namespace EDMProcessConfigIO
             rule.found = true;
             rule.line = lineNumber;
         }
+        // An older complete schema-2 document has neither E5 ramp key and
+        // retains the frozen parent ramp in both directions. A partial new
+        // pair is an authoring error, never an implicit per-file default.
+        if (document == Detail::DocumentKind::Process)
+        {
+            const Detail::Rule& acceleration = rules[lookup["Flush.AccelerationTimeSeconds"]];
+            const Detail::Rule& deceleration = rules[lookup["Flush.DecelerationTimeSeconds"]];
+            if (acceleration.found != deceleration.found)
+                return Detail::Fail(diagnostic, path, lineNumber + 1U,
+                    acceleration.found ? deceleration.name : acceleration.name,
+                    "flush acceleration and deceleration keys must both be present or both absent");
+        }
         for (std::size_t index = 0U; index < rules.size(); ++index)
             if (!rules[index].found) {
                 // EDM339: an older schema-2 file retains its own cutting
                 // scale as the orbit starting value, never an unrelated default.
                 if (document == Detail::DocumentKind::Process && rules[index].name == "Servo.OrbitScaleMmPerVoltMin")
                     candidate.orbitScaleMmPerVoltMin = candidate.servo.cuttingScaleMmPerVoltMin;
+                else if (document == Detail::DocumentKind::Process &&
+                    (rules[index].name == "Flush.AccelerationTimeSeconds" ||
+                        rules[index].name == "Flush.DecelerationTimeSeconds"))
+                    continue;
                 else return Detail::Fail(diagnostic, path, lineNumber + 1U, rules[index].name, "required key is missing");
             }
         candidate.servo.revision = candidate.revision;

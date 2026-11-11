@@ -70,8 +70,8 @@ bool Initialize() noexcept
     if(!RtQueryPerformanceFrequency(&frequency) || frequency.QuadPart<=0 ||
         !RtQueryPerformanceCounter(&counter) || counter.QuadPart<=0) return false;
     void* dataLocation=nullptr;void* controlLocation=nullptr;
-    if(!CreateMapping(L"OSCARMAX_MACHINING_SCOPE_DATA",sizeof(Data),dataHandle,dataLocation) ||
-        !CreateMapping(L"OSCARMAX_MACHINING_SCOPE_CONTROL",sizeof(Control),controlHandle,controlLocation))
+    if(!CreateMapping(L"OSCARMAX_MACHINING_SCOPE_DATA_V2",sizeof(Data),dataHandle,dataLocation) ||
+        !CreateMapping(L"OSCARMAX_MACHINING_SCOPE_CONTROL_V2",sizeof(Control),controlHandle,controlLocation))
     {
         if(dataHandle) RtCloseHandle(dataHandle);
         if(controlHandle) RtCloseHandle(controlHandle);
@@ -94,7 +94,7 @@ bool Initialize() noexcept
     mapped->header.bootId=static_cast<std::uint64_t>(counter.QuadPart);
     if(mapped->header.bootId==previousBootId) ++mapped->header.bootId;
     mapped->header.qpcFrequency=static_cast<std::uint64_t>(frequency.QuadPart);
-    mapped->header.reserved[0]=ProcessStateCapability;
+    mapped->header.reserved[0]=ProcessStateCapability|EdmDetailsCapability;
     auto* mailbox=static_cast<Control*>(controlLocation);
     // Clear owner before rewriting control. Readers must validate DATA boot ID
     // both before/after a command, and echo it in each leased request.
@@ -244,11 +244,15 @@ void CaptureFromPdo(EtherCatMaster* master,std::uint64_t tick,std::int64_t recei
     if(!Begin(tick,nowNs,axisIndex)) return;
     Record row{};const double unavailable=(std::numeric_limits<double>::quiet_NaN)();
     row.commandPosition=row.actualPosition=row.lag=row.commandVelocity=row.actualVelocity=row.motorRpm=unavailable;
-    row.gapVoltage=row.gapReferenceVoltage=row.gapBoardVoltage=unavailable;
+    row.gapVoltage=row.gapReferenceVoltage=row.gapBoardVoltage=row.filteredGapVoltage=unavailable;
     row.pdoTick=tick;row.axisIndex=axisIndex;row.processAgeUs=0xFFFFFFFFU;
     if(valid&&master)
     {
-        if(master->m_Motion.ReadMachiningScopeProcessFromOwner(row.processPhase,row.processFlags))
+        // Current G76/common-path RT control takes precedence over the legacy
+        // coordinator and the explicitly aged NC/P50 fallback.
+        if(master->m_Motion.ReadMachiningScopeEdmFromOwner(tick,row))
+            row.processAgeUs=0U;
+        else if(master->m_Motion.ReadMachiningScopeProcessFromOwner(row.processPhase,row.processFlags))
             row.processAgeUs=0U;
         else
         {
@@ -303,9 +307,8 @@ void CaptureFromPdo(EtherCatMaster* master,std::uint64_t tick,std::int64_t recei
             if(converted.inputStatus==EDMGapInput::InputStatus::Valid && converted.gapInRange)
             { row.gapVoltage=converted.voltageMv/1000.0;row.flags|=GapValid; }
         }
-        // The existing EDM65 reference is a frozen diagnostic SIM recipe,
-        // not live E-code provenance. Until a current reference publisher is
-        // available this field remains NaN rather than mislabelling it live.
+        // A fresh RT control observation above may supply the reference used
+        // by the consumed curve. Legacy/NC-only paths keep it NaN.
     }
     Commit(row);
 }

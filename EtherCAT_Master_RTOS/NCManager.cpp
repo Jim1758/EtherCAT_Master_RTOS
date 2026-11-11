@@ -90,7 +90,7 @@ namespace
     bool ManualGapZAssertion382(const NCParsedBlock& parsed,const NCBlock& block) noexcept
     {
         if(block.isEmpty||block.isBlockSkip||block.isGoto||!block.hasG||block.gCode!=181||
-           block.gCount!=1||block.gCodes[0]!=181||block.mCount!=0||!block.has('P')||block.val('P')!=382.0||
+           block.gCount!=1||block.gCodes[0]!=181||block.mCount!=0||!block.has('P')||(block.val('P')!=382.0&&block.val('P')!=384.0&&block.val('P')!=385.0&&block.val('P')!=386.0)||
            parsed.error!=NCParseError::NONE||parsed.controlType!=NCParsedControlType::NONE||parsed.isEmpty||
            parsed.isBlockSkip||parsed.dependsOnMacroState||parsed.duplicateAddressMask||parsed.gCount!=1||parsed.mCount!=0)return false;
         double code=0.0;if(!NCHoldPolicy::LiteralNumber(parsed.gExpressions[0],code)||code!=181.0)return false;
@@ -5718,7 +5718,7 @@ void NCManager::ProcessExecutionEngine()
                 std::uint32_t ignored=0U;
                 if(!NCHoldPolicy::DecodeAuthored(parsedBlock,block,ignored)&&!ManualGapZAssertion382(parsedBlock,block)){
                     markDispatchFailed(static_cast<std::uint32_t>(AlarmManager::G_Code_Invalid_parameter));
-                    RtPrintf("[HOLD] build=EDM332 event=DECLARATION_REJECT pc=%d line=%d reason=STANDALONE_LITERAL_G181_P0_TO_15_OR_P382 beforeFrame=1\n",currentPC,sourceLineNumber);
+                    RtPrintf("[HOLD] build=EDM332 event=DECLARATION_REJECT pc=%d line=%d reason=STANDALONE_LITERAL_G181_P0_TO_15_OR_P382_P384_P385_P386 beforeFrame=1\n",currentPC,sourceLineNumber);
                     AlarmManager::GetInstance().Trigger(AlarmManager::G_Code_Invalid_parameter,sourceLineNumber);
                     ChangeState(NCState::HOLD);return;
                 }
@@ -7096,7 +7096,7 @@ bool NCManager::ValidateHoldPolicyBlockSameThread(const NCBlock& block,int pc,in
 
 bool NCManager::CommitHoldPolicySameThread(const NCBlock& block,int pc,int line)
 {
-    if(block.has('P')&&block.val('P')==382.0){
+    if(block.has('P')&&(block.val('P')==382.0||block.val('P')==384.0||block.val('P')==385.0||block.val('P')==386.0)){
         const NCProgramCache* program=m_macroStack.empty()?&GetBaseProgramCache():m_macroStack.back().program;
         const auto* source=program?program->TryGetLine(pc):nullptr;
         unsigned axes=0U;

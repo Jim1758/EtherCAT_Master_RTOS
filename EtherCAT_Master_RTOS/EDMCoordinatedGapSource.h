@@ -165,6 +165,23 @@ public:
             return Fail(Reason::CounterOverflow);
         evidence_.lastFrame=frame; ++evidence_.freshFrames; return true;
     }
+    bool RequalifyPhysicalAfterTransportGap(const Frame& frame,std::uint64_t nowUs,
+        std::uint64_t maxTransportGapUs=100000ULL) noexcept
+    {
+        if (!maxTransportGapUs || maxTransportGapUs > 5000000ULL || !active_ || !physical_ || evidence_.faulted || !evidence_.freshFrames ||
+            !nowUs || nowUs <= lastObserverUs_ ||
+            nowUs < evidence_.lastFrame.capturedAtUs ||
+            nowUs - evidence_.lastFrame.capturedAtUs > maxTransportGapUs) return Fail(Reason::ObserverClock);
+        if (!SameIdentity(frame.identity,config_.identity)) return Fail(Reason::Identity);
+        if (!frame.valid || !std::isfinite(frame.voltageV) || frame.voltageV < 0.0 || frame.voltageV > 300.0)
+            return Fail(Reason::Invalid);
+        if (frame.sequence <= evidence_.lastFrame.sequence) return Fail(Reason::Sequence);
+        if (frame.capturedAtUs <= evidence_.lastFrame.capturedAtUs) return Fail(Reason::SourceClock);
+        if (!AcceptAge(frame.capturedAtUs,nowUs)) return false;
+        if (evidence_.freshFrames == (std::numeric_limits<std::uint64_t>::max)()) return Fail(Reason::CounterOverflow);
+        lastObserverUs_ = nowUs; evidence_.lastFrame = frame; ++evidence_.freshFrames;
+        return true;
+    }
     const SourceConfig& FrozenConfig() const noexcept { return config_; }
     const Evidence& Current() const noexcept { return evidence_; }
 private:

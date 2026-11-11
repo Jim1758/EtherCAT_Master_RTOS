@@ -8,7 +8,7 @@
 #include <sstream>
 #include <string>
 
-// EDM382: boot-only opt-in for physical GAP Z motion while the
+// EDM382/384: boot-only opt-in for physical GAP coordinated line motion while the
 // generator is controlled externally. This grants no discharge-output authority.
 namespace EDM382
 {
@@ -23,7 +23,7 @@ inline bool Valid(const Config& c) noexcept
 }
 inline bool AssertionReady(const Config& c,std::uint32_t selectedECode,unsigned axisMask) noexcept
 {
-    return c.enabled&&c.manualExternalPower&&Valid(c)&&selectedECode==c.requiredECode&&axisMask==7U;
+    return c.enabled&&c.manualExternalPower&&Valid(c)&&selectedECode==c.requiredECode&&(axisMask&7U)==7U&&(axisMask&~0x3fU)==0U;
 }
 inline Config& BootStorage() noexcept { static Config value{};return value; }
 inline const Config& Current() noexcept { return BootStorage(); }

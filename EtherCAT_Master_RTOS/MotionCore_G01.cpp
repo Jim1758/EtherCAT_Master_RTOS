@@ -1522,12 +1522,12 @@ bool MotionCore::TryG01XYZCMoveTransactionalTail(
 
 
 // BASE74: G90 resolves native XYZ and each positional C/U/V target once.
-// G91 keeps its full signed increments; only XYZ defines the millimetre clock.
+// G91 keeps full signed increments; configured linear axes define the millimetre clock.
 bool MotionCore::TryG01XYZCUVMoveTransactionalTail(
     const std::array<double, 6U>& programmedValues,
     const std::array<double, 6U>& targetMCS, double feedMMMin,
     double(&commandedMCSTail)[MAX_AXES], MotionFeedLineWorkspace& workspace,
-    bool sparseCommissioning)
+    bool sparseCommissioning,std::uint32_t authoredAxisMask)
 {
     MotionFeedLineReceipt& result = workspace.receipt;
     result.Clear();
@@ -1562,7 +1562,7 @@ bool MotionCore::TryG01XYZCUVMoveTransactionalTail(
     const MotionExecutionEpoch plannedEpoch = GetCurrentExecutionEpoch();
     const MotionOwnerLease plannedOwner = GetMotionOwnerLease();
     const MotionCommandSource source = m_pendingCommandSource.load(std::memory_order_acquire);
-    if (m_pContexts == nullptr || m_pContexts->size() < 6U || m_pContexts->size() > 8U ||
+    if (m_pContexts == nullptr || m_pContexts->size() < 3U || m_pContexts->size() > 8U ||
         m_pCoordMgr == nullptr || !IsNCXYZCUVFeedNeutralFrame(m_pendingTranslation) ||
         !IsPendingFixedTranslationSourceAllowed() || m_pendingIsAbsoluteMode != absolute ||
         !std::isfinite(feedMMMin) || feedMMMin <= 0.0 || feedMMMin > 100.0 ||
@@ -1575,20 +1575,30 @@ bool MotionCore::TryG01XYZCUVMoveTransactionalTail(
         plannedOwner.owner != MotionOwner::AUTO || source != MotionCommandSource::NC_MEMORY ||
         !m_programBlockMotionCaptureActive || m_programBlockMotionCapture.overflow ||
         m_programBlockMotionCapture.count != 0U || HasPendingSafetyOrRecoveryRequests() ||
-        !FeedLineNormalOverride(*this))
+        IsRotarySpindleSessionClaimed() || !FeedLineNormalOverride(*this))
     {
         result.code = MotionFeedLineCode::NOT_READY;
         return false;
     }
-    const std::uint32_t selectedMask = 63U;
+    std::uint32_t selectedMask = 0U;
+    for(unsigned axis=0U;axis<6U;++axis)
+        if(m_pendingTranslation.axisIdentity.exists[axis])selectedMask|=1U<<axis;
+    if((selectedMask&7U)!=7U||(selectedMask&~0x3fU)!=0U)
+    { result.code = MotionFeedLineCode::INVALID_INPUT; return false; }
     NCXYZCUVFeedLineInput& input = workspace.xyzcuvInput;
     input.axisIdentity = m_pendingTranslation.axisIdentity;
     input.axisMask = selectedMask;
+    input.authoredAxisMask=authoredAxisMask==0xffffffffU?selectedMask:authoredAxisMask;
+    if(!input.authoredAxisMask||(input.authoredAxisMask&~selectedMask)!=0U)
+    { result.code=MotionFeedLineCode::INVALID_INPUT;return false; }
     input.feedMMMin = feedMMMin;
     input.absolute = absolute;
     input.zOnlyCommissioning = zOnlyCommissioning;
     input.xyzOnlyCommissioning = xyzOnlyCommissioning;
     input.sparseCommissioning = sparseCommissioning;
+    if((zOnlyCommissioning||xyzOnlyCommissioning||sparseCommissioning)&&
+        input.authoredAxisMask!=selectedMask)
+    { result.code=MotionFeedLineCode::INVALID_INPUT;return false; }
     if (sparseCommissioning && (absolute || !EDM149::ValidSparseIncrement(programmedValues,feedMMMin)))
     { result.code = MotionFeedLineCode::INVALID_INPUT; return false; }
     if (xyzOnlyCommissioning && (absolute || !EDM149::ValidXYZIncrement(programmedValues,feedMMMin)))
@@ -1599,27 +1609,33 @@ bool MotionCore::TryG01XYZCUVMoveTransactionalTail(
     else input.deltaNative = programmedValues;
     for (unsigned selected = 0U; selected < 6U; ++selected)
     {
+        if(!std::isfinite(programmedValues[selected])||!std::isfinite(targetMCS[selected]))
+        { result.code=MotionFeedLineCode::INVALID_INPUT;return false; }
+        if(!(selectedMask&(1U<<selected))){
+            // No optional-axis configuration or physical position is read.
+            if(programmedValues[selected]!=0.0||
+                !NCXYZCUVFeedDetail::SameBits(targetMCS[selected],commandedMCSTail[selected]))
+            { result.code=MotionFeedLineCode::INVALID_INPUT;return false; }
+            continue;
+        }
+        if(selected>=m_pContexts->size())
+        { result.code=MotionFeedLineCode::INVALID_INPUT;return false; }
         const AxisContext& axis = (*m_pContexts)[selected];
-        if (!std::isfinite(programmedValues[selected]) ||
-            (!absolute && programmedValues[selected] == 0.0 && !zOnlyCommissioning && !xyzOnlyCommissioning && !sparseCommissioning) ||
-            !std::isfinite(targetMCS[selected]) || !axis.isExist ||
-            axis.axisIndex != static_cast<int>(selected) ||
-            axis.axisType != (selected < 3U ? AxisType::LINEAR : AxisType::ROTARY) ||
+        if (!axis.isExist || axis.axisIndex != static_cast<int>(selected) ||
+            static_cast<unsigned>(axis.axisType)!=input.axisIdentity.axisType[selected] ||
+            (selected<3U&&axis.axisType!=AxisType::LINEAR) ||
             !std::isfinite(axis.resolution_PPR) || axis.resolution_PPR <= 0.0 ||
             !std::isfinite(axis.finalLead) || axis.finalLead <= 0.0 ||
             !std::isfinite(axis.maxVel_PPS) || axis.maxVel_PPS <= 0.0 ||
             !std::isfinite(axis.G00_acc_time) || axis.G00_acc_time < 0.0 ||
             !std::isfinite(axis.G00_dec_time) || axis.G00_dec_time < 0.0 ||
-            (selected >= 3U && (!std::isfinite(axis.rotaryModulo) || axis.rotaryModulo <= 0.0)))
-        {
-            result.code = MotionFeedLineCode::INVALID_INPUT;
-            return false;
-        }
+            (axis.axisType==AxisType::ROTARY&&(!std::isfinite(axis.rotaryModulo)||axis.rotaryModulo<=0.0)))
+        { result.code=MotionFeedLineCode::INVALID_INPUT;return false; }
         input.pulsePerUnit[selected] = axis.resolution_PPR / axis.finalLead;
         input.maxVelocityPPS[selected] = axis.maxVel_PPS;
         input.axisAccTime[selected] = axis.G00_acc_time;
         input.axisDecTime[selected] = axis.G00_dec_time;
-        if (absolute && selected >= 3U)
+        if (absolute && selected >= 3U && axis.axisType==AxisType::ROTARY)
         {
             input.rotaryModulo[selected - 3U] = axis.rotaryModulo;
             input.rotaryShortestPath[selected - 3U] = axis.useShortestPath;
@@ -1663,26 +1679,30 @@ bool MotionCore::TryG01XYZCUVMoveTransactionalTail(
     };
     for (unsigned selected = 0U; selected < 6U; ++selected)
     {
+        if(!(selectedMask&(1U<<selected)))continue;
         const AxisContext& axis = (*m_pContexts)[selected];
         const double programmed = programmedValues[selected];
         const double target = targetMCS[selected];
         const double ppu = input.pulsePerUnit[selected];
-        const double authoredTarget = absolute ?
-            programmed + NCTranslationAxisOffsetMM(m_pendingTranslation, selected) :
-            commandedMCSTail[selected] + programmed;
+        const double offset=NCTranslationAxisOffsetMM(m_pendingTranslation,selected);
+        const bool authored=(input.authoredAxisMask&(1U<<selected))!=0U;
+        if(!authored&&(absolute?!NCXYZCUVFeedDetail::SameBits(programmed,
+            commandedMCSTail[selected]-offset):programmed!=0.0))
+        { result.code=MotionFeedLineCode::GEOMETRY_REJECTED;return false; }
+        const double authoredTarget = !authored?commandedMCSTail[selected]:absolute?
+            programmed+offset:programmed==0.0?commandedMCSTail[selected]:commandedMCSTail[selected]+programmed;
         const double startPulse = input.startPulse[selected];
         const double nativeBaseline = startPulse * axis.finalLead / axis.resolution_PPR;
         const double forwardPulse = commandedMCSTail[selected] * ppu;
         double moduloBaseline = 0.0;
-        if (selected >= 3U)
+        if (axis.axisType==AxisType::ROTARY)
         {
             moduloBaseline = std::fmod(nativeBaseline, axis.rotaryModulo);
             if (moduloBaseline < 0.0) moduloBaseline += axis.rotaryModulo;
         }
         if (!std::isfinite(ppu) || ppu <= 0.0 || !std::isfinite(authoredTarget) ||
             !NCXYZCUVFeedDetail::SameBits(target, authoredTarget) ||
-            (!absolute && target == commandedMCSTail[selected] && !((EDM149::StaticAxis(zOnlyCommissioning,xyzOnlyCommissioning,selected) ||
-                (sparseCommissioning && programmedValues[selected] == 0.0)))))
+            (!absolute && programmed!=0.0 && target == commandedMCSTail[selected]))
         {
             result.code = MotionFeedLineCode::GEOMETRY_REJECTED;
             return false;
@@ -1691,15 +1711,17 @@ bool MotionCore::TryG01XYZCUVMoveTransactionalTail(
             !acceptedBaseline(m_rotaryFeedProducerTail, selected) &&
             !(std::isfinite(forwardPulse) && forwardPulse == startPulse) &&
             !(std::isfinite(nativeBaseline) && nativeBaseline == commandedMCSTail[selected]) &&
-            !(selected >= 3U && std::isfinite(moduloBaseline) && moduloBaseline == commandedMCSTail[selected]))
+            !(axis.axisType==AxisType::ROTARY&&std::isfinite(moduloBaseline)&&moduloBaseline==commandedMCSTail[selected])&&
+            !(axis.axisType!=AxisType::ROTARY&&std::isfinite(forwardPulse)&&
+                std::fabs(forwardPulse-startPulse)<=64.0*std::numeric_limits<double>::epsilon()*
+                    (std::max)(1.0,std::fabs(startPulse))))
         {
             result.code = MotionFeedLineCode::NOT_READY;
             return false;
         }
         if (!absolute)
         {
-            if ((EDM149::StaticAxis(zOnlyCommissioning,xyzOnlyCommissioning,selected) ||
-                (sparseCommissioning && programmedValues[selected] == 0.0)))
+            if (programmed==0.0)
             {
                 input.endMCS[selected] = input.startMCS[selected];
                 input.endPulse[selected] = startPulse;
@@ -1708,8 +1730,7 @@ bool MotionCore::TryG01XYZCUVMoveTransactionalTail(
             const double deltaPulse = programmed * ppu;
             const double targetPulse = startPulse + deltaPulse;
             if (!std::isfinite(deltaPulse) || !std::isfinite(targetPulse) ||
-                ((deltaPulse == 0.0 || targetPulse == startPulse) && !((EDM149::StaticAxis(zOnlyCommissioning,xyzOnlyCommissioning,selected) ||
-                (sparseCommissioning && programmedValues[selected] == 0.0)))))
+                deltaPulse==0.0||targetPulse==startPulse)
             {
                 result.code = MotionFeedLineCode::GEOMETRY_REJECTED;
                 return false;
@@ -1727,8 +1748,8 @@ bool MotionCore::TryG01XYZCUVMoveTransactionalTail(
             startPulse[selected] = input.startPulse[selected];
         }
         NCXYZCUVAbsoluteFeedTarget resolved{};
-        if (!TryResolveNCXYZCUVAbsoluteFeedTarget(startMCS, startPulse, targetMCS,
-            input.pulsePerUnit, input.rotaryShortestPath, input.rotaryModulo, resolved))
+        if (!TryResolveNCXYZCUVAbsoluteFeedTarget(input.axisIdentity,startMCS,startPulse,targetMCS,
+            input.pulsePerUnit,input.rotaryShortestPath,input.rotaryModulo,resolved,input.authoredAxisMask))
         {
             result.code = MotionFeedLineCode::GEOMETRY_REJECTED;
             return false;
@@ -1751,6 +1772,7 @@ bool MotionCore::TryG01XYZCUVMoveTransactionalTail(
     workspace.decTime = result.xyzcuv.decTime;
     for (unsigned selected = 0U; selected < 6U; ++selected)
     {
+        if(!(selectedMask&(1U<<selected)))continue;
         const AxisContext& axis = (*m_pContexts)[selected];
         const double ppu = input.pulsePerUnit[selected];
         const double physicalStart = input.startPulse[selected] / ppu;

@@ -674,10 +674,10 @@ void NCManager::CapturePathCoreLiveNativeConfigSameThread() noexcept
 }
 
 NC_PATH_CORE_NOINLINE
-bool NCManager::IsPathCoreLiveNativeConfigCurrentSameThread() noexcept
+bool NCManager::IsPathCoreLiveNativeConfigCurrentSameThread(bool ignoreLegacyAxisTimes) noexcept
 {
     if (CoordSys.IsTranslationRunFrozen() &&
-        (!CoordSys.IsTranslationRunCurrent() || !IsFixedTranslationTravelCurrentSameThread())) return false;
+        (!CoordSys.IsTranslationRunCurrent() || !IsFixedTranslationTravelCurrentSameThread(ignoreLegacyAxisTimes))) return false;
     if (!m_pathCoreLiveBookkeeping.nativeBound ||
         (CoordSys.IsTranslationRunBound() && !CoordSys.IsTranslationAxisIdentityCurrent())) return false;
     for (std::size_t axis = 0U; axis < 8U; ++axis)
@@ -2556,17 +2556,23 @@ bool NCManager::IsXYZCFeedProfileCurrentSameThread() const noexcept
 // The six-axis lane freezes the profiles of all selected physical axes.
 bool NCManager::IsXYZCUVFeedProfileCurrentSameThread() const noexcept
 {
+    const NCTranslationSnapshot& source = CoordSys.GetTranslationSnapshot();
+    if (!IsNCXYZCUVFeedAxisScopeValid(source.axisIdentity)) return false;
     if (!CoordSys.IsTranslationRunFrozen()) return true;
-    if (CoordSys.GetTranslationSnapshot().generation != m_fixedTranslationTravelGeneration) return false;
-    for (unsigned i = 0U; i < 6U; ++i)
+    if (source.generation != m_fixedTranslationTravelGeneration) return false;
+    for (unsigned i = 0U; i < 8U; ++i)
     {
         const AxisContext& axis = m_motion.GetAxisContext(static_cast<int>(i));
+        const bool exists = source.axisIdentity.exists[i] != 0U;
+        if (axis.isExist != exists) return false;
+        if (!exists) continue;
         const FixedTranslationTravelPolicy& captured = m_fixedTranslationTravel[i];
-        if (!axis.isExist || axis.axisType != (i < 3U ? AxisType::LINEAR : AxisType::ROTARY) ||
+        if (static_cast<unsigned>(axis.axisType) != source.axisIdentity.axisType[i] ||
             std::memcmp(&captured.maximumVelocity, &axis.maxVel_PPS, sizeof(double)) != 0 ||
             std::memcmp(&captured.accelerationTime, &axis.G00_acc_time, sizeof(double)) != 0 ||
             std::memcmp(&captured.decelerationTime, &axis.G00_dec_time, sizeof(double)) != 0 ||
-            (i >= 3U && (captured.shortestPath != axis.useShortestPath ||
+            (i >= 3U && axis.axisType == AxisType::ROTARY &&
+                (captured.shortestPath != axis.useShortestPath ||
                 std::memcmp(&captured.rotaryModulo, &axis.rotaryModulo, sizeof(double)) != 0))) return false;
     }
     return true;
@@ -2589,7 +2595,7 @@ bool NCManager::IsEccentricCFeedProfileCurrentSameThread() const noexcept
     return true;
 }
 
-bool NCManager::IsFixedTranslationTravelCurrentSameThread() const noexcept
+bool NCManager::IsFixedTranslationTravelCurrentSameThread(bool ignoreLegacyAxisTimes) const noexcept
 {
     if (!CoordSys.IsTranslationRunFrozen()) return true;
     const NCTranslationSnapshot snapshot = CoordSys.GetTranslationSnapshot();
@@ -2620,8 +2626,9 @@ bool NCManager::IsFixedTranslationTravelCurrentSameThread() const noexcept
         // BASE70: the physical Z profile is part of the frozen common-time proof.
         if ((positionalRotary || (i == 2U && axis.isExist && axis.axisType == AxisType::LINEAR)) &&
             (std::memcmp(&captured.maximumVelocity, &axis.maxVel_PPS, sizeof(double)) != 0 ||
-            std::memcmp(&captured.accelerationTime, &axis.G00_acc_time, sizeof(double)) != 0 ||
-            std::memcmp(&captured.decelerationTime, &axis.G00_dec_time, sizeof(double)) != 0)) return false;
+            (!ignoreLegacyAxisTimes&&
+             (std::memcmp(&captured.accelerationTime, &axis.G00_acc_time, sizeof(double)) != 0 ||
+              std::memcmp(&captured.decelerationTime, &axis.G00_dec_time, sizeof(double)) != 0)))) return false;
         for (unsigned j = 0U; j < 3U; ++j)
             if (captured.enabled[j] != enabled[j] ||
                 std::memcmp(&captured.minimum[j], &minimum[j], sizeof(double)) != 0 ||

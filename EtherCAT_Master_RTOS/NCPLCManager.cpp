@@ -504,13 +504,63 @@ void NCPLCManager::ProcessSafetyInputs()
 // =========================================================
 // Manual Inputs
 // =========================================================
+void NCPLCManager::UpdateHmiManualShortRelease(bool plcBypass) noexcept
+{
+    const auto state = m_nc.GetState();
+    const auto owner = m_motion.GetMotionOwnerLease().owner;
+    bool permitted = !plcBypass && m_collisionValid && m_collisionShortActive &&
+        m_nc.GetMode() == NCOperationMode::MANUAL &&
+        (state == NCState::READY || state == NCState::IDLE) &&
+        (owner == MotionOwner::NONE || owner == MotionOwner::IDLE_HOLD ||
+         owner == MotionOwner::JOG || owner == MotionOwner::MPG) &&
+        m_plc.Get_C(NCPLC::C::SERVO_READY) && !m_plc.Get_C(NCPLC::C::EMERGENCY_STOP) &&
+        !m_plc.Get_C(NCPLC::C::RESET) && !m_plc.Get_C(NCPLC::C::CONTROLLED_STOP) &&
+        !m_nc.Homing.IsActive() && !AlarmManager::GetInstance().HasAlarm();
+    if (permitted) {
+        for (int i = 0; i < NCPLC::AXIS_COUNT; ++i) {
+            const auto& axis = m_motion.GetAxisContext(i);
+            if (m_plc.Get_C(NCPLC::C::AxisPoint(NCPLC::C::AXIS_PROTECT_STOP_BASE, i)) ||
+                (axis.isExist && (axis.isFault || axis.isLagAlarm ||
+                 axis.state == MotionState::MotionState_ERROR || axis.state == MotionState::MotionState_ESTOP))) {
+                permitted = false;
+                break;
+            }
+        }
+    }
+    // Same RTX QPC domain as the independent 250 us expiry check.
+    static std::uint64_t frequency = 0;
+    LARGE_INTEGER counter{};
+    if (permitted && !frequency) {
+        LARGE_INTEGER value{};
+        if (RtQueryPerformanceFrequency(&value) && value.QuadPart > 0)
+            frequency = static_cast<std::uint64_t>(value.QuadPart);
+    }
+    const bool clockValid = permitted && frequency && RtQueryPerformanceCounter(&counter) && counter.QuadPart > 0;
+    const auto now = clockValid ? static_cast<std::uint64_t>(counter.QuadPart) : 0ULL;
+    const auto action = m_plc.PollHmiShortRelease(now, frequency, clockValid);
+    if (action == EDMManualShortRelease::Action::Cancel) {
+        m_motion.CancelHmiManualShortRelease();
+        return;
+    }
+    if (action != EDMManualShortRelease::Action::Arm || HasActiveManualAxis()) return;
+    for (int i = 0; i < NCPLC::AXIS_COUNT; ++i) {
+        const auto& axis = m_motion.GetAxisContext(i);
+        if ((axis.isExist && axis.state != MotionState::MotionState_IDLE) ||
+            m_plc.Get_C(NCPLC::C::AxisPoint(NCPLC::C::JOG_POSITIVE_BASE, i)) ||
+            m_plc.Get_C(NCPLC::C::AxisPoint(NCPLC::C::JOG_NEGATIVE_BASE, i))) return;
+    }
+    if (m_plc.Get_C(NCPLC::C::MPG_MODE) &&
+        static_cast<std::int32_t>(m_plc.GetMemory("DR", NCPLC::DR::MPG_ENCODER_COUNT)) != m_lastMPGCount) return;
+    m_motion.ArmHmiManualShortRelease(now, frequency);
+}
+
 void NCPLCManager::UpdateCollisionProtectionSameThread() noexcept
 {
     const bool previousValid=m_collisionValid,previousShort=m_collisionShortActive;
     const bool previousBypass=m_edmProtectionBypass;
     const auto previousStopSequence=m_collisionManualStopSequence;
-    m_edmProtectionBypass=m_plc.Get_C(NCPLC::C::EDM_PROTECTION_BYPASS);
-    m_motion.SetManualShortBypass(m_edmProtectionBypass);
+    const bool plcBypass = m_plc.Get_C(NCPLC::C::EDM_PROTECTION_BYPASS);
+    m_motion.SetManualShortBypass(plcBypass);
     EDMShortCircuitProtection::Snapshot observed{};
     const bool ready=m_motion.ReadCollisionProtection(observed);
     m_collisionValid=ready&&observed.valid;
@@ -520,6 +570,11 @@ void NCPLCManager::UpdateCollisionProtectionSameThread() noexcept
         m_collisionSequence=observed.sequence;
         m_collisionManualStopSequence=observed.manualStopSequence;
     }
+    UpdateHmiManualShortRelease(plcBypass);
+    const bool hmiActive = m_motion.HmiManualShortReleaseActive();
+    if (m_hmiManualShortWasActive && !hmiActive) m_manualShortRearm.releaseRequired = true;
+    m_hmiManualShortWasActive = hmiActive;
+    m_edmProtectionBypass = plcBypass || hmiActive;
     // A busy/missing read invalidates admission but never clears accepted S207.
     m_plc.Set_S(NCPLC::S::SHORT_ACTIVE,m_collisionShortActive);
     m_plc.Set_S(NCPLC::S::EDM_PROTECTION_BYPASS_ACTIVE,m_edmProtectionBypass);

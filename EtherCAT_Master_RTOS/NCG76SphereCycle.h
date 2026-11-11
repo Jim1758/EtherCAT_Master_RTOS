@@ -4,6 +4,9 @@
 #include "NCG76SphereRetreat.h"
 #include "NCG76SphereDeepFlush.h"
 #include "HoldConfig.h"
+#include "EDMFlushAxisLimits.h"
+#include "EDMCoordinatedAxes384.h"
+#include "EDMAxisMotionLimits385.h"
 #include "NCMachiningTime.h"
 #include <array>
 #include <algorithm>
@@ -23,6 +26,7 @@ namespace NCG76SphereCycle
 {
 using Point8 = std::array<double,8U>;
 using Point3 = std::array<double,3U>;
+using Native6 = EDM384Axes::Native6;
 using Geometry = NCG76SphereRuntimeGeometry::Geometry;
 
 enum class Phase : std::uint8_t
@@ -205,6 +209,14 @@ struct FlushConfig
     double heightMm = 0.0, feedMmMin = 0.0;
     // Independent E5 excursion ramp seconds; zero inherits the frozen axis budget.
     double accelerationTimeSeconds=0.0,decelerationTimeSeconds=0.0;
+    Native6 axisAccelerationTimeSeconds{},axisDecelerationTimeSeconds{};
+    std::uint8_t axisRampMask=0U;
+    double settleTimeSeconds=0.05;
+    // Each axis uses native mm or degrees; the path station remains millimetres.
+    Native6 axisVelocityMmS{},axisAccelerationMmS2{},axisDecelerationMmS2{};
+    EDM385::AxisLimits axisModeLimits{};
+    std::uint32_t axisMask=7U;
+    bool axisLimitsEnabled=false;
     // Cooked native mm/min: the NC recipe binder applies percentages once.
     double centerRetreatFeedMmMin = 0.0, axisRetreatFeedMmMin = 0.0;
     double centerReturnFeedMmMin = 0.0, axisReturnFeedMmMin = 0.0, pathRetreatFeedMmMin = 0.0;
@@ -233,6 +245,10 @@ struct GapConfig {
 // Validation is an admission operation, not part of the 250-us tick.
 inline bool ValidateRequest(const Request& request) noexcept;
 inline bool ValidateFlushConfig(const Request& request,const FlushConfig& config) noexcept;
+inline bool ValidateLiveFlushConfig(const Request& request,const FlushConfig& config,
+    std::uint32_t finishRequiredCount=0U) noexcept;
+inline bool ValidateLiveFlushValues(const Request& request,const FlushConfig& config,
+    std::uint32_t finishRequiredCount) noexcept;
 
 class Cycle
 {
@@ -240,6 +256,21 @@ public:
     bool Begin(const Request& request,const Input& input,const FlushConfig* flush = nullptr,
         const GapConfig* gap = nullptr) noexcept;
     Output Step(const Input& input) noexcept;
+    bool CanQuarantinePhysicalLine() const noexcept;
+    bool CanRemainTransportPaused(std::uint64_t nowUs) const noexcept;
+    bool RequalifyPhysicalLine(const Input& fresh,std::uint64_t maxTransportGapUs=100000ULL) noexcept;
+    // RT-owned numerical pump edit. An in-flight wash retains all of its
+    // existing leg profiles; the latest feeds are adopted before the next one.
+    bool UpdateFlushFeeds(const FlushConfig& config) noexcept;
+    bool HasPendingFlushFeeds() const noexcept {return pendingFlushFeeds_;}
+    bool UpdateLiveFlushConfig(const FlushConfig& config) noexcept;
+    bool HasPendingLiveFlushConfig() const noexcept {return pendingFlushFeeds_;}
+    bool UpdateLiveOrbitCompletion(std::uint32_t threshold,std::uint8_t retry) noexcept;
+    bool HasPendingLiveOrbitCompletion() const noexcept {return pendingLiveOrbitCriteria_;}
+    std::uint32_t LiveOrbitThresholdScaled() const noexcept {return liveOrbitCriteria_?liveOrbitThreshold_:request_.orbitThresholdScaled;}
+    std::uint8_t LiveOrbitRetryLimit() const noexcept {return liveOrbitCriteria_?liveOrbitRetry_:request_.orbitRetryLimit;}
+    std::uint64_t ArchivedOrbitAttempts() const noexcept {return archivedOrbitAttempts_;}
+    std::uint64_t ArchivedOrbitFailures() const noexcept {return archivedOrbitFailures_;}
     const Feedback& Current() const noexcept { return feedback_; }
     // EDM339: the forward cursor is saved during historical GAP motion; the
     // live leg may instead be an earlier pure depth or circle-entry segment.
@@ -258,6 +289,8 @@ public:
     const Point8& TimedCompletionEndpoint() const noexcept {return machiningTime_.endpoint;}
     const NCG76SphereRuntimeGeometry::Geometry& Geometry() const noexcept { return request_.geometry; }
     bool ZeroDemand() const noexcept { return output_.zeroDemand; }
+    // The admitted leg owns its mode through braking and zero-speed settle.
+    bool UsingFlushAxisLimits() const noexcept { return leg_.flushAxisLimits; }
     bool ConfigureFinishVerification(std::uint32_t requiredCount) noexcept;
     // completedOldestFirst is immutable RT-owned storage. It must outlive
     // this admitted parent, including its HOLD, inspection and return route.
@@ -313,6 +346,7 @@ private:
         double accelerationNow = 0.0;
         double stopPosition = 0.0, stopTime = 0.0, stopElapsed = 0.0, stopDirection = 1.0;
         bool circle = false;
+        bool flushAxisLimits = false;
         unsigned circleLayer = 0U;
         double circleStartAngle = 0.0, circleEndAngle = NCG76SphereRuntimeGeometry::TwoPi;
         ProfilePart approachPrefix{}, approachTail{};
@@ -328,10 +362,14 @@ private:
     bool FlushOutboundStartDistance(Phase phase,double& distance) const noexcept;
     double FlushFeed(Phase phase) const noexcept;
     bool EvaluateProfilePart(const ProfilePart& part,double elapsed,double& position,double& speed,double& acceleration) const noexcept;
+    bool InitializeLine(const Point8& end,Leg& next) noexcept;
+    bool LimitNativeLine(Leg& next,const NCG76SphereRuntimeGeometry::Geometry* limitGeometry=nullptr) const noexcept;
+    bool NativeRatio(const Leg& leg,Native6& ratio) const noexcept;
     bool StartLine(const Point8& end,Phase phase,double feed,
         double acceleration=0.0,double deceleration=0.0) noexcept;
-    double FlushAcceleration(double targetSpeed,bool circle=false) const noexcept;
-    double FlushDeceleration(double targetSpeed,bool circle=false) const noexcept;
+    double FlushAcceleration(double targetSpeed,bool circle=false,const Native6* direction=nullptr) const noexcept;
+    double FlushDeceleration(double targetSpeed,bool circle=false,const Native6* direction=nullptr) const noexcept;
+    double FlushRampTime(bool acceleration,bool circle,const Native6& direction) const noexcept;
     bool StartNominal(Phase phase) noexcept;
     bool EvaluateLeg() noexcept;
     bool AdvanceLeg(double dt,bool brake,bool& finished) noexcept;
@@ -349,6 +387,8 @@ private:
     bool HandleAdditionalEndpoint(const Input&) noexcept;
     void CompleteSphereWithAdditional(const Input&) noexcept;
     void CompleteContourWithAdditional(const Input&) noexcept;
+    void ApplyLiveOrbitCriteria(std::uint32_t,std::uint8_t) noexcept;
+    bool ApplyPendingLiveOrbitCriteria() noexcept;
     void RefreshOrbitCompletionFeedback() noexcept;
     void ObserveOrbitCompletion(const Input&,bool holdEdge) noexcept;
     bool BeginOrbitInspectionSweep(const Input&) noexcept;
@@ -421,6 +461,8 @@ private:
 
     Request request_{};
     FlushConfig flush_{};
+    FlushConfig pendingFlushConfig_{};
+    bool pendingFlushFeeds_=false;
     GapConfig gap_{};
     Output output_{};
     Feedback feedback_{};
@@ -453,6 +495,10 @@ private:
         bool active=false,lastStationValid=false,circleOpen=false,percentAvailable=false,attemptInvalid=false;
         NCG76OrbitCompletion::AttemptEvidence evaluation{};
     } orbitInspection_{};
+    std::uint32_t liveOrbitThreshold_=0U,pendingOrbitThreshold_=0U;
+    std::uint8_t liveOrbitRetry_=0U,pendingOrbitRetry_=0U;
+    bool liveOrbitCriteria_=false,pendingLiveOrbitCriteria_=false;
+    std::uint64_t archivedOrbitAttempts_=0ULL,archivedOrbitFailures_=0ULL;
     Point8 savedAnchor_{}, savedCenter_{};
     Point8 flushTop_{}, flushWaypoint_{};
     double flushPathTarget_ = 0.0, flushPathLegStart_ = 0.0, flushPathLegEnd_ = 0.0;
@@ -525,6 +571,36 @@ inline bool IsFlushMotionPhase(Phase phase) noexcept
     phase==Phase::FlushFromCenter||phase==Phase::FlushPathRetreat||phase==Phase::FlushPathReturn;}
 inline bool IsFlushReturnPhase(Phase phase) noexcept
 {return phase==Phase::FlushReturn||phase==Phase::FlushFromCenter||phase==Phase::FlushPathReturn;}
+// Convert native line-coordinate discrepancies to an already-admitted metric
+// projection bound. Degrees remain in native units until divided by their
+// own degrees/mm ratio; stationary and absent coordinates stay exact.
+inline bool MixedLineProjection(const Geometry& geometry,const Point8& candidate,const Point8& anchor,
+    double metricBudget,double& projection) noexcept
+{
+    projection=0.0;
+    if(geometry.kind!=NCG76SphereRuntimeGeometry::Kind::Line||!Positive(geometry.travelMm)||!Positive(metricBudget))return false;
+    const auto& identity=geometry.frame.translation.axisIdentity;
+    const double infinity=std::numeric_limits<double>::infinity();
+    for(unsigned axis=0U;axis<8U;++axis){
+        const double delta=axis<6U?geometry.endMCS[axis]-geometry.startMCS[axis]:0.0;
+        if(axis>=6U||!identity.exists[axis]||delta==0.0){
+            if(std::memcmp(&candidate[axis],&anchor[axis],sizeof(double))!=0)return false;
+            continue;
+        }
+        const double ratio=std::fabs(delta/geometry.travelMm);
+        const double nativeError=NCG76SphereRuntimeGeometry::NativeAxisErrorBound(geometry,axis);
+        const double error=std::fabs(candidate[axis]-anchor[axis]);
+        if(!Positive(ratio)||!std::isfinite(nativeError)||nativeError<0.0||!std::isfinite(error))return false;
+        const double nativeSpan=std::nextafter(metricBudget*ratio,infinity);
+        const double nativeBudget=std::nextafter(nativeSpan+nativeError,infinity);
+        if(!std::isfinite(nativeBudget)||error>nativeBudget)return false;
+        const double excess=error>nativeError?(error-nativeError)/ratio:0.0;
+        const double upper=excess==0.0?0.0:std::nextafter(std::nextafter(excess,infinity),infinity);
+        if(!std::isfinite(upper)||upper>metricBudget)return false;
+        projection=(std::max)(projection,upper);
+    }
+    return true;
+}
 // A stopped interior cursor can be closer to an endpoint than the global
 // station representation can retain. Coalesce only that station identity,
 // under the existing physical arithmetic budget; never rewrite the cursor or
@@ -554,20 +630,32 @@ inline bool ResolveStoppedFlushStation(const Geometry& geometry,NCG76SphereRetre
     if(!NCG76SphereRetreat::Evaluate(geometry,span,atStart?0.0:1.0,endpoint,center))return false;
     // Exact coordinate aliases can retain the endpoint station unchanged.
     if(std::memcmp(endpoint.data(),anchor.data(),sizeof(Point8))==0){station=rounded;return true;}
-    if(std::memcmp(endpoint.data()+3U,anchor.data()+3U,5U*sizeof(double))!=0)return false;
     const double projectionBudget=(std::min)(budget,stationUlp);
-    Point3 error{};for(unsigned axis=0U;axis<3U;++axis)error[axis]=endpoint[axis]-anchor[axis];
-    if(!Finite(error)||Norm(error)>projectionBudget)return false;
+    bool mixedLine=false;
+    if(geometry.kind==NCG76SphereRuntimeGeometry::Kind::Line)
+        for(unsigned axis=3U;axis<6U;++axis)mixedLine=mixedLine||geometry.endMCS[axis]!=geometry.startMCS[axis];
+    Point3 error{};double endpointProjection=0.0;
+    if(mixedLine){if(!MixedLineProjection(geometry,endpoint,anchor,projectionBudget,endpointProjection))return false;}
+    else{
+        if(std::memcmp(endpoint.data()+3U,anchor.data()+3U,5U*sizeof(double))!=0)return false;
+        for(unsigned axis=0U;axis<3U;++axis)error[axis]=endpoint[axis]-anchor[axis];
+        if(!Finite(error)||Norm(error)>projectionBudget)return false;
+    }
     // A distinct stopped point must never gain unvisited station distance.
     // Use the representable floor, and prove its coordinate projection under
     // the SAME admitted error budget; no new physical phase or cursor change.
     const double floor=atStart?span.start:interiorStation;
     if(atEnd&&!(floor>span.start&&floor<span.end))return false;
     Point8 projected{};
-    if(!NCG76SphereRetreat::Evaluate(geometry,span,NCG76SphereRetreat::Fraction(span,floor),projected,center)||
-       std::memcmp(projected.data()+3U,anchor.data()+3U,5U*sizeof(double))!=0)return false;
-    for(unsigned axis=0U;axis<3U;++axis)error[axis]=projected[axis]-anchor[axis];
-    const double projection=Norm(error),target=floor-height;
+    if(!NCG76SphereRetreat::Evaluate(geometry,span,NCG76SphereRetreat::Fraction(span,floor),projected,center))return false;
+    double projection=0.0;
+    if(mixedLine){if(!MixedLineProjection(geometry,projected,anchor,projectionBudget,projection))return false;}
+    else{
+        if(std::memcmp(projected.data()+3U,anchor.data()+3U,5U*sizeof(double))!=0)return false;
+        for(unsigned axis=0U;axis<3U;++axis)error[axis]=projected[axis]-anchor[axis];
+        projection=Norm(error);
+    }
+    const double target=floor-height;
     const double distanceError=std::fabs((floor-target)-height);
     if(!Finite(error)||!std::isfinite(target)||!std::isfinite(distanceError)||
        projection>projectionBudget||projection+distanceError>budget)return false;
@@ -578,7 +666,7 @@ inline bool ResolveStoppedFlushStation(const Geometry& geometry,NCG76SphereRetre
 inline bool ValidateRequest(const Request& r) noexcept
 {
     if(r.physicalZManual!=r.geometry.frame.physicalZManual)return false;
-    if(r.physicalZManual&&(r.geometry.kind!=NCG76SphereRuntimeGeometry::Kind::Line||r.retreatMode!=0U||
+    if(r.physicalZManual&&(r.geometry.kind!=NCG76SphereRuntimeGeometry::Kind::Line||r.retreatMode>4U||
        r.orbitInspectionRounds||r.orbitRetryLimit||r.orbitThresholdScaled||
        r.geometry.travelMm<=0.0))return false;
     if(!NCMachiningTime::ValidConfig({r.totalLimitUs,r.additionalUs}))return false;
@@ -662,6 +750,30 @@ inline bool ValidateFlushHeight(const Request& r,double height) noexcept
         const double budget=(std::min)(r.geometry.arithmeticErrorBoundMm,height/64.0);
         return resolved&&Detail::Positive(budget)&&Detail::Norm(error)<=budget;
     }
+    if(r.geometry.kind==NCG76SphereRuntimeGeometry::Kind::Line&&(r.retreatMode==0U||r.retreatMode==3U||r.retreatMode==4U)){
+        Point8 ratio{};if(!NCG76SphereRuntimeGeometry::LineNativeRatio(r.geometry,ratio))return false;
+        const double budget=(std::min)(r.geometry.arithmeticErrorBoundMm,height/64.0);
+        if(!Detail::Positive(budget))return false;
+        bool resolved=false;
+        for(unsigned axis=0U;axis<6U;++axis){
+            const double lift=-ratio[axis]*height;
+            const double low=r.geometry.boundsMinMCS[axis]+(std::min)(0.0,lift);
+            const double high=r.geometry.boundsMaxMCS[axis]+(std::max)(0.0,lift);
+            if(!std::isfinite(lift)||!std::isfinite(low)||!std::isfinite(high))return false;
+            const double outwardLow=std::nextafter(low,-std::numeric_limits<double>::infinity());
+            const double outwardHigh=std::nextafter(high,std::numeric_limits<double>::infinity());
+            if(!std::isfinite(outwardLow)||!std::isfinite(outwardHigh)||
+               ((r.travelMask&(1U<<axis))&&(outwardLow<r.travelMin[axis]||outwardHigh>r.travelMax[axis])))return false;
+            if(lift==0.0)continue;
+            const double lo=(r.geometry.boundsMinMCS[axis]+lift)-r.geometry.boundsMinMCS[axis];
+            const double hi=(r.geometry.boundsMaxMCS[axis]+lift)-r.geometry.boundsMaxMCS[axis];
+            const double nativeBudget=std::fabs(ratio[axis])*budget+NCG76SphereRuntimeGeometry::NativeAxisErrorBound(r.geometry,axis);
+            if(!std::isfinite(lo)||!std::isfinite(hi)||!std::isfinite(nativeBudget)||
+               std::fabs(lo-lift)>nativeBudget||std::fabs(hi-lift)>nativeBudget)return false;
+            resolved=resolved||lo!=0.0||hi!=0.0;
+        }
+        return resolved;
+    }
     Point3 lift{};
     if(r.retreatMode==1U)lift[2]=height;
     else for(unsigned a=0U;a<3U;++a)lift[a]=-r.geometry.axis[a]*height;
@@ -688,12 +800,24 @@ inline bool ValidateFlushHeight(const Request& r,double height) noexcept
 
 inline bool ValidateFlushConfig(const Request& r,const FlushConfig& config) noexcept
 {
+    if(!EDM385::Valid(config.axisModeLimits)||(!config.axisLimitsEnabled&&!EDM385::Empty(config.axisModeLimits)))return false;
     if(!std::isfinite(config.accelerationTimeSeconds)||config.accelerationTimeSeconds<0.0||
        !std::isfinite(config.decelerationTimeSeconds)||config.decelerationTimeSeconds<0.0)return false;
+    if((config.axisRampMask&~0x3fU)!=0U||!config.axisMask||(config.axisMask&~0x3fU)!=0U||!std::isfinite(config.settleTimeSeconds)||config.settleTimeSeconds<0.0||
+       config.settleTimeSeconds+static_cast<double>(r.maximumTickUs)*1.e-6>=r.settleTimeoutSeconds)return false;
+    for(unsigned axis=0U;axis<6U;++axis){
+        const double a=config.axisAccelerationTimeSeconds[axis],d=config.axisDecelerationTimeSeconds[axis];
+        if(!std::isfinite(a)||a<0.0||!std::isfinite(d)||d<0.0||
+           (!(config.axisRampMask&(1U<<axis))&&(a!=0.0||d!=0.0)))return false;
+        const double v=config.axisVelocityMmS[axis],acc=config.axisAccelerationMmS2[axis],dec=config.axisDecelerationMmS2[axis];
+        if(config.axisLimitsEnabled&&(config.axisMask&(1U<<axis))){if(!Detail::Positive(v)||!Detail::Positive(acc)||!Detail::Positive(dec))return false;}
+        else if(v!=0.0||acc!=0.0||dec!=0.0)return false;
+    }
     const double maximumHeight=MaximumFlushHeightMm(r);
-    if(!config.enabled)return !config.independentFeedsEnabled&&!config.finalApproachEnabled&&!config.initialSlowEnabled&&!config.deepFlushEnabled&&
-        config.deepFlushCycleInterval==0U&&config.deepFlushHeightMm==0.0&&
-        (r.retreatMode==0U||(r.geometry.kind==NCG76SphereRuntimeGeometry::Kind::Line&&r.geometry.travelMm==0.0))&&ValidateRequest(r);
+    // E6=0 disables only periodic flushing. The source B route and its GAP
+    // history remain valid, including a subsequent parent admitted with E6=0.
+    // NC L finish verification independently requires a positive flush image.
+    if(!config.enabled)return ValidateLiveFlushValues(r,config,0U)&&ValidateRequest(r);
     if(config.independentFeedsEnabled){
         const double feeds[]={config.centerRetreatFeedMmMin,config.axisRetreatFeedMmMin,
             config.centerReturnFeedMmMin,config.axisReturnFeedMmMin,config.pathRetreatFeedMmMin};
@@ -718,6 +842,156 @@ inline bool ValidateFlushConfig(const Request& r,const FlushConfig& config) noex
         (!config.deepFlushEnabled||ValidateFlushHeight(r,config.deepFlushHeightMm));
 }
 
+// Live E6 may disable periodic flushing while the parent keeps its B route
+// for GAP history. Geometry and protection remain the admitted parent image.
+// This bounded value/height check is also used by the RT-owned setter; the NC
+// admission wrapper below additionally validates the complete Request.
+inline bool ValidateLiveFlushValues(const Request& r,const FlushConfig& config,
+    std::uint32_t finishRequiredCount) noexcept
+{
+    if(finishRequiredCount>99U||(!config.enabled&&finishRequiredCount)||
+       !EDM385::Valid(config.axisModeLimits)||(!config.axisLimitsEnabled&&!EDM385::Empty(config.axisModeLimits))||
+       !std::isfinite(config.accelerationTimeSeconds)||config.accelerationTimeSeconds<0.0||
+       !std::isfinite(config.decelerationTimeSeconds)||config.decelerationTimeSeconds<0.0||
+       (config.axisRampMask&~0x3fU)!=0U||!config.axisMask||(config.axisMask&~0x3fU)!=0U||
+       !std::isfinite(config.settleTimeSeconds)||config.settleTimeSeconds<0.0||
+       config.settleTimeSeconds+static_cast<double>(r.maximumTickUs)*1.e-6>=r.settleTimeoutSeconds)return false;
+    for(unsigned axis=0U;axis<6U;++axis){
+        const double a=config.axisAccelerationTimeSeconds[axis],d=config.axisDecelerationTimeSeconds[axis];
+        if(!std::isfinite(a)||a<0.0||!std::isfinite(d)||d<0.0||
+           (!(config.axisRampMask&(1U<<axis))&&(a!=0.0||d!=0.0)))return false;
+        const double v=config.axisVelocityMmS[axis],acc=config.axisAccelerationMmS2[axis],dec=config.axisDecelerationMmS2[axis];
+        if(config.axisLimitsEnabled&&(config.axisMask&(1U<<axis))){
+            if(!Detail::Positive(v)||!Detail::Positive(acc)||!Detail::Positive(dec))return false;
+        }else if(v!=0.0||acc!=0.0||dec!=0.0)return false;
+    }
+    const auto feed=[&](double v) noexcept {return Detail::Positive(v)&&Detail::Positive(v/60.0)&&v<=r.feedMmMin;};
+    const double independent[]={config.centerRetreatFeedMmMin,config.axisRetreatFeedMmMin,
+        config.centerReturnFeedMmMin,config.axisReturnFeedMmMin,config.pathRetreatFeedMmMin};
+    if(!config.enabled){
+        if(config.heightMm!=0.0||config.feedMmMin!=0.0||config.independentFeedsEnabled||config.finalApproachEnabled||
+           config.initialSlowEnabled||config.deepFlushEnabled||config.deepFlushCycleInterval||config.deepFlushHeightMm!=0.0||
+           config.finalApproachFeedMmMin!=0.0||config.finalApproachDistanceMm!=0.0||
+           config.initialSlowFeedMmMin!=0.0||config.initialSlowDistanceMm!=0.0)return false;
+        for(double v:independent)if(v!=0.0)return false;
+        return true;
+    }
+    const double maximum=MaximumFlushHeightMm(r);
+    if(!Detail::Positive(config.heightMm)||config.heightMm>maximum||!feed(config.feedMmMin)||
+       !ValidateFlushHeight(r,config.heightMm)||
+       r.settleTimeoutSeconds<=(std::max)(0.05,r.minimumSettleSeconds)+static_cast<double>(r.maximumTickUs)*1.e-6)return false;
+    for(double v:independent)if(config.independentFeedsEnabled?!feed(v):v!=0.0)return false;
+    if(config.finalApproachEnabled){
+        if(!config.independentFeedsEnabled||!feed(config.finalApproachFeedMmMin)||
+           !std::isfinite(config.finalApproachDistanceMm)||config.finalApproachDistanceMm<0.0)return false;
+    }else if(config.finalApproachFeedMmMin!=0.0||config.finalApproachDistanceMm!=0.0)return false;
+    if(config.initialSlowEnabled){
+        if(!config.independentFeedsEnabled||!feed(config.initialSlowFeedMmMin)||
+           !Detail::Positive(config.initialSlowDistanceMm)||config.initialSlowDistanceMm>900.0)return false;
+    }else if(config.initialSlowFeedMmMin!=0.0||config.initialSlowDistanceMm!=0.0)return false;
+    if(config.deepFlushEnabled){
+        if(!config.independentFeedsEnabled||!config.deepFlushCycleInterval||config.deepFlushCycleInterval>20U||
+           !Detail::Positive(config.deepFlushHeightMm)||config.deepFlushHeightMm>maximum||
+           !ValidateFlushHeight(r,config.deepFlushHeightMm))return false;
+    }else if(config.deepFlushCycleInterval||config.deepFlushHeightMm!=0.0)return false;
+    return true;
+}
+inline bool ValidateLiveFlushConfig(const Request& r,const FlushConfig& config,
+    std::uint32_t finishRequiredCount) noexcept
+{
+    return ValidateRequest(r)&&ValidateLiveFlushValues(r,config,finishRequiredCount)&&
+        (!config.enabled||ValidateFlushConfig(r,config));
+}
+
+inline bool SameFlushFeedEnvelope(const FlushConfig& a,const FlushConfig& b) noexcept
+{
+    const auto same=[](double x,double y) noexcept {return std::memcmp(&x,&y,sizeof(double))==0;};
+    if(a.enabled!=b.enabled||a.independentFeedsEnabled!=b.independentFeedsEnabled||
+       a.finalApproachEnabled!=b.finalApproachEnabled||a.initialSlowEnabled!=b.initialSlowEnabled||
+       a.deepFlushEnabled!=b.deepFlushEnabled||a.deepFlushCycleInterval!=b.deepFlushCycleInterval||
+       a.axisRampMask!=b.axisRampMask||a.axisMask!=b.axisMask||a.axisLimitsEnabled!=b.axisLimitsEnabled||
+       !EDM385::Same(a.axisModeLimits,b.axisModeLimits)||!same(a.heightMm,b.heightMm)||
+       !same(a.accelerationTimeSeconds,b.accelerationTimeSeconds)||
+       !same(a.decelerationTimeSeconds,b.decelerationTimeSeconds)||!same(a.settleTimeSeconds,b.settleTimeSeconds)||
+       !same(a.finalApproachDistanceMm,b.finalApproachDistanceMm)||
+       !same(a.initialSlowDistanceMm,b.initialSlowDistanceMm)||!same(a.deepFlushHeightMm,b.deepFlushHeightMm))return false;
+    for(unsigned axis=0U;axis<6U;++axis)
+        if(!same(a.axisAccelerationTimeSeconds[axis],b.axisAccelerationTimeSeconds[axis])||
+           !same(a.axisDecelerationTimeSeconds[axis],b.axisDecelerationTimeSeconds[axis])||
+           !same(a.axisVelocityMmS[axis],b.axisVelocityMmS[axis])||
+           !same(a.axisAccelerationMmS2[axis],b.axisAccelerationMmS2[axis])||
+           !same(a.axisDecelerationMmS2[axis],b.axisDecelerationMmS2[axis]))return false;
+    return true;
+}
+inline bool Cycle::UpdateFlushFeeds(const FlushConfig& config) noexcept
+{
+    if(!initialized_||!output_.active||output_.faulted||output_.complete||
+       !SameFlushFeedEnvelope(flush_,config))return false;
+    const auto validFeed=[&](double value) noexcept {
+        return Detail::Positive(value)&&Detail::Positive(value/60.0)&&value<=request_.feedMmMin;
+    };
+    const auto same=[](double x,double y) noexcept {return std::memcmp(&x,&y,sizeof(double))==0;};
+    // Revalidate only the changed numerical feeds. The unchanged envelope was
+    // fully admitted at Begin; no geometry walk or path replan occurs here.
+    if(config.enabled?!validFeed(config.feedMmMin):!same(config.feedMmMin,flush_.feedMmMin))return false;
+    const double incoming[]={config.centerRetreatFeedMmMin,config.axisRetreatFeedMmMin,
+        config.centerReturnFeedMmMin,config.axisReturnFeedMmMin,config.pathRetreatFeedMmMin};
+    const double current[]={flush_.centerRetreatFeedMmMin,flush_.axisRetreatFeedMmMin,
+        flush_.centerReturnFeedMmMin,flush_.axisReturnFeedMmMin,flush_.pathRetreatFeedMmMin};
+    for(unsigned i=0U;i<5U;++i)
+        if(config.independentFeedsEnabled?!validFeed(incoming[i]):!same(incoming[i],current[i]))return false;
+    if(config.finalApproachEnabled?!validFeed(config.finalApproachFeedMmMin):
+       !same(config.finalApproachFeedMmMin,flush_.finalApproachFeedMmMin))return false;
+    if(config.initialSlowEnabled?!validFeed(config.initialSlowFeedMmMin):
+       !same(config.initialSlowFeedMmMin,flush_.initialSlowFeedMmMin))return false;
+    const bool unchanged=same(config.feedMmMin,flush_.feedMmMin)&&
+        same(config.centerRetreatFeedMmMin,flush_.centerRetreatFeedMmMin)&&
+        same(config.axisRetreatFeedMmMin,flush_.axisRetreatFeedMmMin)&&
+        same(config.centerReturnFeedMmMin,flush_.centerReturnFeedMmMin)&&
+        same(config.axisReturnFeedMmMin,flush_.axisReturnFeedMmMin)&&
+        same(config.pathRetreatFeedMmMin,flush_.pathRetreatFeedMmMin)&&
+        same(config.finalApproachFeedMmMin,flush_.finalApproachFeedMmMin)&&
+        same(config.initialSlowFeedMmMin,flush_.initialSlowFeedMmMin);
+    if(unchanged){pendingFlushFeeds_=false;pendingFlushConfig_=FlushConfig{};return true;}
+    if(feedback_.flushActive||feedback_.flushCheckpointSaved){
+        pendingFlushConfig_=config;pendingFlushFeeds_=true;return true;
+    }
+    flush_=config;pendingFlushFeeds_=false;pendingFlushConfig_=FlushConfig{};return true;
+}
+
+inline bool SameLiveFlushEnvelope(const FlushConfig& birth,const FlushConfig& candidate) noexcept
+{
+    FlushConfig normalized=candidate;
+    normalized.enabled=birth.enabled;normalized.independentFeedsEnabled=birth.independentFeedsEnabled;
+    normalized.finalApproachEnabled=birth.finalApproachEnabled;normalized.initialSlowEnabled=birth.initialSlowEnabled;
+    normalized.deepFlushEnabled=birth.deepFlushEnabled;normalized.deepFlushCycleInterval=birth.deepFlushCycleInterval;
+    normalized.heightMm=birth.heightMm;normalized.deepFlushHeightMm=birth.deepFlushHeightMm;
+    normalized.finalApproachDistanceMm=birth.finalApproachDistanceMm;
+    normalized.initialSlowDistanceMm=birth.initialSlowDistanceMm;
+    return SameFlushFeedEnvelope(birth,normalized);
+}
+inline bool SameLiveFlushConfig(const FlushConfig& a,const FlushConfig& b) noexcept
+{
+    const auto same=[](double x,double y) noexcept {return std::memcmp(&x,&y,sizeof(double))==0;};
+    return SameFlushFeedEnvelope(a,b)&&same(a.feedMmMin,b.feedMmMin)&&
+        same(a.centerRetreatFeedMmMin,b.centerRetreatFeedMmMin)&&same(a.axisRetreatFeedMmMin,b.axisRetreatFeedMmMin)&&
+        same(a.centerReturnFeedMmMin,b.centerReturnFeedMmMin)&&same(a.axisReturnFeedMmMin,b.axisReturnFeedMmMin)&&
+        same(a.pathRetreatFeedMmMin,b.pathRetreatFeedMmMin)&&same(a.finalApproachFeedMmMin,b.finalApproachFeedMmMin)&&
+        same(a.initialSlowFeedMmMin,b.initialSlowFeedMmMin);
+}
+inline bool Cycle::UpdateLiveFlushConfig(const FlushConfig& config) noexcept
+{
+    if(!initialized_||!output_.active||output_.faulted||output_.complete||
+       !SameLiveFlushEnvelope(flush_,config)||!ValidateLiveFlushValues(request_,config,feedback_.finishRequiredCount))return false;
+    if(SameLiveFlushConfig(flush_,config)){
+        pendingFlushFeeds_=false;pendingFlushConfig_=FlushConfig{};return true;
+    }
+    if(feedback_.flushActive||feedback_.flushCheckpointSaved){
+        pendingFlushConfig_=config;pendingFlushFeeds_=true;return true;
+    }
+    flush_=config;pendingFlushFeeds_=false;pendingFlushConfig_=FlushConfig{};return true;
+}
+
 inline bool Cycle::InsideTravel(const Point8& point) const noexcept
 {
     if(!Detail::Finite(point))return false;
@@ -732,12 +1006,15 @@ inline bool Cycle::InsideTravel(const Point8& point) const noexcept
 inline bool Cycle::AtCommand(const Point8& actual) const noexcept
 {
     if(!Detail::Finite(actual))return false;
-    for(unsigned a=0U;a<8U;++a)
-        if(std::fabs(actual[a]-output_.commandMCS[a])>(a<3U?request_.positionToleranceMm:request_.rotaryToleranceDeg))return false;
+    const auto& identity=request_.geometry.frame.translation.axisIdentity;
+    for(unsigned a=0U;a<6U;++a)if(identity.exists[a])
+        if(std::fabs(actual[a]-output_.commandMCS[a])>(identity.nativeUnit[a]==1U?
+            request_.positionToleranceMm:request_.rotaryToleranceDeg))return false;
     return true;
 }
 inline void Cycle::Fail(Fault fault,bool emergency) noexcept
 {
+    pendingFlushFeeds_=false;pendingFlushConfig_=FlushConfig{};pendingLiveOrbitCriteria_=false;
     if(recovery_.enabled){
         recovery_.active=false;recovery_.evaluationGeometry=nullptr;
         feedback_.holdRecoveryPhase=10U;feedback_.inspectionJogActive=false;
@@ -930,7 +1207,7 @@ inline bool Cycle::ConfigureFlushProfile(Phase phase) noexcept
 {
     // A manual HOLD brake uses the existing safety budget. On an explicit
     // resume, restore this still-frozen E5 ramp before rebuilding its profile.
-    if(Detail::IsFlushMotionPhase(phase)&&(flush_.accelerationTimeSeconds>0.0||flush_.decelerationTimeSeconds>0.0)){
+    if(Detail::IsFlushMotionPhase(phase)&&(flush_.accelerationTimeSeconds>0.0||flush_.decelerationTimeSeconds>0.0||flush_.axisRampMask||flush_.axisLimitsEnabled)){
         const double a=FlushAcceleration(leg_.speedLimit,leg_.circle);
         const double d=FlushDeceleration(leg_.speedLimit,leg_.circle);
         if(leg_.acceleration!=a||leg_.deceleration!=d){
@@ -981,21 +1258,94 @@ inline bool Cycle::ConfigureFlushProfile(Phase phase) noexcept
     {Fail(Fault::Numeric);return false;}
     leg_.approachProfile=true;return true;
 }
+inline bool Cycle::NativeRatio(const Leg& leg,Native6& ratio) const noexcept
+{
+    ratio=Native6{};if(!Detail::Positive(leg.length)||leg.circle)return false;
+    for(unsigned axis=0U;axis<6U;++axis){
+        const double delta=leg.end[axis]-leg.start[axis];ratio[axis]=delta/leg.length;
+        if(!std::isfinite(ratio[axis])||(delta!=0.0&&ratio[axis]==0.0))return false;
+    }
+    return true;
+}
+inline bool Cycle::InitializeLine(const Point8& end,Leg& next) noexcept
+{
+    if(!InsideTravel(end)){Fail(Fault::TravelLimit);return false;}
+    next=Leg{};next.start=output_.commandMCS;next.end=end;
+    if(!EDM384Axes::LinearDistance(request_.geometry.frame.translation.axisIdentity,next.start,next.end,next.length))
+    {Fail(Fault::Numeric);return false;}
+    if(next.length==0.0){
+        for(unsigned axis=0U;axis<8U;++axis)if(next.start[axis]!=next.end[axis]){Fail(Fault::Numeric);return false;}
+    }else{
+        Native6 ratio{};if(!NativeRatio(next,ratio)){Fail(Fault::Numeric);return false;}
+        for(unsigned a=0U;a<3U;++a)next.direction[a]=ratio[a];
+    }
+    return true;
+}
+inline bool Cycle::LimitNativeLine(Leg& next,const NCG76SphereRuntimeGeometry::Geometry* limitGeometry) const noexcept
+{
+    if(next.length==0.0||!flush_.axisLimitsEnabled)return true;
+    const EDM384Axes::Budget installed{flush_.axisVelocityMmS,flush_.axisAccelerationMmS2,flush_.axisDecelerationMmS2,flush_.axisMask};
+    EDM384Axes::Budget axes{};
+    if(!EDM385::ResolveBudget(installed,flush_.axisModeLimits,next.flushAxisLimits,axes))return false;
+    if(next.circle){
+        // Keep the legacy curve exactly when no mode ceiling is requested.
+        // With explicit caps reserve half of each axis's symmetric budget for
+        // tangent acceleration and half for its normal v^2/r component.
+        const auto& geometry=limitGeometry?*limitGeometry:ActiveLegGeometry();
+        bool explicitMovingCeiling=false;
+        for(unsigned a=0U;a<3U;++a){
+            const double requestedAcceleration=next.flushAxisLimits?flush_.axisModeLimits.flushAcceleration[a]:flush_.axisModeLimits.machiningAcceleration[a];
+            const double requestedDeceleration=next.flushAxisLimits?flush_.axisModeLimits.flushDeceleration[a]:flush_.axisModeLimits.machiningDeceleration[a];
+            if((geometry.u[a]!=0.0||geometry.v[a]!=0.0)&&(requestedAcceleration>0.0||requestedDeceleration>0.0))explicitMovingCeiling=true;
+        }
+        if(!explicitMovingCeiling)return true;
+        const double angle=std::fabs(next.circleEndAngle-next.circleStartAngle);
+        const double radius=next.length/angle;
+        if(!Detail::Positive(angle)||!Detail::Positive(radius))return false;
+        for(unsigned a=0U;a<3U;++a){
+            const double tangent=std::hypot(geometry.u[a],geometry.v[a]);
+            if(!std::isfinite(tangent))return false;
+            if(tangent==0.0)continue;
+            if(!(axes.mask&(1U<<a)))return false;
+            const double budget=0.5*(std::min)(axes.acceleration[a],axes.deceleration[a]);
+            const double ramp=EDM384Axes::Quotient(budget,tangent);
+            const double normalSpeed=std::sqrt(radius)*std::sqrt(ramp);
+            if(!Detail::Positive(ramp)||!Detail::Positive(normalSpeed))return false;
+            next.speedLimit=(std::min)(next.speedLimit,(std::min)(normalSpeed,EDM384Axes::Quotient(axes.velocity[a],tangent)));
+            next.acceleration=(std::min)(next.acceleration,ramp);
+            next.deceleration=(std::min)(next.deceleration,ramp);
+        }
+    }else{
+        Native6 ratio{};if(!NativeRatio(next,ratio))return false;
+        EDM384Axes::Limits limits{};if(!EDM384Axes::LimitsForRatio(axes,ratio,limits))return false;
+        next.speedLimit=(std::min)(next.speedLimit,limits.velocity);
+        if(gap_.enabled){
+            // A straight EDM leg has no normal v^2/r component. Its own
+            // acceleration and deceleration budgets apply in full; signed
+            // GAP reversals still use the smaller pair in AdvanceGap.
+            next.acceleration=(std::min)(next.acceleration,limits.acceleration);
+            next.deceleration=(std::min)(next.deceleration,limits.deceleration);
+        }else{
+            // Preserve the historical AIR/non-GAP trajectory policy.
+            const double ramp=0.5*(std::min)(limits.acceleration,limits.deceleration);
+            next.acceleration=(std::min)(next.acceleration,ramp);next.deceleration=(std::min)(next.deceleration,ramp);
+        }
+    }
+    return Detail::Positive(next.speedLimit)&&Detail::Positive(next.acceleration)&&Detail::Positive(next.deceleration);
+}
 inline bool Cycle::StartLine(const Point8& end,Phase phase,double feed,double acceleration,double deceleration) noexcept
 {
-    if(!InsideTravel(end)) {Fail(Fault::TravelLimit);return false;}
-    Leg next{};next.start=output_.commandMCS;next.end=end;
-    for(unsigned a=0U;a<3U;++a)next.direction[a]=end[a]-next.start[a];
-    for(unsigned a=3U;a<8U;++a)
-        if(end[a]!=request_.geometry.startMCS[a] || next.start[a]!=request_.geometry.startMCS[a])
-        {Fail(Fault::Numeric);return false;}
-    next.length=Detail::Norm(next.direction);
-    if(!std::isfinite(next.length)) {Fail(Fault::Numeric);return false;}
-    if(next.length>0.0)for(double& value:next.direction)value/=next.length;
+    Leg next{};if(!InitializeLine(end,next))return false;
+    next.flushAxisLimits=Detail::IsFlushMotionPhase(phase);
     next.speedLimit=(std::min)(feed/60.0,request_.velocityCapMmS);
     next.acceleration=acceleration>0.0?(std::min)(acceleration,request_.accelerationMmS2):request_.accelerationMmS2;
     next.deceleration=deceleration>0.0?(std::min)(deceleration,request_.decelerationMmS2):request_.decelerationMmS2;
-    if(!Detail::Positive(next.speedLimit) || !StartProfile(next)) {Fail(Fault::Numeric);return false;}
+    if(Detail::IsFlushMotionPhase(phase)&&next.length>0.0&&flush_.axisLimitsEnabled){
+        Native6 ratio{};if(!NativeRatio(next,ratio)){Fail(Fault::Numeric);return false;}
+        next.acceleration=FlushAcceleration(next.speedLimit,false,&ratio);
+        next.deceleration=FlushDeceleration(next.speedLimit,false,&ratio);
+    }
+    if(!LimitNativeLine(next)||!Detail::Positive(next.speedLimit)||!StartProfile(next)){Fail(Fault::Numeric);return false;}
     leg_=next;feedback_.phase=phase;
     output_.velocityNative.fill(0.0);output_.accelerationNative.fill(0.0);
     RefreshOutput();return true;
@@ -1030,7 +1380,7 @@ inline bool Cycle::StartNominal(Phase phase) noexcept
         next.acceleration=next.deceleration=normalBudget;
         const double radialSpeed=std::sqrt(normalBudget)*std::sqrt(request_.geometry.radiusMm);
         next.speedLimit=(std::min)((std::min)(nominalFeed/60.0,request_.velocityCapMmS),radialSpeed);
-        if(!Detail::Positive(next.length)||!Detail::Positive(next.speedLimit)||!Detail::Positive(radialSpeed)||!StartProfile(next))
+        if(!Detail::Positive(next.length)||!Detail::Positive(next.speedLimit)||!Detail::Positive(radialSpeed)||!LimitNativeLine(next)||!StartProfile(next))
         {Fail(Fault::Numeric);return false;}
         leg_=next;feedback_.phase=phase;
         output_.velocityNative.fill(0.0);output_.accelerationNative.fill(0.0);RefreshOutput();return true;
@@ -1089,7 +1439,7 @@ inline bool Cycle::StartNominal(Phase phase) noexcept
         const double radialSpeed=std::sqrt(normalBudget)*std::sqrt(layer.radiusMm);
         next.speedLimit=(std::min)((std::min)(request_.feedMmMin/60.0,request_.velocityCapMmS),radialSpeed);
         if(!Detail::Positive(next.length) || !Detail::Positive(radialSpeed) || !Detail::Positive(next.speedLimit) ||
-           !StartProfile(next)) {Fail(Fault::Numeric);return false;}
+           !LimitNativeLine(next)||!StartProfile(next)) {Fail(Fault::Numeric);return false;}
         leg_=next;feedback_.phase=phase;
         if(orbitInspection_.active){
             if(!orbitInspection_.coverage.Begin(leg_.length)){Fail(Fault::Numeric);return false;}
@@ -1113,39 +1463,36 @@ inline bool Cycle::StartNominal(Phase phase) noexcept
 }
 inline bool Cycle::EvaluateLeg() noexcept
 {
-    Point3 tangent{},curvature{};
-    if(leg_.circle)
-    {
+    Point3 tangent{},curvature{};Native6 ratio{};
+    if(leg_.circle){
         const double fraction=leg_.position/leg_.length;
         const double angle=leg_.position==0.0?leg_.circleStartAngle:leg_.position==leg_.length?leg_.circleEndAngle:
             (std::max)((std::min)(leg_.circleStartAngle,leg_.circleEndAngle),
                 (std::min)((std::max)(leg_.circleStartAngle,leg_.circleEndAngle),
                     leg_.circleStartAngle+fraction*(leg_.circleEndAngle-leg_.circleStartAngle)));
         const auto& geometry=ActiveLegGeometry();
-        if(!NCG76SphereRuntimeGeometry::CircleAt(geometry,leg_.circleLayer,angle,
-            output_.commandMCS,tangent,curvature))return false;
+        if(!NCG76SphereRuntimeGeometry::CircleAt(geometry,leg_.circleLayer,angle,output_.commandMCS,tangent,curvature))return false;
         if(leg_.position==leg_.length)output_.commandMCS=leg_.end;
         else if(leg_.position==0.0)output_.commandMCS=leg_.start;
         if(leg_.circleEndAngle<leg_.circleStartAngle)for(double& x:tangent)x=-x;
-    }
-    else
-    {
-        tangent=leg_.direction;
+        for(unsigned axis=0U;axis<3U;++axis)ratio[axis]=tangent[axis];
+    }else{
+        if(leg_.length>0.0&&!NativeRatio(leg_,ratio))return false;
         if(leg_.position==leg_.length)output_.commandMCS=leg_.end;
         else if(leg_.position==0.0)output_.commandMCS=leg_.start;
-        else
-        {
+        else{
             output_.commandMCS=leg_.start;
-            for(unsigned a=0U;a<3U;++a)output_.commandMCS[a]=leg_.start[a]+leg_.position*leg_.direction[a];
+            for(unsigned axis=0U;axis<6U;++axis)if(ratio[axis]!=0.0)
+                output_.commandMCS[axis]=leg_.start[axis]+leg_.position*ratio[axis];
         }
     }
     output_.velocityNative.fill(0.0);output_.accelerationNative.fill(0.0);
-    for(unsigned a=0U;a<3U;++a)
-    {
-        output_.velocityNative[a]=tangent[a]*leg_.speed;
-        output_.accelerationNative[a]=tangent[a]*leg_.accelerationNow+curvature[a]*leg_.speed*leg_.speed;
+    for(unsigned axis=0U;axis<6U;++axis){
+        output_.velocityNative[axis]=ratio[axis]*leg_.speed;
+        output_.accelerationNative[axis]=ratio[axis]*leg_.accelerationNow+
+            (axis<3U?curvature[axis]*leg_.speed*leg_.speed:0.0);
     }
-    return InsideTravel(output_.commandMCS) && Detail::Finite(output_.velocityNative) && Detail::Finite(output_.accelerationNative);
+    return InsideTravel(output_.commandMCS)&&Detail::Finite(output_.velocityNative)&&Detail::Finite(output_.accelerationNative);
 }
 inline bool Cycle::AdvanceLeg(double dt,bool brake,bool& finished) noexcept
 {
@@ -1290,10 +1637,15 @@ inline bool Cycle::StartBrake(Phase phase) noexcept
     // budget rather than inheriting a deliberately slow flush-only ramp.
     const bool holdFromFlush=phase==Phase::FlushHoldBrake||
         (phase==Phase::RecoveryBrake&&feedback_.flushActive&&Detail::IsFlushMotionPhase(feedback_.phase));
-    if(holdFromFlush&&(flush_.accelerationTimeSeconds>0.0||flush_.decelerationTimeSeconds>0.0)){
-        leg_.acceleration=request_.accelerationMmS2;leg_.deceleration=request_.decelerationMmS2;
-        if(leg_.circle)leg_.acceleration=leg_.deceleration=0.5*(std::min)(request_.accelerationMmS2,request_.decelerationMmS2);
+    if(holdFromFlush&&(flush_.accelerationTimeSeconds>0.0||flush_.decelerationTimeSeconds>0.0||flush_.axisRampMask||flush_.axisLimitsEnabled)){
+        const double a=leg_.circle?0.5*(std::min)(request_.accelerationMmS2,request_.decelerationMmS2):request_.accelerationMmS2;
+        const double d=leg_.circle?a:request_.decelerationMmS2;
+        // Keep any faster, already admitted excursion braking budget. Falling
+        // back to a slower nominal ramp near its endpoint could overshoot.
+        leg_.acceleration=(std::max)(leg_.acceleration,a);
+        leg_.deceleration=(std::max)(leg_.deceleration,d);
     }
+    if(!LimitNativeLine(leg_)){Fail(Fault::Numeric);return false;}
     const double stopTime=std::fabs(leg_.speed)/leg_.deceleration;
     double stopPosition=leg_.position+0.5*stopTime*leg_.speed;
     const double tolerance=(std::max)(8.0*LegCoordinateError(),
@@ -1339,8 +1691,12 @@ inline bool Cycle::Settled(const Input& input,double dt) noexcept
         feedback_.phase==Phase::TimeLimitSettle||feedback_.phase==Phase::GapHistorySettle||
         (machiningTime_.totalExpired&&feedback_.phase==Phase::HoldSettle)||
         (request_.geometry.kind!=NCG76SphereRuntimeGeometry::Kind::Sphere&&feedback_.phase==Phase::HoldSettle);
-    const unsigned requiredSamples=strict?(std::max)(200U,request_.settleSamples):request_.settleSamples;
-    const double requiredSeconds=strict?(std::max)(0.05,request_.minimumSettleSeconds):request_.minimumSettleSeconds;
+    const bool normalFlush=feedback_.phase==Phase::FlushSettle&&!feedback_.holdActive&&
+        !machiningTime_.totalExpired&&feedback_.flushOrigin==static_cast<std::uint8_t>(FlushOrigin::Periodic)&&
+        (settleAction_==SettleAction::CaptureFlush||settleAction_==SettleAction::NextFlushLeg||
+         settleAction_==SettleAction::RestoreAfterFlush);
+    const unsigned requiredSamples=normalFlush?3U:strict?(std::max)(200U,request_.settleSamples):request_.settleSamples;
+    const double requiredSeconds=normalFlush?flush_.settleTimeSeconds:strict?(std::max)(0.05,request_.minimumSettleSeconds):request_.minimumSettleSeconds;
     return settledSamples_>=requiredSamples && settleProvedSeconds_>=requiredSeconds;
 }
 inline void Cycle::NextNominal(const Input& input) noexcept
@@ -1492,22 +1848,54 @@ inline bool Cycle::FlushDistanceAvailable() const noexcept
     return NCG76SphereRetreat::Station(request_.geometry,stage,feedback_.layerIndex,
         leg_.position/leg_.length,station)&&station>=height;
 }
-inline double Cycle::FlushAcceleration(double targetSpeed,bool circle) const noexcept
+inline double Cycle::FlushRampTime(bool acceleration,bool circle,const Native6& direction) const noexcept
 {
-    const double budget=circle?0.5*(std::min)(request_.accelerationMmS2,request_.decelerationMmS2):request_.accelerationMmS2;
-    return flush_.accelerationTimeSeconds>0.0?(std::min)(targetSpeed/flush_.accelerationTimeSeconds,budget):budget;
+    const double fallback=acceleration?flush_.accelerationTimeSeconds:flush_.decelerationTimeSeconds;
+    double seconds=0.0;bool active=false;
+    for(unsigned axis=0U;axis<6U;++axis){
+        if(circle?(axis>=3U||(request_.geometry.u[axis]==0.0&&request_.geometry.v[axis]==0.0)):direction[axis]==0.0)continue;
+        active=true;
+        const double value=(flush_.axisRampMask&(1U<<axis))?
+            (acceleration?flush_.axisAccelerationTimeSeconds[axis]:flush_.axisDecelerationTimeSeconds[axis]):fallback;
+        seconds=(std::max)(seconds,value);
+    }
+    return active?seconds:fallback;
 }
-inline double Cycle::FlushDeceleration(double targetSpeed,bool circle) const noexcept
+inline double Cycle::FlushAcceleration(double targetSpeed,bool circle,const Native6* direction) const noexcept
 {
-    const double budget=circle?0.5*(std::min)(request_.accelerationMmS2,request_.decelerationMmS2):request_.decelerationMmS2;
-    return flush_.decelerationTimeSeconds>0.0?(std::min)(targetSpeed/flush_.decelerationTimeSeconds,budget):budget;
+    Native6 unit{};if(direction)unit=*direction;else if(!circle&&leg_.length>0.0&&!NativeRatio(leg_,unit))return 0.0;
+    double budget=circle?0.5*(std::min)(request_.accelerationMmS2,request_.decelerationMmS2):request_.accelerationMmS2;
+    if(!circle&&flush_.axisLimitsEnabled&&std::any_of(unit.begin(),unit.end(),[](double value){return value!=0.0;})){
+        const EDM384Axes::Budget installed{flush_.axisVelocityMmS,flush_.axisAccelerationMmS2,flush_.axisDecelerationMmS2,flush_.axisMask};
+        EDM384Axes::Budget axes{};
+        if(!EDM385::ResolveBudget(installed,flush_.axisModeLimits,true,axes))return 0.0;
+        EDM384Axes::Limits limits{};if(!EDM384Axes::LimitsForRatio(axes,unit,limits))return 0.0;
+        budget=gap_.enabled?limits.acceleration:0.5*(std::min)(limits.acceleration,limits.deceleration);
+    }
+    const double seconds=FlushRampTime(true,circle,unit);
+    return seconds>0.0?(std::min)(targetSpeed/seconds,budget):budget;
+}
+inline double Cycle::FlushDeceleration(double targetSpeed,bool circle,const Native6* direction) const noexcept
+{
+    Native6 unit{};if(direction)unit=*direction;else if(!circle&&leg_.length>0.0&&!NativeRatio(leg_,unit))return 0.0;
+    double budget=circle?0.5*(std::min)(request_.accelerationMmS2,request_.decelerationMmS2):request_.decelerationMmS2;
+    if(!circle&&flush_.axisLimitsEnabled&&std::any_of(unit.begin(),unit.end(),[](double value){return value!=0.0;})){
+        const EDM384Axes::Budget installed{flush_.axisVelocityMmS,flush_.axisAccelerationMmS2,flush_.axisDecelerationMmS2,flush_.axisMask};
+        EDM384Axes::Budget axes{};
+        if(!EDM385::ResolveBudget(installed,flush_.axisModeLimits,true,axes))return 0.0;
+        EDM384Axes::Limits limits{};if(!EDM384Axes::LimitsForRatio(axes,unit,limits))return 0.0;
+        budget=gap_.enabled?limits.deceleration:0.5*(std::min)(limits.acceleration,limits.deceleration);
+    }
+    const double seconds=FlushRampTime(false,circle,unit);
+    return seconds>0.0?(std::min)(targetSpeed/seconds,budget):budget;
 }
 inline bool Cycle::StartFlushLine(const Point8& end,Phase phase) noexcept
 {
-    if(feedback_.flushLegSequence==(std::numeric_limits<std::uint64_t>::max)())
-    {Fail(Fault::Numeric);return false;}
+    if(feedback_.flushLegSequence==(std::numeric_limits<std::uint64_t>::max)()){Fail(Fault::Numeric);return false;}
+    Leg next{};if(!InitializeLine(end,next))return false;
     const double targetSpeed=(std::min)(FlushFeed(phase)/60.0,request_.velocityCapMmS);
-    const double a=FlushAcceleration(targetSpeed),d=FlushDeceleration(targetSpeed);
+    Native6 ratio{};if(next.length>0.0&&!NativeRatio(next,ratio)){Fail(Fault::Numeric);return false;}
+    const double a=FlushAcceleration(targetSpeed,false,&ratio),d=FlushDeceleration(targetSpeed,false,&ratio);
     if(!Detail::Positive(a)||!Detail::Positive(d)){Fail(Fault::Numeric);return false;}
     if(!StartLine(end,phase,FlushFeed(phase),a,d)||!ConfigureFlushProfile(phase))return false;
     if(leg_.length>0.0)++feedback_.flushLegSequence;
@@ -1535,7 +1923,7 @@ inline bool Cycle::StartFlushPathLeg(bool reverse) noexcept
     {Fail(Fault::Numeric);return false;}
     const double arcAngle=primitiveArc?request_.geometry.arcSweepRad:NCG76SphereRuntimeGeometry::TwoPi;
     const double arcRadius=primitiveArc?request_.geometry.radiusMm:layer.radiusMm;
-    Leg next{};next.circle=true;next.circleLayer=span.layer;next.start=output_.commandMCS;next.end=end;
+    Leg next{};next.circle=true;next.flushAxisLimits=true;next.circleLayer=span.layer;next.start=output_.commandMCS;next.end=end;
     next.center=center;next.circleStartAngle=from*arcAngle;
     next.circleEndAngle=to*arcAngle;
     next.length=std::fabs(to-from)*span.length;
@@ -1543,7 +1931,7 @@ inline bool Cycle::StartFlushPathLeg(bool reverse) noexcept
     const double radialSpeed=std::sqrt(legacyBudget)*std::sqrt(arcRadius);
     next.speedLimit=(std::min)((std::min)(FlushFeed(phase)/60.0,request_.velocityCapMmS),radialSpeed);
     next.acceleration=FlushAcceleration(next.speedLimit,true);next.deceleration=FlushDeceleration(next.speedLimit,true);
-    if(!Detail::Positive(next.length)||!Detail::Positive(next.speedLimit)||!StartProfile(next)||
+    if(!Detail::Positive(next.length)||!Detail::Positive(next.speedLimit)||!LimitNativeLine(next)||!StartProfile(next)||
        feedback_.flushLegSequence==(std::numeric_limits<std::uint64_t>::max)())
     {Fail(Fault::Numeric);return false;}
     leg_=next;feedback_.phase=phase;if(!ConfigureFlushProfile(phase))return false;++feedback_.flushLegSequence;
@@ -1591,6 +1979,28 @@ inline void Cycle::CaptureFlush(const Input& input) noexcept
             if(!NCG76SphereRuntimeGeometry::CircleAt(request_.geometry,0U,angle,point,liftDirection,curvature))
             {Fail(Fault::Numeric);return;}
         }
+    }
+    if(request_.geometry.kind==NCG76SphereRuntimeGeometry::Kind::Line&&
+       (request_.retreatMode==0U||request_.retreatMode==3U||request_.retreatMode==4U)){
+        // G01 B3/B4 have an exact zero center offset. Keep the canonical
+        // anchor for their coalesced route and E20 outbound-distance origin.
+        flushWaypoint_=savedAnchor_;
+        Point8 ratio{};if(!NCG76SphereRuntimeGeometry::LineNativeRatio(request_.geometry,ratio)){Fail(Fault::Numeric);return;}
+        const double budget=(std::min)(request_.geometry.arithmeticErrorBoundMm,feedback_.flushSelectedHeightMm/64.0);
+        const Point8 baseline=flushTop_;
+        for(unsigned axis=0U;axis<6U;++axis)if(ratio[axis]!=0.0){
+            const double lift=-ratio[axis]*feedback_.flushSelectedHeightMm;
+            flushTop_[axis]=baseline[axis]+lift;
+            const double nativeBudget=std::fabs(ratio[axis])*budget+
+                NCG76SphereRuntimeGeometry::NativeAxisErrorBound(request_.geometry,axis);
+            if(!std::isfinite(flushTop_[axis])||!std::isfinite(nativeBudget)||
+               std::fabs((flushTop_[axis]-baseline[axis])-lift)>nativeBudget){Fail(Fault::Numeric);return;}
+        }
+        double distance=0.0;
+        if(!InsideTravel(flushTop_)||!EDM384Axes::LinearDistance(request_.geometry.frame.translation.axisIdentity,
+            baseline,flushTop_,distance)||!Detail::Positive(distance)||
+            std::fabs(distance-feedback_.flushSelectedHeightMm)>budget){Fail(Fault::TravelLimit);return;}
+        (void)StartFlushLine(flushTop_,Phase::FlushLift);return;
     }
     Point3 actualLift{},error{};
     for(unsigned a=0U;a<3U;++a){
@@ -1716,7 +2126,8 @@ inline bool Cycle::SeedPreviousPrimitive(const NCG76SphereRuntimeGeometry::Geome
            geometry.boundsMinMCS[a]>geometry.boundsMaxMCS[a]||
            ((request_.travelMask&(1U<<a))&&
                (geometry.boundsMinMCS[a]<request_.travelMin[a]||geometry.boundsMaxMCS[a]>request_.travelMax[a])))return false;
-        if(a>=3U&&std::memcmp(&geometry.startMCS[a],&request_.geometry.startMCS[a],sizeof(double))!=0)return false;
+        if(a>=3U&&geometry.kind!=K::Line&&
+           std::memcmp(&geometry.startMCS[a],&request_.geometry.startMCS[a],sizeof(double))!=0)return false;
     }
     previousPrimitive_=geometry;previousLeg_=Leg{};
     auto& prior=previousLeg_;prior.start=geometry.startMCS;prior.end=geometry.endMCS;
@@ -1734,7 +2145,7 @@ inline bool Cycle::SeedPreviousPrimitive(const NCG76SphereRuntimeGeometry::Geome
         prior.direction=geometry.axis;
         prior.acceleration=request_.accelerationMmS2;prior.deceleration=request_.decelerationMmS2;
     }
-    if(!Detail::Positive(prior.speedLimit)||!Detail::Positive(prior.acceleration)||!Detail::Positive(prior.deceleration))return false;
+    if(!LimitNativeLine(prior,&geometry)||!Detail::Positive(prior.speedLimit)||!Detail::Positive(prior.acceleration)||!Detail::Positive(prior.deceleration))return false;
     previousPhase_=Phase::InitialDepth;previousLayer_=0U;previousLegValid_=true;
     feedback_.previousParentHistoryReady=true;return true;
 }
@@ -1887,6 +2298,55 @@ inline bool Cycle::Begin(const Request& request,const Input& input,const FlushCo
     else StartSettle(Phase::Settle,SettleAction::BeginNominal,input);
     return !output_.faulted;
 }
+// Only the RT transport owner may use this bounded, stopped requalification.
+// Geometry, E5/flush ordinals and user machining timers never advance here.
+inline bool Cycle::CanQuarantinePhysicalLine() const noexcept
+{
+    return initialized_ && output_.active && !output_.faulted && !output_.complete &&
+        request_.physicalZManual && request_.parameterFeeds && request_.retreatMode == 0U &&
+        request_.geometry.kind == NCG76SphereRuntimeGeometry::Kind::Line &&
+        request_.totalLimitUs == 0ULL && request_.additionalUs == 0ULL &&
+        feedback_.phase == Phase::InitialDepth && feedback_.nominalPhase == Phase::InitialDepth &&
+        feedback_.fault == Fault::None && gap_.enabled &&
+        !feedback_.holdActive && !feedback_.held && !feedback_.flushActive &&
+        !feedback_.flushCheckpointSaved && !feedback_.gapHistoryActive &&
+        !feedback_.previousParentHistoryActive && !feedback_.finishActive &&
+        feedback_.finishRequiredCount == 0U && !recovery_.active && !primitivePaused_ &&
+        std::isfinite(leg_.speed) && leg_.speed >= 0.0 &&
+        std::isfinite(leg_.position) && leg_.position >= 0.0 && leg_.position < leg_.length;
+}
+// Read-only watchdog check for every quarantined callback. Repeated reads do
+// not accumulate elapsed time; Requalify remains the sole baseline mutation.
+inline bool Cycle::CanRemainTransportPaused(std::uint64_t nowUs) const noexcept
+{
+    if (!CanQuarantinePhysicalLine() || !lastNowUs_ || nowUs < lastNowUs_ ||
+        !std::isfinite(elapsed_) || elapsed_ < 0.0) return false;
+    const double elapsed=elapsed_+static_cast<double>(nowUs-lastNowUs_)*1e-6;
+    return std::isfinite(elapsed) && elapsed<=request_.maximumCycleSeconds;
+}
+inline bool Cycle::RequalifyPhysicalLine(const Input& fresh,std::uint64_t maxTransportGapUs) noexcept
+{
+    if (!maxTransportGapUs || maxTransportGapUs > 5000000ULL || !CanQuarantinePhysicalLine() || !fresh.sourceValid || !fresh.pdoValid ||
+        !fresh.powerInhibited || fresh.cancel || fresh.hold ||
+        fresh.holdSequence != lastHold_ || fresh.startSequence != lastStart_ ||
+        !fresh.physicalSettled || !fresh.zeroFinalSend || fresh.tick <= lastTick_ ||
+        fresh.zeroSendTick != fresh.tick - 1ULL || fresh.zeroSendTick <= lastTick_ ||
+        fresh.nowUs <= lastNowUs_ ||
+        fresh.nowUs - lastNowUs_ > maxTransportGapUs || fresh.physicalSequence <= lastPhysical_ ||
+        !InsideTravel(fresh.actualMCS) || !AtCommand(fresh.actualMCS)) return false;
+    // Preserve the absolute cycle watchdog even though no path/work progress is credited.
+    const double elapsed = elapsed_ + static_cast<double>(fresh.nowUs - lastNowUs_) * 1e-6;
+    if (!std::isfinite(elapsed) || elapsed > request_.maximumCycleSeconds) return false;
+    elapsed_ = elapsed;
+    lastTick_ = fresh.tick; lastNowUs_ = fresh.nowUs; lastPhysical_ = fresh.physicalSequence;
+    leg_.speed = leg_.accelerationNow = 0.0;
+    output_.velocityNative.fill(0.0); output_.accelerationNative.fill(0.0);
+    feedback_.tick = fresh.tick; feedback_.gapApplied = false;
+    RefreshOutput();
+    // This proof callback sends zero; ordinary INITIAL_DEPTH resumes next tick.
+    output_.zeroDemand = true;
+    return output_.active && !output_.faulted;
+}
 inline Output Cycle::Step(const Input& input) noexcept
 {
     if(!initialized_ || !output_.active)return output_;
@@ -1924,6 +2384,12 @@ inline Output Cycle::Step(const Input& input) noexcept
     lastHold_=input.holdSequence;lastStart_=input.startSequence;lastHoldLevel_=input.hold;
     elapsed_+=dt;
     if(!std::isfinite(elapsed_) || elapsed_>request_.maximumCycleSeconds){Fail(Fault::CycleTimeout);return output_;}
+
+    // Apply at a fresh ordinary RT boundary, after the previous wash/abandon
+    // has released its saved checkpoint. This also precedes finish washes.
+    if(pendingFlushFeeds_&&!feedback_.flushActive&&!feedback_.flushCheckpointSaved){
+        flush_=pendingFlushConfig_;pendingFlushFeeds_=false;pendingFlushConfig_=FlushConfig{};
+    }
 
     if(!UpdateMachiningTime(input,deltaUs,holdEdge))return output_;
     if(!machiningTime_.totalExpired)ObserveOrbitCompletion(input,holdEdge);
@@ -2055,4 +2521,5 @@ inline Output Cycle::Step(const Input& input) noexcept
 
 #include "NCG76SphereHoldRecovery.h"
 #include "NCG76SphereFinishVerification.h"
+#include "NCG76SphereLiveRecipeCompletion.h"
 #include "NCG76SphereMachiningTime.h"

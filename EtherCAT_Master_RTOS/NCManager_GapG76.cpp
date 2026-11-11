@@ -277,7 +277,7 @@ bool NCManager::IsEDM234SequenceScopeCurrentSameThread() noexcept
         !Close_System_Com_flag&&m_externalReadyInterlock&&!m_isSingleBlockEnabled&&!m_isG66Active&&
         m_macroStack.empty()&&!Homing.IsActive()&&!AlarmManager::GetInstance().HasAlarm()&&
         m_resetContinuationPhase==ResetContinuationPhase::IDLE&&CoordSys.IsTranslationRunFrozen()&&
-        IsNCXYZCUVFeedNeutralFrame(CoordSys.GetTranslationSnapshot())&&CoordSys.GetTranslationSnapshot().distanceMode==91&&
+        IsNCLegacyXYZCUVFeedNeutralFrame(CoordSys.GetTranslationSnapshot())&&CoordSys.GetTranslationSnapshot().distanceMode==91&&
         IsPathCoreLiveNativeConfigCurrentSameThread()&&IsFixedTranslationTravelCurrentSameThread()&&
         SameNCTranslationSnapshot(q.translation,CoordSys.GetTranslationSnapshot())&&m_motion.MatchesNCTranslation(q.translation)&&
         E234ProgramShape(GetBaseProgramCache(),first,arms,&program,&ordinaryCode)&&first==q.firstArmPC&&arms==q.arms&&
@@ -480,7 +480,7 @@ bool NCManager::IsEDM236SequenceScopeCurrentSameThread() noexcept
         Close_System_Com_flag||!m_externalReadyInterlock||m_isSingleBlockEnabled||m_isG66Active||
         !m_macroStack.empty()||Homing.IsActive()||AlarmManager::GetInstance().HasAlarm()||
         m_resetContinuationPhase!=ResetContinuationPhase::IDLE||!CoordSys.IsTranslationRunFrozen()||
-        !IsNCXYZCUVFeedNeutralFrame(CoordSys.GetTranslationSnapshot())||CoordSys.GetTranslationSnapshot().distanceMode!=91||
+        !IsNCLegacyXYZCUVFeedNeutralFrame(CoordSys.GetTranslationSnapshot())||CoordSys.GetTranslationSnapshot().distanceMode!=91||
         !IsPathCoreLiveNativeConfigCurrentSameThread()||!IsFixedTranslationTravelCurrentSameThread()||
         !SameNCTranslationSnapshot(q.translation,CoordSys.GetTranslationSnapshot())||!m_motion.MatchesNCTranslation(q.translation)||
         !E236ProgramShape(GetBaseProgramCache(),first,kinds)||first!=q.firstArmPC||kinds!=q.kinds)return false;
@@ -937,7 +937,7 @@ bool NCManager::IsEDM237SequenceScopeCurrentSameThread(bool nativeParentReceipt,
         Close_System_Com_flag||!m_externalReadyInterlock||m_isSingleBlockEnabled||m_isG66Active||
         !m_macroStack.empty()||Homing.IsActive()||AlarmManager::GetInstance().HasAlarm()||
         m_resetContinuationPhase!=ResetContinuationPhase::IDLE||!CoordSys.IsTranslationRunFrozen()||
-        !IsNCXYZCUVFeedNeutralFrame(CoordSys.GetTranslationSnapshot())||CoordSys.GetTranslationSnapshot().distanceMode!=91||
+        !IsNCLegacyXYZCUVFeedNeutralFrame(CoordSys.GetTranslationSnapshot())||CoordSys.GetTranslationSnapshot().distanceMode!=91||
         !IsPathCoreLiveNativeConfigCurrentSameThread()||!IsFixedTranslationTravelCurrentSameThread()||
         !SameNCTranslationSnapshot(q.translation,CoordSys.GetTranslationSnapshot())||!m_motion.MatchesNCTranslation(q.translation)||
         !E237HistoryProgramShape(GetBaseProgramCache(),first,kinds,program,count)||first!=q.firstArmPC||kinds!=q.kinds||program!=q.program||count!=q.parentCount||

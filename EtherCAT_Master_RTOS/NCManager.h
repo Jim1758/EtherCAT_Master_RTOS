@@ -1724,7 +1724,7 @@ private:
     };
     std::array<FixedTranslationTravelPolicy, 8U> m_fixedTranslationTravel{};
     std::uint64_t m_fixedTranslationTravelGeneration = 0ULL;
-    bool IsFixedTranslationTravelCurrentSameThread() const noexcept;
+    bool IsFixedTranslationTravelCurrentSameThread(bool ignoreLegacyAxisTimes=false) const noexcept;
     bool PrepareFixedTranslationMotionSameThread(const NCBlock& block, int gCode);
     bool IsEDMPathXYZTranslationBlockAllowedSameThread(const NCBlock& block,
         const NCTranslationSnapshot& source, std::uint32_t presentMask);
@@ -2615,7 +2615,7 @@ private:
     static std::uint64_t AllocatePathCoreLiveOwnerTagStartup() noexcept;
     NCPathCoreLiveRetentionScopeV1 BuildPathCoreLiveScopeSameThread() const noexcept;
     void CapturePathCoreLiveNativeConfigSameThread() noexcept;
-    bool IsPathCoreLiveNativeConfigCurrentSameThread() noexcept;
+    bool IsPathCoreLiveNativeConfigCurrentSameThread(bool ignoreLegacyAxisTimes=false) noexcept;
     bool ValidatePathCoreLiveRetentionSameThread() noexcept;
     void ArmPathCoreLiveRetentionSameThread() noexcept;
     void FencePathCoreLiveRetentionSameThread(PathCoreLiveFenceReason reason) noexcept;
@@ -2740,8 +2740,33 @@ private:
         bool orbitLogInitialized=false;
         NCG76SphereGapProcess::Feedback gapShadow{};
         std::uint64_t gapRequestLogged=0ULL;
+        // NC-only authenticated E5 edit chain; never changes gapBinding's
+        // admitted recipe/source identity. Latest timing request may coalesce.
+        std::uint64_t e5LiveAcceptedGeneration=0ULL,e5LiveWorkTimeUs=0ULL;
+        std::uint64_t e5LiveUpdateSequence=0ULL,e5LivePublishedSequence=0ULL;
+        std::uint64_t e5LiveObservedWorkTimeUs=0ULL;
+        // Full NC source profile authenticates only the accepted live tuning
+        // chain. The admitted binding/config is never rewritten by an edit.
+        EDM20::ProcessProfile liveTuningSourceProfile{};
+        NCG76SphereGapProcess::Config liveTuningConfig{};
+        std::uint64_t liveTuningAcceptedGeneration=0ULL,liveTuningPublishedGeneration=0ULL;
+        std::uint64_t liveTuningCurveObserved=0ULL,liveTuningFlushObserved=0ULL;
+        // Owner-only complete recipe provenance. Mutable 200-field images and
+        // preview storage stay in this heap-owned state, never on the RT stack.
+        EDMRecipe::Controller liveRecipePreview{};
+        EDMRecipe::ActiveSnapshot liveRecipeSnapshot{},liveRecipeObservedSnapshot{},liveRecipePreparedSnapshot{};
+        NCG76SphereGapBinding::Binding liveRecipeBinding{},liveRecipePreparedBinding{};
+        NCOrbitCompletionBinding::Binding liveOrbitBinding{},liveOrbitPreparedBinding{};
+        NCG76SphereGapProcess::Config liveRecipeConfig{},liveRecipePreparedConfig{};
+        NCG76SphereCycle::Request liveRecipeValidationRequest{},completionViewRequest{};
+        std::uint64_t liveRecipeSequence=0ULL,liveRecipePublishedSequence=0ULL;
+        std::uint64_t liveRecipeObservedSequence=0ULL,liveFlushObservedSequence=0ULL,liveOrbitObservedSequence=0ULL;
         std::uint64_t flushAcceptedLogged=0ULL,flushCompletedLogged=0ULL,flushAbandonedLogged=0ULL;
         unsigned flushDiagnosticEvents=0U;
+        std::uint64_t e5WaitLogged=0ULL,e5StartLogged=0ULL,e5PauseLogged=0ULL,e5ResumeLogged=0ULL,e5DueLogged=0ULL;
+        bool e5ConfigLogged=false; // NC-only E5 event observations; never motion authority.
+        std::uint64_t e5LegacyCompleteLogged=0ULL,e5LegacyAbortLogged=0ULL;
+        bool e5LegacyInitialized=false,e5LegacyStarted=false,e5LegacyEligible=false;
         unsigned gapDiagnosticEvents=0U;
         unsigned orbitFeedDiagnosticEvents=0U;
         int gapLastDirection=0;
@@ -2789,6 +2814,27 @@ private:
     bool ValidateG76SphereBlockSameThread(const NCBlock&,int pc,int line=0);
     bool PrepareG76SphereTranslationSameThread(const NCBlock&);
     bool IsG76SphereScopeCurrentSameThread();
+    bool IsG76SphereLiveProcessCurrentSameThread(std::uint64_t e5Generation,std::uint64_t e5WorkTimeUs) const noexcept;
+    bool IsG76SphereLiveRecipeCurrentSameThread() const noexcept;
+    bool PrepareG76SphereLiveRecipeSameThread(const EDMRecipe::Controller& recipe,
+        const EDM20::ProcessProfile& profile,std::uint64_t tuningGeneration,
+        NCG76SphereGapBinding::Binding& binding,NCOrbitCompletionBinding::Binding& orbit,
+        NCG76SphereGapProcess::Config& config);
+    void AcceptG76SphereLiveRecipeSameThread(const NCG76SphereGapBinding::Binding& binding,
+        const NCOrbitCompletionBinding::Binding& orbit,const EDM20::ProcessProfile& profile,
+        std::uint64_t tuningGeneration,const NCG76SphereGapProcess::Config& config) noexcept;
+    bool UpdateG76SphereCompletionViewSameThread(const MotionG76SphereFeedback& feedback) const noexcept;
+    bool IsPhysicalLiveRecipeCarryScopeCurrentSameThread() const noexcept;
+    bool IsPhysicalLiveRecipeSelectionCurrentSameThread() const noexcept;
+    void RememberPhysicalLiveRecipeSameThread() noexcept;
+    EDMRecipe::ActiveSnapshot m_physicalLiveRecipeSnapshot{};
+    mutable EDMRecipe::ActiveSnapshot m_physicalLiveRecipeScratch{};
+    const EDMRecipe::Catalog* m_physicalLiveRecipeCatalog=nullptr;
+    std::uint64_t m_physicalLiveRecipeRun=0ULL,m_physicalLiveRecipeCache=0ULL;
+    MotionExecutionEpoch m_physicalLiveRecipeEpoch=MOTION_EXECUTION_EPOCH_INVALID;
+    MotionOwnerLease m_physicalLiveRecipeOwner{};
+    bool PrepareG76SphereLiveTuningSameThread(const EDM20::ProcessProfile& candidate,
+        std::uint64_t generation,NCG76SphereGapProcess::Config& output);
     WaitConditionFunc StartG76SphereSameThread(const NCBlock&);
     static bool WaitForG76SphereCallback(NCManager*);
     bool ValidateG76SphereWaitCallbackSameThread(WaitConditionFunc);

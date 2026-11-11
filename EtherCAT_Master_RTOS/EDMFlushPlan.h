@@ -1,5 +1,6 @@
 #pragma once
 
+#include "EDMAxisMotionLimits385.h"
 #include <array>
 #include <cmath>
 #include <cstddef>
@@ -25,13 +26,30 @@ namespace EDM20
         double pathDistanceMm = 0.0;           // Pump_Path_Dist
         // Distance not supplied by the machine owner: zero disables it.
         double initialSlowDistanceMm = 0.0;
-        // E5 flush trajectory only. Zero inherits that direction's frozen
-        // parent ramp; positive seconds request a ramp to the active leg's
-        // target speed. The independent axis budget can require more time.
+        // E5 flush trajectory only. In signed EDM, zero adds no ramp-time
+        // restriction; positive seconds request a ramp to the active leg's
+        // target speed. Explicit EDM mode ceilings may require more time.
+        // G00/Stop times do not limit signed EDM; MAX_Speed remains binding.
         // Short moves can finish before reaching target speed. No authority.
         double accelerationTimeSeconds = 0.0;
         double decelerationTimeSeconds = 0.0;
+        // XYZCUV may explicitly override the shared pair. For signed EDM,
+        // a present zero adds no ramp-time restriction; an absent pair uses
+        // the shared time above. Legacy non-GAP AIR retains its old policy.
+        // Presence is frozen. Positive native EDM ceilings remain separate.
+        std::array<double,6U> axisAccelerationTimeSeconds{};
+        std::array<double,6U> axisDecelerationTimeSeconds{};
+        std::uint8_t axisRampMask = 0U;
+        // Legacy files retain the existing 50 ms normal-flush confirmation.
+        double settleTimeSeconds = 0.05;
+        // EDM385: independent native machining/flush acceleration ceilings.
+        EDM385::AxisLimits axisModeLimits{};
     };
+
+    inline double EffectiveFlushAccelerationTimeSeconds(const FlushProfile& value,unsigned axis) noexcept
+    { return axis<6U&&(value.axisRampMask&(1U<<axis))?value.axisAccelerationTimeSeconds[axis]:value.accelerationTimeSeconds; }
+    inline double EffectiveFlushDecelerationTimeSeconds(const FlushProfile& value,unsigned axis) noexcept
+    { return axis<6U&&(value.axisRampMask&(1U<<axis))?value.axisDecelerationTimeSeconds[axis]:value.decelerationTimeSeconds; }
 
     enum class FlushMode : std::uint8_t
     {
@@ -114,6 +132,7 @@ namespace EDM20
 
     inline bool ValidateFlushProfile(const FlushProfile& value) noexcept
     {
+        if(!EDM385::Valid(value.axisModeLimits))return false;
         const double speeds[] = { value.finalApproachMmPerMin,
             value.centerRetractMmPerMin, value.mainRetractMmPerMin,
             value.centerReturnMmPerMin, value.mainReturnMmPerMin,
@@ -127,6 +146,13 @@ namespace EDM20
             if (!std::isfinite(distance) || distance < 0.0) return false;
         if (!std::isfinite(value.accelerationTimeSeconds) || value.accelerationTimeSeconds < 0.0 ||
             !std::isfinite(value.decelerationTimeSeconds) || value.decelerationTimeSeconds < 0.0) return false;
+        if ((value.axisRampMask&~63U)!=0U) return false;
+        if(!std::isfinite(value.settleTimeSeconds)||value.settleTimeSeconds<0.0)return false;
+        for(unsigned axis=0U;axis<6U;++axis) {
+            const double a=value.axisAccelerationTimeSeconds[axis],d=value.axisDecelerationTimeSeconds[axis];
+            if(!std::isfinite(a)||a<0.0||!std::isfinite(d)||d<0.0||
+                (!(value.axisRampMask&(1U<<axis))&&(a!=0.0||d!=0.0)))return false;
+        }
         return true;
     }
 

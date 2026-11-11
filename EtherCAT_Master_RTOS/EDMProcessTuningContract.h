@@ -6,16 +6,22 @@
 // mm/(V*min). The NC owner alone writes Context, Values and Ack. Windows SDK
 // writers serialize with Global\\OSCARMAX_EDM_PROCESS_TUNING_WRITER.
 constexpr std::uint32_t EDM_PROCESS_TUNING_MAGIC = 0x544D4445U;
-// v1.1 consumes one formerly reserved parameter double. Both directions
-// require the exact version so an older peer cannot silently drop orbit edits.
+// v1.2 publishes scoped RT curve/flush receipts in the former Context tail.
+// Exact versions prevent a peer from silently claiming runtime application.
 constexpr std::uint16_t EDM_PROCESS_TUNING_VERSION_MAJOR = 1U;
-constexpr std::uint16_t EDM_PROCESS_TUNING_VERSION_MINOR = 1U;
+constexpr std::uint16_t EDM_PROCESS_TUNING_VERSION_MINOR = 2U;
 constexpr std::uint32_t EDM_PROCESS_TUNING_PARAMETER_VERSION = 1U;
 constexpr std::uint32_t EDM_PROCESS_TUNING_SIZE = 2432U;
 constexpr std::uint32_t EDM_PROCESS_TUNING_PUBLISHED = 1U;
 constexpr std::uint32_t EDM_PROCESS_TUNING_SHUTTING_DOWN = 2U;
 constexpr std::uint32_t EDM_PROCESS_TUNING_READY = 1U;
 constexpr std::uint32_t EDM_PROCESS_TUNING_CAN_APPLY = 2U;
+constexpr std::uint32_t EDM_PROCESS_TUNING_LIVE_ACTIVE = 1U;
+constexpr std::uint32_t EDM_PROCESS_TUNING_LIVE_CURVE_PENDING = 2U;
+constexpr std::uint32_t EDM_PROCESS_TUNING_LIVE_FLUSH_PENDING = 4U;
+constexpr std::uint32_t EDM_PROCESS_TUNING_LIVE_SPECIAL_E_GAIN = 8U;
+constexpr std::uint32_t EDM_PROCESS_TUNING_EDIT_CURVE = 1U;
+constexpr std::uint32_t EDM_PROCESS_TUNING_EDIT_FLUSH_SPEEDS = 2U;
 constexpr std::uint32_t EDM_PROCESS_TUNING_PROCESS = 1U;
 constexpr std::uint32_t EDM_PROCESS_TUNING_DISCHARGE = 2U;
 constexpr std::uint32_t EDM_PROCESS_TUNING_FLUSH = 4U;
@@ -44,9 +50,12 @@ struct EDMProcessTuningContext
     std::uint32_t ProfileRevision, MachineProfileId, SchemaVersion, Flags;
     // Legacy gain-application flag remains 0: no physical PID/discharge gains.
     // EDM280 collision thresholds are active RT protection, independently of
-    // this flag. Successful Apply reports that effect in Ack.Detail.
+    // this flag. GAP curve/flush application uses the scoped receipts below.
     std::uint32_t ActiveAxisMask, PhysicalApplied;
-    std::uint8_t Reserved[32];
+    // NC acceptance is Generation; these independent RT receipts can lag it.
+    // Session zero has no active RT scope and therefore zero receipts/flags.
+    std::uint64_t ActiveParentSession, RtCurveGeneration, RtFlushGeneration;
+    std::uint32_t LiveStatusFlags, LiveEditableMask;
 };
 struct EDMProcessTuningParameters
 {
@@ -98,6 +107,11 @@ struct EDMProcessTuningData
 #pragma pack(pop)
 static_assert(sizeof(EDMProcessTuningHeader) == 64U, "EDM tuning header ABI");
 static_assert(sizeof(EDMProcessTuningContext) == 64U, "EDM tuning context ABI");
+static_assert(offsetof(EDMProcessTuningContext, ActiveParentSession) == 32U, "EDM tuning active parent offset");
+static_assert(offsetof(EDMProcessTuningContext, RtCurveGeneration) == 40U, "EDM tuning curve receipt offset");
+static_assert(offsetof(EDMProcessTuningContext, RtFlushGeneration) == 48U, "EDM tuning flush receipt offset");
+static_assert(offsetof(EDMProcessTuningContext, LiveStatusFlags) == 56U, "EDM tuning live flags offset");
+static_assert(offsetof(EDMProcessTuningContext, LiveEditableMask) == 60U, "EDM tuning editable mask offset");
 static_assert(sizeof(EDMProcessTuningParameters) == 384U, "EDM tuning parameters ABI");
 static_assert(offsetof(EDMProcessTuningParameters, ParameterVersion) == 28U, "EDM tuning parameter version offset");
 static_assert(offsetof(EDMProcessTuningParameters, OrbitScaleMmPerVoltMin) == 264U, "EDM tuning orbit scale offset");

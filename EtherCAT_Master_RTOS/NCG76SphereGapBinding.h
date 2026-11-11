@@ -118,6 +118,11 @@ inline bool SameDouble(double a,double b) noexcept
 {return std::memcmp(&a,&b,sizeof(double))==0;}
 inline bool SameFlushProfile(const EDM20::FlushProfile& a,const EDM20::FlushProfile& b) noexcept
 {
+    if(!EDM385::Same(a.axisModeLimits,b.axisModeLimits))return false;
+    if(a.axisRampMask!=b.axisRampMask||!SameDouble(a.settleTimeSeconds,b.settleTimeSeconds))return false;
+    for(unsigned axis=0U;axis<6U;++axis)
+        if(!SameDouble(a.axisAccelerationTimeSeconds[axis],b.axisAccelerationTimeSeconds[axis])||
+            !SameDouble(a.axisDecelerationTimeSeconds[axis],b.axisDecelerationTimeSeconds[axis]))return false;
     return SameDouble(a.finalApproachMmPerMin,b.finalApproachMmPerMin)&&
         SameDouble(a.centerRetractMmPerMin,b.centerRetractMmPerMin)&&SameDouble(a.mainRetractMmPerMin,b.mainRetractMmPerMin)&&
         SameDouble(a.centerReturnMmPerMin,b.centerReturnMmPerMin)&&SameDouble(a.mainReturnMmPerMin,b.mainReturnMmPerMin)&&
@@ -361,6 +366,52 @@ inline bool SameServoProfile(const EDMGapServo::Profile& a,const EDMGapServo::Pr
         SameDouble(a.shortRetreatMmPerMin,b.shortRetreatMmPerMin);
 }
 
+// Full source-profile equality excludes object padding. It also covers fields
+// outside the process mailbox, so an unknown direct edit cannot be legitimized
+// by the next permitted live-tuning request.
+inline bool SameProcessProfile(const EDM20::ProcessProfile& a,const EDM20::ProcessProfile& b) noexcept
+{
+    if(a.schemaVersion!=b.schemaVersion||a.revision!=b.revision||a.machineProfileId!=b.machineProfileId||
+       a.mode!=b.mode||!SameServoProfile(a.servo,b.servo)||!SameFlushProfile(a.flush,b.flush)||
+       !SameDouble(a.orbitScaleMmPerVoltMin,b.orbitScaleMmPerVoltMin)||
+       !EDM386E5::Same(a.e5WorkTimer,b.e5WorkTimer))return false;
+    for(unsigned axis=0U;axis<8U;++axis){
+        const EDM20::AxisGainProfile* left[]={&a.axisGains.discharge[axis],&a.axisGains.flush[axis]};
+        const EDM20::AxisGainProfile* right[]={&b.axisGains.discharge[axis],&b.axisGains.flush[axis]};
+        for(unsigned bank=0U;bank<2U;++bank)
+            if(left[bank]->inheritCnc!=right[bank]->inheritCnc||
+               !SameDouble(left[bank]->custom.Kp,right[bank]->custom.Kp)||
+               !SameDouble(left[bank]->custom.Ki,right[bank]->custom.Ki)||
+               !SameDouble(left[bank]->custom.Kd,right[bank]->custom.Kd)||
+               !SameDouble(left[bank]->custom.Kvff,right[bank]->custom.Kvff))return false;
+    }
+    return true;
+}
+inline bool OnlyLiveProcessChanges(const EDM20::ProcessProfile& before,
+    const EDM20::ProcessProfile& after) noexcept
+{
+    if(!EDM20::ValidateProcessProfile(before)||!EDM20::ValidateProcessProfile(after))return false;
+    auto normalized=after;
+    for(unsigned i=0U;i<3U;++i){normalized.servo.positiveGain[i]=before.servo.positiveGain[i];
+        normalized.servo.negativeGain[i]=before.servo.negativeGain[i];}
+    for(unsigned i=0U;i<2U;++i){normalized.servo.positiveBreakV[i]=before.servo.positiveBreakV[i];
+        normalized.servo.negativeBreakV[i]=before.servo.negativeBreakV[i];}
+    normalized.servo.cuttingScaleMmPerVoltMin=before.servo.cuttingScaleMmPerVoltMin;
+    normalized.servo.maxFeedMmPerMin=before.servo.maxFeedMmPerMin;
+    normalized.servo.maxRetreatMmPerMin=before.servo.maxRetreatMmPerMin;
+    normalized.servo.deadbandV=before.servo.deadbandV;
+    normalized.servo.shortRetreatMmPerMin=before.servo.shortRetreatMmPerMin;
+    normalized.flush.finalApproachMmPerMin=before.flush.finalApproachMmPerMin;
+    normalized.flush.centerRetractMmPerMin=before.flush.centerRetractMmPerMin;
+    normalized.flush.mainRetractMmPerMin=before.flush.mainRetractMmPerMin;
+    normalized.flush.centerReturnMmPerMin=before.flush.centerReturnMmPerMin;
+    normalized.flush.mainReturnMmPerMin=before.flush.mainReturnMmPerMin;
+    normalized.flush.pathRetractMmPerMin=before.flush.pathRetractMmPerMin;
+    normalized.flush.initialSlowMmPerMin=before.flush.initialSlowMmPerMin;
+    normalized.flush.manualReturnMmPerMin=before.flush.manualReturnMmPerMin;
+    return SameProcessProfile(before,normalized);
+}
+
 inline Binding Capture(const EDMRecipe::Controller& controller,const EDM20::ProcessProfile& process,
     std::uint64_t tuningGeneration,bool processReady,bool parameterFeeds=false,bool orbitFeeds=false) noexcept
 {
@@ -371,6 +422,7 @@ inline Binding Capture(const EDMRecipe::Controller& controller,const EDM20::Proc
     }
     const auto before=controller.Current();const auto* catalog=controller.GetCatalog();
     const auto servo=process.servo;const auto flushProfile=process.flush;
+    const auto e5WorkTimer=process.e5WorkTimer;
     const double orbitScale=process.orbitScaleMmPerVoltMin;
     const auto revision=process.revision,profile=process.machineProfileId;
     const auto timed=EDM130::BindWorkTime(controller,profile);
@@ -413,6 +465,7 @@ inline Binding Capture(const EDMRecipe::Controller& controller,const EDM20::Proc
     if(controller.GetCatalog()!=catalog||!EDM58::BindingDetail::SameSelection(before,controller.Current())||
        !EDM20::ValidateProcessProfile(process)||process.revision!=revision||process.machineProfileId!=profile||
        !SameServoProfile(servo,process.servo)||!SameFlushProfile(flushProfile,process.flush)||
+       !EDM386E5::Same(e5WorkTimer,process.e5WorkTimer)||
        (orbitFeeds&&!SameDouble(orbitScale,process.orbitScaleMmPerVoltMin))){
         out.reason=Reason::CaptureChanged;out.error=EDM58::BindingError::CaptureChanged;return out;
     }
@@ -435,7 +488,8 @@ inline Binding Capture(const EDMRecipe::Controller& controller,const EDM20::Proc
     // EDM298: this P50 binding releases only the bounded software-simulation
     // feed lane. Actual GAP input and physical discharge remain unreleased.
     out.config.signedMotionEnabled=true;
-    out.config.flushProfile=flushProfile;out.config.independentFeedsEnabled=out.config.flushMotionEnabled;
+    out.config.flushProfile=flushProfile;out.config.e5WorkTimer=e5WorkTimer;
+    out.config.independentFeedsEnabled=out.config.flushMotionEnabled;
     if(!catalog||!CaptureApproach(controller,*catalog,out)){
         out.config=NCG76SphereGapProcess::Config{};
         out.reason=Reason::FieldRejected;out.error=out.approachError;out.failedFieldId=out.approachFailedFieldId;return out;
@@ -451,6 +505,7 @@ inline Binding Capture(const EDMRecipe::Controller& controller,const EDM20::Proc
     if(controller.GetCatalog()!=catalog||!EDM58::BindingDetail::SameSelection(before,controller.Current())||
        !EDM20::ValidateProcessProfile(process)||process.revision!=revision||process.machineProfileId!=profile||
        !SameServoProfile(servo,process.servo)||!SameFlushProfile(flushProfile,process.flush)||
+       !EDM386E5::Same(e5WorkTimer,process.e5WorkTimer)||
        !EDMSpecialGapGainBinding::IsCurrent(out.specialGain,controller,profile)||
        (orbitFeeds&&!SameDouble(orbitScale,process.orbitScaleMmPerVoltMin))){
         out.config=NCG76SphereGapProcess::Config{};
@@ -474,6 +529,7 @@ inline bool IsCurrent(const Binding& b,const EDMRecipe::Controller& controller,
        tuningGeneration!=b.config.tuningGeneration||process.revision!=b.processRevision||
        process.machineProfileId!=b.machineProfileId||!SameServoProfile(process.servo,b.sourceServo)||
        !SameFlushProfile(process.flush,b.config.flushProfile)||
+       !EDM386E5::Same(process.e5WorkTimer,b.config.e5WorkTimer)||
        (b.orbitFeeds&&!SameDouble(process.orbitScaleMmPerVoltMin,b.config.orbitScaleMmPerVoltMin))||
        !EDM58::BindingDetail::SameSelection(b.selection,controller.Current()))return false;
     const auto current=Capture(controller,process,tuningGeneration,processReady,b.parameterFeeds,b.orbitFeeds);
@@ -512,9 +568,62 @@ inline bool IsCurrent(const Binding& b,const EDMRecipe::Controller& controller,
         SameDouble(current.config.deepFlushHeightMultiplier,b.config.deepFlushHeightMultiplier)&&
         SameDouble(current.config.deepFlushHeightMm,b.config.deepFlushHeightMm)&&
         SameFlushProfile(current.config.flushProfile,b.config.flushProfile)&&
+        EDM386E5::Same(current.config.e5WorkTimer,b.config.e5WorkTimer)&&
         SameDouble(current.config.jumpHeightMm,b.config.jumpHeightMm)&&
         SameDouble(current.config.jumpSpeedPercent,b.config.jumpSpeedPercent)&&
         SameDouble(current.config.machiningOverridePercent,b.config.machiningOverridePercent)&&
         SameDouble(current.config.referenceV,b.config.referenceV)&&SameServoProfile(current.config.curve,b.config.curve);
 }
+
+// NC-only live E5 proof. The caller authenticates the generation/value chain
+// from an E5 HMI command; an arbitrary recipe generation is never accepted.
+// Reuse every original current-binding check after adjusting a local copy of
+// only the captured work-time metadata. The admitted binding stays immutable.
+inline bool IsCurrentWithWorkTime(const Binding& b,const EDMRecipe::Controller& controller,
+    const EDM20::ProcessProfile& process,std::uint64_t tuningGeneration,bool processReady,
+    std::uint64_t acceptedGeneration,std::uint64_t acceptedWorkTimeUs) noexcept
+{
+    if(!b.ready||!acceptedGeneration||acceptedGeneration<b.selection.generation||
+       !EDM130::ValidWorkTime(acceptedWorkTimeUs)||controller.Current().generation!=acceptedGeneration)
+        return false;
+    const auto timed=EDM130::BindWorkTime(controller,b.machineProfileId);
+    if(!timed.ready||timed.recipe.fieldId!=b.fields[0]||timed.recipe.generation!=acceptedGeneration||
+       timed.recipe.workTimeUs!=acceptedWorkTimeUs)return false;
+    Binding adjusted=b;
+    adjusted.selection.generation=acceptedGeneration;
+    adjusted.specialGain.selection.generation=acceptedGeneration;
+    adjusted.config.recipeGeneration=acceptedGeneration;
+    adjusted.config.workTimeUs=acceptedWorkTimeUs;
+    adjusted.values[0]=static_cast<EDMRecipe::Value>(acceptedWorkTimeUs);
+    return IsCurrent(adjusted,controller,process,tuningGeneration,processReady);
+}
+// NC-only authenticated process-tuning chain, composed with the existing E5
+// chain. The caller records this complete source profile only after a valid
+// hot-field command. The birth binding and its motion bank remain immutable.
+inline bool IsCurrentWithRuntimeTuning(const Binding& b,const EDMRecipe::Controller& controller,
+    const EDM20::ProcessProfile& process,std::uint64_t tuningGeneration,bool processReady,
+    std::uint64_t acceptedE5Generation,std::uint64_t acceptedE5WorkTimeUs,
+    const EDM20::ProcessProfile& acceptedProfile,std::uint64_t acceptedTuningGeneration) noexcept
+{
+    if(!acceptedTuningGeneration||tuningGeneration!=acceptedTuningGeneration||
+       acceptedTuningGeneration<b.config.tuningGeneration||!SameProcessProfile(process,acceptedProfile))return false;
+    auto normalized=process;
+    normalized.revision=b.processRevision;normalized.servo=b.sourceServo;
+    normalized.flush=b.config.flushProfile;
+    // Orbit-role tuning is deliberately outside the physical common-path lane.
+    if(b.orbitFeeds)normalized.orbitScaleMmPerVoltMin=b.config.orbitScaleMmPerVoltMin;
+    return IsCurrentWithWorkTime(b,controller,normalized,b.config.tuningGeneration,processReady,
+        acceptedE5Generation,acceptedE5WorkTimeUs);
+}
+// Complete owner-thread image equality deliberately ignores only lastError:
+// a rejected edit changes that diagnostic, never the committed selection.
+inline bool SameActiveRecipe(const EDMRecipe::ActiveSnapshot& a,const EDMRecipe::ActiveSnapshot& b) noexcept
+{
+    if(!EDMSpecialGapGainBinding::SameSelection(a.summary,b.summary)||
+       a.summary.modifiedCount!=b.summary.modifiedCount)return false;
+    for(std::size_t i=0U;i<a.fields.size();++i)
+        if(!EDMSpecialGapGainBinding::SameSnapshot(a.fields[i],b.fields[i]))return false;
+    return true;
+}
+
 }

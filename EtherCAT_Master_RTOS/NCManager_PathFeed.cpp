@@ -2,6 +2,7 @@
 #include "NCManager.h"
 #include "NCFinishPolicy.h"
 #include "NCMachiningTimePolicy.h"
+#include "NCEDMCoordinatedLineSource384.h"
 #include "NCG76TimedP11Source.h"
 #include "NCG76StartDiagnostic.h"
 #include "NCG76DiagnosticPrint.h"
@@ -651,6 +652,7 @@ void NCManager::ValidatePathCoreFeedSameThread()
             receipt.xyzcuv.zOnlyCommissioning != IsEDM149ZFeedSameThread() ||
             receipt.xyzcuv.xyzOnlyCommissioning != IsEDM150XYZFeedSameThread() ||
             receipt.xyzcuv.sparseCommissioning != IsEDM154SparseFeedSameThread() ||
+            m_motion.IsRotarySpindleSessionClaimed() ||
             !IsXYZCUVFeedProfileCurrentSameThread()) : receipt.xyzcFeed ? (!IsNCXYZCFeedNeutralFrame(CoordSys.GetTranslationSnapshot()) ||
             receipt.xyzc.absolute != (CoordSys.GetTranslationSnapshot().distanceMode == 90) ||
             !IsXYZCFeedProfileCurrentSameThread()) : receipt.zcFeed ? (!IsNCZCFeedNeutralFrame(CoordSys.GetTranslationSnapshot()) ||
@@ -1536,7 +1538,7 @@ bool NCManager::IsEDM149ZFeedSameThread() const noexcept
 bool NCManager::IsEDM149ZFeedBlockSameThread(const NCBlock& block) const noexcept
 {
     const auto& source = CoordSys.GetTranslationSnapshot();
-    if (!IsEDM149ZFeedSameThread() || source.distanceMode != 91 || !IsNCXYZCUVFeedNeutralFrame(source) ||
+    if (!IsEDM149ZFeedSameThread() || source.distanceMode != 91 || !IsNCLegacyXYZCUVFeedNeutralFrame(source) ||
         !IsNCXYZFeedSingleGBlock(block,1) || !block.has('Z') || !block.has('F')) return false;
     for (char letter='A';letter<='Z';++letter)
         if (block.has(letter) && (std::strchr("NXYZCUVF",letter) == nullptr || !std::isfinite(block.val(letter)))) return false;
@@ -1558,7 +1560,7 @@ bool NCManager::IsEDM150XYZFeedSameThread() const noexcept
 bool NCManager::IsEDM150XYZFeedBlockSameThread(const NCBlock& block) const noexcept
 {
     const auto& source = CoordSys.GetTranslationSnapshot();
-    if (!IsEDM150XYZFeedSameThread() || source.distanceMode != 91 || !IsNCXYZCUVFeedNeutralFrame(source) ||
+    if (!IsEDM150XYZFeedSameThread() || source.distanceMode != 91 || !IsNCLegacyXYZCUVFeedNeutralFrame(source) ||
         !IsNCXYZFeedSingleGBlock(block,1) || !block.has('X') || !block.has('Y') || !block.has('Z') || !block.has('F')) return false;
     for (char letter='A';letter<='Z';++letter)
         if (block.has(letter) && (std::strchr("NXYZCUVF",letter) == nullptr || !std::isfinite(block.val(letter)))) return false;
@@ -1574,25 +1576,26 @@ WaitConditionFunc NCManager::StartPathCoreXYZCUVFeedSameThread(const NCBlock& bl
     const bool zOnlyCommissioning = IsEDM149ZFeedSameThread();
     const bool xyzOnlyCommissioning = IsEDM150XYZFeedSameThread();
     const bool sparseCommissioning = IsEDM154SparseFeedSameThread();
-    std::array<double,6U> zWords{};
-    if (zOnlyCommissioning || xyzOnlyCommissioning || sparseCommissioning)
-        for (unsigned axis=0U;axis<6U;++axis) if(block.has("XYZCUV"[axis])) zWords[axis]=block.val("XYZCUV"[axis]);
-    if (!(zOnlyCommissioning ? IsEDM149ZFeedBlockSameThread(block) : xyzOnlyCommissioning ? IsEDM150XYZFeedBlockSameThread(block) : sparseCommissioning ? IsEDM154SparseFeedBlockSameThread(block) : IsNCXYZCUVFeedBlockAllowed(source, block)))
+    const bool commissioning = zOnlyCommissioning || xyzOnlyCommissioning || sparseCommissioning;
+    const std::uint32_t presentMask = NCXYZFeedPresentMask(source.axisIdentity);
+    if (!(zOnlyCommissioning ? IsEDM149ZFeedBlockSameThread(block) :
+        xyzOnlyCommissioning ? IsEDM150XYZFeedBlockSameThread(block) :
+        sparseCommissioning ? IsEDM154SparseFeedBlockSameThread(block) : IsNCXYZCUVFeedBlockAllowed(source, block)))
     {
         RejectPathCoreFeedSameThread(2U, AlarmManager::G_Code_Invalid_parameter);
         return nullptr;
     }
-    for (int i = 0; i < 6; ++i)
+    for (unsigned i = 0U; i < 6U; ++i) if (presentMask & (1U << i))
     {
-        const unsigned invalidMask = CoordSys.GetInvalidSoftwareTravelLimitMask(m_motion.GetAxisContext(i));
+        const unsigned invalidMask = CoordSys.GetInvalidSoftwareTravelLimitMask(m_motion.GetAxisContext(static_cast<int>(i)));
         if (invalidMask != 0U)
         {
-            RtPrintf("[TRAVEL-CONFIG][REJECT] unit=XYZCUV_FEED axis=%d invalidMask=%u beforeSubmit=1\n", i, invalidMask);
+            RtPrintf("[TRAVEL-CONFIG][REJECT] unit=XYZCUV_FEED axis=%u invalidMask=%u beforeSubmit=1\n", i, invalidMask);
             RejectPathCoreFeedSameThread(7U, AlarmManager::SOFTWARE_TRAVEL_LIMIT_INVALID_CONFIG);
             return nullptr;
         }
     }
-    if (!m_pathFeed.armed || m_pathFeed.pending || Close_System_Com_flag || m_state != NCState::RUN ||
+    if (m_motion.IsRotarySpindleSessionClaimed() || !m_pathFeed.armed || m_pathFeed.pending || Close_System_Com_flag || m_state != NCState::RUN ||
         m_mode != NCOperationMode::MEMORY || m_isG66Active || !m_macroStack.empty() || Homing.IsActive() ||
         IsFeedHoldActive() || !IsPathCoreFeedConfigurationValid() || !IsXYZCUVFeedProfileCurrentSameThread() ||
         !IsFixedTranslationTravelCurrentSameThread() || !FeedTranslationCurrent(CoordSys, source.generation) ||
@@ -1613,10 +1616,10 @@ WaitConditionFunc NCManager::StartPathCoreXYZCUVFeedSameThread(const NCBlock& bl
             AlarmManager::PATH_INVALIDATED_BY_GOTO : AlarmManager::G_Code_Invalid_parameter);
         return nullptr;
     }
-    for (unsigned i = 0U; i < 6U; ++i)
+    for (unsigned i = 0U; i < 6U; ++i) if (presentMask & (1U << i))
     {
         const AxisContext& axis = m_motion.GetAxisContext(static_cast<int>(i));
-        if (!axis.isExist || axis.axisType != (i < 3U ? AxisType::LINEAR : AxisType::ROTARY) ||
+        if (!axis.isExist || static_cast<unsigned>(axis.axisType) != source.axisIdentity.axisType[i] ||
             m_axisNames[i] != "XYZCUV"[i] || source.axisIdentity.address[i] != m_axisNames[i])
         {
             RejectPathCoreFeedSameThread(3U, AlarmManager::G_Code_Invalid_parameter);
@@ -1630,7 +1633,8 @@ WaitConditionFunc NCManager::StartPathCoreXYZCUVFeedSameThread(const NCBlock& bl
         RejectPathCoreFeedSameThread(11U, AlarmManager::MOTION_GROUP_MAPPING_INTEGRITY);
         return nullptr;
     }
-    // Explicit XYZ-length feed has no XYZ modal, cutter, retained or EDM source.
+    // All configured linear components define F; all present axes share one
+    // pulse-space progress and profile. Authored words remain separate from holds.
     ClearCncModalFeedSameThread();
     ClearPathCoreReplayHistorySameThread();
     m_pathFeedProgrammed.fill(false);
@@ -1639,39 +1643,45 @@ WaitConditionFunc NCManager::StartPathCoreXYZCUVFeedSameThread(const NCBlock& bl
     m_pathFeedAxes.clear();
     m_pathFeedTargets.clear();
     const bool absolute = source.distanceMode == 90;
+    std::uint32_t authoredMask = commissioning ? presentMask : 0U;
     std::array<double, 6U> programmedWords{}, targetMCS{};
-    for (unsigned i = 0U; i < 6U; ++i)
-    {
-        programmedWords[i] = (zOnlyCommissioning || xyzOnlyCommissioning || sparseCommissioning) ? zWords[i] : block.val("XYZCUV"[i]);
-        m_pathFeedProgrammed[i] = true;
-        m_pathFeedWCS[i] = programmedWords[i];
-    }
-    const double feedMMMin = block.val('F');
-    CoordSys.Preview_WCS_to_MCS(m_pathFeedWCS.data(), m_pathFeedProgrammed.data(), m_pathFeedCandidate.data());
     std::array<double, 8U> authoredStart{};
     for (unsigned i = 0U; i < 8U; ++i)
     {
         authoredStart[i] = CoordSys.commandedMCS[i];
-        const bool sparseStatic = sparseCommissioning && i < 6U && programmedWords[i] == 0.0;
-        const double expected = sparseStatic ? authoredStart[i] : i < 6U ?
-            (absolute ? programmedWords[i] + NCTranslationAxisOffsetMM(source, i) :
-                authoredStart[i] + programmedWords[i]) : authoredStart[i];
-        if (sparseStatic && m_pathFeedCandidate[i] == authoredStart[i]) m_pathFeedCandidate[i] = authoredStart[i];
-        if (!std::isfinite(authoredStart[i]) || !std::isfinite(expected) ||
-            FeedDoubleBits(m_pathFeedCandidate[i]) != FeedDoubleBits(expected))
+        m_pathFeedCandidate[i] = authoredStart[i];
+        if (!std::isfinite(authoredStart[i]))
         {
             RejectPathCoreFeedSameThread(5U, AlarmManager::G_Code_Invalid_parameter);
             return nullptr;
         }
-        if (i < 6U) targetMCS[i] = expected;
+        if (i >= 6U) continue;
+        targetMCS[i] = authoredStart[i];
+        if (!(presentMask & (1U << i))) continue;
+        const bool authored = commissioning || block.has("XYZCUV"[i]);
+        if (authored) authoredMask |= 1U << i;
+        programmedWords[i] = block.has("XYZCUV"[i]) ? block.val("XYZCUV"[i]) :
+            absolute ? authoredStart[i] - NCTranslationAxisOffsetMM(source, i) : 0.0;
+        m_pathFeedProgrammed[i] = authored;
+        m_pathFeedWCS[i] = programmedWords[i];
+        const double expected = !authored ? authoredStart[i] : absolute ?
+            programmedWords[i] + NCTranslationAxisOffsetMM(source, i) :
+            programmedWords[i] == 0.0 ? authoredStart[i] : authoredStart[i] + programmedWords[i];
+        if (!std::isfinite(programmedWords[i]) || !std::isfinite(expected))
+        {
+            RejectPathCoreFeedSameThread(5U, AlarmManager::G_Code_Invalid_parameter);
+            return nullptr;
+        }
+        m_pathFeedCandidate[i] = targetMCS[i] = expected;
     }
-    // Raw native interval proof precedes publication. The producer also checks
-    // each resolved canonical native and continuous physical-pulse interval.
-    for (int i = 0; i < 6; ++i)
+    const double feedMMMin = block.val('F');
+    // Neutral native mapping never rotates or scales C/U/V. Raw native limits
+    // precede publication; resolved native and continuous pulse limits follow.
+    for (unsigned i = 0U; i < 6U; ++i) if (presentMask & (1U << i))
     {
-        const AxisContext& axis = m_motion.GetAxisContext(i);
+        const AxisContext& axis = m_motion.GetAxisContext(static_cast<int>(i));
         if (!CoordSys.IsTargetWithinSoftwareTravelLimit(axis, authoredStart[i]) ||
-            !CoordSys.IsTargetWithinSoftwareTravelLimit(axis, m_pathFeedCandidate[i]))
+            !CoordSys.IsTargetWithinSoftwareTravelLimit(axis, targetMCS[i]))
         {
             RejectPathCoreFeedSameThread(7U, CoordSys.GetSoftwareTravelLimitAlarmCode(axis, AlarmManager::PROGRAMMED_OVER_TRAVEL));
             return nullptr;
@@ -1682,9 +1692,8 @@ WaitConditionFunc NCManager::StartPathCoreXYZCUVFeedSameThread(const NCBlock& bl
         RejectEDM94SameThread("ENDPOINT_OR_SCOPE", m_gapDryRun.sourceLine);
         return nullptr;
     }
-    const bool accepted = m_motion.TryG01XYZCUVMoveTransactionalTail(programmedWords, targetMCS,
-        feedMMMin, CoordSys.commandedMCS, m_pathFeedMotion, sparseCommissioning);
-    if (!accepted)
+    if (!m_motion.TryG01XYZCUVMoveTransactionalTail(programmedWords, targetMCS,
+        feedMMMin, CoordSys.commandedMCS, m_pathFeedMotion, sparseCommissioning, authoredMask))
     {
         RejectPathCoreFeedSameThread(6U, m_pathFeedMotion.receipt.commandAccepted ?
             static_cast<int>(AlarmManager::MOTION_GROUP_MAPPING_INTEGRITY) :
@@ -1693,123 +1702,83 @@ WaitConditionFunc NCManager::StartPathCoreXYZCUVFeedSameThread(const NCBlock& bl
     }
     const MotionFeedLineReceipt& receipt = m_pathFeedMotion.receipt;
     const NCXYZCUVFeedLineValue& geometry = receipt.xyzcuv;
-    if (geometry.zOnlyCommissioning != zOnlyCommissioning || geometry.xyzOnlyCommissioning != xyzOnlyCommissioning ||
-        geometry.sparseCommissioning != sparseCommissioning)
+    // Rebuild independently from frozen source words and the accepted physical
+    // anchor; no cached length, component rate, endpoint or ramp is trusted.
+    NCXYZCUVFeedLineInput expected{};
+    expected.axisIdentity = source.axisIdentity;
+    expected.axisMask = presentMask;
+    expected.authoredAxisMask = authoredMask;
+    expected.absolute = absolute;
+    expected.feedMMMin = feedMMMin;
+    expected.zOnlyCommissioning = zOnlyCommissioning;
+    expected.xyzOnlyCommissioning = xyzOnlyCommissioning;
+    expected.sparseCommissioning = sparseCommissioning;
+    if (absolute) expected.absoluteTargetMCS = targetMCS;
+    for (unsigned i = 0U; i < 8U; ++i)
     {
-        RejectPathCoreFeedSameThread(8U, AlarmManager::MOTION_GROUP_MAPPING_INTEGRITY);
-        return nullptr;
-    }
-    // Re-resolve independently from the immutable continuous pulse anchor.
-    // The three positional rotaries each apply their own modulo/shortest policy.
-    std::array<double, 6U> startNative{}, startPulse{}, pulsePerUnit{};
-    std::array<double, 3U> modulo{};
-    std::array<bool, 3U> shortest{};
-    for (unsigned i = 0U; i < 6U; ++i)
-    {
+        expected.startMCS[i] = expected.endMCS[i] = authoredStart[i];
+        expected.startPulse[i] = expected.endPulse[i] = geometry.startPulse[i];
+        if (i >= 6U || !(presentMask & (1U << i)))
+        {
+            if (geometry.startPulse[i] != 0.0)
+            {
+                RejectPathCoreFeedSameThread(8U, AlarmManager::MOTION_GROUP_MAPPING_INTEGRITY);
+                return nullptr;
+            }
+            continue;
+        }
         const AxisContext& axis = m_motion.GetAxisContext(static_cast<int>(i));
-        startNative[i] = authoredStart[i];
-        startPulse[i] = geometry.startPulse[i];
-        pulsePerUnit[i] = axis.resolution_PPR / axis.finalLead;
-        if (i >= 3U) { modulo[i - 3U] = axis.rotaryModulo; shortest[i - 3U] = axis.useShortestPath; }
+        expected.pulsePerUnit[i] = axis.resolution_PPR / axis.finalLead;
+        expected.maxVelocityPPS[i] = axis.maxVel_PPS;
+        expected.axisAccTime[i] = axis.G00_acc_time;
+        expected.axisDecTime[i] = axis.G00_dec_time;
+        if (absolute && i >= 3U && axis.axisType == AxisType::ROTARY)
+        {
+            expected.rotaryModulo[i - 3U] = axis.rotaryModulo;
+            expected.rotaryShortestPath[i - 3U] = axis.useShortestPath;
+        }
+        if (!absolute)
+        {
+            expected.deltaNative[i] = programmedWords[i];
+            expected.endMCS[i] = targetMCS[i];
+            if (programmedWords[i] != 0.0)
+                expected.endPulse[i] = expected.startPulse[i] + programmedWords[i] * expected.pulsePerUnit[i];
+        }
     }
     NCXYZCUVAbsoluteFeedTarget resolved{};
-    if (absolute && !TryResolveNCXYZCUVAbsoluteFeedTarget(startNative, startPulse, targetMCS,
-            pulsePerUnit, shortest, modulo, resolved))
+    std::array<double, 6U> startNative{}, startPulse{};
+    for (unsigned i = 0U; i < 6U; ++i) { startNative[i] = authoredStart[i]; startPulse[i] = expected.startPulse[i]; }
+    if (absolute)
     {
-        RejectPathCoreFeedSameThread(8U, AlarmManager::MOTION_GROUP_MAPPING_INTEGRITY);
-        return nullptr;
+        if (!TryResolveNCXYZCUVAbsoluteFeedTarget(source.axisIdentity, startNative, startPulse, targetMCS,
+            expected.pulsePerUnit, expected.rotaryShortestPath, expected.rotaryModulo, resolved, authoredMask))
+        {
+            RejectPathCoreFeedSameThread(8U, AlarmManager::MOTION_GROUP_MAPPING_INTEGRITY);
+            return nullptr;
+        }
+        expected.deltaNative = resolved.deltaNative;
+        for (unsigned i = 0U; i < 6U; ++i)
+        { expected.endMCS[i] = resolved.endMCS[i]; expected.endPulse[i] = resolved.endPulse[i]; }
     }
-    const std::array<double, 6U>& effectiveDelta = absolute ? resolved.deltaNative : programmedWords;
-    const double linearLengthMM = std::hypot(std::hypot(effectiveDelta[0], effectiveDelta[1]), effectiveDelta[2]);
-    const double nominalSeconds = NCZCFeedDetail::ProductRatio(linearLengthMM, 60.0, feedMMMin);
-    double lengthPulse = 0.0, accTime = 0.0, decTime = 0.0;
-    for (unsigned i = 0U; i < 6U; ++i)
-    {
-        const AxisContext& axis = m_motion.GetAxisContext(static_cast<int>(i));
-        lengthPulse = std::hypot(lengthPulse, geometry.endPulse[i] - geometry.startPulse[i]);
-        accTime = NCZCFeedDetail::Maximum(accTime, NCZCFeedDetail::EffectiveTime(axis.G00_acc_time));
-        decTime = NCZCFeedDetail::Maximum(decTime, NCZCFeedDetail::EffectiveTime(axis.G00_dec_time));
-    }
-    const double velocityPPS = NCZCFeedDetail::ProductRatio(lengthPulse, 1.0, nominalSeconds);
-    if (!receipt.xyzcuvFeed || receipt.xyzcFeed || receipt.zcFeed || receipt.rotaryFeed || !receipt.valid || !receipt.commandAccepted ||
-        !receipt.tailCommitted || !receipt.captureBound || !geometry.valid || geometry.axisMask != 63U ||
-        geometry.absolute != absolute ||
-        !FeedTranslationCurrent(CoordSys, receipt.translationGeneration) ||
-        (receipt.validAxisMask & 63U) != 63U || !IsXYZCUVFeedProfileCurrentSameThread() ||
-        FeedDoubleBits(geometry.feedMMMin) != FeedDoubleBits(feedMMMin) ||
-        FeedDoubleBits(geometry.linearLengthMM) != FeedDoubleBits(linearLengthMM) ||
-        FeedDoubleBits(geometry.nominalSeconds) != FeedDoubleBits(nominalSeconds) ||
-        FeedDoubleBits(geometry.lengthPulse) != FeedDoubleBits(lengthPulse) ||
-        FeedDoubleBits(geometry.velocityPPS) != FeedDoubleBits(velocityPPS) ||
-        FeedDoubleBits(geometry.accTime) != FeedDoubleBits(accTime) ||
-        FeedDoubleBits(geometry.decTime) != FeedDoubleBits(decTime) ||
-        !std::isfinite(linearLengthMM) || linearLengthMM <= 0.0 ||
-        !std::isfinite(nominalSeconds) || nominalSeconds <= 0.0 ||
-        !std::isfinite(lengthPulse) || lengthPulse <= 0.0 || !std::isfinite(velocityPPS) || velocityPPS < 1.0 ||
-        receipt.identity.source != MotionCommandSource::NC_MEMORY ||
-        receipt.identity.epoch != m_motion.GetCurrentExecutionEpoch() ||
-        !receipt.ownerLease.Matches(m_programMotionLease))
+    NCXYZCUVFeedLineValue rebuilt{};
+    (void)BuildNCXYZCUVFeedLine(expected, rebuilt);
+    if (absolute) rebuilt.absoluteTargetWCS = programmedWords;
+    if (!receipt.xyzcuvFeed || receipt.eccentricFeed || receipt.xyzcFeed || receipt.zcFeed || receipt.rotaryFeed || !receipt.valid ||
+        !receipt.commandAccepted || !receipt.tailCommitted || !receipt.captureBound ||
+        receipt.validAxisMask != presentMask || !rebuilt.valid || !SameNCXYZCUVFeedLineValue(geometry, rebuilt) ||
+        !FeedTranslationCurrent(CoordSys, receipt.translationGeneration) || !IsXYZCUVFeedProfileCurrentSameThread() ||
+        m_motion.IsRotarySpindleSessionClaimed() || receipt.identity.source != MotionCommandSource::NC_MEMORY ||
+        receipt.identity.epoch != m_motion.GetCurrentExecutionEpoch() || !receipt.ownerLease.Matches(m_programMotionLease))
     {
         RejectPathCoreFeedSameThread(8U, AlarmManager::MOTION_GROUP_MAPPING_INTEGRITY);
         return nullptr;
     }
     for (unsigned i = 0U; i < 8U; ++i)
-    {
-        const double ppu = i < 6U ? pulsePerUnit[i] : 0.0;
-        const bool sparseStatic = sparseCommissioning && i < 6U && effectiveDelta[i] == 0.0;
-        const bool staticAxis = i < 6U && (EDM149::StaticAxis(zOnlyCommissioning,xyzOnlyCommissioning,i) || sparseStatic);
-        const double expectedNative = sparseStatic ? authoredStart[i] :
-            absolute && i < 6U ? resolved.endMCS[i] : m_pathFeedCandidate[i];
-        const double expectedPulse = sparseStatic ? geometry.startPulse[i] : i < 6U ? (absolute ? resolved.endPulse[i] :
-            geometry.startPulse[i] + effectiveDelta[i] * ppu) : geometry.startPulse[i];
-        if (!std::isfinite(geometry.startMCS[i]) || !std::isfinite(geometry.endMCS[i]) ||
-            !std::isfinite(geometry.startPulse[i]) || !std::isfinite(geometry.endPulse[i]) ||
-            FeedDoubleBits(geometry.startMCS[i]) != FeedDoubleBits(authoredStart[i]) ||
-            FeedDoubleBits(geometry.endMCS[i]) != FeedDoubleBits(expectedNative) ||
-            FeedDoubleBits(geometry.endMCS[i]) != FeedDoubleBits(CoordSys.commandedMCS[i]) ||
-            FeedDoubleBits(geometry.endPulse[i]) != FeedDoubleBits(expectedPulse))
+        if (FeedDoubleBits(geometry.endMCS[i]) != FeedDoubleBits(CoordSys.commandedMCS[i]))
         {
             RejectPathCoreFeedSameThread(8U, AlarmManager::MOTION_GROUP_MAPPING_INTEGRITY);
             return nullptr;
         }
-        if (i < 6U)
-        {
-            const double deltaPulse = geometry.endPulse[i] - geometry.startPulse[i];
-            const double directVelocity = NCZCFeedDetail::ProductRatio(std::fabs(deltaPulse), 1.0, nominalSeconds);
-            const double axisVelocity = std::fabs(velocityPPS * (deltaPulse / lengthPulse));
-            const AxisContext& axis = m_motion.GetAxisContext(static_cast<int>(i));
-            if (FeedDoubleBits(geometry.absoluteTargetWCS[i]) != FeedDoubleBits(absolute ? programmedWords[i] : 0.0) ||
-                FeedDoubleBits(geometry.absoluteTargetMCS[i]) != FeedDoubleBits(absolute ? targetMCS[i] : 0.0) ||
-                !CoordSys.IsTargetWithinSoftwareTravelLimit(axis, expectedNative))
-            {
-                RejectPathCoreFeedSameThread(8U, AlarmManager::MOTION_GROUP_MAPPING_INTEGRITY);
-                return nullptr;
-            }
-            if (i >= 3U)
-            {
-                const double rotaryFeedDegMin = NCZCFeedDetail::ProductRatio(std::fabs(effectiveDelta[i]), 60.0, nominalSeconds);
-                if (FeedDoubleBits(geometry.rotaryModulo[i - 3U]) != FeedDoubleBits(absolute ? modulo[i - 3U] : 0.0) ||
-                    geometry.rotaryShortestPath[i - 3U] != (absolute && shortest[i - 3U]) ||
-                    FeedDoubleBits(geometry.rotaryFeedDegMin[i - 3U]) != FeedDoubleBits(rotaryFeedDegMin) ||
-                    !std::isfinite(rotaryFeedDegMin) || (staticAxis ? rotaryFeedDegMin != 0.0 : rotaryFeedDegMin <= 0.0) || rotaryFeedDegMin > 100.0)
-                {
-                    RejectPathCoreFeedSameThread(8U, AlarmManager::MOTION_GROUP_MAPPING_INTEGRITY);
-                    return nullptr;
-                }
-            }
-            if (FeedDoubleBits(geometry.deltaNative[i]) != FeedDoubleBits(effectiveDelta[i]) ||
-                FeedDoubleBits(geometry.pulsePerUnit[i]) != FeedDoubleBits(ppu) ||
-                FeedDoubleBits(geometry.axisVelocityPPS[i]) != FeedDoubleBits(axisVelocity) ||
-                !std::isfinite(deltaPulse) ||
-                (staticAxis ? deltaPulse != 0.0 : std::fabs(deltaPulse) < 1.0e-5) ||
-                !std::isfinite(directVelocity) || (staticAxis ? directVelocity != 0.0 : directVelocity <= 0.0) || directVelocity > axis.maxVel_PPS ||
-                !std::isfinite(axisVelocity) || (staticAxis ? axisVelocity != 0.0 : axisVelocity <= 0.0) || axisVelocity > axis.maxVel_PPS)
-            {
-                RejectPathCoreFeedSameThread(8U, AlarmManager::MOTION_GROUP_MAPPING_INTEGRITY);
-                return nullptr;
-            }
-        }
-    }
     ++m_pathFeed.submitted;
     m_pathFeed.pending = true;
     m_pathFeed.explicitFeed = true;
@@ -1829,10 +1798,21 @@ WaitConditionFunc NCManager::StartPathCoreFeedSameThread(const NCBlock& block)
     const NCAxisIdentitySnapshot& nativeAxes = CoordSys.GetTranslationSnapshot().axisIdentity;
     if (nativeAxes.eccentricEnabled != 0U && CoordSys.GetTranslationSnapshot().toolLengthMode != 49)
         return StartPathCoreEccentricCFeedSameThread(block);
-    // Classify six-axis mixtures before XYZC and Z+C subsets. Standalone
-    // U/V remain on the existing single-rotary lane; partial mixtures reject.
-    if ((block.has('U') || block.has('V')) &&
-        (block.has('X') || block.has('Y') || block.has('Z') || block.has('C') || (block.has('U') && block.has('V'))))
+    // Addressed linear C/U/V components use the same metric and profile as
+    // XYZ. Continuous and positional rotaries retain native degrees.
+    bool auxiliaryWord = false, linearWord = false;
+    unsigned auxiliaryWords = 0U;
+    for (unsigned axis = 0U; axis < 6U; ++axis) if (block.has("XYZCUV"[axis]))
+    {
+        if (axis >= 3U) { auxiliaryWord = true; ++auxiliaryWords; }
+        if (axis < 3U || (nativeAxes.exists[axis] && nativeAxes.nativeUnit[axis] == 1U)) linearWord = true;
+    }
+    // Preserve the existing concurrent XYZ/spindle lane. A positioned native
+    // group claims every installed slot and is rejected while that run owns CUV.
+    const bool needsMixedXYZ = !auxiliaryWord && (block.has('X') || block.has('Y') || block.has('Z')) &&
+        (NCXYZFeedPresentMask(nativeAxes) & ~7U) != 0U && !IsNCXYZFeedAxisScopeValid(nativeAxes) &&
+        !IsRotarySpindleXYZProgramSameThread();
+    if ((auxiliaryWord && (linearWord || auxiliaryWords > 1U)) || needsMixedXYZ)
         return StartPathCoreXYZCUVFeedSameThread(block);
     if (block.has('C') && (block.has('X') || block.has('Y'))) return StartPathCoreXYZCFeedSameThread(block);
     if (block.has('Z') && block.has('C')) return StartPathCoreZCFeedSameThread(block);
@@ -2185,8 +2165,14 @@ void NCManager::CommitPathCoreFeedCaptureSameThread(NCBlockDispatchId dispatchId
     bool sixRatesValid = true, sixAuthorshipCurrent = true;
     if (r.xyzcuvFeed)
     {
-        const bool absolute = CoordSys.GetTranslationSnapshot().distanceMode == 90;
-        if (r.xyzcuv.absolute != absolute || r.xyzcuv.zOnlyCommissioning != IsEDM149ZFeedSameThread() ||
+        const NCTranslationSnapshot& source = CoordSys.GetTranslationSnapshot();
+        const bool absolute = source.distanceMode == 90;
+        const std::uint32_t presentMask = NCXYZFeedPresentMask(source.axisIdentity);
+        std::uint32_t authoredMask = 0U;
+        for (unsigned i = 0U; i < 6U; ++i) if (m_pathFeedProgrammed[i]) authoredMask |= 1U << i;
+        if (r.xyzcuv.axisMask != presentMask || r.validAxisMask != presentMask ||
+            r.xyzcuv.authoredAxisMask != authoredMask || m_motion.IsRotarySpindleSessionClaimed() ||
+            r.xyzcuv.absolute != absolute || r.xyzcuv.zOnlyCommissioning != IsEDM149ZFeedSameThread() ||
             r.xyzcuv.xyzOnlyCommissioning != IsEDM150XYZFeedSameThread() ||
             r.xyzcuv.sparseCommissioning != IsEDM154SparseFeedSameThread()) sixAuthorshipCurrent = false;
         for (unsigned i = 0U; i < 6U; ++i)
@@ -2195,14 +2181,18 @@ void NCManager::CommitPathCoreFeedCaptureSameThread(NCBlockDispatchId dispatchId
                 FeedDoubleBits(r.xyzcuv.absoluteTargetMCS[i]) != FeedDoubleBits(absolute ? m_pathFeedCandidate[i] : 0.0))
                 sixAuthorshipCurrent = false;
             if (i < 3U) continue;
-            const AxisContext& axis = m_motion.GetAxisContext(static_cast<int>(i));
-            if (FeedDoubleBits(r.xyzcuv.rotaryModulo[i - 3U]) != FeedDoubleBits(absolute ? axis.rotaryModulo : 0.0) ||
-                r.xyzcuv.rotaryShortestPath[i - 3U] != (absolute && axis.useShortestPath)) sixAuthorshipCurrent = false;
-            if (!std::isfinite(r.xyzcuv.rotaryFeedDegMin[i - 3U]) ||
-                ((EDM149::StaticAxis(r.xyzcuv.zOnlyCommissioning,r.xyzcuv.xyzOnlyCommissioning,i) ||
-                    (r.xyzcuv.sparseCommissioning && r.xyzcuv.deltaNative[i] == 0.0)) ?
-                r.xyzcuv.rotaryFeedDegMin[i - 3U] != 0.0 : r.xyzcuv.rotaryFeedDegMin[i - 3U] <= 0.0) ||
-                r.xyzcuv.rotaryFeedDegMin[i - 3U] > 100.0) sixRatesValid = false;
+            const bool exists = (presentMask & (1U << i)) != 0U;
+            const bool positional = exists && source.axisIdentity.axisType[i] == 1U;
+            const bool rotaryMoving = exists && source.axisIdentity.nativeUnit[i] == 2U && r.xyzcuv.deltaNative[i] != 0.0;
+            if (positional)
+            {
+                const AxisContext& axis = m_motion.GetAxisContext(static_cast<int>(i));
+                if (FeedDoubleBits(r.xyzcuv.rotaryModulo[i - 3U]) != FeedDoubleBits(absolute ? axis.rotaryModulo : 0.0) ||
+                    r.xyzcuv.rotaryShortestPath[i - 3U] != (absolute && axis.useShortestPath)) sixAuthorshipCurrent = false;
+            }
+            else if (r.xyzcuv.rotaryModulo[i - 3U] != 0.0 || r.xyzcuv.rotaryShortestPath[i - 3U]) sixAuthorshipCurrent = false;
+            const double rate = r.xyzcuv.rotaryFeedDegMin[i - 3U];
+            if (!std::isfinite(rate) || (rotaryMoving ? rate <= 0.0 : rate != 0.0) || rate > 100.0) sixRatesValid = false;
         }
     }
     bool fourAuthorshipCurrent = true;
@@ -2219,7 +2209,7 @@ void NCManager::CommitPathCoreFeedCaptureSameThread(NCBlockDispatchId dispatchId
                 fourAuthorshipCurrent = false;
     }
     const bool feedValueCurrent = r.eccentricFeed ? IsEccentricCFeedReceiptCurrentSameThread() : r.xyzcuvFeed ?
-        (r.xyzcuv.valid && !r.xyzcFeed && !r.zcFeed && !r.rotaryFeed && r.xyzcuv.axisMask == 63U &&
+        (r.xyzcuv.valid && !r.xyzcFeed && !r.zcFeed && !r.rotaryFeed && r.xyzcuv.axisMask == NCXYZFeedPresentMask(CoordSys.GetTranslationSnapshot().axisIdentity) &&
             std::isfinite(r.xyzcuv.feedMMMin) && r.xyzcuv.feedMMMin > 0.0 && r.xyzcuv.feedMMMin <= 100.0 && sixRatesValid && sixAuthorshipCurrent &&
             !m_pathFeed.capturedFeed.valid && !m_cncFeed.selected && !m_cncFeed.active && m_cncFeed.count == 0U &&
             IsNCXYZCUVFeedNeutralFrame(CoordSys.GetTranslationSnapshot()) && IsXYZCUVFeedProfileCurrentSameThread()) : r.xyzcFeed ?
@@ -4332,7 +4322,7 @@ bool NCManager::IsEDM171AirProgramSameThread(int firstPC) const noexcept
             }else if (!IsG76OrbitBlockShapeValid(b,true,CoordSys.isInchMode?20:21)) return false;
         }
         else if (b.gCode==1)
-        { if (!IsPathCoreFeedBlockShapeValid(b,true,CoordSys.isInchMode?20:21,false,CoordSys.activePlane)) return false; }
+        { if (!NCEDMCoordinatedLine384::GeometryShape(b,true,CoordSys.isInchMode?20:21)) return false; }
         else if (b.gCode==2 || b.gCode==3)
         { if (b.has('P') || !IsPathCoreArcBlockShapeValid(b,true,CoordSys.isInchMode?20:21,false,CoordSys.activePlane)) return false; }
         else return false;

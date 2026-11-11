@@ -5,19 +5,23 @@
 namespace EDMGapInput { struct Profile; }
 class EtherCatMaster;
 
-// EDM379 v1: telemetry has no motion, output, alarm or discharge authority.
+// EDM379 v2: telemetry has no motion, output, alarm or discharge authority.
 // Windows opens DATA read-only. CONTROL is a separate, bounded observation
 // lease; its fields are never read by the servo callback.
 namespace MachiningScope379
 {
 constexpr std::uint32_t DataMagic=0x39504353U, ControlMagic=0x39434353U;
-constexpr std::uint32_t Version=1U, Capacity=8192U;
+constexpr std::uint32_t Version=2U, Capacity=8192U;
 constexpr std::uint64_t LeaseNs=2000000000ULL;
 enum : std::uint32_t { Idle=0U, Active=1U, Stopped=2U, LeaseExpired=3U, Rejected=4U };
 enum : std::uint32_t { PdoValid=1U, AxisValid=2U, GapValid=4U, TimestampValid=8U, Rotary=16U };
 // EDM380 optional extension in the v1 reserved tail. Zero capability means
 // unknown; NC RUN is never interpreted as an EDM feed or energized output.
-constexpr std::uint64_t ProcessStateCapability=1ULL;
+constexpr std::uint64_t ProcessStateCapability=1ULL,EdmDetailsCapability=2ULL;
+constexpr std::uint32_t EdmValid=1U,GainRegionValid=2U,E5TimerValid=4U,
+    E5Eligible=8U,E5GateLatched=16U,E5GateAllow=32U,E5ShortBlocked=64U,E5Pending=128U,
+    EdmSuspended=256U,PeriodicFlushActive=512U,E5Mode1=1024U,FlushPhysicalMotion=2048U,
+    CoreForwardEligible=4096U,FlushEnabled=8192U,EdmFlagsMask=16383U;
 constexpr std::uint32_t ProcessValid=1U,ProcessSourceMode=0x100U,
     ProcessSourceRt=0x200U,ProcessSourceNc=0x300U,ProcessMaximumAgeUs=100000U;
 enum class ProcessPhase : std::uint32_t { Unknown=0U,Idle=1U,Machining=2U,
@@ -51,6 +55,13 @@ struct alignas(8) Record
     double gapVoltage,gapReferenceVoltage,gapBoardVoltage;
     std::int32_t gapRaw;
     std::uint32_t gapReason,gapSource,processPhase,processFlags,processAgeUs;
+    // v2 tail: same-callback RT evidence. Event times share the core's
+    // monotonic microsecond clock; they are not the earlier PDO receipt QPC.
+    std::int32_t gainRegion;
+    std::uint32_t edmFlags;
+    std::uint64_t parentSession,curveTick,edmNowUs,e5ElapsedUs,e5TargetUs,e5StartUs,e5DueUs;
+    std::uint64_t flushAcceptedUs,flushMotionUs,e5RequestSequence;
+    double filteredGapVoltage;
 };
 struct alignas(8) Data { Header header; Record records[Capacity]; };
 struct alignas(8) Control
@@ -60,11 +71,16 @@ struct alignas(8) Control
     std::uint32_t sequence,enabled,axisIndex,periodTicks;
     std::uint64_t heartbeat,requestId,echoBootId,echoOwnerToken,reserved[6];
 };
-static_assert(sizeof(Header)==256U && sizeof(Record)==160U && sizeof(Data)==1310976U && sizeof(Control)==128U,"Scope v1 ABI size");
-static_assert(offsetof(Header,sequence)==40U && offsetof(Header,requestId)==88U && offsetof(Record,gapVoltage)==112U && offsetof(Control,ownerToken)==24U && offsetof(Control,echoOwnerToken)==72U,"Scope v1 ABI offsets");
+static_assert(sizeof(Header)==256U && sizeof(Record)==256U && sizeof(Data)==2097408U && sizeof(Control)==128U,"Scope v2 ABI size");
+static_assert(offsetof(Header,sequence)==40U && offsetof(Header,requestId)==88U && offsetof(Record,gapVoltage)==112U && offsetof(Control,ownerToken)==24U && offsetof(Control,echoOwnerToken)==72U,"Scope v2 unchanged prefix ABI offsets");
 static_assert(std::is_trivially_copyable<Record>::value,"Fixed telemetry payload");
 static_assert(offsetof(Header,reserved)==96U && offsetof(Record,processPhase)==148U &&
     offsetof(Record,processFlags)==152U && offsetof(Record,processAgeUs)==156U,"EDM380 optional process-state offsets");
+static_assert(offsetof(Record,gainRegion)==160U&&offsetof(Record,edmFlags)==164U&&
+    offsetof(Record,parentSession)==168U&&offsetof(Record,curveTick)==176U&&offsetof(Record,edmNowUs)==184U&&
+    offsetof(Record,e5ElapsedUs)==192U&&offsetof(Record,e5TargetUs)==200U&&offsetof(Record,e5StartUs)==208U&&
+    offsetof(Record,e5DueUs)==216U&&offsetof(Record,flushAcceptedUs)==224U&&offsetof(Record,flushMotionUs)==232U&&
+    offsetof(Record,e5RequestSequence)==240U&&offsetof(Record,filteredGapVoltage)==248U,"Scope v2 RT evidence offsets");
 inline bool ValidPeriod(std::uint32_t ticks) noexcept
 { return ticks==1U || ticks==2U || ticks==4U || ticks==8U || ticks==20U; }
 

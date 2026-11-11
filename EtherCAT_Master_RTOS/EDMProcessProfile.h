@@ -3,6 +3,7 @@
 #include "EDMGapServo.h"
 #include "EDMFlushPlan.h"
 #include "EDMAxisGainProfiles.h"
+#include "EDME5WorkTimer386.h"
 #include <cmath>
 #include <cstdint>
 
@@ -22,6 +23,8 @@ namespace EDM20
         // this separate leaves the ordinary cutting/short-retreat curve intact.
         double orbitScaleMmPerVoltMin = 0.010;
         FlushProfile flush{};
+        // EDM386: independent E5 interval qualification; not the E9 servo target.
+        EDM386E5::Profile e5WorkTimer{};
         AxisGainProfiles axisGains{};
     };
 
@@ -32,6 +35,7 @@ namespace EDM20
             profile.servo.revision == profile.revision &&
             EDMGapServo::ValidateProfile(profile.servo) &&
             std::isfinite(profile.orbitScaleMmPerVoltMin) && profile.orbitScaleMmPerVoltMin >= 0.001 &&
-            ValidateFlushProfile(profile.flush) && ValidateAxisGainProfiles(profile.axisGains);
+            ValidateFlushProfile(profile.flush) && EDM386E5::Valid(profile.e5WorkTimer) &&
+            ValidateAxisGainProfiles(profile.axisGains);
     }
 }

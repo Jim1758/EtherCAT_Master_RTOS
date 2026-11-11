@@ -41,6 +41,8 @@ private:
 
     // NC -> PLC 
     void UpdateCollisionProtectionSameThread() noexcept;
+    void UpdateHmiManualShortRelease(bool plcBypass) noexcept;
+    bool m_hmiManualShortWasActive = false;
     bool ApplyManualCollisionGateSameThread(bool mpgInputSelected) noexcept;
     void SyncNCStateToPLC();          // 將 NC / Motion 目前狀態同步回 PLC S Point。
 

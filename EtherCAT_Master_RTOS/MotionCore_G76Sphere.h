@@ -5,6 +5,10 @@
 #include "NCG76SphereGapProcess.h"
 #include "MotionExecutionContract.h"
 #include "MotionServoHandoffDiagnostic.h"
+#include "EDMCoordinatedAxes384.h"
+// EDM386_GAP_FAULT_TRACE_BEGIN
+#include "EDMGapPhysicalSource.h"
+// EDM386_GAP_FAULT_TRACE_END
 #include <array>
 #include <cstdint>
 #include <cmath>
@@ -48,6 +52,34 @@ inline bool CommandPulse(double native,double referenceNative,double referencePu
         !SameBits(native,referenceNative))return false;
     pulse=referencePulse;return true;
 }
+// EDM384: a moving native auxiliary axis retains its accepted pulse origin.
+// Modulo spelling belongs to admission, never to interpolation. This helper
+// adds no motion permission and checks pulse rounding against the admitted
+// native coordinate error budget, never against a servo arrival window.
+inline bool CommandPulseRelative(double native,double referenceNative,double referencePulse,
+    double ppu,double& pulse,double maximumNativeError=1.e-9) noexcept
+{
+    if(!std::isfinite(native)||!std::isfinite(referenceNative)||!std::isfinite(referencePulse)||
+       !std::isfinite(ppu)||ppu<=0.0||!std::isfinite(maximumNativeError)||maximumNativeError<0.0)return false;
+    if(SameBits(native,referenceNative)){pulse=referencePulse;return true;}
+    const double nativeDelta=native-referenceNative;
+    const double requestedDelta=nativeDelta*ppu;
+    const double candidate=referencePulse+requestedDelta;
+    const double representedDelta=candidate-referencePulse;
+    if(!std::isfinite(nativeDelta)||nativeDelta==0.0||!std::isfinite(requestedDelta)||
+       (requestedDelta==0.0&&nativeDelta!=0.0)||!std::isfinite(candidate)||!std::isfinite(representedDelta)||
+       (representedDelta!=0.0&&(representedDelta<0.0)!=(requestedDelta<0.0)))return false;
+    // The entire path's admitted native error budget also covers sub-tick
+    // quantization at a large continuous pulse origin. A smaller-than-ULP
+    // sub-tick may legitimately send the same pulse; it must not acquire a
+    // per-increment relative-error test or silently exceed the path budget.
+    const double pulseError=representedDelta-requestedDelta;
+    const double nativeError=std::fabs(pulseError/ppu);
+    const double reconstructed=referenceNative+representedDelta/ppu;
+    if(!std::isfinite(pulseError)||!std::isfinite(nativeError)||nativeError>maximumNativeError||
+       !std::isfinite(reconstructed)||std::fabs(reconstructed-native)>maximumNativeError)return false;
+    pulse=candidate;return true;
+}
 }
 
 // EDM293: software NIC-handoff evidence for the SIM-only observer. This is
@@ -56,22 +88,33 @@ namespace MotionG76SphereProcessSend
 {
 inline bool ExactNonzeroSend(const MotionServoHandoffSample& sample,
     MotionExecutionEpoch epoch,const MotionOwnerLease& owner,std::uint32_t mask,
-    std::uint64_t tick,bool physicalZManual=false) noexcept
+    std::uint64_t tick,bool physicalZManual=false,
+    std::uint32_t nominalMovingMask=0xffffffffU) noexcept
 {
-    if(!epoch||!owner.IsValid()||mask!=(physicalZManual?0x07U:0x3FU)||!tick||!sample.sequence||!sample.frameGeneration||
+    (void)physicalZManual; // Mode/source authority is checked by the parent adapter.
+    const bool allowedMask=(mask&7U)==7U&&(mask&~0x3fU)==0U;
+    // Old callers prove moving XYZ only. New mixed-axis callers explicitly
+    // identify this tick's nonzero nominal velocity axes; a PID holding
+    // correction on a fixed axis must not earn discharge-work time.
+    const std::uint32_t moving=nominalMovingMask==0xffffffffU?(mask&7U):nominalMovingMask;
+    if(!epoch||!owner.IsValid()||!allowedMask||!moving||(moving&~mask)!=0U||!tick||!sample.sequence||!sample.frameGeneration||
        sample.sourceTick!=tick||sample.epoch!=epoch||sample.owner!=static_cast<std::uint32_t>(owner.owner)||
        sample.ownerGeneration!=owner.generation||sample.idleScope||sample.scrubbed||
        !sample.finalChecked||!sample.attempted||!sample.apiAccepted||
-       sample.slotMask!=mask||(sample.observedMask&mask)!=mask||
-       (sample.sourceInputMask&mask)!=mask)return false;
+       (sample.slotMask&~0xffU)!=0U||(sample.slotMask&mask)!=mask||
+       (sample.observedMask&mask)!=mask||(sample.sourceInputMask&mask)!=mask)return false;
     bool nonzero=false;
-    for(unsigned axis=0U;axis<(physicalZManual?3U:6U);++axis){
+    // The physical PDO frame may contain logically disabled drives. Its slot
+    // mask is a superset of this parent's installed logical axes; those extra
+    // slots must still carry zero proposed/copied velocity, never work credit.
+    for(unsigned axis=0U;axis<8U;++axis){
+        if(!(mask&(1U<<axis))){
+            if(sample.proposedVelocity[axis]!=0||sample.copiedVelocity[axis]!=0)return false;
+            continue;
+        }
         if((sample.sourceStatusWord[axis]&0x006FU)!=0x0027U||sample.sourceMode[axis]!=9||
            sample.proposedVelocity[axis]!=sample.copiedVelocity[axis])return false;
-        if(axis<3U)nonzero=nonzero||sample.copiedVelocity[axis]!=0;
-        // Fixed rotary axes may need CSV holding corrections from the existing
-        // position PID. The caller proves their nominal targets/velocities are
-        // fixed; a nonzero correction is not a rotary-spindle command.
+        if(moving&(1U<<axis))nonzero=nonzero||sample.copiedVelocity[axis]!=0;
     }
     return nonzero;
 }
@@ -342,6 +385,22 @@ struct MotionG76SphereInputDiagnostic
     std::int8_t axis=-1,mode=0;
     bool valid=false;
 };
+// EDM386_GAP_FAULT_TRACE_BEGIN
+// First-fault data copied before cancellation. Never a source of permission.
+// Conversion is recomputed by P50 from these immutable values, outside RT.
+struct MotionG76SphereGapInputFault
+{
+    EDMAnalogInput::Snapshot sample{};
+    EDMGapInput::Profile profile{};
+    std::uint64_t adapterSequence=0ULL,adapterCapturedUs=0ULL;
+    std::uint64_t frameSequence=0ULL,frameCapturedUs=0ULL;
+    EDM63::State adapterState=EDM63::State::AwaitBegin;
+    EDM63::Reason adapterReason=EDM63::Reason::AwaitBegin;
+    bool captured=false,readSucceeded=false,profileConfigured=false,sourceReady=false;
+};
+static_assert(sizeof(MotionG76SphereGapInputFault)<=320U,"First GAP fault must remain bounded.");
+static_assert(std::is_trivially_copyable<MotionG76SphereGapInputFault>::value,"GAP fault must be plain data.");
+// EDM386_GAP_FAULT_TRACE_END
 static_assert(sizeof(MotionG76SphereInputDiagnostic)<=128U,"P50 first input fault must remain a bounded small value.");
 static_assert(std::is_trivially_copyable<MotionG76SphereInputDiagnostic>::value,"P50 input diagnostics must remain POD transport data.");
 inline const char* MotionG76SphereInputStageName(MotionG76SphereInputStage stage) noexcept
@@ -400,10 +459,28 @@ struct MotionG76SphereFeedback
     NCG76SphereRuntimeGeometry::Kind nominalKind=NCG76SphereRuntimeGeometry::Kind::Sphere;
     std::uint32_t runtimeFault=0U;
     MotionG76SphereInputDiagnostic firstInputFault{};
+    // EDM386_GAP_FAULT_TRACE_BEGIN
+    MotionG76SphereGapInputFault firstGapInputFault{};
+    // EDM386_GAP_FAULT_TRACE_END
     std::uint32_t inputValidAxisMask=0U;
     bool accepted=false,started=false,terminal=false,completed=false,endpointCommitted=false;
     // RT receipt: deadline braking, physical zero settle and group retirement all succeeded.
     bool timeLimitStopped=false;
+    std::uint64_t transportPauseTick=0ULL,transportResumeTick=0ULL;
+    std::uint32_t transportPauseCount=0U,transportRetryCount=0U;
+    std::uint64_t transportLastRetryTick=0ULL,transportPauseBudgetUs=0ULL;
+    // Historical last-valid collision observation captured before a loss.
+    // The sample flag never asserts that GAP is valid in the missing exchange.
+    std::uint64_t transportLastValidTick=0ULL;
+    std::int32_t transportLastValidGapMv=0;
+    bool transportLastValidShort=false,transportLastValidSample=false;
+    bool transportShortBlocked=false,transportBudgetExpired=false;
+    bool transportPaused=false;
+    // Separate RT receipts; birth process generation and physical PID banks stay immutable.
+    std::uint64_t liveCurveTuningGeneration=0ULL,liveFlushTuningGeneration=0ULL;
+    // Distinct receipts: immediate recipe/curve, whole flush configuration,
+    // and G76 criteria. They never replace birth geometry/source authority.
+    std::uint64_t liveRecipeSequence=0ULL,liveFlushRecipeSequence=0ULL,liveOrbitRecipeSequence=0ULL;
 };
 static_assert(sizeof(MotionG76SphereFeedback)<=2048U,"P50 diagnostics must fit the existing bounded feedback channel.");
 
@@ -434,6 +511,9 @@ inline bool CompletedEndpointQualified(const MotionG76SphereFeedback& report,
         if(!TimedCompletionEndpointMatches(report,request)||f.completedLayers>g.circleLayerCount)return false;
     }else if(f.completedLayers!=g.circleLayerCount||
         std::memcmp(report.endpointMCS.data(),g.endMCS.data(),sizeof(report.endpointMCS))!=0)return false;
+    const auto& identity=g.frame.translation.axisIdentity;
+    if(!IsNCAxisIdentitySnapshotValid(identity)||(EDM384Axes::ExistingMask(identity)&7U)!=7U||
+       identity.exists[6]||identity.exists[7])return false;
     for(unsigned a=0U;a<8U;++a){
         const double endpoint=report.endpointMCS[a],actual=report.actualMCS[a];
         if(!std::isfinite(endpoint)||!std::isfinite(actual)||
@@ -442,8 +522,17 @@ inline bool CompletedEndpointQualified(const MotionG76SphereFeedback& report,
            g.boundsMinMCS[a]>g.boundsMaxMCS[a]||endpoint<g.boundsMinMCS[a]||endpoint>g.boundsMaxMCS[a])return false;
         if((request.travelMask&(1U<<a))&&(!std::isfinite(request.travelMin[a])||!std::isfinite(request.travelMax[a])||
            request.travelMin[a]>request.travelMax[a]||endpoint<request.travelMin[a]||endpoint>request.travelMax[a]))return false;
-        if(a>=3U&&!MotionG76SphereFixedAxes::SameBits(endpoint,g.startMCS[a]))return false;
-        const double tolerance=a<3U?request.positionToleranceMm:request.rotaryToleranceDeg;
+        const bool present=a<6U&&identity.exists[a]==1U;
+        if(!present){
+            if(!MotionG76SphereFixedAxes::SameBits(endpoint,g.startMCS[a])||
+               !MotionG76SphereFixedAxes::SameBits(actual,endpoint))return false;
+            continue;
+        }
+        // Only an admitted coordinated line can move auxiliary native axes.
+        // Arcs/orbit parents retain their existing fixed auxiliary geometry.
+        if(a>=3U&&g.kind!=NCG76SphereRuntimeGeometry::Kind::Line&&
+           !MotionG76SphereFixedAxes::SameBits(endpoint,g.startMCS[a]))return false;
+        const double tolerance=identity.nativeUnit[a]==1U?request.positionToleranceMm:request.rotaryToleranceDeg;
         if(!std::isfinite(tolerance)||tolerance<=0.0||std::fabs(actual-endpoint)>tolerance)return false;
     }
     return true;

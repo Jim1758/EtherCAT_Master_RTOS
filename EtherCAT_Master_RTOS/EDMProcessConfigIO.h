@@ -174,6 +174,33 @@ namespace EDMProcessConfigIO
             AddReal(rules, "Flush.InitialSlowDistanceMm", profile.flush.initialSlowDistanceMm);
             AddReal(rules, "Flush.AccelerationTimeSeconds", profile.flush.accelerationTimeSeconds);
             AddReal(rules, "Flush.DecelerationTimeSeconds", profile.flush.decelerationTimeSeconds);
+            AddReal(rules, "Flush.SettleTimeSeconds", profile.flush.settleTimeSeconds);
+            for(unsigned axis=0U;axis<6U;++axis) {
+                const std::string name="Flush."+std::string(1U,"XYZCUV"[axis]);
+                AddReal(rules,name+"AccelerationTimeSeconds",profile.flush.axisAccelerationTimeSeconds[axis]);
+                AddReal(rules,name+"DecelerationTimeSeconds",profile.flush.axisDecelerationTimeSeconds[axis]);
+            }
+            // Optional native EDM ceilings. For signed EDM, zero/missing adds
+            // no mode acceleration cap; positive values are independent of
+            // G00/Stop times. MAX_Speed and coordinated geometry still apply.
+            for(unsigned axis=0U;axis<6U;++axis) {
+                const std::string name="MachiningAxisLimits."+std::string(1U,"XYZCUV"[axis]);
+                AddReal(rules,name+"MaxAcceleration",profile.flush.axisModeLimits.machiningAcceleration[axis]);
+                AddReal(rules,name+"MaxDeceleration",profile.flush.axisModeLimits.machiningDeceleration[axis]);
+            }
+            for(unsigned axis=0U;axis<6U;++axis) {
+                const std::string name="FlushAxisLimits."+std::string(1U,"XYZCUV"[axis]);
+                AddReal(rules,name+"MaxAcceleration",profile.flush.axisModeLimits.flushAcceleration[axis]);
+                AddReal(rules,name+"MaxDeceleration",profile.flush.axisModeLimits.flushDeceleration[axis]);
+            }
+            // EDM386: optional independent E5 GAP-voltage qualification. Old
+            // schema-2 documents retain Mode0 and the profile's initial values.
+            AddUnsigned(rules,"E5WorkTimer.Mode",profile.e5WorkTimer.mode,0U,1U);
+            AddReal(rules,"E5WorkTimer.GapLowVoltageV",profile.e5WorkTimer.gapLowVoltageV);
+            AddReal(rules,"E5WorkTimer.GapHighVoltageV",profile.e5WorkTimer.gapHighVoltageV);
+            AddUnsigned(rules,"E5WorkTimer.GapFilterTimeMs",profile.e5WorkTimer.gapFilterTimeMs);
+            AddUnsigned(rules,"E5WorkTimer.StartConfirmTimeMs",profile.e5WorkTimer.startConfirmTimeMs);
+            AddUnsigned(rules,"E5WorkTimer.AbnormalGapPauseTimeMs",profile.e5WorkTimer.abnormalGapPauseTimeMs);
             return rules;
         }
 
@@ -331,6 +358,14 @@ namespace EDMProcessConfigIO
                 return Detail::Fail(diagnostic, path, lineNumber + 1U,
                     acceleration.found ? deceleration.name : acceleration.name,
                     "flush acceleration and deceleration keys must both be present or both absent");
+            for(unsigned axis=0U;axis<6U;++axis) {
+                const std::string prefix="Flush."+std::string(1U,"XYZCUV"[axis]);
+                const Detail::Rule& a=rules[lookup[prefix+"AccelerationTimeSeconds"]];
+                const Detail::Rule& d=rules[lookup[prefix+"DecelerationTimeSeconds"]];
+                if(a.found!=d.found)return Detail::Fail(diagnostic,path,lineNumber+1U,
+                    a.found?d.name:a.name,"each axis flush acceleration and deceleration pair must both be present or both absent");
+                if(a.found)candidate.flush.axisRampMask=static_cast<std::uint8_t>(candidate.flush.axisRampMask|(1U<<axis));
+            }
         }
         for (std::size_t index = 0U; index < rules.size(); ++index)
             if (!rules[index].found) {
@@ -339,8 +374,19 @@ namespace EDMProcessConfigIO
                 if (document == Detail::DocumentKind::Process && rules[index].name == "Servo.OrbitScaleMmPerVoltMin")
                     candidate.orbitScaleMmPerVoltMin = candidate.servo.cuttingScaleMmPerVoltMin;
                 else if (document == Detail::DocumentKind::Process &&
+                    (rules[index].name.compare(0U,20U,"MachiningAxisLimits.")==0 ||
+                     rules[index].name.compare(0U,16U,"FlushAxisLimits.")==0 ||
+                     rules[index].name.compare(0U,12U,"E5WorkTimer.")==0))
+                    continue;
+                else if (document == Detail::DocumentKind::Process &&
                     (rules[index].name == "Flush.AccelerationTimeSeconds" ||
-                        rules[index].name == "Flush.DecelerationTimeSeconds"))
+                        rules[index].name == "Flush.DecelerationTimeSeconds" || rules[index].name == "Flush.SettleTimeSeconds" ||
+                        rules[index].name == "Flush.XAccelerationTimeSeconds" || rules[index].name == "Flush.XDecelerationTimeSeconds" ||
+                        rules[index].name == "Flush.YAccelerationTimeSeconds" || rules[index].name == "Flush.YDecelerationTimeSeconds" ||
+                        rules[index].name == "Flush.ZAccelerationTimeSeconds" || rules[index].name == "Flush.ZDecelerationTimeSeconds" ||
+                        rules[index].name == "Flush.CAccelerationTimeSeconds" || rules[index].name == "Flush.CDecelerationTimeSeconds" ||
+                        rules[index].name == "Flush.UAccelerationTimeSeconds" || rules[index].name == "Flush.UDecelerationTimeSeconds" ||
+                        rules[index].name == "Flush.VAccelerationTimeSeconds" || rules[index].name == "Flush.VDecelerationTimeSeconds"))
                     continue;
                 else return Detail::Fail(diagnostic, path, lineNumber + 1U, rules[index].name, "required key is missing");
             }
@@ -358,6 +404,8 @@ namespace EDMProcessConfigIO
             !std::isfinite(candidate.servo.shortMachiningV + candidate.servo.shortHysteresisV))
             return Detail::Fail(diagnostic, path, rules[lookup["ShortCircuit.HysteresisV"]].line,
                 "ShortCircuit.HysteresisV", "threshold plus hysteresis must remain finite");
+        if(!EDM386E5::Valid(candidate.e5WorkTimer))
+            return Detail::Fail(diagnostic,path,0U,"E5WorkTimer","invalid E5 timer mode, voltage range or time setting");
         if (!EDM20::ValidateProcessProfile(candidate))
             return Detail::Fail(diagnostic, path, 0U, "Profile", "profile cross-field validation failed");
         out = candidate;

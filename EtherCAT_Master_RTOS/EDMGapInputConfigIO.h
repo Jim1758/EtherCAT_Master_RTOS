@@ -7,14 +7,17 @@
 
 // EDM18 boot-thread-only file loading. Never call LoadFile from NC/RT service.
 // Parsing has bounded fixed storage and commits the complete profile only once
-// every required key and all semantic constraints have passed. No defaults.
+// every required key and all semantic constraints have passed. In station mode
+// ExpectedDeviceId is an optional additional guard; omission means no guard.
 namespace EDMGapInputConfigIO
 {
     constexpr std::size_t MaximumFileBytes = 4096U;
     constexpr std::size_t MaximumLineBytes = 256U;
     constexpr std::size_t MaximumLines = 128U;
     constexpr std::size_t Schema1KeyCount = 22U;
-    constexpr std::size_t KeyCount = 25U;
+    constexpr std::size_t Schema2KeyCount = 25U;
+    constexpr std::size_t KeyCount = 27U;
+    static_assert(KeyCount <= 32U, "Key presence mask must cover every key.");
 
     enum class Error : std::uint8_t
     {
@@ -58,7 +61,8 @@ namespace EDMGapInputConfigIO
                 "SchemaVersion", "ProfileRevision", "Source", "AdIndex", "ExpectedDeviceId", "CalibrationRevision",
                 "CalibrationConfirmed", "RawMin", "RawMax", "BoardMvAtMin", "BoardMvAtMax", "VoltageGain",
                 "VoltageOffsetMv", "MinMv", "MaxMv", "LowEnterMv", "LowExitMv", "HighExitMv", "HighEnterMv",
-                "MaxAgeMs", "DwellMs", "SimulationMv", "CalibrationRawMin", "CalibrationRawMax", "ZeroClampBoardUv"
+                "MaxAgeMs", "DwellMs", "SimulationMv", "CalibrationRawMin", "CalibrationRawMax", "ZeroClampBoardUv",
+                "StationNumber", "AdChannel"
             };
             return index < KeyCount ? names[index] : "";
         }
@@ -145,6 +149,8 @@ namespace EDMGapInputConfigIO
             case 22U: p.calibrationRawMin = static_cast<std::int32_t>(n); break;
             case 23U: p.calibrationRawMax = static_cast<std::int32_t>(n); break;
             case 24U: p.zeroClampBoardUv = static_cast<std::uint32_t>(n); break;
+            case 25U: p.stationNumber = static_cast<std::uint32_t>(n); break;
+            case 26U: p.adIndex = static_cast<std::uint32_t>(n); break;
             default: break;
             }
         }
@@ -227,12 +233,33 @@ namespace EDMGapInputConfigIO
         }
         // Defer schema-specific key checks until all lines have been read so
         // SchemaVersion may appear anywhere without changing acceptance.
+        const bool stationPresent = (seen & (1U << 25U)) != 0U;
+        const bool channelPresent = (seen & (1U << 26U)) != 0U;
+        const bool stationSelection = stationPresent || channelPresent;
+        if (stationSelection)
+        {
+            if (!stationPresent) return Detail::Fail(diagnostic, Error::MissingKey, 0U, "StationNumber");
+            if (!channelPresent) return Detail::Fail(diagnostic, Error::MissingKey, 0U, "AdChannel");
+            if ((seen & (1U << 3U)) != 0U)
+                return Detail::Fail(diagnostic, Error::Format, keyLines[3U], "AdIndex");
+            if (candidate.schemaVersion != 2U)
+                return Detail::Fail(diagnostic, Error::UnknownKey, keyLines[25U], "StationNumber");
+            if (candidate.stationNumber == 0U || candidate.stationNumber > 128U)
+                return Detail::Fail(diagnostic, Error::Profile, keyLines[25U], "StationNumber");
+            if (candidate.adIndex == 0U || candidate.adIndex > 64U)
+                return Detail::Fail(diagnostic, Error::Profile, keyLines[26U], "AdChannel");
+        }
         for (std::size_t i = 0U; i < Schema1KeyCount; ++i)
+        {
+            // New selectors replace legacy AdIndex. Device identity may still
+            // be supplied as an optional additional station-mode guard.
+            if (stationSelection && (i == 3U || i == 4U)) continue;
             if ((seen & (1U << static_cast<unsigned int>(i))) == 0U)
                 return Detail::Fail(diagnostic, Error::MissingKey, 0U, Detail::Key(i));
+        }
         if (candidate.schemaVersion != 1U && candidate.schemaVersion != 2U)
             return Detail::Fail(diagnostic, Error::Profile, 0U, "PROFILE");
-        for (std::size_t i = Schema1KeyCount; i < KeyCount; ++i)
+        for (std::size_t i = Schema1KeyCount; i < Schema2KeyCount; ++i)
         {
             const bool present = (seen & (1U << static_cast<unsigned int>(i))) != 0U;
             if (candidate.schemaVersion == 1U && present)

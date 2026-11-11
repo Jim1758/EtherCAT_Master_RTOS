@@ -10,9 +10,9 @@
 #include <limits>
 #include <type_traits>
 
-// BASE73/74: independent G90/G91 XYZ+C+U+V immutable geometry. F is the XYZ linear path
-// rate in mm/min; degrees never enter that path length. All six explicit native
-// increments must move. One pulse-space scalar and one acceleration profile
+// EDM384: optional mixed-native G90/G91 XYZ+C+U+V immutable geometry. F is
+// the configured linear-axis path rate in mm/min; degrees never enter length.
+// Fixed present and absent axes are legal. One pulse-space scalar and one profile
 // give every selected axis the same progress. Building this value grants no
 // source, ownership, travel, capture, replay, or live Motion permission.
 // G91 retains full authored C/U/V increments. G90 independently verifies one
@@ -61,6 +61,9 @@ struct NCXYZCUVFeedLineInput
     bool zOnlyCommissioning = false;
     bool xyzOnlyCommissioning = false;
     bool sparseCommissioning = false;
+    // 0xffffffff retains the original all-present-addresses contract. New
+    // sources freeze their actual authored native axis words independently.
+    std::uint32_t authoredAxisMask=0xffffffffU;
 };
 
 struct NCXYZCUVFeedLineValue
@@ -82,6 +85,7 @@ struct NCXYZCUVFeedLineValue
     bool xyzOnlyCommissioning = false;
     bool sparseCommissioning = false;
     bool valid = false;
+    std::uint32_t authoredAxisMask=0U;
 
     void Clear() noexcept
     {
@@ -96,7 +100,7 @@ struct NCXYZCUVFeedLineValue
         zOnlyCommissioning = false;
         xyzOnlyCommissioning = false;
         sparseCommissioning = false;
-        valid = false;
+        valid = false; authoredAxisMask=0U;
     }
 };
 
@@ -169,7 +173,8 @@ namespace NCXYZCUVFeedDetail
 
 // Disjoint caller-owned input/output; every rejection clears the entire value.
 // Sparse references are admitted only by a disjoint dry commissioning flag.
-// The default six-axis G90/G91 contract remains strict; no allocation is used.
+// Normal G90/G91 permits configured sparse/fixed axes; the named dry
+// commissioning patterns retain their separate strict contracts. No allocation.
 inline NCXYZCUVFeedLineCode BuildNCXYZCUVFeedLine(
     const NCXYZCUVFeedLineInput& input, NCXYZCUVFeedLineValue& output) noexcept
 {
@@ -177,11 +182,21 @@ inline NCXYZCUVFeedLineCode BuildNCXYZCUVFeedLine(
     output.Clear();
     const NCAxisIdentitySnapshot& identity = input.axisIdentity;
     if (!IsNCAxisIdentitySnapshotValid(identity)) return Code::INVALID_AXIS_IDENTITY;
-    for (unsigned axis = 0U; axis < 6U; ++axis)
-        if (identity.exists[axis] != 1U || identity.axisType[axis] != (axis >= 3U ? 1U : 0U) ||
-            identity.nativeUnit[axis] != (axis >= 3U ? 2U : 1U) || identity.address[axis] != "XYZCUV"[axis])
+    if(identity.exists[6]||identity.exists[7])return Code::INVALID_AXIS_IDENTITY;
+    std::uint32_t presentMask=0U;
+    const bool commissioning=input.zOnlyCommissioning||input.xyzOnlyCommissioning||input.sparseCommissioning;
+    for(unsigned axis=0U;axis<6U;++axis){
+        if(axis<3U&&(identity.exists[axis]!=1U||identity.axisType[axis]!=0U))return Code::INVALID_AXIS_IDENTITY;
+        if(identity.exists[axis]){
+            if(identity.address[axis]!="XYZCUV"[axis])return Code::INVALID_AXIS_IDENTITY;
+            presentMask|=1U<<axis;
+        }
+        if(commissioning&&(identity.exists[axis]!=1U||identity.axisType[axis]!=(axis<3U?0U:1U)))
             return Code::INVALID_AXIS_IDENTITY;
-    if (input.axisMask != 0x3fU) return Code::INVALID_AXIS_MASK;
+    }
+    if(input.axisMask!=presentMask)return Code::INVALID_AXIS_MASK;
+    const std::uint32_t authoredMask=input.authoredAxisMask==0xffffffffU?presentMask:input.authoredAxisMask;
+    if((authoredMask&~presentMask)!=0U)return Code::INVALID_AXIS_MASK;
     if ((static_cast<unsigned>(input.zOnlyCommissioning) + static_cast<unsigned>(input.xyzOnlyCommissioning) +
         static_cast<unsigned>(input.sparseCommissioning) > 1U) ||
         (input.sparseCommissioning && (input.absolute ||
@@ -194,9 +209,9 @@ inline NCXYZCUVFeedLineCode BuildNCXYZCUVFeedLine(
         return Code::INVALID_FEED;
     for (unsigned axis = 0U; axis < 6U; ++axis)
     {
-        if (!std::isfinite(input.deltaNative[axis]) ||
-            (input.deltaNative[axis] == 0.0 && !input.zOnlyCommissioning && !input.xyzOnlyCommissioning && !input.sparseCommissioning))
-            return Code::INVALID_AUTHORED_DELTA;
+        if(!std::isfinite(input.deltaNative[axis])||
+           (!(authoredMask&(1U<<axis))&&input.deltaNative[axis]!=0.0))return Code::INVALID_AUTHORED_DELTA;
+        if(!identity.exists[axis]){if(input.deltaNative[axis]!=0.0)return Code::OUTSIDE_AXIS_CHANGED;continue;}
         if (!std::isfinite(input.pulsePerUnit[axis]) || input.pulsePerUnit[axis] <= 0.0 ||
             !std::isfinite(input.maxVelocityPPS[axis]) || input.maxVelocityPPS[axis] <= 0.0 ||
             !NCXYZCUVFeedDetail::ValidTime(input.axisAccTime[axis]) ||
@@ -208,9 +223,9 @@ inline NCXYZCUVFeedLineCode BuildNCXYZCUVFeedLine(
         std::array<double, 6U> startMCS{}, startPulse{};
         for (unsigned axis = 0U; axis < 6U; ++axis)
         { startMCS[axis] = input.startMCS[axis]; startPulse[axis] = input.startPulse[axis]; }
-        if (!TryResolveNCXYZCUVAbsoluteFeedTarget(startMCS, startPulse,
+        if (!TryResolveNCXYZCUVAbsoluteFeedTarget(identity,startMCS, startPulse,
             input.absoluteTargetMCS, input.pulsePerUnit, input.rotaryShortestPath,
-            input.rotaryModulo, resolved)) return Code::INVALID_ABSOLUTE_TARGET;
+            input.rotaryModulo, resolved,authoredMask)) return Code::INVALID_ABSOLUTE_TARGET;
         for (unsigned axis = 0U; axis < 6U; ++axis)
             if (!NCXYZCUVFeedDetail::SameBits(input.deltaNative[axis], resolved.deltaNative[axis]))
                 return Code::INVALID_ABSOLUTE_TARGET;
@@ -231,7 +246,7 @@ inline NCXYZCUVFeedLineCode BuildNCXYZCUVFeedLine(
         if (!std::isfinite(input.startMCS[axis]) || !std::isfinite(input.endMCS[axis]) ||
             !std::isfinite(input.startPulse[axis]) || !std::isfinite(input.endPulse[axis]))
             return Code::NONFINITE_COORDINATE;
-        if (axis >= 6U)
+        if(axis>=6U||!identity.exists[axis])
         {
             if (!NCXYZCUVFeedDetail::SameBits(input.startMCS[axis], input.endMCS[axis]) ||
                 !NCXYZCUVFeedDetail::SameBits(input.startPulse[axis], input.endPulse[axis]))
@@ -240,8 +255,8 @@ inline NCXYZCUVFeedLineCode BuildNCXYZCUVFeedLine(
         }
         const double authored = input.deltaNative[axis], ppu = input.pulsePerUnit[axis];
         const double authoredPulse = authored * ppu;
-        const bool staticAxis = (EDM149::StaticAxis(input.zOnlyCommissioning,input.xyzOnlyCommissioning,axis) ||
-            (input.sparseCommissioning && input.deltaNative[axis] == 0.0));
+        const bool staticAxis=input.deltaNative[axis]==0.0||
+            EDM149::StaticAxis(input.zOnlyCommissioning,input.xyzOnlyCommissioning,axis);
         const double expectedNative = staticAxis ? input.startMCS[axis] :
             (input.absolute ? resolved.endMCS[axis] : input.startMCS[axis] + authored);
         const double expectedPulse = staticAxis ? input.startPulse[axis] :
@@ -253,8 +268,7 @@ inline NCXYZCUVFeedLineCode BuildNCXYZCUVFeedLine(
         const double deltaNative = input.endMCS[axis] - input.startMCS[axis];
         deltaPulse[axis] = input.endPulse[axis] - input.startPulse[axis];
         if (!std::isfinite(deltaNative) || !std::isfinite(deltaPulse[axis])) return Code::NONFINITE_GEOMETRY;
-        if ((EDM149::StaticAxis(input.zOnlyCommissioning,input.xyzOnlyCommissioning,axis) ||
-            (input.sparseCommissioning && input.deltaNative[axis] == 0.0)))
+        if(staticAxis)
         {
             if (authored != 0.0 || deltaNative != 0.0 || deltaPulse[axis] != 0.0 ||
                 !NCXYZCUVFeedDetail::SameBits(input.startMCS[axis],input.endMCS[axis]) ||
@@ -273,7 +287,11 @@ inline NCXYZCUVFeedLineCode BuildNCXYZCUVFeedLine(
                 NCXYZCUVFeedDetail::DeltaAgrees(authored, deltaPulse[axis], input.startPulse[axis], input.endPulse[axis], ppu)))
             return Code::DELTA_CONVERSION_MISMATCH;
     }
-    const double linearLength = std::hypot(std::hypot(input.deltaNative[0], input.deltaNative[1]), input.deltaNative[2]);
+    double linearLength=0.0;
+    // Millimetres come only from configured linear axes. A degree is never
+    // added to the linear metric, even when its address is C, U or V.
+    for(unsigned axis=0U;axis<6U;++axis)if(identity.exists[axis]&&identity.nativeUnit[axis]==1U)
+        linearLength=std::hypot(linearLength,input.deltaNative[axis]);
     if (!std::isfinite(linearLength) || linearLength <= 0.0) return Code::NONFINITE_GEOMETRY;
     const double seconds = NCXYZCUVFeedDetail::ProductRatio(linearLength, 60.0, input.feedMMMin);
     if (!std::isfinite(seconds) || seconds <= 0.0) return Code::NONFINITE_GEOMETRY;
@@ -287,8 +305,8 @@ inline NCXYZCUVFeedLineCode BuildNCXYZCUVFeedLine(
     std::array<double, 3U> rotaryFeed{};
     for (unsigned rotary = 0U; rotary < 3U; ++rotary)
     {
-        if (input.zOnlyCommissioning || input.xyzOnlyCommissioning ||
-            (input.sparseCommissioning && input.deltaNative[rotary + 3U] == 0.0)) continue;
+        const unsigned axis=rotary+3U;
+        if(!identity.exists[axis]||identity.nativeUnit[axis]!=2U||input.deltaNative[axis]==0.0)continue;
         rotaryFeed[rotary] = NCXYZCUVFeedDetail::ProductRatio(
             std::fabs(input.deltaNative[rotary + 3U]), 60.0, seconds);
         if (!std::isfinite(rotaryFeed[rotary]) || rotaryFeed[rotary] <= 0.0)
@@ -298,8 +316,7 @@ inline NCXYZCUVFeedLineCode BuildNCXYZCUVFeedLine(
     std::array<double, 6U> projectedVelocity{};
     for (unsigned axis = 0U; axis < 6U; ++axis)
     {
-        if ((EDM149::StaticAxis(input.zOnlyCommissioning,input.xyzOnlyCommissioning,axis) ||
-            (input.sparseCommissioning && input.deltaNative[axis] == 0.0))) continue;
+        if(!identity.exists[axis]||input.deltaNative[axis]==0.0)continue;
         const double directVelocity = NCXYZCUVFeedDetail::ProductRatio(std::fabs(deltaPulse[axis]), 1.0, seconds);
         const double ratio = deltaPulse[axis] / length;
         projectedVelocity[axis] = std::fabs(velocity * ratio);
@@ -313,8 +330,7 @@ inline NCXYZCUVFeedLineCode BuildNCXYZCUVFeedLine(
     const double eps64 = 64.0 * (std::numeric_limits<double>::epsilon)();
     for (unsigned axis = 3U; axis < 6U; ++axis)
     {
-        if (input.zOnlyCommissioning || input.xyzOnlyCommissioning ||
-            (input.sparseCommissioning && input.deltaNative[axis] == 0.0)) continue;
+        if(!identity.exists[axis]||identity.nativeUnit[axis]!=2U||input.deltaNative[axis]==0.0)continue;
         const double mappedRotaryFeed = NCXYZCUVFeedDetail::ProductRatio(
             projectedVelocity[axis], 60.0, input.pulsePerUnit[axis]);
         if (!std::isfinite(mappedRotaryFeed) || mappedRotaryFeed <= 0.0)
@@ -334,6 +350,7 @@ inline NCXYZCUVFeedLineCode BuildNCXYZCUVFeedLine(
     double accTime = 0.0, decTime = 0.0;
     for (unsigned axis = 0U; axis < 6U; ++axis)
     {
+        if(!identity.exists[axis]||input.deltaNative[axis]==0.0)continue;
         accTime = NCXYZCUVFeedDetail::Maximum(accTime, NCXYZCUVFeedDetail::EffectiveTime(input.axisAccTime[axis]));
         decTime = NCXYZCUVFeedDetail::Maximum(decTime, NCXYZCUVFeedDetail::EffectiveTime(input.axisDecTime[axis]));
     }
@@ -343,10 +360,12 @@ inline NCXYZCUVFeedLineCode BuildNCXYZCUVFeedLine(
     output.startMCS = input.startMCS; output.endMCS = input.endMCS;
     output.startPulse = input.startPulse; output.endPulse = input.endPulse;
     output.axisMask = input.axisMask; output.feedMMMin = input.feedMMMin;
+    output.authoredAxisMask=authoredMask;
     output.zOnlyCommissioning = input.zOnlyCommissioning;
     output.xyzOnlyCommissioning = input.xyzOnlyCommissioning;
     output.sparseCommissioning = input.sparseCommissioning;
     output.deltaNative = input.deltaNative; output.pulsePerUnit = input.pulsePerUnit;
+    for(unsigned axis=0U;axis<6U;++axis)if(!identity.exists[axis])output.pulsePerUnit[axis]=0.0;
     output.axisVelocityPPS = projectedVelocity;
     output.linearLengthMM = linearLength; output.nominalSeconds = seconds;
     output.lengthPulse = length; output.velocityPPS = velocity;
@@ -360,6 +379,29 @@ inline NCXYZCUVFeedLineCode BuildNCXYZCUVFeedLine(
     }
     output.valid = true;
     return Code::BUILT_LINE;
+}
+
+// Full value comparison without interpreting padding as packet identity.
+inline bool SameNCXYZCUVFeedLineValue(const NCXYZCUVFeedLineValue& a,const NCXYZCUVFeedLineValue& b) noexcept
+{
+    using NCXYZCUVFeedDetail::SameBits;
+    if(a.axisMask!=b.axisMask||a.authoredAxisMask!=b.authoredAxisMask||a.absolute!=b.absolute||a.zOnlyCommissioning!=b.zOnlyCommissioning||
+       a.xyzOnlyCommissioning!=b.xyzOnlyCommissioning||a.sparseCommissioning!=b.sparseCommissioning||a.valid!=b.valid)return false;
+    if(!SameBits(a.feedMMMin,b.feedMMMin)||!SameBits(a.linearLengthMM,b.linearLengthMM)||
+       !SameBits(a.nominalSeconds,b.nominalSeconds)||!SameBits(a.lengthPulse,b.lengthPulse)||
+       !SameBits(a.velocityPPS,b.velocityPPS)||!SameBits(a.accTime,b.accTime)||!SameBits(a.decTime,b.decTime))return false;
+    return std::memcmp(a.startMCS.data(),b.startMCS.data(),sizeof(a.startMCS))==0&&
+        std::memcmp(a.endMCS.data(),b.endMCS.data(),sizeof(a.endMCS))==0&&
+        std::memcmp(a.startPulse.data(),b.startPulse.data(),sizeof(a.startPulse))==0&&
+        std::memcmp(a.endPulse.data(),b.endPulse.data(),sizeof(a.endPulse))==0&&
+        std::memcmp(a.deltaNative.data(),b.deltaNative.data(),sizeof(a.deltaNative))==0&&
+        std::memcmp(a.pulsePerUnit.data(),b.pulsePerUnit.data(),sizeof(a.pulsePerUnit))==0&&
+        std::memcmp(a.axisVelocityPPS.data(),b.axisVelocityPPS.data(),sizeof(a.axisVelocityPPS))==0&&
+        std::memcmp(a.rotaryFeedDegMin.data(),b.rotaryFeedDegMin.data(),sizeof(a.rotaryFeedDegMin))==0&&
+        std::memcmp(a.absoluteTargetWCS.data(),b.absoluteTargetWCS.data(),sizeof(a.absoluteTargetWCS))==0&&
+        std::memcmp(a.absoluteTargetMCS.data(),b.absoluteTargetMCS.data(),sizeof(a.absoluteTargetMCS))==0&&
+        std::memcmp(a.rotaryModulo.data(),b.rotaryModulo.data(),sizeof(a.rotaryModulo))==0&&
+        a.rotaryShortestPath==b.rotaryShortestPath;
 }
 
 static_assert(std::numeric_limits<double>::is_iec559 && sizeof(double) == 8U,

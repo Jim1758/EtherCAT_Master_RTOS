@@ -7,8 +7,8 @@ inline void Cycle::RefreshOrbitCompletionFeedback() noexcept
 {
     auto& f=feedback_;auto& o=orbitInspection_;
     f.orbitRequiredPasses=request_.orbitInspectionRounds;
-    f.orbitTargetPercentScaled=request_.orbitThresholdScaled;
-    f.orbitRetryLimit=request_.orbitRetryLimit;
+    f.orbitTargetPercentScaled=LiveOrbitThresholdScaled();
+    f.orbitRetryLimit=LiveOrbitRetryLimit();
     if(!request_.orbitInspectionRounds){
         f.orbitQualifiedPasses=0U;f.orbitAttemptCount=0ULL;f.orbitPercentScaled=0U;
         f.orbitCompletionState=0U;f.orbitPercentAvailable=f.orbitCompletionActive=false;
@@ -120,7 +120,7 @@ inline void Cycle::CompleteOrbitInspectionSweep(const Input& input) noexcept
        o.attempts==(std::numeric_limits<std::uint64_t>::max)())
     {Fail(Fault::Numeric);return;}
     ++o.attempts;o.percent=o.attemptInvalid?0U:NCG76OrbitCompletion::Percent(o.qualifiedLength,o.expectedLength);o.percentAvailable=true;
-    const bool accepted=o.percent>=request_.orbitThresholdScaled;
+    const bool accepted=o.percent>=LiveOrbitThresholdScaled();
     const auto qualifiedBefore=o.qualifiedPasses;
     o.qualifiedPasses=accepted?o.qualifiedPasses+1U:0U;
     // Preserve the completed-sweep decision when Begin resets live coverage,
@@ -130,6 +130,14 @@ inline void Cycle::CompleteOrbitInspectionSweep(const Input& input) noexcept
     o.evaluation.lastPercentScaled=o.percent;o.evaluation.lastQualifiedBefore=qualifiedBefore;
     o.evaluation.peakQualified=(std::max)(o.evaluation.peakQualified,o.qualifiedPasses);
     o.evaluation.lastAvailable=true;o.evaluation.lastAccepted=accepted;
+    // The complete old sweep is scored under its original criterion. A
+    // pending E16/E29 edit then begins a new local evidence epoch instead of
+    // retroactively reclassifying that score or inheriting its retry debt.
+    if(pendingLiveOrbitCriteria_&&!machiningTime_.totalExpired&&!feedback_.timeLimitReached){
+        o.active=false;
+        if(!ApplyPendingLiveOrbitCriteria()){Fail(Fault::Numeric);return;}
+        (void)BeginOrbitInspectionSweep(input);return;
+    }
     if(o.qualifiedPasses==request_.orbitInspectionRounds){
         o.active=false;o.state=NCG76OrbitCompletion::State::Passed;
         output_.commandMCS=request_.geometry.endMCS;feedback_.phase=Phase::Complete;
@@ -138,7 +146,7 @@ inline void Cycle::CompleteOrbitInspectionSweep(const Input& input) noexcept
     // The same complete-sweep physical center proof used by Passed already
     // precedes this hook. A rejected process may finish its NC motion parent
     // here without claiming L passed, a D goal, or a runtime fault.
-    if(!accepted&&request_.orbitRetryLimit&&o.failedSweeps>request_.orbitRetryLimit){
+    if(!accepted&&LiveOrbitRetryLimit()&&o.failedSweeps>LiveOrbitRetryLimit()){
         o.active=false;o.state=NCG76OrbitCompletion::State::RetryExhausted;
         output_.commandMCS=request_.geometry.endMCS;feedback_.phase=Phase::Complete;
         leg_.speed=leg_.accelerationNow=0.0;RefreshOutput();return;
@@ -230,7 +238,8 @@ inline void Cycle::ContinueTimedStop(const Input& input) noexcept
     if(!Detail::Finite(endpoint)||!InsideTravel(endpoint)) {Fail(Fault::TravelLimit);return;}
     for(unsigned axis=0U;axis<8U;++axis){
         if(endpoint[axis]<request_.geometry.boundsMinMCS[axis]||endpoint[axis]>request_.geometry.boundsMaxMCS[axis]||
-           (axis>=3U&&std::memcmp(&endpoint[axis],&request_.geometry.startMCS[axis],sizeof(double))!=0))
+           (axis>=3U&&request_.geometry.kind!=NCG76SphereRuntimeGeometry::Kind::Line&&
+            std::memcmp(&endpoint[axis],&request_.geometry.startMCS[axis],sizeof(double))!=0))
         {Fail(Fault::TravelLimit);return;}
     }
     machiningTime_.endpoint=endpoint;machiningTime_.endpointReady=true;

@@ -7,6 +7,7 @@
 #include "EDMCoordinatedGapSource.h"
 #include "EDMGapServo.h"
 #include "EDMFlushPlan.h"
+#include "EDME5WorkTimer386.h"
 #include <cmath>
 #include <cstdint>
 #include <limits>
@@ -56,6 +57,15 @@ struct Config
     bool orbitFeedsEnabled=false;
     // Manual external generator: these limits grant axis motion only.
     bool physicalZManual=false;
+    // Native envelope, frozen and revalidated by Motion at admission. Signed
+    // EDM derives its finite envelope from MAX_Speed and the PDO interval,
+    // independent of G00/Stop times; explicit mode caps are applied separately.
+    // Legacy field names: native units/s and native units/s^2 (mm or degrees).
+    std::array<double,6U> flushAxisVelocityMmS{},flushAxisAccelerationMmS2{},flushAxisDecelerationMmS2{};
+    std::uint32_t flushAxisMask=7U;
+    bool flushAxisLimitsEnabled=false;
+    // E5-only gate: raw GAP servo and D/H clocks remain independent.
+    EDM386E5::Profile e5WorkTimer{};
 
 };
 inline bool Disabled(const Config& c) noexcept{return !c.enabled;}
@@ -103,6 +113,21 @@ inline bool ProfileCeiling(const Config& c,double& ceiling) noexcept
 }
 inline bool Valid(const Config& c) noexcept
 {
+    if(!EDM386E5::Valid(c.e5WorkTimer)||(!c.enabled&&c.e5WorkTimer.mode!=0U))return false;
+    if(c.e5WorkTimer.mode==1U){
+        const double shortFloor=c.curve.shortMachiningEnabled?
+            (std::max)(c.curve.shortIdleV,c.curve.shortMachiningV):c.curve.shortIdleV;
+        if(!std::isfinite(shortFloor)||c.e5WorkTimer.gapHighVoltageV<=shortFloor)return false;
+    }
+    if(!EDM385::Valid(c.flushProfile.axisModeLimits))return false;
+    if(!c.enabled&&!EDM385::Empty(c.flushProfile.axisModeLimits))return false;
+    if(!c.flushAxisMask||(c.flushAxisMask&~0x3fU)!=0U)return false;
+    for(unsigned a=0U;a<6U;++a){
+        const double v=c.flushAxisVelocityMmS[a],acc=c.flushAxisAccelerationMmS2[a],dec=c.flushAxisDecelerationMmS2[a];
+        if(c.flushAxisLimitsEnabled&&(c.flushAxisMask&(1U<<a))){
+            if(!c.enabled||!std::isfinite(v)||v<=0.0||!std::isfinite(acc)||acc<=0.0||!std::isfinite(dec)||dec<=0.0)return false;
+        }else if(v!=0.0||acc!=0.0||dec!=0.0)return false;
+    }
     if(c.physicalZManual&&(!c.enabled||!c.signedMotionEnabled||!c.parameterFeeds||c.orbitFeedsEnabled))return false;
     if(c.orbitFeedsEnabled){
         if(!c.enabled||!c.signedMotionEnabled||c.parameterFeeds||
@@ -156,20 +181,29 @@ inline bool ResolveParameterMotionCeiling(const Config& c,double& ceiling) noexc
     return c.parameterFeeds&&Valid(c)&&ParameterFeedDetail::ProfileCeiling(c,ceiling);
 }
 // EDM307: a completed, independently scoped path parent may pass only its
-// accounting totals to a fresh observer. This value contains no pending
-// request, source sample, clock, completion acknowledgement or motion permit.
+// accounting totals to a fresh observer. Mode 1 also retains its elapsed-clock
+// observations. This contains no pending request, source sample, completion
+// acknowledgement or motion permit.
 // The RT adapter proves the previous completed parent and frozen recipe scope;
 // accepting these numbers alone never authorizes a cross-parent handoff.
 struct Continuation
 {
     std::uint64_t intervalWorkUs=0ULL,simulatedWorkUs=0ULL;
     std::uint64_t completedFlushes=0ULL,abortedFlushes=0ULL;
+    EDM386E5::Evidence e5Evidence{};
+    // Only the separately proved adjacent-parent handoff may retain these
+    // monotonic-clock observations. They carry no sample or motion authority.
+    std::uint64_t e5StartUs=0ULL,e5ObservedUs=0ULL;
 };
 inline bool ValidContinuation(const Config& config,const Continuation& value) noexcept
 {
     const auto maximum=(std::numeric_limits<std::uint64_t>::max)();
-    return config.enabled&&Valid(config)&&EDM130::ValidWorkTime(config.workTimeUs)&&
+    return config.enabled&&Valid(config)&&EDM386E5::ValidEvidence(config.e5WorkTimer,value.e5Evidence)&&EDM130::ValidWorkTime(config.workTimeUs)&&
         value.intervalWorkUs<=config.workTimeUs&&value.simulatedWorkUs>=value.intervalWorkUs&&
+        (config.e5WorkTimer.mode==0U||
+         ((!value.e5StartUs||value.e5ObservedUs>=value.e5StartUs)&&
+          ((!value.e5StartUs&&!value.e5ObservedUs)||value.e5Evidence.latched)))&&
+        (config.e5WorkTimer.mode==0U||value.intervalWorkUs==0ULL||value.e5Evidence.latched)&&
         value.completedFlushes<maximum&&value.abortedFlushes<maximum&&
         value.completedFlushes<=maximum-value.abortedFlushes;
 }
@@ -196,7 +230,13 @@ inline bool SameCurve(const EDMGapServo::Profile& a,const EDMGapServo::Profile& 
 }
 inline bool SameFlush(const EDM20::FlushProfile& a,const EDM20::FlushProfile& b) noexcept
 {
-    return SameDouble(a.accelerationTimeSeconds,b.accelerationTimeSeconds)&&
+    if(!EDM385::Same(a.axisModeLimits,b.axisModeLimits))return false;
+    if(a.axisRampMask!=b.axisRampMask)return false;
+    for(unsigned axis=0U;axis<6U;++axis)
+        if(!SameDouble(a.axisAccelerationTimeSeconds[axis],b.axisAccelerationTimeSeconds[axis])||
+           !SameDouble(a.axisDecelerationTimeSeconds[axis],b.axisDecelerationTimeSeconds[axis]))return false;
+    return SameDouble(a.settleTimeSeconds,b.settleTimeSeconds)&&
+        SameDouble(a.accelerationTimeSeconds,b.accelerationTimeSeconds)&&
         SameDouble(a.decelerationTimeSeconds,b.decelerationTimeSeconds)&&
         SameDouble(a.finalApproachMmPerMin,b.finalApproachMmPerMin)&&
         SameDouble(a.centerRetractMmPerMin,b.centerRetractMmPerMin)&&SameDouble(a.mainRetractMmPerMin,b.mainRetractMmPerMin)&&
@@ -210,6 +250,11 @@ inline bool SameFlush(const EDM20::FlushProfile& a,const EDM20::FlushProfile& b)
 inline bool EquivalentForContinuation(const Config& a,const Config& b) noexcept
 {
     using ContinuationDetail::SameDouble;
+    if(!EDM386E5::Same(a.e5WorkTimer,b.e5WorkTimer)||a.flushAxisLimitsEnabled!=b.flushAxisLimitsEnabled||a.flushAxisMask!=b.flushAxisMask)return false;
+    for(unsigned axis=0U;axis<6U;++axis)
+        if(!SameDouble(a.flushAxisVelocityMmS[axis],b.flushAxisVelocityMmS[axis])||
+           !SameDouble(a.flushAxisAccelerationMmS2[axis],b.flushAxisAccelerationMmS2[axis])||
+           !SameDouble(a.flushAxisDecelerationMmS2[axis],b.flushAxisDecelerationMmS2[axis]))return false;
     return a.enabled&&b.enabled&&Valid(a)&&Valid(b)&&
         a.workTimeUs==b.workTimeUs&&a.recipeGeneration==b.recipeGeneration&&a.tuningGeneration==b.tuningGeneration&&
         a.enabled==b.enabled&&a.flushMotionEnabled==b.flushMotionEnabled&&a.signedMotionEnabled==b.signedMotionEnabled&&
@@ -227,7 +272,70 @@ inline bool EquivalentForContinuation(const Config& a,const Config& b) noexcept
         SameDouble(a.deepFlushHeightMultiplier,b.deepFlushHeightMultiplier)&&SameDouble(a.deepFlushHeightMm,b.deepFlushHeightMm)&&
         ContinuationDetail::SameCurve(a.curve,b.curve)&&ContinuationDetail::SameFlush(a.flushProfile,b.flushProfile);
 }
-static_assert(sizeof(Continuation)==4U*sizeof(std::uint64_t)&&std::is_trivially_copyable<Continuation>::value,
+// A live edit changes numerical curve/feeds only. Recipe, source, timers,
+// short qualification, geometry and the frozen native motion envelope stay bound
+// to the admitted parent. The caller separately authenticates the new tuning
+// generation and preserves the original immutable process publication.
+inline void CopyLiveCurveFields(const EDMGapServo::Profile& from,EDMGapServo::Profile& to) noexcept
+{
+    for(unsigned i=0U;i<3U;++i){to.positiveGain[i]=from.positiveGain[i];to.negativeGain[i]=from.negativeGain[i];}
+    for(unsigned i=0U;i<2U;++i){to.positiveBreakV[i]=from.positiveBreakV[i];to.negativeBreakV[i]=from.negativeBreakV[i];}
+    to.cuttingScaleMmPerVoltMin=from.cuttingScaleMmPerVoltMin;
+    to.maxFeedMmPerMin=from.maxFeedMmPerMin;to.maxRetreatMmPerMin=from.maxRetreatMmPerMin;
+    to.deadbandV=from.deadbandV;to.shortRetreatMmPerMin=from.shortRetreatMmPerMin;
+}
+inline bool EquivalentForLiveTuning(const Config& birth,const Config& candidate) noexcept
+{
+    if(!Valid(birth)||!Valid(candidate)||
+       !EDMGapServo::Evaluate(candidate.curve,0.0,candidate.referenceV,candidate.machiningOverridePercent).valid||
+       !EDMGapServo::Evaluate(candidate.curve,300.0,candidate.referenceV,candidate.machiningOverridePercent).valid)return false;
+    Config normalized=candidate;
+    CopyLiveCurveFields(birth.curve,normalized.curve);
+    normalized.curve.revision=birth.curve.revision;
+    normalized.tuningGeneration=birth.tuningGeneration;
+    auto& to=normalized.flushProfile;const auto& from=birth.flushProfile;
+    to.finalApproachMmPerMin=from.finalApproachMmPerMin;
+    to.centerRetractMmPerMin=from.centerRetractMmPerMin;to.mainRetractMmPerMin=from.mainRetractMmPerMin;
+    to.centerReturnMmPerMin=from.centerReturnMmPerMin;to.mainReturnMmPerMin=from.mainReturnMmPerMin;
+    to.pathRetractMmPerMin=from.pathRetractMmPerMin;to.initialSlowMmPerMin=from.initialSlowMmPerMin;
+    to.manualReturnMmPerMin=from.manualReturnMmPerMin;
+    return EquivalentForContinuation(birth,normalized);
+}
+// Full, canonically authenticated E-condition update. Only recipe-derived
+// values and the established hot-tuning curve/feed subset may differ. Source,
+// native envelopes, E5 gate profile and protection configuration stay frozen.
+inline bool EquivalentForLiveRecipe(const Config& birth,const Config& candidate) noexcept
+{
+    if(!Valid(birth)||!Valid(candidate)||
+       !EDMGapServo::Evaluate(candidate.curve,0.0,candidate.referenceV,candidate.machiningOverridePercent).valid||
+       !EDMGapServo::Evaluate(candidate.curve,300.0,candidate.referenceV,candidate.machiningOverridePercent).valid)return false;
+    Config normalized=candidate;
+    normalized.workTimeUs=birth.workTimeUs;normalized.recipeGeneration=birth.recipeGeneration;
+    normalized.jumpHeightMm=birth.jumpHeightMm;normalized.jumpSpeedPercent=birth.jumpSpeedPercent;
+    normalized.machiningOverridePercent=birth.machiningOverridePercent;normalized.referenceV=birth.referenceV;
+    normalized.flushMotionEnabled=birth.flushMotionEnabled;normalized.independentFeedsEnabled=birth.independentFeedsEnabled;
+    normalized.finalApproachEnabled=birth.finalApproachEnabled;
+    normalized.finalApproachPercent=birth.finalApproachPercent;normalized.finalApproachDistanceMm=birth.finalApproachDistanceMm;
+    normalized.initialSlowEnabled=birth.initialSlowEnabled;
+    normalized.initialSlowPercent=birth.initialSlowPercent;normalized.initialSlowDistanceMm=birth.initialSlowDistanceMm;
+    normalized.deepFlushEnabled=birth.deepFlushEnabled;normalized.deepFlushCycleInterval=birth.deepFlushCycleInterval;
+    normalized.deepFlushHeightMultiplier=birth.deepFlushHeightMultiplier;normalized.deepFlushHeightMm=birth.deepFlushHeightMm;
+    normalized.orbitOverridePercent=birth.orbitOverridePercent;
+    return EquivalentForLiveTuning(birth,normalized);
+}
+inline bool SameLiveRecipeFlush(const Config& a,const Config& b) noexcept
+{
+    using ContinuationDetail::SameDouble;
+    return a.flushMotionEnabled==b.flushMotionEnabled&&a.independentFeedsEnabled==b.independentFeedsEnabled&&
+        a.finalApproachEnabled==b.finalApproachEnabled&&a.initialSlowEnabled==b.initialSlowEnabled&&
+        a.deepFlushEnabled==b.deepFlushEnabled&&a.deepFlushCycleInterval==b.deepFlushCycleInterval&&
+        SameDouble(a.jumpHeightMm,b.jumpHeightMm)&&SameDouble(a.jumpSpeedPercent,b.jumpSpeedPercent)&&
+        SameDouble(a.finalApproachPercent,b.finalApproachPercent)&&SameDouble(a.finalApproachDistanceMm,b.finalApproachDistanceMm)&&
+        SameDouble(a.initialSlowPercent,b.initialSlowPercent)&&SameDouble(a.initialSlowDistanceMm,b.initialSlowDistanceMm)&&
+        SameDouble(a.deepFlushHeightMultiplier,b.deepFlushHeightMultiplier)&&SameDouble(a.deepFlushHeightMm,b.deepFlushHeightMm)&&
+        ContinuationDetail::SameFlush(a.flushProfile,b.flushProfile);
+}
+static_assert(sizeof(Continuation)<=64U&&std::is_trivially_copyable<Continuation>::value,
     "Process continuation is bounded accounting data, never an execution receipt");
 // Shared NC/RT derivation; whole-cycle travel admission remains the motion
 // owner's independent proof. E6 is physical native mm, never authored scale.
@@ -236,7 +344,24 @@ inline bool BuildFlushConfig(const Config& config,double feedMmMin,
 {
     output=NCG76SphereCycle::FlushConfig{};
     if(!Valid(config))return false;
-    if(!config.enabled||!config.flushMotionEnabled)return true;
+    output.axisModeLimits=config.flushProfile.axisModeLimits;
+    if(!config.enabled)return true;
+    // Native motion limits govern machining, GAP retreat and HOLD even when
+    // the current E condition disables periodic flushing (E6 == 0).
+    output.axisVelocityMmS=config.flushAxisVelocityMmS;
+    output.axisAccelerationMmS2=config.flushAxisAccelerationMmS2;
+    output.axisDecelerationMmS2=config.flushAxisDecelerationMmS2;
+    output.axisLimitsEnabled=config.flushAxisLimitsEnabled;
+    output.axisMask=config.flushAxisMask;
+    output.accelerationTimeSeconds=config.flushProfile.accelerationTimeSeconds;
+    output.decelerationTimeSeconds=config.flushProfile.decelerationTimeSeconds;
+    output.axisAccelerationTimeSeconds=config.flushProfile.axisAccelerationTimeSeconds;
+    output.axisDecelerationTimeSeconds=config.flushProfile.axisDecelerationTimeSeconds;
+    output.axisRampMask=config.flushProfile.axisRampMask;
+    output.settleTimeSeconds=config.flushProfile.settleTimeSeconds;
+    // Keep the frozen native/ramp/settle envelope even when E6 disables periodic
+    // flushing, so a later valid E6 enable uses the same admitted envelope.
+    if(!config.flushMotionEnabled)return true;
     if(!std::isfinite(feedMmMin)||feedMmMin<=0.0)return false;
     if(config.parameterFeeds){
         double ceiling=0.0;
@@ -245,8 +370,6 @@ inline bool BuildFlushConfig(const Config& config,double feedMmMin,
     const double feed=(std::min)(feedMmMin,feedMmMin*(config.jumpSpeedPercent/100.0));
     if(!std::isfinite(feed)||feed<=0.0||feed/60.0<=0.0)return false;
     output.heightMm=config.jumpHeightMm;output.feedMmMin=feed;output.enabled=true;
-    output.accelerationTimeSeconds=config.flushProfile.accelerationTimeSeconds;
-    output.decelerationTimeSeconds=config.flushProfile.decelerationTimeSeconds;
     if(!config.independentFeedsEnabled)return true;
     const double ratio=config.jumpSpeedPercent/100.0;
     const auto cap=[&](double native,double overrideRatio,double& value) noexcept {
@@ -335,6 +458,9 @@ struct Input
     // matching PRE-step parent and the current positive GAP sample again.
     bool additionalEndpointQualified=false;
     bool sourceValid=false,powerInhibited=false,suspended=false,terminal=false,cancel=false;
+    // HOLD/return-to-process reset is distinct from normal GAP history retreat.
+    bool holdResetActive=false,currentFlushActive=false,timingStopActive=false;
+    std::uint64_t currentFlushSequence=0ULL;
     EDM88::Frame physicalFrame{}; // Actual immutable PDO receipt, never synthetic.
 };
 struct Feedback
@@ -355,6 +481,16 @@ struct Feedback
     FeedRole selectedFeedRole=FeedRole::Unavailable;
     bool enabled=false,valid=false,eligible=false,suspended=false,pending=false,terminal=false;
     double selectedScaleMmPerVoltMin=0.0,selectedOverridePercent=0.0;
+    EDM386E5::Feedback e5Timer{};
+    // Only this historical accounting evidence may cross an admitted adjacent parent.
+    EDM386E5::Evidence e5Evidence{};
+    std::uint64_t e5DueEvents=0ULL,e5LastDueTick=0ULL;
+    bool e5Eligible=false,e5ShortBlocked=false;
+    // Actual curve result for this observer tick, independent of nominal
+    // motion direction. The motion owner separately proves its consumption.
+    std::int32_t gainRegion=0;
+    bool gainRegionValid=false;
+    double referenceV=0.0;
 };
 
 class Observer
@@ -366,9 +502,13 @@ public:
         const EDM88::SourceConfig* physicalSource=nullptr) noexcept
     {
         qualifier_.Cancel();active_=false;feedback_=Feedback{};work_=EDM130::WorkEvidence{};
+        e5Gate_=EDM386E5::Gate{};transportPaused_=requalifying_=physicalLineNominal_=false;
+        lastRequalifiedTick_=0ULL;requalifyMaxTransportGapUs_=100000ULL;
         physicalShort_.Reset();physicalShortResult_=EDMGapServo::ShortResult{};physicalShortSequence_=0ULL;
         frame_=EDM88::Frame{};lastTick_=lastUs_=firstUs_=0ULL;haveClock_=false;
-        requestHighWater_=workBaseUs_=0ULL;
+        requestHighWater_=workBaseUs_=pendingWorkTimeUs_=0ULL;
+        e5StartUs_=e5DueUs_=elapsedClockUs_=0ULL;holdRoundReset_=false;
+        pendingLiveRecipeFlush_=false;pendingLiveRecipeConfig_=Config{};
         probeElapsedUs_=0ULL;probeLengthMm_=0.0;probeSeeded_=probeEntered_=false;
         feedback_.simulationMode=mode;finishLegCount_=4U;nominalLegCount_=25U;nominalWorkEndIndex_=24U;
         if(Disabled(config)&&!config.flushMotionEnabled&&!config.signedMotionEnabled){
@@ -377,6 +517,7 @@ public:
         }
         feedback_.enabled=config.enabled;feedback_.session=session;feedback_.recipeGeneration=config.recipeGeneration;
         feedback_.tuningGeneration=config.tuningGeneration;feedback_.workTimeUs=config.workTimeUs;
+        feedback_.referenceV=config.referenceV;
         if(config.physicalZManual!=(physicalSource!=nullptr)||
            (physicalSource&&(!EDM88::ValidPhysical(*physicalSource)||mode!=SimulationMode::Wave)))
         {Withdraw(Reason::Configuration);return false;}
@@ -421,6 +562,9 @@ public:
             nominalWorkEndIndex_=nominalLegCount_-1U;finishLegCount_=count;
         }
         config_=config;
+        if(!e5Gate_.Begin(config.e5WorkTimer,continuation?&continuation->e5Evidence:nullptr))
+        {Withdraw(Reason::Configuration);return false;}
+        feedback_.e5Timer=e5Gate_.Current();feedback_.e5Evidence=e5Gate_.Export();
         if(mode==SimulationMode::PreviousParentProbe){
             const auto reverse=EDMGapServo::Evaluate(config.curve,config.referenceV-10.0,
                 config.referenceV,config.machiningOverridePercent);
@@ -447,13 +591,75 @@ public:
             feedback_.simulatedWorkUs=continuation->simulatedWorkUs;
             feedback_.completedFlushes=continuation->completedFlushes;
             feedback_.abortedFlushes=continuation->abortedFlushes;
+            if(config.e5WorkTimer.mode==1U&&continuation->e5Evidence.latched){
+                e5StartUs_=continuation->e5StartUs;
+                elapsedClockUs_=continuation->e5ObservedUs;
+            }
             if(!EDM130::ValidWorkEvidence(work_)){Withdraw(Reason::Configuration);return false;}
         }
         frame_.identity=physicalSource?physicalSource->identity:source.identity;feedback_.reason=Reason::None;feedback_.sourceReason=EDM88::Reason::None;
         active_=true;return true;
     }
+    // RT owner only. Retiming never restarts the source, electrical gate or
+    // parent identity. An issued flush retains its original timing evidence;
+    // only the latest requested duration is adopted after its real ACK.
+    bool UpdateWorkTime(std::uint64_t workTimeUs) noexcept
+    {
+        if(!active_||!feedback_.enabled||feedback_.terminal||
+           !EDM130::ValidWorkTime(workTimeUs)||!EDM130::ValidWorkEvidence(work_))return false;
+        if(feedback_.pending){
+            pendingWorkTimeUs_=workTimeUs==config_.workTimeUs?0ULL:workTimeUs;
+            return true;
+        }
+        if(!ApplyWorkTimeUpdate(workTimeUs))return false;
+        pendingWorkTimeUs_=0ULL;
+        return true;
+    }
+    bool HasPendingWorkTimeUpdate() const noexcept
+    {return active_&&pendingWorkTimeUs_!=0ULL;}
+    bool UpdateLiveCurve(const EDMGapServo::Profile& curve) noexcept
+    {
+        if(!active_||!feedback_.enabled||feedback_.terminal||!EDMGapServo::ValidateProfile(curve))return false;
+        auto normalized=curve;
+        CopyLiveCurveFields(config_.curve,normalized);
+        // Keep the parent's original revision as well as detector thresholds,
+        // dwell and enable flags. This never resets a short or E5 latch.
+        if(!ContinuationDetail::SameCurve(config_.curve,normalized)||
+           !EDMGapServo::Evaluate(curve,0.0,config_.referenceV,config_.machiningOverridePercent).valid||
+           !EDMGapServo::Evaluate(curve,300.0,config_.referenceV,config_.machiningOverridePercent).valid)return false;
+        config_.curve=curve;return true;
+    }
+    bool UpdateLiveRecipe(const Config& config) noexcept
+    {
+        if(!active_||!feedback_.enabled||feedback_.terminal||
+           !EquivalentForLiveRecipe(config_,config)||!EDM130::ValidWorkEvidence(work_))return false;
+        // WorkEvidence owns an issued request until its real ACK. Its existing
+        // retiming API preserves current credit and queues only the latest E5.
+        if(!UpdateWorkTime(config.workTimeUs))return false;
+        auto curve=config.curve;curve.revision=config_.curve.revision;
+        config_.curve=curve;config_.referenceV=config.referenceV;
+        config_.machiningOverridePercent=config.machiningOverridePercent;
+        config_.orbitOverridePercent=config.orbitOverridePercent;
+        // An E6 disable cannot invalidate the old request's completion proof.
+        // Keep that whole flush image until its actual complete/abort ACK.
+        if(feedback_.pending&&!SameLiveRecipeFlush(config_,config)){
+            pendingLiveRecipeConfig_=config;pendingLiveRecipeFlush_=true;
+        }else{
+            ApplyLiveRecipeFlush(config);pendingLiveRecipeFlush_=false;pendingLiveRecipeConfig_=Config{};
+        }
+        return true;
+    }
+    bool HasPendingLiveRecipeFlush() const noexcept
+    {return active_&&pendingLiveRecipeFlush_;}
+    bool LiveFlushEnabled() const noexcept
+    {return active_&&config_.flushMotionEnabled;}
+    // Local interval diagnostics only; neither timestamp grants work credit.
+    std::uint64_t E5StartUs() const noexcept {return e5StartUs_;}
+    std::uint64_t E5DueUs() const noexcept {return e5DueUs_;}
+    std::uint64_t E5ObservedUs() const noexcept {return elapsedClockUs_;}
     const Feedback& Step(const Input& input) noexcept
     {
+        if(!requalifying_)lastRequalifiedTick_=0ULL;
         if(!active_)return feedback_;
         if(input.cancel||input.terminal){
             // Publication identity only: the NC reader can associate this
@@ -465,15 +671,16 @@ public:
         }
         if(input.session!=feedback_.session||input.nominal.session!=input.session)
         {Withdraw(Reason::Session);return feedback_;}
+        if(transportPaused_&&!requalifying_)return feedback_;
         if(!input.tick||!input.nowUs||
-           (haveClock_&&(lastTick_==(std::numeric_limits<std::uint64_t>::max)()||input.tick!=lastTick_+1ULL||
+           (!requalifying_&&((haveClock_&&(lastTick_==(std::numeric_limits<std::uint64_t>::max)()||input.tick!=lastTick_+1ULL||
                input.nowUs<=lastUs_||input.nowUs-lastUs_<50ULL||input.nowUs-lastUs_>1000ULL))||
            (!haveClock_?!(input.nominal.tick==input.tick||
                (input.nominal.tick&&input.nominal.tick==input.tick-1ULL)):
-               input.nominal.tick!=input.tick-1ULL))
+               input.nominal.tick!=input.tick-1ULL))))
         {Withdraw(Reason::Clock);return feedback_;}
-        const bool seed=!haveClock_;const auto delta=seed?0ULL:input.nowUs-lastUs_;
-        if(seed)firstUs_=input.nowUs;
+        const bool seed=!haveClock_||requalifying_;const auto delta=seed?0ULL:input.nowUs-lastUs_;
+        if(seed&&!requalifying_)firstUs_=input.nowUs;
         lastTick_=input.tick;lastUs_=input.nowUs;haveClock_=true;feedback_.tick=input.tick;
         if(!input.sourceValid){Withdraw(Reason::Source);return feedback_;}
         if(!input.powerInhibited){Withdraw(Reason::Power);return feedback_;}
@@ -490,7 +697,7 @@ public:
                 (feedback_.probePhase!=ProbePhase::Return&&phase>=HighIntervalUs);
             frame_.voltageV=config_.referenceV+(low?-10.0:10.0);
         }
-        if(!qualifier_.Observe(frame_,input.nowUs)){
+        if(!(requalifying_?qualifier_.RequalifyPhysicalAfterTransportGap(frame_,input.nowUs,requalifyMaxTransportGapUs_):qualifier_.Observe(frame_,input.nowUs))){
             feedback_.sourceReason=qualifier_.Current().reason;Withdraw(Reason::Source);return feedback_;
         }
         FeedSelection selection{};
@@ -502,6 +709,10 @@ public:
             config_.referenceV,selection.overridePercent);
         if(!gap.valid){Withdraw(Reason::Configuration);return feedback_;}
         double signedGapSpeed=gap.limitedSpeedMmPerMin;
+        bool gainRegionValid=true;
+        std::int32_t gainRegion=gap.segment>=1U&&gap.segment<=3U?
+            (gap.errorV>0.0?static_cast<std::int32_t>(gap.segment):
+             gap.errorV<0.0?-static_cast<std::int32_t>(gap.segment):0):0;
         if(config_.physicalZManual){
             if(frame_.sequence!=physicalShortSequence_){
                 EDMGapServo::Sample sample{};sample.valid=true;sample.voltage=frame_.voltageV;
@@ -515,7 +726,12 @@ public:
                 if(!retreat.valid){Withdraw(Reason::Configuration);return feedback_;}
                 signedGapSpeed=retreat.signedSpeedMmPerMin;
                 if(!retreat.usingCurve)signedGapSpeed*=selection.overridePercent/100.0;
-            }else if(physicalShortResult_.feedInhibited&&signedGapSpeed>0.0)signedGapSpeed=0.0;
+                if(!retreat.usingCurve||gap.limitedSpeedMmPerMin>=0.0||signedGapSpeed>=0.0){
+                    gainRegion=0;gainRegionValid=false;
+                }
+            }else if(physicalShortResult_.feedInhibited&&signedGapSpeed>0.0){
+                signedGapSpeed=0.0;gainRegion=0;gainRegionValid=false;
+            }
             if(!std::isfinite(signedGapSpeed)){Withdraw(Reason::Configuration);return feedback_;}
         }
         if(config_.orbitFeedsEnabled){
@@ -525,15 +741,36 @@ public:
         }
         feedback_.sourceSequence=frame_.sequence;feedback_.sourceCapturedAtUs=frame_.capturedAtUs;
         feedback_.voltageV=frame_.voltageV;feedback_.signedGapSpeedMmMin=signedGapSpeed;
+        feedback_.gainRegion=gainRegion;feedback_.gainRegionValid=gainRegionValid;
+        feedback_.referenceV=config_.referenceV;
         bool acknowledged=false;
         if(!ApplyFlushAcknowledgement(input,acknowledged)){Withdraw(Reason::Input);return feedback_;}
+        if(acknowledged&&pendingWorkTimeUs_!=0ULL){
+            if(!ApplyWorkTimeUpdate(pendingWorkTimeUs_)){Withdraw(Reason::Input);return feedback_;}
+            pendingWorkTimeUs_=0ULL;
+        }
+        if(acknowledged&&pendingLiveRecipeFlush_){
+            ApplyLiveRecipeFlush(pendingLiveRecipeConfig_);
+            pendingLiveRecipeFlush_=false;pendingLiveRecipeConfig_=Config{};
+        }
+        const auto& n=input.nominal;
+        const bool holdNow=input.holdResetActive||n.holdActive||n.held;
+        if(holdNow&&!holdRoundReset_){
+            // An accepted excursion may survive primitive/recovery HOLD.
+            // Preserve its ledger for the real Cycle ACK; an unaccepted
+            // proposal has no ACK and is canceled without inventing one.
+            const bool accepted=feedback_.pending&&
+                ((n.flushActive&&n.flushRequestSequence==feedback_.requestSequence)||
+                 (input.currentFlushActive&&input.currentFlushSequence==feedback_.requestSequence));
+            if(!ResetRoundForHold(accepted,input.tick)){Withdraw(Reason::Input);return feedback_;}
+        }
+        holdRoundReset_=holdNow;
         // EDM300: historical retreat and replay are an excursion from the
         // saved nominal cursor, even when their signed velocity is positive.
         // Neither direction may earn E5 time or a new flush candidate.
         feedback_.suspended=input.suspended||input.nominal.holdActive||input.nominal.held||
             input.nominal.flushActive||input.nominal.gapHistoryActive||input.nominal.finishActive||
             IsTimeLimitStopping(input.nominal);
-        const auto& n=input.nominal;
         const bool movingWork=IsWorkPhase(n.phase,n.layerIndex)&&n.phase==n.nominalPhase&&
             n.speedMmS>0.0&&n.nominalProgressMm>0.0&&n.nominalProgressMm<n.nominalLengthMm&&
             (!n.gapMotionEnabled||(n.gapApplied&&n.signedSpeedMmS>0.0));
@@ -553,28 +790,204 @@ public:
             input.acceptedSendTick!=0ULL&&input.acceptedSendTick==input.tick-1ULL&&
             signedGapSpeed>0.0;
         feedback_.eligible=eligible&&!feedback_.pending;
+        // Mode 0 retains successful-forward accounting. Mode 1 uses voltage
+        // only for first-discharge confirmation, then continuous elapsed time.
+        // Raw servo demand, short protection and D/H inputs remain unchanged.
+        feedback_.e5Eligible=feedback_.eligible&&config_.flushMotionEnabled;feedback_.e5ShortBlocked=false;
+        bool mayTrigger=feedback_.e5Eligible;
+        if(config_.e5WorkTimer.mode==1U){
+            EDM386E5::Input timerInput{};timerInput.tick=input.tick;timerInput.deltaUs=delta;
+            timerInput.voltageV=frame_.voltageV;
+            // EDM280 independently protects at the idle threshold even during
+            // machining; the optional machining short detector may be stricter.
+            timerInput.shortThresholdV=config_.curve.shortIdleV;
+            if(config_.curve.shortMachiningEnabled)
+                timerInput.shortThresholdV=(std::max)(timerInput.shortThresholdV,config_.curve.shortMachiningV);
+            timerInput.sourceValid=true;
+            const bool blocked=holdNow||n.flushActive||input.currentFlushActive||input.timingStopActive||n.finishActive||IsTimeLimitStopping(n);
+            timerInput.active=!input.stationaryNominal&&!seed&&!acknowledged&&!blocked&&!feedback_.pending&&
+                (feedback_.e5Timer.latched||(IsWorkPhase(n.phase,n.layerIndex)&&n.phase==n.nominalPhase)||additionalEndpoint||n.gapHistoryActive);
+            const auto previousStarts=feedback_.e5Timer.startEvents;
+            const auto& timer=e5Gate_.Step(timerInput);
+            if(!timer.valid){Withdraw(Reason::Input);return feedback_;}
+            if(timer.startEvents>previousStarts&&!e5StartUs_){
+                e5StartUs_=input.nowUs;elapsedClockUs_=input.nowUs;
+            }
+            feedback_.e5Timer=timer;feedback_.e5Evidence=e5Gate_.Export();
+            const bool elapsedActive=timer.latched&&!input.stationaryNominal&&!blocked&&!feedback_.pending&&config_.flushMotionEnabled;
+            // Requalification/seed still owns a zero-output fence. Recover
+            // elapsed wall time only on the next healthy callback; do not
+            // alter the transport owner's due/pending recovery predicates.
+            feedback_.e5Eligible=elapsedActive&&!seed&&!requalifying_&&!acknowledged;
+            if(!feedback_.pending&&!seed&&!requalifying_){
+                if(!AccrueElapsed(input.nowUs,feedback_.e5Eligible)){Withdraw(Reason::Input);return feedback_;}
+            }else if(!config_.flushMotionEnabled&&!feedback_.pending){
+                // E6-off remains the explicit pause of periodic flushing.
+                elapsedClockUs_=timer.latched?input.nowUs:0ULL;
+            }
+            mayTrigger=feedback_.e5Eligible;
+        }
+        if(config_.e5WorkTimer.mode==0U&&feedback_.e5Eligible&&!e5StartUs_)e5StartUs_=input.nowUs;
         if(!feedback_.pending){
-            if(!EDM130::AccrueWork(work_,delta,eligible)){Withdraw(Reason::Input);return feedback_;}
+            if(config_.e5WorkTimer.mode==0U&&!EDM130::AccrueWork(work_,delta,feedback_.e5Eligible)){Withdraw(Reason::Input);return feedback_;}
             if(workBaseUs_>(std::numeric_limits<std::uint64_t>::max)()-work_.totalWorkUs)
             {Withdraw(Reason::Input);return feedback_;}
             feedback_.simulatedWorkUs=workBaseUs_+work_.totalWorkUs;feedback_.intervalWorkUs=work_.elapsedUs;
-            if(work_.due&&eligible){
+            if(work_.due&&mayTrigger){
                 if(requestHighWater_==(std::numeric_limits<std::uint64_t>::max)())
                 {Withdraw(Reason::Input);return feedback_;}
                 if(!EDM130::TriggerWork(work_,input.tick,input.nowUs)){Withdraw(Reason::Input);return feedback_;}
-                feedback_.pending=true;feedback_.eligible=false;feedback_.requestSequence=++requestHighWater_;feedback_.requestTick=input.tick;
+                feedback_.pending=true;feedback_.eligible=false;feedback_.e5Eligible=false;feedback_.requestSequence=++requestHighWater_;feedback_.requestTick=input.tick;
+                feedback_.e5DueEvents=requestHighWater_;feedback_.e5LastDueTick=input.tick;e5DueUs_=input.nowUs;
                 feedback_.candidateMCS=input.candidateMCS;feedback_.nominalPhase=n.nominalPhase;
                 feedback_.layerIndex=n.layerIndex;feedback_.nominalProgressMm=n.nominalProgressMm;
                 feedback_.nominalLengthMm=n.nominalLengthMm;
             }
         }
+        physicalLineNominal_ = n.phase == NCG76SphereCycle::Phase::InitialDepth &&
+            n.nominalPhase == NCG76SphereCycle::Phase::InitialDepth &&
+            n.totalLimitUs == 0ULL && n.additionalUs == 0ULL;
         feedback_.valid=true;feedback_.reason=Reason::None;feedback_.sourceReason=EDM88::Reason::None;
         return feedback_;
+    }
+    bool CanQuarantinePhysicalLine() const noexcept
+    {
+        return active_ && !transportPaused_ && config_.physicalZManual && config_.parameterFeeds &&
+            config_.signedMotionEnabled && feedback_.valid && feedback_.reason == Reason::None &&
+            !feedback_.pending && !feedback_.suspended && !work_.due &&
+            physicalShortResult_.valid && !physicalShortResult_.feedInhibited &&
+            !physicalShortResult_.shortActive && feedback_.signedGapSpeedMmMin >= 0.0 && physicalLineNominal_;
+    }
+    bool SuspendPhysicalLine() noexcept
+    {
+        if (!CanQuarantinePhysicalLine()) return false;
+        lastRequalifiedTick_=0ULL;
+        transportPaused_ = true; work_.previousEligible = false;
+        feedback_.valid = feedback_.eligible = feedback_.e5Eligible = false;
+        feedback_.suspended = true; feedback_.signedGapSpeedMmMin = 0.0;feedback_.gainRegion=0;feedback_.gainRegionValid=false;
+        e5Gate_.SuspendForTransportGap(); feedback_.e5Timer = e5Gate_.Current();
+        return true;
+    }
+    bool RequalifyPhysicalLine(const Input& fresh,std::uint64_t maxTransportGapUs=100000ULL) noexcept
+    {
+        if (!maxTransportGapUs || maxTransportGapUs > 5000000ULL || !active_ || !transportPaused_ || requalifying_ || fresh.session != feedback_.session ||
+            fresh.nominal.session != fresh.session || !physicalLineNominal_ ||
+            fresh.nominal.phase != NCG76SphereCycle::Phase::InitialDepth ||
+            fresh.nominal.nominalPhase != NCG76SphereCycle::Phase::InitialDepth ||
+            fresh.nominal.totalLimitUs != 0ULL || fresh.nominal.additionalUs != 0ULL || !fresh.sourceValid || !fresh.powerInhibited ||
+            fresh.cancel || fresh.terminal || fresh.suspended || fresh.acceptedSendTick != 0ULL ||
+            fresh.tick <= lastTick_ || fresh.nowUs <= lastUs_ || fresh.nowUs - lastUs_ > maxTransportGapUs ||
+            !fresh.physicalFrame.valid || fresh.physicalFrame.sequence <= frame_.sequence ||
+            fresh.physicalFrame.capturedAtUs <= frame_.capturedAtUs) return false;
+        lastRequalifiedTick_=0ULL;
+        requalifying_ = true; requalifyMaxTransportGapUs_=maxTransportGapUs;
+        (void)Step(fresh);
+        requalifying_ = false; requalifyMaxTransportGapUs_=100000ULL;
+        const bool ready = active_ && feedback_.valid && feedback_.reason == Reason::None;
+        if (ready) { transportPaused_ = false; lastRequalifiedTick_=lastTick_; }
+        return ready;
+    }
+    // A successful requalification still sends zero. Only its immediate,
+    // unconsumed receipt may be suspended again if the final zero ACK is lost.
+    // A fresh negative GAP demand has not moved the axis and may be retained.
+    bool ResuspendRequalifiedPhysicalLine() noexcept
+    {
+        const bool receipt=lastRequalifiedTick_ && lastRequalifiedTick_==lastTick_ &&
+            lastRequalifiedTick_==feedback_.tick;
+        lastRequalifiedTick_=0ULL;
+        if (!receipt || !active_ || transportPaused_ || requalifying_ ||
+            !config_.physicalZManual || !config_.parameterFeeds || !config_.signedMotionEnabled ||
+            !feedback_.valid || feedback_.reason!=Reason::None || feedback_.pending ||
+            feedback_.suspended || work_.due || !physicalShortResult_.valid ||
+            physicalShortResult_.feedInhibited || physicalShortResult_.shortActive ||
+            !std::isfinite(feedback_.signedGapSpeedMmMin) || !physicalLineNominal_) return false;
+        transportPaused_=true;work_.previousEligible=false;
+        feedback_.valid=feedback_.eligible=feedback_.e5Eligible=false;
+        feedback_.suspended=true;feedback_.signedGapSpeedMmMin=0.0;feedback_.gainRegion=0;feedback_.gainRegionValid=false;
+        e5Gate_.SuspendForTransportGap();feedback_.e5Timer=e5Gate_.Current();
+        return true;
     }
     void Revoke() noexcept{Withdraw(Reason::Cancelled);}
     const Feedback& Current() const noexcept{return feedback_;}
 
 private:
+    bool AccrueElapsed(std::uint64_t nowUs,bool counting) noexcept
+    {
+        if(!nowUs||!EDM130::ValidWorkEvidence(work_)||!EDM130::IsTimed(work_)||
+           work_.triggeredEvents!=work_.completedEvents)return false;
+        if(!counting){
+            elapsedClockUs_=feedback_.e5Timer.latched?nowUs:0ULL;
+            work_.previousEligible=false;return true;
+        }
+        if(!elapsedClockUs_){elapsedClockUs_=nowUs;work_.previousEligible=true;return true;}
+        if(nowUs<elapsedClockUs_)return false;
+        const auto delta=nowUs-elapsedClockUs_;
+        if(work_.totalWorkUs>(std::numeric_limits<std::uint64_t>::max)()-delta)return false;
+        work_.totalWorkUs+=delta;
+        const auto remaining=work_.workTimeUs-work_.elapsedUs;
+        work_.elapsedUs+=delta<remaining?delta:remaining;
+        work_.due=work_.elapsedUs==work_.workTimeUs;work_.previousEligible=true;
+        elapsedClockUs_=nowUs;
+        return EDM130::ValidWorkEvidence(work_);
+    }
+    bool ResetRoundForHold(bool preservePending,std::uint64_t tick) noexcept
+    {
+        e5Gate_.Reset(tick);feedback_.e5Timer=e5Gate_.Current();feedback_.e5Evidence=e5Gate_.Export();
+        e5StartUs_=e5DueUs_=elapsedClockUs_=0ULL;
+        feedback_.intervalWorkUs=0ULL;feedback_.eligible=feedback_.e5Eligible=feedback_.e5ShortBlocked=false;
+        if(preservePending)return true;
+        const auto archive=feedback_.simulatedWorkUs;
+        const auto duration=pendingWorkTimeUs_?pendingWorkTimeUs_:config_.workTimeUs;
+        EDM130::WorkEvidence next{};
+        if(!EDM130::BeginWork(next,duration))return false;
+        if(pendingLiveRecipeFlush_){
+            ApplyLiveRecipeFlush(pendingLiveRecipeConfig_);
+            pendingLiveRecipeFlush_=false;pendingLiveRecipeConfig_=Config{};
+        }
+        config_.workTimeUs=feedback_.workTimeUs=duration;pendingWorkTimeUs_=0ULL;
+        work_=next;workBaseUs_=archive;
+        feedback_.pending=false;feedback_.requestSequence=feedback_.requestTick=0ULL;
+        feedback_.candidateMCS=Point8{};feedback_.nominalPhase=NCG76SphereCycle::Phase::Idle;
+        feedback_.layerIndex=0U;feedback_.nominalProgressMm=feedback_.nominalLengthMm=0.0;
+        return true;
+    }
+    void ApplyLiveRecipeFlush(const Config& config) noexcept
+    {
+        config_.jumpHeightMm=config.jumpHeightMm;config_.jumpSpeedPercent=config.jumpSpeedPercent;
+        config_.flushMotionEnabled=config.flushMotionEnabled;config_.independentFeedsEnabled=config.independentFeedsEnabled;
+        config_.flushProfile=config.flushProfile;
+        config_.finalApproachEnabled=config.finalApproachEnabled;config_.finalApproachPercent=config.finalApproachPercent;
+        config_.finalApproachDistanceMm=config.finalApproachDistanceMm;
+        config_.initialSlowEnabled=config.initialSlowEnabled;config_.initialSlowPercent=config.initialSlowPercent;
+        config_.initialSlowDistanceMm=config.initialSlowDistanceMm;
+        config_.deepFlushEnabled=config.deepFlushEnabled;config_.deepFlushCycleInterval=config.deepFlushCycleInterval;
+        config_.deepFlushHeightMultiplier=config.deepFlushHeightMultiplier;config_.deepFlushHeightMm=config.deepFlushHeightMm;
+    }
+    bool ApplyWorkTimeUpdate(std::uint64_t workTimeUs) noexcept
+    {
+        if(!EDM130::ValidWorkTime(workTimeUs)||!EDM130::ValidWorkEvidence(work_)||
+           work_.triggeredEvents!=work_.completedEvents||feedback_.pending)return false;
+        if(workTimeUs==config_.workTimeUs)return true;
+        const auto maximum=(std::numeric_limits<std::uint64_t>::max)();
+        if(workBaseUs_>maximum-work_.totalWorkUs)return false;
+        const auto total=workBaseUs_+work_.totalWorkUs;
+        // WorkEvidence binds every historical trigger to one duration. Start a
+        // fresh local timing epoch rather than rewriting those old receipts.
+        // Preserve uncapped credit since the last flush, including a shortened
+        // target subsequently lengthened before a legal trigger checkpoint.
+        const auto credit=work_.totalWorkUs-work_.lastTriggerTotalUs;
+        if(credit>total)return false;
+        EDM130::WorkEvidence next{};
+        if(!EDM130::BeginWork(next,workTimeUs))return false;
+        next.totalWorkUs=credit;
+        next.elapsedUs=(std::min)(credit,workTimeUs);
+        next.due=next.elapsedUs==workTimeUs;
+        if(!EDM130::ValidWorkEvidence(next))return false;
+        work_=next;workBaseUs_=total-credit;
+        config_.workTimeUs=feedback_.workTimeUs=workTimeUs;
+        feedback_.simulatedWorkUs=total;feedback_.intervalWorkUs=next.elapsedUs;
+        return true;
+    }
     void FailProbe(std::uint64_t nowUs) noexcept
     {feedback_.probePhase=ProbePhase::Failed;firstUs_=nowUs;}
     void UpdateProbe(const Input& input,std::uint64_t delta) noexcept
@@ -640,7 +1053,9 @@ private:
             if(!EDM130::BeginWork(work_,config_.workTimeUs))return false;
             feedback_.abortedFlushSequence=sequence;++feedback_.abortedFlushes;
         }
-        feedback_.pending=false;feedback_.eligible=false;feedback_.intervalWorkUs=0ULL;
+        e5Gate_.Reset(input.tick);feedback_.e5Timer=e5Gate_.Current();feedback_.e5Evidence=e5Gate_.Export();
+        e5StartUs_=e5DueUs_=elapsedClockUs_=0ULL;
+        feedback_.pending=false;feedback_.eligible=false;feedback_.e5Eligible=false;feedback_.intervalWorkUs=0ULL;
         feedback_.requestSequence=feedback_.requestTick=0ULL;feedback_.candidateMCS=Point8{};
         feedback_.nominalPhase=NCG76SphereCycle::Phase::Idle;feedback_.layerIndex=0U;
         feedback_.nominalProgressMm=feedback_.nominalLengthMm=0.0;
@@ -725,10 +1140,25 @@ private:
     }
     void Withdraw(Reason reason) noexcept
     {
+        // A normal, adjacent parent may inherit the last qualified accounting
+        // latch through the separately proved RT continuation. Every other
+        // withdrawal destroys that evidence immediately.
+        if(reason!=Reason::Terminal)feedback_.e5Evidence=EDM386E5::Evidence{};
+        e5Gate_.Withdraw(feedback_.tick);feedback_.e5Timer=e5Gate_.Current();feedback_.e5Eligible=feedback_.e5ShortBlocked=false;
         if(feedback_.probePhase==ProbePhase::Retreat||feedback_.probePhase==ProbePhase::Return)
             feedback_.probePhase=ProbePhase::Failed;
-        active_=false;qualifier_.Cancel();feedback_.valid=feedback_.eligible=feedback_.pending=feedback_.suspended=false;
+        active_=false;transportPaused_=requalifying_=physicalLineNominal_=false;pendingWorkTimeUs_=0ULL;
+        pendingLiveRecipeFlush_=false;pendingLiveRecipeConfig_=Config{};
+        lastRequalifiedTick_=0ULL;requalifyMaxTransportGapUs_=100000ULL;qualifier_.Cancel();feedback_.valid=feedback_.eligible=feedback_.pending=feedback_.suspended=false;
         feedback_.reason=reason;feedback_.signedGapSpeedMmMin=feedback_.voltageV=0.0;
+        feedback_.gainRegion=0;feedback_.gainRegionValid=false;feedback_.referenceV=0.0;
+        // Terminal handoff retains only clock/accounting evidence, under the
+        // same separate adjacency proof as e5Evidence. Every cancellation,
+        // RESET, source failure or revoke destroys it.
+        if(reason!=Reason::Terminal||config_.e5WorkTimer.mode!=1U){
+            e5StartUs_=elapsedClockUs_=0ULL;
+        }
+        e5DueUs_=0ULL;holdRoundReset_=false;
         feedback_.selectedFeedRole=FeedRole::Unavailable;
         feedback_.selectedScaleMmPerVoltMin=feedback_.selectedOverridePercent=0.0;
         feedback_.sourceSequence=feedback_.sourceCapturedAtUs=feedback_.requestSequence=feedback_.requestTick=0ULL;
@@ -736,19 +1166,24 @@ private:
         feedback_.layerIndex=0U;feedback_.nominalProgressMm=feedback_.nominalLengthMm=0.0;
     }
     unsigned finishLegCount_=4U,nominalLegCount_=25U,nominalWorkEndIndex_=24U;
-    Config config_{};Feedback feedback_{};EDM130::WorkEvidence work_{};
+    Config config_{};Config pendingLiveRecipeConfig_{};bool pendingLiveRecipeFlush_=false;
+    Feedback feedback_{};EDM130::WorkEvidence work_{};
+    EDM386E5::Gate e5Gate_{};
     EDM88::Qualifier qualifier_{};EDM88::Frame frame_{};
     EDMGapServo::ShortDetector physicalShort_{};EDMGapServo::ShortResult physicalShortResult_{};
     std::uint64_t physicalShortSequence_=0ULL;
     std::uint64_t sessionHighWater_=0ULL,lastTick_=0ULL,lastUs_=0ULL,firstUs_=0ULL;
-    std::uint64_t requestHighWater_=0ULL,workBaseUs_=0ULL;
+    std::uint64_t requestHighWater_=0ULL,workBaseUs_=0ULL,pendingWorkTimeUs_=0ULL;
+    std::uint64_t e5StartUs_=0ULL,e5DueUs_=0ULL,elapsedClockUs_=0ULL;
+    bool holdRoundReset_=false;
     std::uint64_t probeElapsedUs_=0ULL;
     double probeLengthMm_=0.0;
     bool probeSeeded_=false,probeEntered_=false;
-    bool active_=false,haveClock_=false;
+    std::uint64_t lastRequalifiedTick_=0ULL,requalifyMaxTransportGapUs_=100000ULL;
+    bool active_=false,haveClock_=false,transportPaused_=false,requalifying_=false,physicalLineNominal_=false;
 };
 static_assert(std::is_trivially_copyable<Config>::value,"P50 SIM config is an immutable value");
-static_assert(sizeof(Config)<=448U,"Role-selected P50 feed config remains bounded");
-static_assert(std::is_trivially_copyable<Feedback>::value&&sizeof(Feedback)<=256U,"P50 SIM feedback stays bounded");
+static_assert(sizeof(Config)<=960U,"Role-selected native-axis feed config remains bounded");
+static_assert(std::is_trivially_copyable<Feedback>::value&&sizeof(Feedback)<=384U,"P50 SIM feedback stays bounded");
 static_assert(!MotionExecutionReleased&&!DischargeExecutionReleased,"P50 SIM observer cannot authorize outputs");
 }

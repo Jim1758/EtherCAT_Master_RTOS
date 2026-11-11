@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <atomic>
 #include "EDMPLCOutputState.h"
+#include "EDMManualShortRelease.h"
 #include "NCPLCMap.h"
 static_assert(ATOMIC_INT_LOCK_FREE == 2, "EDM137 PLC image requires lock-free atomic unsigned");
 #include <string>
@@ -231,7 +232,10 @@ public:
     PLCManager();
     ~PLCManager();
 
-    uint32_t PLC_RunCount = 0;
+    std::atomic<std::uint32_t> PLC_RunCount{0};
+    EDMManualShortRelease::Action PollHmiShortRelease(std::uint64_t now, std::uint64_t frequency, bool permitted) noexcept {
+        return m_hmiShortRequests.Poll(PLC_RunCount.load(std::memory_order_relaxed), now, frequency, permitted);
+    }
     int Init_flag = 0;
     int Close_flag = 0;
 
@@ -300,6 +304,7 @@ public:
     PLCScanHealth GetScanHealth() const;
 
 private:
+    EDMManualShortRelease::Requests m_hmiShortRequests;
     friend class NCManager;
     // Only the NC owner can publish these three reserved S points.
     void PublishEDMOutputs(unsigned word) noexcept;

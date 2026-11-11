@@ -33,6 +33,7 @@ inline bool SameCalibration(const EDMGapInput::Profile&a,const EDMGapInput::Prof
 {
     return a.schemaVersion==b.schemaVersion && a.profileRevision==b.profileRevision &&
         a.source==b.source && a.adIndex==b.adIndex && a.expectedDeviceId==b.expectedDeviceId &&
+        a.stationNumber==b.stationNumber &&
         a.calibrationRevision==b.calibrationRevision && a.calibrationConfirmed==b.calibrationConfirmed &&
         a.rawMin==b.rawMin && a.rawMax==b.rawMax && a.boardMvAtMin==b.boardMvAtMin && a.boardMvAtMax==b.boardMvAtMax &&
         a.calibrationRawMin==b.calibrationRawMin && a.calibrationRawMax==b.calibrationRawMax &&
@@ -47,6 +48,9 @@ inline bool Valid(const Descriptor&d) noexcept
     const auto&b=d.binding; const auto&p=d.calibration;
     // Raw conversion accepts either declared source class. Do not coerce it to
     // SIM in order to reuse the stricter motion admission check.
+    // This conversion descriptor has no slave position. Station selection must
+    // be proved by EDM63 physical admission before a raw frame is projected;
+    // BoundPhysicalSource checks that route and this complete calibration.
     return d.schemaRevision==1U && d.deviceId && d.channelId==p.adIndex &&
         b.schemaRevision==1U && b.clockDomain==1U && b.profile>=35U && b.profile<=52U &&
         b.session && b.run && b.cache && b.dispatch && b.map && b.config && b.epoch &&

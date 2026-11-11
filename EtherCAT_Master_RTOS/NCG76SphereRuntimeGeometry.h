@@ -14,7 +14,8 @@
 // their work is bounded O(1), with no frame transforms, allocation, publication,
 // controller ownership or discharge authority. The original full frame and
 // descriptor remain attached for producer/consumer/hold identity comparisons.
-// C/U/V and absent slots retain their accepted native binary64 values.
+// Sphere/arc C/U/V remain fixed. Coordinated lines retain one metric progress
+// across optional linear/rotary C/U/V; absent slots retain their binary64 values.
 // Pitch/backlash remain exclusively with the existing final send correction.
 namespace NCG76SphereRuntimeGeometry
 {
@@ -202,10 +203,13 @@ namespace Detail
 inline Point3 Cross(const Point3& a,const Point3& b) noexcept
 {return Point3{{a[1]*b[2]-a[2]*b[1],a[2]*b[0]-a[0]*b[2],a[0]*b[1]-a[1]*b[0]}};}
 inline bool PrimitiveSource(const NCG76SphereCoordinates::FrozenFrame& frame,
-    const Point8& target,double feed,Geometry& g) noexcept
+    const Point8& target,double feed,Geometry& g,bool coordinatedLine=false) noexcept
 {
     if(!NCG76SphereCoordinates::ValidFrame(frame)||!Finite(target)||!Positive(feed)||feed>100000.0)return false;
-    for(unsigned a=3U;a<8U;++a)if(!Bits(frame.startMCS[a],target[a]))return false;
+    const auto& identity=frame.translation.axisIdentity;
+    for(unsigned a=3U;a<8U;++a)
+        if((!coordinatedLine||a>=6U||!identity.exists[a])&&!Bits(frame.startMCS[a],target[a]))return false;
+    if(coordinatedLine&&frame.fixedEccentric&&!Bits(frame.startMCS[3],target[3]))return false;
     g.frame=frame;g.startMCS=frame.startMCS;g.endMCS=target;g.feedMmMin=feed;
     return true;
 }
@@ -276,32 +280,54 @@ inline bool ArcMappingEnvelope(const NCG76SphereCoordinates::FrozenFrame& frame,
     if(!Finite(magnitude)||!std::isfinite(mapped))return false;
     envelope=(std::max)(envelope,mapped);return true;
 }
+inline double NativeLineError(const Geometry& g,unsigned axis) noexcept
+{
+    if(axis>=6U)return 0.0;
+    if(g.frame.translation.axisIdentity.nativeUnit[axis]==1U)return g.coordinateErrorBoundMm;
+    const double scale=(std::max)(std::fabs(g.startMCS[axis]),std::fabs(g.endMCS[axis]));
+    return std::nextafter(scale*(64.0*std::numeric_limits<double>::epsilon()),
+        std::numeric_limits<double>::infinity());
+}
 inline bool DeriveLine(const NCG76SphereCoordinates::FrozenFrame& frame,
     const Point8& target,double feed,Geometry& out) noexcept
 {
     Geometry g{};g.kind=Kind::Line;
-    if(!PrimitiveSource(frame,target,feed,g))return false;
-    Point3 delta{};double envelope=0.0;
-    for(unsigned a=0U;a<3U;++a){delta[a]=target[a]-frame.startMCS[a];
-        envelope=(std::max)(envelope,(std::max)(std::fabs(target[a]),std::fabs(frame.startMCS[a])));}
-    g.travelMm=Norm(delta);
-    if(!Finite(delta)||!std::isfinite(g.travelMm))return false;
+    if(!PrimitiveSource(frame,target,feed,g,true))return false;
+    const auto& identity=frame.translation.axisIdentity;
+    Point8 delta{};double envelope=0.0;bool moving=false;
+    for(unsigned a=0U;a<6U;++a){
+        delta[a]=target[a]-frame.startMCS[a];moving=moving||delta[a]!=0.0;
+        if(identity.exists[a]&&identity.nativeUnit[a]==1U)
+            envelope=(std::max)(envelope,(std::max)(std::fabs(target[a]),std::fabs(frame.startMCS[a])));
+    }
+    if(!Finite(delta)||!EDM384Axes::LinearDistance(identity,frame.startMCS,target,g.travelMm))return false;
     if(g.travelMm==0.0){
-        // An addressed G01 at the accepted endpoint is a real stationary
-        // parent. Preserve that accepted spelling; no tangent or positive
-        // path distance is fabricated and no flushing motion is generated.
+        // A stationary endpoint remains legal; a rotary-only GAP move has no
+        // configured millimetre feed metric and cannot borrow degrees as mm.
+        if(moving)return false;
         if(!PrimitiveBudget(g,1.0,(std::max)(1.0,envelope)))return false;
         g.endMCS=g.boundsMinMCS=g.boundsMaxMCS=g.startMCS;
         g.version=Version;g.valid=true;out=g;return true;
     }
     if(!Positive(g.travelMm)||g.travelMm>10000.0||!PrimitiveBudget(g,g.travelMm,envelope))return false;
-    for(unsigned a=0U;a<3U;++a){g.axis[a]=delta[a]/g.travelMm;g.maxCircleTangentAbs[a]=std::fabs(g.axis[a]);}
+    for(unsigned a=0U;a<6U;++a){
+        const double ratio=delta[a]/g.travelMm;
+        if(!std::isfinite(ratio)||(delta[a]!=0.0&&ratio==0.0))return false;
+        if(a<3U){g.axis[a]=ratio;g.maxCircleTangentAbs[a]=std::fabs(ratio);}
+    }
     g.boundsMinMCS=g.boundsMaxMCS=g.startMCS;
-    for(unsigned a=0U;a<3U;++a){
-        g.boundsMinMCS[a]=std::nextafter((std::min)(g.startMCS[a],g.endMCS[a])-g.coordinateErrorBoundMm,
+    for(unsigned a=0U;a<6U;++a)if(identity.exists[a]){
+        const double error=NativeLineError(g,a);
+        if(!std::isfinite(error)||error<0.0)return false;
+        // Stationary axes retain their exact admitted position; moving native
+        // rotary bounds use degrees, never the millimetre arithmetic fence.
+        if(delta[a]==0.0)continue;
+        g.boundsMinMCS[a]=std::nextafter((std::min)(g.startMCS[a],g.endMCS[a])-error,
             -std::numeric_limits<double>::infinity());
-        g.boundsMaxMCS[a]=std::nextafter((std::max)(g.startMCS[a],g.endMCS[a])+g.coordinateErrorBoundMm,
-            std::numeric_limits<double>::infinity());}
+        g.boundsMaxMCS[a]=std::nextafter((std::max)(g.startMCS[a],g.endMCS[a])+error,
+            std::numeric_limits<double>::infinity());
+        if(!std::isfinite(g.boundsMinMCS[a])||!std::isfinite(g.boundsMaxMCS[a]))return false;
+    }
     g.version=Version;g.valid=true;out=g;return true;
 }
 inline bool DeriveArc(const NCG76SphereCoordinates::FrozenFrame& frame,const Point8& target,
@@ -357,6 +383,38 @@ inline bool BuildLine(const NCG76SphereCoordinates::FrozenFrame& frame,const Poi
     const auto frozenFrame=frame;const Point8 frozenTarget=target;output=Geometry{};
     return Detail::DeriveLine(frozenFrame,frozenTarget,feed,output);
 }
+// The producer resolves native rotary G90 topology using installed policy
+// before this call. A single metric station then coordinates all native axes.
+inline bool BuildNativeCoordinatedLine(const NCG76SphereCoordinates::FrozenFrame& frame,
+    const Point8& nativeEndpoint,double feedMmMin,Geometry& output) noexcept
+{
+    const auto frozenFrame=frame;const Point8 frozenTarget=nativeEndpoint;output=Geometry{};
+    return Detail::DeriveLine(frozenFrame,frozenTarget,feedMmMin,output);
+}
+inline bool BuildCoordinatedLine(const NCG76SphereCoordinates::FrozenFrame& frame,
+    const Point8& authoredTarget,unsigned authoredMask,double feedMmMin,Geometry& output) noexcept
+{
+    const auto frozenFrame=frame;const Point8 frozenAuthored=authoredTarget;output=Geometry{};
+    Point8 native{};
+    return NCG76SphereCoordinates::MapCoordinatedPoint(frozenFrame,frozenAuthored,authoredMask,native)==
+        NCG76SphereCoordinates::Status::Ok&&Detail::DeriveLine(frozenFrame,native,feedMmMin,output);
+}
+inline bool LinearDistance(const NCG76SphereCoordinates::FrozenFrame& frame,const Point8& start,
+    const Point8& end,double& output) noexcept
+{return EDM384Axes::LinearDistance(frame.translation.axisIdentity,start,end,output);}
+inline bool LineNativeRatio(const Geometry& geometry,Point8& output) noexcept
+{
+    output=Point8{};
+    if(!geometry.valid||geometry.kind!=Kind::Line||!Detail::Positive(geometry.travelMm))return false;
+    for(unsigned axis=0U;axis<6U;++axis){
+        const double delta=geometry.endMCS[axis]-geometry.startMCS[axis];
+        output[axis]=delta/geometry.travelMm;
+        if(!std::isfinite(output[axis])||(delta!=0.0&&output[axis]==0.0))return false;
+    }
+    return true;
+}
+inline double NativeAxisErrorBound(const Geometry& geometry,unsigned axis) noexcept
+{return geometry.kind==Kind::Line?Detail::NativeLineError(geometry,axis):geometry.coordinateErrorBoundMm;}
 inline bool BuildArc(const NCG76SphereCoordinates::FrozenFrame& frame,const Point8& target,
     const Point3& center,const Point3& normal,int direction,double feed,bool fullCircle,Geometry& output) noexcept
 {
@@ -477,7 +535,7 @@ inline bool NominalAt(const Geometry& g,double fraction,Point8& position,Point3&
     if(g.kind==Kind::Arc)return ArcAt(g,fraction==1.0?g.arcSweepRad:fraction*g.arcSweepRad,position,tangent,curvature);
     if(g.kind!=Kind::Line||(g.travelMm==0.0&&fraction!=0.0))return false;
     position=fraction==1.0?g.endMCS:g.startMCS;tangent=g.axis;curvature=Point3{};
-    if(fraction>0.0&&fraction<1.0)for(unsigned a=0U;a<3U;++a)position[a]=g.startMCS[a]+(g.endMCS[a]-g.startMCS[a])*fraction;
+    if(fraction>0.0&&fraction<1.0)for(unsigned a=0U;a<6U;++a)position[a]=g.startMCS[a]+(g.endMCS[a]-g.startMCS[a])*fraction;
     return Detail::Finite(position)&&Detail::Finite(tangent);
 }
 // Native analytic circle; tangent is dP/ds (unitless), curvature is dT/ds

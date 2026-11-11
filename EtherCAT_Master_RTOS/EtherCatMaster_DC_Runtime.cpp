@@ -53,7 +53,7 @@ namespace
         const EDM174Comm::Cycle& cycle, std::uint64_t qpcFrequency) noexcept
     {
         (void)g_edm174CommunicationTrace.Record(observation.session, cycle,
-            observation.inputFaultTick, observation.guardFaultTick, qpcFrequency);
+            observation.inputFaultTick, observation.guardFaultTick, qpcFrequency, observation.domain);
     }
 
     OSCARMAX_P64_DIAG_NOINLINE void PublishEDM174CommunicationTrace() noexcept
@@ -2934,6 +2934,35 @@ namespace
         return mask;
     }
 
+    // PDO-owner admission for the optional ESC register sweep. A stopped
+    // alarm can still be inspected after its stop and reset work has drained.
+    bool CanRunBackgroundEscProbe(const EtherCatMaster& master) noexcept
+    {
+        if (!master.m_NC) return false;
+        const auto nc = master.m_NC->GetState();
+        const auto owner = master.m_Motion.GetMotionOwner();
+        const bool idle = nc == NCState::IDLE || nc == NCState::READY || nc == NCState::P_END;
+        const bool stopped = nc == NCState::ALARM || nc == NCState::NOT_READY;
+        if (!(idle || stopped)) return false;
+        if (owner != MotionOwner::NONE && !(idle && owner == MotionOwner::IDLE_HOLD) &&
+            !(stopped && owner == MotionOwner::SAFETY)) return false;
+
+        if (!master.m_Motion.IsGroupDone() || master.m_Motion.GetAxisCommandMailboxDepth() ||
+            master.m_Motion.HasPendingSafetyOrRecoveryRequests() ||
+            master.m_Motion.IsRotarySpindleSessionClaimed()) return false;
+
+        for (const auto& axis : master.m_Axes)
+        {
+            if (!axis.isExist) continue;
+            const bool stoppedAxis = axis.state == MotionState::MotionState_IDLE ||
+                axis.state == MotionState::MotionState_ERROR || axis.state == MotionState::MotionState_ESTOP;
+            if (!stoppedAxis || axis.homeRuntime.active || axis.resetRequest ||
+                axis.currentCmdVel != 0.0 || axis.targetVelocity != 0.0 ||
+                axis.logicalCmdVel != 0.0 || axis.currentActVel != 0.0) return false;
+        }
+        return true;
+    }
+
     void ProcessRuntimeEscDiagProbe(
         EtherCatMaster* pMaster,
         uint64_t pdoCycleStartMasterNs,
@@ -2974,6 +3003,13 @@ namespace
             g_ecatEscDiagRtShadow.DeferredSdo++;
             nextProbeTick =
                 pMaster->tickCount_PDO + OSCARMAX_ECAT_ESC_DIAG_PROBE_INTERVAL_CYCLES;
+            return;
+        }
+
+        if (!CanRunBackgroundEscProbe(*pMaster))
+        {
+            // Leave the current slave and diagnostic field pending until an idle slot.
+            nextProbeTick = pMaster->tickCount_PDO + OSCARMAX_ECAT_ESC_DIAG_PROBE_INTERVAL_CYCLES;
             return;
         }
 
@@ -12774,6 +12810,7 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
     // DC-RX.3D receives the exact software TX/RX window only when a fully
     // correlated LRW+FRMW response is accepted by ecx_LRW_FRMW().
     EtherCatDcCycleTiming dcCycleTiming = {};
+    bool cleanReceiveDeadline = false;
 
     // =============================================================
 // EtherCAT combined call 前的 QPC 時間戳
@@ -12852,7 +12889,8 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
                         DC_reference_time,
                         &dcWkc,
                         50,
-                        &dcCycleTiming);
+                        &dcCycleTiming,
+                        &cleanReceiveDeadline);
     }
     else
     {
@@ -19298,7 +19336,11 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
                                 m_Motion.
                                 ObserveNCSettleRuntimeCycle(
                                     pMaster->tickCount_PDO,
-                                    processDataValid);
+                                    processDataValid,
+                                    cleanReceiveDeadline && !dcRx3fInjectionAppliedThisCycle,
+                                    dcReferencePresent && dcRx3fActualCombinedValid &&
+                                    dcRx3fActualExactTimingValid && !dcRx3fInjectionRequestedThisCycle &&
+                                    !dcRx3fInjectionAppliedThisCycle);
 
 
                             // =========================================================
@@ -20653,6 +20695,7 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
     {
         EDM174Comm::Cycle cycle{};
         cycle.tick=pMaster->tickCount_PDO;
+        cycle.gap=edm174After.gap;
         cycle.startNs=pdoCycleStartMasterNs;
         cycle.commStartNs=combinedCommStartNs;
         cycle.commEndNs=combinedCommEndNs;
@@ -20665,15 +20708,16 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
         cycle.lrwWkc=static_cast<std::int32_t>(wkc);
         cycle.dcWkc=static_cast<std::int32_t>(dcWkc);
         cycle.expectedWkc=static_cast<std::int32_t>(pMaster->EXPECTED_WKC_PDO);
-        cycle.phaseBefore=edm174Before.session==edm174After.session?edm174Before.phase:0U;
+        cycle.phaseBefore=edm174Before.session==edm174After.session&&edm174Before.domain==edm174After.domain?edm174Before.phase:0U;
         cycle.phaseAfter=edm174After.phase;
-        cycle.childBefore=edm174Before.session==edm174After.session?edm174Before.child:0U;
+        cycle.childBefore=edm174Before.session==edm174After.session&&edm174Before.domain==edm174After.domain?edm174Before.child:0U;
         cycle.childAfter=edm174After.child;
         cycle.flags=(processDataValid?EDM174Comm::ProcessValid:0U) |
             (edm174ActualTiming.valid!=0U && edm174ActualTiming.source==
                 static_cast<std::uint32_t>(EtherCatDcCycleTimingSource::ExactSoftwareTxRx)
                 ?EDM174Comm::MatchedTimingValid:0U) |
-            (dcRx3fInjectionAppliedThisCycle?EDM174Comm::Injected:0U);
+            (dcRx3fInjectionAppliedThisCycle?EDM174Comm::Injected:0U) |
+            (cleanReceiveDeadline?EDM174Comm::CleanReceiveDeadline:0U);
         RecordEDM174CommunicationCycle(edm174After,cycle,qpcFrequency);
     }
     // A retirement to session zero must not strand an unpublished capture.

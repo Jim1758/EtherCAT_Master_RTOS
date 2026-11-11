@@ -4,6 +4,7 @@
 #include "NCTranslationSnapshot.h"
 #include "NCXYZCUVFeedScope.h"
 #include "NCEccentricCPath.h"
+#include "EDMCoordinatedAxes384.h"
 #include <array>
 #include <cmath>
 #include <cstring>
@@ -14,9 +15,11 @@
 // All lengths enter as canonical mm, F remains native mm/min (never scaled).
 // Supported affine frame: G21 Cartesian G90/G91; G17/G18/G19; ext/WCS;
 // G43/G44/G49 fixed XYZ H; G68; G168's one matching normal-axis rotation;
-// positive uniform XYZ scale and XYZ mirrors. C/U/V and absent slots stay
-// bitwise fixed at the accepted native start. Cross-plane WORK tilt, cutter
-// compensation, polar notation and simultaneous rotary motion are not admitted.
+// positive uniform XYZ scale and XYZ mirrors. Spatial G76/arc maps keep C/U/V
+// fixed; EDM384's separate coordinated-line map admits optional native auxiliary
+// coordinates without inventing tool-center rotary kinematics. Absent slots
+// stay bitwise fixed. Cross-plane WORK tilt, cutter compensation and polar
+// notation remain outside this affine lane.
 // Eccentric H49 is an identity only when the untouched snapshot is valid.
 // Eccentric H43/H44 additionally require the existing NCEccentricCDetail
 // Scope/Role==physical C proof; its fixed signed Offset uses physical start C,
@@ -100,13 +103,18 @@ inline Status Supported(const NCTranslationSnapshot& s,bool physicalZManual=fals
     double workAngle=0.0;
     if(!TryGetNCTranslationWorkPlaneAngle(s,workAngle))return Status::UnsupportedWorkRotation;
     if(!IsNCTranslationSnapshotValid(s))return Status::InvalidSnapshot;
-    if(physicalZManual){
-        if(!IsNCAxisIdentitySnapshotValid(s.axisIdentity)||s.axisIdentity.eccentricEnabled)return Status::UnsupportedAxisScope;
-        for(unsigned axis=0U;axis<3U;++axis)if(s.axisIdentity.exists[axis]!=1U||
-            s.axisIdentity.axisType[axis]!=0U||s.axisIdentity.address[axis]!="XYZ"[axis])return Status::UnsupportedAxisScope;
-        for(unsigned axis=3U;axis<8U;++axis)if(s.axisIdentity.exists[axis])return Status::UnsupportedAxisScope;
-    }else if(!IsNCXYZCUVFeedAxisScopeValid(s.axisIdentity)||s.axisIdentity.exists[6]!=0||s.axisIdentity.exists[7]!=0)
-        return Status::UnsupportedAxisScope;
+    // EDM384: dimensional axis identity, rather than a C/U/V letter, selects
+    // linear or rotary native units. Optional C/U/V slots may be absent.
+    if(!IsNCAxisIdentitySnapshotValid(s.axisIdentity))return Status::UnsupportedAxisScope;
+    for(unsigned axis=0U;axis<3U;++axis)if(s.axisIdentity.exists[axis]!=1U||
+        s.axisIdentity.axisType[axis]!=0U||s.axisIdentity.nativeUnit[axis]!=1U||
+        s.axisIdentity.address[axis]!="XYZ"[axis])return Status::UnsupportedAxisScope;
+    for(unsigned axis=3U;axis<6U;++axis)if(s.axisIdentity.exists[axis]&&
+        (s.axisIdentity.address[axis]!="XYZCUV"[axis]||s.axisIdentity.axisType[axis]>2U))return Status::UnsupportedAxisScope;
+    for(unsigned axis=6U;axis<8U;++axis)if(s.axisIdentity.exists[axis])return Status::UnsupportedAxisScope;
+    // The manual physical lane still forbids eccentric processing; its exact
+    // movement scope is independently checked by the NC/Motion adapters.
+    if(physicalZManual&&s.axisIdentity.eccentricEnabled)return Status::UnsupportedAxisScope;
     return Status::Ok;
 }
 inline bool RawVector(const FrozenFrame& frame,const Point3& point,Point3& output) noexcept
@@ -203,6 +211,34 @@ inline Status MapPoint(const FrozenFrame& inputFrame,const Point3& programPoint,
     if(!Detail::Finite(actualVector)||!Detail::Finite(expectedPoint))return Status::NumericRange;
     if(!Detail::PreservesVector(actualVector,expectedVector)||
         !Detail::WithinError(nativePoint,expectedPoint))return Status::PrecisionLoss;
+    output=native;return Status::Ok;
+}
+// Authored optional XYZ/C/U/V, with no rotary shortest-path guess. The
+// configuration-owning adapter resolves absolute rotary topology before
+// passing an endpoint to BuildNativeCoordinatedLine. XYZ retain the existing
+// affine transform; auxiliary slots retain their independent native offsets.
+inline Status MapCoordinatedPoint(const FrozenFrame& inputFrame,const Point8& authored,
+    unsigned authoredMask,Point8& output) noexcept
+{
+    const FrozenFrame frame=inputFrame;const Point8 frozen=authored;output=Point8{};
+    if(!ValidFrame(frame))return Status::FrameMismatch;
+    const auto& identity=frame.translation.axisIdentity;
+    const unsigned existing=EDM384Axes::ExistingMask(identity);
+    if(!authoredMask||(authoredMask&~existing)!=0U||(authoredMask&~0x3fU)!=0U)return Status::UnsupportedAxisScope;
+    Point3 xyz{};
+    for(unsigned axis=0U;axis<6U;++axis)if((authoredMask&(1U<<axis))&&!std::isfinite(frozen[axis]))return Status::InvalidInput;
+    for(unsigned axis=0U;axis<3U;++axis)xyz[axis]=(authoredMask&(1U<<axis))?frozen[axis]:
+        (frame.translation.distanceMode==90?frame.programStart[axis]:0.0);
+    Point8 native{};const auto mapped=MapPoint(frame,xyz,native);if(mapped!=Status::Ok)return mapped;
+    for(unsigned axis=3U;axis<6U;++axis){
+        if(!(authoredMask&(1U<<axis)))continue;
+        native[axis]=frame.translation.distanceMode==91?frame.startMCS[axis]+frozen[axis]:
+            frozen[axis]+(frame.translation.extOffsetMM[axis]+frame.translation.wcsOffsetMM[axis]);
+        const double delta=native[axis]-frame.startMCS[axis];
+        if(!std::isfinite(native[axis])||!std::isfinite(delta)||
+           (frame.translation.distanceMode==91&&frozen[axis]!=0.0&&delta==0.0))return Status::PrecisionLoss;
+    }
+    if(frame.fixedEccentric&&!Detail::Bits(native[3],frame.startMCS[3]))return Status::UnsupportedEccentric;
     output=native;return Status::Ok;
 }
 inline Status BuildInput(const FrozenFrame& frame,const Point3& authoredXYZ,unsigned authoredMask,

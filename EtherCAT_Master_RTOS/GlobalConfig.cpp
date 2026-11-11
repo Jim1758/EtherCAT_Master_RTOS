@@ -1543,7 +1543,7 @@ bool GlobalConfig::InitSystemParameters(EtherCatMaster& master)
         const bool loaded = EDMGapInputConfigIO::LoadFile(gapPath.c_str(), gapProfile, gapDiagnostic);
         const bool installed = master.m_NC->InstallEDMGapInputBeforeStart(gapProfile, &master);
         master.ConfigureGapAnalogInputBeforeStart(loaded ? gapProfile.adIndex : 0U,
-            loaded ? gapProfile.expectedDeviceId : 0U);
+            loaded ? gapProfile.expectedDeviceId : 0U, loaded ? gapProfile.stationNumber : 0U);
         DEBUG_PRINT("[EDM18] event=PROFILE result=%s reason=%s key=%s line=%u source=%s AD=%u expectedDevice=%u gainMillionths=%lld offsetMv=%d calibrated=%u physicalPermit=0 discharge=0\n",
             loaded && installed ? "READY" : "DISABLED", loaded ? (installed ? "NONE" : "INSTALL") : EDMGapInputConfigIO::ErrorName(gapDiagnostic.error),
             gapDiagnostic.key, static_cast<unsigned>(gapDiagnostic.line), EDMGap::SourceName(gapProfile.source),

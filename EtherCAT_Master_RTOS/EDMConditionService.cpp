@@ -346,7 +346,7 @@ void ProcessEDMConditionServiceSameThread(NCManager& nc) noexcept
     EDMRecipeControl::HmiResult result{};
     nc.ApplyEDMRecipeHmiCommandSameThread(DecodeContext(request.Expected), DecodeCommand(request), result);
     Acknowledge(nc, request, TranslateStatus(result.status),
-        result.status == EDMRecipeControl::HmiStatus::Success ? "Condition applied to shadow state." :
+        result.status == EDMRecipeControl::HmiStatus::Success ? "NC condition accepted; runtime recipe update queued; see RT recipe receipts." :
             (result.status == EDMRecipeControl::HmiStatus::DomainRejected ? EDMRecipe::ErrorName(result.domainError) : "Condition request rejected."),
         static_cast<std::uint32_t>(result.domainError));
 }

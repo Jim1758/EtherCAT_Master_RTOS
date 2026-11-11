@@ -5426,10 +5426,116 @@ namespace
     }
 
     // EDM174_FIX1_COMM_PRINTER_BEGIN
+    struct FirstExchangeRxEvidence
+    {
+        std::uint64_t targetTick = 0, firstId = 0, lastId = 0;
+        std::uint64_t oldestTick = 0, newestTick = 0;
+        unsigned unread = 0, tickHits = 0, scopedHits = 0;
+        bool clockBound = false;
+        bool eligible = false, matched = false, linkedRecovery = false;
+        EtherCatRxIncidentRecord failure{}, recovery{};
+    };
+
+    OSCARMAX_DIAG_NOINLINE void CaptureFirstExchangeRxEvidence(
+        const EDM174Comm::Snapshot& snapshot, FirstExchangeRxEvidence& out)
+    {
+        const auto& cycle = snapshot.firstBad;
+        out.eligible = snapshot.domain == EDM174Comm::Domain::PhysicalG01 &&
+            cycle.tick != 0 && cycle.lrwWkc < 0 &&
+            (snapshot.inputFaultTick == cycle.tick || (snapshot.reasonFlags & EDM174Comm::TransportInvalid)) &&
+            !(cycle.flags & (EDM174Comm::ProcessValid | EDM174Comm::Injected));
+        out.matched = out.linkedRecovery = false;
+        if (!out.eligible) return;
+        // The RX owner records pre-increment PDO ticks. The motion observer
+        // records the same exchange after tickCount_PDO increments.
+        out.targetTick = cycle.tick - 1ULL;
+        out.lastId = EtherCatRx4aIncidentLatestId();
+        const auto available = out.lastId < ETHERCAT_RX4A_INCIDENT_RING_CAPACITY ?
+            static_cast<unsigned>(out.lastId) : ETHERCAT_RX4A_INCIDENT_RING_CAPACITY;
+        out.firstId = available ? out.lastId - available + 1ULL : 0ULL;
+        out.oldestTick = out.newestTick = 0;
+        out.unread = out.tickHits = out.scopedHits = 0U;
+        // CLOCK_2 envelope stamps have a different origin from RTX QPC.
+        // Use a previous accepted exchange of this exact trace as the raw
+        // QPC lower bound. A stale equal tick from an older master run
+        // predates that exchange. Missing comparable time is inconclusive.
+        std::uint64_t lowerQpc = 0ULL;
+        const unsigned historyCount = snapshot.historyCount < EDM174Comm::HistoryCapacity ?
+            snapshot.historyCount : EDM174Comm::HistoryCapacity;
+        for (unsigned i = historyCount; i > 0U; --i)
+        {
+            const auto& previous = snapshot.history[i - 1U];
+            if ((previous.flags & EDM174Comm::MatchedTimingValid) && previous.tick < cycle.tick &&
+                previous.rxAfterQpc && !(previous.flags & (EDM174Comm::QpcTimingMissing | EDM174Comm::QpcTimingBackwards |
+                    EDM174Comm::QpcFrequencyMissing | EDM174Comm::QpcFrequencyChanged)))
+            {
+                lowerQpc = previous.rxAfterQpc;
+                break;
+            }
+        }
+        LARGE_INTEGER publishedQpc{}, publishedFrequency{};
+        out.clockBound = lowerQpc && snapshot.qpcFrequency &&
+            !(cycle.flags & (EDM174Comm::QpcFrequencyMissing | EDM174Comm::QpcFrequencyChanged)) &&
+            RtQueryPerformanceFrequency(&publishedFrequency) && publishedFrequency.QuadPart > 0 &&
+            static_cast<std::uint64_t>(publishedFrequency.QuadPart) == snapshot.qpcFrequency &&
+            RtQueryPerformanceCounter(&publishedQpc) && publishedQpc.QuadPart > 0 &&
+            static_cast<std::uint64_t>(publishedQpc.QuadPart) > lowerQpc;
+        bool readAny = false, foundRecovery = false;
+        static EtherCatRxIncidentRecord row{};
+        for (unsigned offset = 0; offset < available; ++offset)
+        {
+            const auto id = out.lastId - offset;
+            if (!EtherCatRx4aIncidentRead(id, &row) || row.IncidentId != id)
+            {
+                ++out.unread;
+                continue;
+            }
+            if (!readAny) { out.newestTick = row.PdoTick; readAny = true; }
+            out.oldestTick = row.PdoTick;
+            const auto kind = static_cast<EtherCatRxIncidentKind>(row.Kind);
+            const bool failureTick = row.PdoTick == out.targetTick &&
+                (kind == EtherCatRxIncidentKind::HardTimeout || kind == EtherCatRxIncidentKind::QueueStopped);
+            if (failureTick) ++out.tickHits;
+            if (!out.clockBound || row.QpcFrequency != snapshot.qpcFrequency ||
+                row.Qpc <= lowerQpc || row.Qpc > static_cast<std::uint64_t>(publishedQpc.QuadPart))
+                continue;
+            if (kind == EtherCatRxIncidentKind::Recovery && row.PdoTick == cycle.tick)
+            {
+                out.recovery = row;
+                foundRecovery = true;
+            }
+            if (failureTick)
+            {
+                out.failure = row;
+                ++out.scopedHits;
+            }
+        }
+        out.matched = out.scopedHits == 1U;
+        out.linkedRecovery = out.matched && foundRecovery &&
+            out.recovery.RelatedIncidentId == out.failure.IncidentId &&
+            out.recovery.IncidentId > out.failure.IncidentId && out.recovery.Qpc > out.failure.Qpc &&
+            out.recovery.BurstId == out.failure.BurstId;
+    }
+
+    const char* FirstRxReason(std::uint32_t reason)
+    {
+        static const char* const names[] = {"NONE","QPC_FAILURE","PRE_RECEIVE_DEADLINE","POST_RECEIVE_LATE",
+            "PRE_WAIT_DEADLINE","PRE_FALLBACK_DEADLINE","FALLBACK_EXHAUSTED","EVENT_STOPPED"};
+        return reason < sizeof(names)/sizeof(names[0]) ? names[reason] : "UNKNOWN";
+    }
+
+    const char* FirstRxClass(std::uint32_t classification)
+    {
+        static const char* const names[] = {"UNKNOWN","NO_FRAME_BY_DEADLINE","NAL_CALL_STALL",
+            "LATE_FRAME_RETURNED","LATE_FRAME_QUEUED","NO_LATE_FRAME_QUEUED","QPC_FAILURE","QUEUE_STOPPED","RECOVERED"};
+        return classification < sizeof(names)/sizeof(names[0]) ? names[classification] : "UNKNOWN";
+    }
+
     // P50 only. Finish one immutable capture before reading the next one.
     // One RtPrintf per 10ms supervisory iteration; no retries or allocation.
     OSCARMAX_DIAG_NOINLINE void PrintEDM174CommunicationTrace()
     {
+        static FirstExchangeRxEvidence rx{};
         static bool readyLogged = false;
         if (!readyLogged)
         {
@@ -5449,6 +5555,7 @@ namespace
             if (!EDM174Comm::Read(snapshot, fetched) || !fetched || fetched == lastPublication)
                 return;
             lastPublication = publication = fetched;
+            CaptureFirstExchangeRxEvidence(snapshot, rx);
             history = snapshot.historyCount < EDM174Comm::HistoryCapacity ?
                 snapshot.historyCount : EDM174Comm::HistoryCapacity;
             count = 0U;
@@ -5471,9 +5578,10 @@ namespace
         }
         if (cursor == 0U)
         {
-            RtPrintf("[EDM174_FIX1] event=COMM_BEGIN session=%llu pub=%llu inputFaultTick=%llu guardFaultTick=%llu qpcHz=%llu captured=%llu firstTick=%llu lastTick=%llu history=%u printedHistory=%u historyCap=20 rows=%u maxValid=%x invalidTiming=%u authority=NONE elapsedNotCpu=1 wireAck=0 qpcUse=matched_flag_only\n",
+            RtPrintf("[EDM174_FIX1] event=COMM_BEGIN session=%llu pub=%llu domain=%u inputFaultTick=%llu guardFaultTick=%llu qpcHz=%llu captured=%llu firstTick=%llu lastTick=%llu history=%u printedHistory=%u historyCap=20 rows=%u maxValid=%x invalidTiming=%u authority=NONE elapsedNotCpu=1 wireAck=0 qpcUse=matched_flag_only domain0=LEGACY173 domain1=PHYSICAL_G01\n",
                 static_cast<unsigned long long>(snapshot.session),
                 static_cast<unsigned long long>(publication),
+                static_cast<unsigned>(snapshot.domain),
                 static_cast<unsigned long long>(snapshot.inputFaultTick),
                 static_cast<unsigned long long>(snapshot.guardFaultTick),
                 static_cast<unsigned long long>(snapshot.qpcFrequency),
@@ -5488,13 +5596,73 @@ namespace
         }
         if (cursor == 1U)
         {
-            RtPrintf("[EDM174_FIX1] event=COMM_SCHEMA session=%llu pub=%llu timeUnit=ns rawQpc=tx0,tx1,rx1 ph=before/after ch=before/after w=lrw/dc/expected f=hex:1pdoValid,2matched,4injected,+timeFlags v=pairValid_hex:01dt,02pre,04ec,08post,10mot,20tl,40cb,80out dt=start_interval pre=start_to_comm ec=comm_envelope post=comm_to_motion tl=motion_to_end out=prev_end_to_start k=H_history,F_firstBad,C_maxCallback,M_maxMotion,E_maxComm,G_maxStartGap,P_gapPrevious\n",
-                static_cast<unsigned long long>(snapshot.session),
-                static_cast<unsigned long long>(publication));
+            RtPrintf("[EDM174_FIX1] event=COMM_SCHEMA session=%llu pub=%llu timeUnit=ns rawQpc=tx0,tx1,rx1 ph=before/after ch=before/after w=lrw/dc/expected f=hex:1pdoValid,2matched,4injected,8cleanRxTimeout,+timeFlags v=pairValid_hex:01dt,02pre,04ec,08post,10mot,20tl,40cb,80out dt=start_interval pre=start_to_comm ec=comm_envelope post=comm_to_motion tl=motion_to_end out=prev_end_to_start\n",
+                static_cast<unsigned long long>(snapshot.session), static_cast<unsigned long long>(publication));
             ++cursor;
             return;
         }
-        const unsigned index = cursor - 2U;
+        if (cursor == 2U)
+        {
+            RtPrintf("[EDM174_FIX1] event=COMM_SCHEMA_GAP session=%llu pub=%llu k=H_history,F_firstBad,C_maxCallback,M_maxMotion,E_maxComm,G_maxStartGap,P_gapPrevious gap=observerTick/mV/signed_um_min/flags/E5state gapFlags_hex=1observer,2values,4eligible,8suspended,10flush,20E5allow,40latched,80paused,100PDO,200running,400E5valid\n",
+                static_cast<unsigned long long>(snapshot.session), static_cast<unsigned long long>(publication));
+            ++cursor;
+            return;
+        }
+        if (rx.eligible && cursor == 3U)
+        {
+            const auto observed = static_cast<unsigned long long>(snapshot.firstBad.tick);
+            const auto target = static_cast<unsigned long long>(rx.targetTick);
+            if (!rx.matched)
+            {
+                RtPrintf("[EDM174_FIX1] event=COMM_RX result=NOMATCH ncTick=%llu rxTick=%llu retainedIds=%llu/%llu readableTicks=%llu/%llu unread=%u rolled=%u clockBound=%u tickHits=%u scopedHits=%u tx=UNKNOWN rx=UNKNOWN\n",
+                    observed, target, static_cast<unsigned long long>(rx.firstId), static_cast<unsigned long long>(rx.lastId),
+                    static_cast<unsigned long long>(rx.oldestTick), static_cast<unsigned long long>(rx.newestTick),
+                    rx.unread, rx.firstId > 1ULL ? 1U : 0U, rx.clockBound ? 1U : 0U,
+                    rx.tickHits, rx.scopedHits);
+            }
+            else
+            {
+                const auto& r = rx.failure;
+                // These two record kinds are produced only after SendPacket
+                // returned success. A post-deadline frame has not been validated.
+                RtPrintf("[EDM174_FIX1] event=COMM_RX result=MATCH ncTick=%llu rxTick=%llu id=%llu kind=%u reason=%u/%s class=%u/%s tx=DRIVER_ACCEPTED rxLen=%d rxNs=%llu callNs=%llu maxCallNs=%llu\n",
+                    observed, target, static_cast<unsigned long long>(r.IncidentId), static_cast<unsigned>(r.Kind),
+                    static_cast<unsigned>(r.Reason), FirstRxReason(r.Reason),
+                    static_cast<unsigned>(r.Classification), FirstRxClass(r.Classification), static_cast<int>(r.RxLength),
+                    static_cast<unsigned long long>(r.RxElapsedNs), static_cast<unsigned long long>(r.ReceiveCallNs),
+                    static_cast<unsigned long long>(r.ReceiveCallMaxNs));
+            }
+            ++cursor;
+            return;
+        }
+        if (rx.matched && cursor == 4U)
+        {
+            const auto& r = rx.failure;
+            RtPrintf("[EDM174_FIX1] event=COMM_RX_NAL id=%llu nalSeq=%llu outcome=%u ok=%u error=%u len=%u attempts=%u waits=%u signaled=%u timeout=%u failed=%u sleep=%u lastEvent=%u eventError=%u schedulerRecoveries=%llu\n",
+                static_cast<unsigned long long>(r.IncidentId), static_cast<unsigned long long>(r.NalCallSequence),
+                static_cast<unsigned>(r.NalOutcome), static_cast<unsigned>(r.NalCallSucceeded),
+                static_cast<unsigned>(r.NalError), static_cast<unsigned>(r.NalLength), static_cast<unsigned>(r.AttemptCount),
+                static_cast<unsigned>(r.CoarseWaitCount), static_cast<unsigned>(r.EventSignaledCount),
+                static_cast<unsigned>(r.EventTimeoutCount), static_cast<unsigned>(r.EventFailedCount),
+                static_cast<unsigned>(r.EventFallbackSleepCount), static_cast<unsigned>(r.LastEventResult),
+                static_cast<unsigned>(r.LastEventError), static_cast<unsigned long long>(r.SchedulerRecoveryTotal));
+            ++cursor;
+            return;
+        }
+        if (rx.linkedRecovery && cursor == 5U)
+        {
+            const auto& r = rx.recovery;
+            RtPrintf("[EDM174_FIX1] event=COMM_RX_REC id=%llu related=%llu rxTick=%llu class=%u/%s resync=%u drained=%u limit=%u lrw=%d/%d dc=%d\n",
+                static_cast<unsigned long long>(r.IncidentId), static_cast<unsigned long long>(r.RelatedIncidentId),
+                static_cast<unsigned long long>(r.PdoTick), static_cast<unsigned>(r.Classification),
+                FirstRxClass(r.Classification), static_cast<unsigned>(r.ResyncAttempted),
+                static_cast<unsigned>(r.ResyncDrainCount), static_cast<unsigned>(r.ResyncDrainLimitHit),
+                static_cast<int>(r.LrwWkc), static_cast<int>(r.ExpectedLrwWkc), static_cast<int>(r.DcWkc));
+            ++cursor;
+            return;
+        }
+        const unsigned index = cursor - 3U - (rx.eligible ? 1U : 0U) -
+            (rx.matched ? 1U : 0U) - (rx.linkedRecovery ? 1U : 0U);
         if (index < count)
         {
             const EDM174Comm::Cycle& cycle = *rows[index];
@@ -5509,7 +5677,7 @@ namespace
             if (EDM174Comm::SafeElapsed(cycle.motionEndNs, cycle.endNs, tail)) valid |= 0x20U;
             if (EDM174Comm::SafeElapsed(cycle.startNs, cycle.endNs, callback)) valid |= 0x40U;
             if (EDM174Comm::SafeElapsed(cycle.prevEndNs, cycle.startNs, outside)) valid |= 0x80U;
-            RtPrintf("[EDM174_FIX1] event=CROW s=%llu p=%llu k=%s i=%u t=%llu dt=%llu pre=%llu ec=%llu post=%llu mot=%llu tl=%llu cb=%llu out=%llu tx0=%llu tx1=%llu rx1=%llu ph=%u/%u ch=%u/%u w=%d/%d/%d f=%x v=%x\n",
+            RtPrintf("[EDM174_FIX1] event=CROW s=%llu p=%llu k=%s i=%u t=%llu dt=%llu pre=%llu ec=%llu post=%llu mot=%llu tl=%llu cb=%llu out=%llu tx0=%llu tx1=%llu rx1=%llu ph=%u/%u ch=%u/%u w=%d/%d/%d f=%x v=%x gap=%llu/%d/%d/%x/%u\n",
                 static_cast<unsigned long long>(snapshot.session),
                 static_cast<unsigned long long>(publication), kinds[index], index,
                 static_cast<unsigned long long>(cycle.tick),
@@ -5523,7 +5691,10 @@ namespace
                 static_cast<unsigned>(cycle.phaseBefore), static_cast<unsigned>(cycle.phaseAfter),
                 static_cast<unsigned>(cycle.childBefore), static_cast<unsigned>(cycle.childAfter),
                 static_cast<int>(cycle.lrwWkc), static_cast<int>(cycle.dcWkc),
-                static_cast<int>(cycle.expectedWkc), static_cast<unsigned>(cycle.flags), valid);
+                static_cast<int>(cycle.expectedWkc), static_cast<unsigned>(cycle.flags), valid,
+                static_cast<unsigned long long>(cycle.gap.tick), static_cast<int>(cycle.gap.millivolts),
+                static_cast<int>(cycle.gap.signedMicrometresPerMinute), static_cast<unsigned>(cycle.gap.flags),
+                static_cast<unsigned>(cycle.gap.e5State));
             ++cursor;
             return;
         }
@@ -5533,6 +5704,341 @@ namespace
         pending = false;
     }
     // EDM174_FIX1_COMM_PRINTER_END
+
+    // P50-only observation of the transport pause, independent of NC HOLD.
+    OSCARMAX_DIAG_NOINLINE void PrintG01TransportPause(MotionCore& motion)
+    {
+        static bool policyLogged = false;
+        if (!policyLogged)
+        {
+            RtPrintf("[G01-PDO] event=POLICY_READY mode=DIAGNOSTIC_RX_RETRY scope=PHYSICAL_G01_Z_B0_NOMINAL_FORWARD emptyRx=PAUSE_RETRY zeroConfirmMinMs=50 pauseBudget=EXISTING_SETTLE_TIMEOUT maxPauseMs=5000 dataError=STOP persistentLoss=GLOBAL_ESTOP\n");
+            policyLogged = true;
+            return;
+        }
+        static MotionG76SphereFeedback value{};
+        static std::uint64_t session = 0ULL, resumeTick = 0ULL;
+        static std::uint32_t pauses = 0U, retries = 0U;
+        static unsigned retryPolls = 100U;
+        static bool paused = false, terminal = false;
+        if (!motion.ReadG76SphereFeedback(value) || !value.session) return;
+        if (session != value.session)
+        {
+            session = value.session;
+            resumeTick = 0ULL; pauses = retries = 0U; paused = terminal = false;
+            retryPolls = 100U;
+        }
+        if (retryPolls < 100U) ++retryPolls;
+        const bool stateChanged = pauses != value.transportPauseCount ||
+            resumeTick != value.transportResumeTick || paused != value.transportPaused ||
+            terminal != value.terminal;
+        const bool retryChanged = retries != value.transportRetryCount;
+        if (!value.transportPauseCount || (!stateChanged && !retryChanged) ||
+            (!stateChanged && retryPolls < 100U)) return;
+        // Retry-only summaries are limited to one per 100 P50 polls (~1 s).
+        // A resume/stop always includes the latest cumulative retry count.
+        RtPrintf("[G01-PDO] session=%llu event=%s pauses=%u retries=%u pauseTick=%llu lastRetryTick=%llu resumeTick=%llu budgetUs=%llu preSource=COLLISION_PHYSICAL preValid=%u preTick=%llu preGapMv=%d preShort=%u shortWait=%u budgetExpired=%u runtimeFault=%u terminal=%u\n",
+            static_cast<unsigned long long>(value.session),
+            value.terminal ? (value.completed ? "COMPLETE" : "STOPPED") :
+                !stateChanged ? "RETRY_SUMMARY" : value.transportPaused ? "PAUSED" : "RESUMED",
+            static_cast<unsigned>(value.transportPauseCount),
+            static_cast<unsigned>(value.transportRetryCount),
+            static_cast<unsigned long long>(value.transportPauseTick),
+            static_cast<unsigned long long>(value.transportLastRetryTick),
+            static_cast<unsigned long long>(value.transportResumeTick),
+            static_cast<unsigned long long>(value.transportPauseBudgetUs),
+            value.transportLastValidSample ? 1U : 0U,
+            static_cast<unsigned long long>(value.transportLastValidTick),
+            static_cast<int>(value.transportLastValidGapMv),
+            value.transportLastValidShort ? 1U : 0U,
+            value.transportShortBlocked ? 1U : 0U,
+            value.transportBudgetExpired ? 1U : 0U,
+            static_cast<unsigned>(value.runtimeFault), value.terminal ? 1U : 0U);
+        pauses = value.transportPauseCount; resumeTick = value.transportResumeTick;
+        paused = value.transportPaused; terminal = value.terminal;
+        retries = value.transportRetryCount; retryPolls = 0U;
+    }
+
+    // EDM386_G01_RESPONSE_TRACE_BEGIN
+    // Integer-only P50 formatting: RtPrintf floating-point support is not
+    // assumed. Non-finite/out-of-range quantities have an explicit sentinel.
+    long long G01ResponseScaled(double value,double scale=1.0) noexcept
+    {
+        const double scaled=value*scale;
+        if(!std::isfinite(scaled)||scaled < -9.e15||scaled > 9.e15)
+            return (std::numeric_limits<long long>::min)();
+        return static_cast<long long>(std::llround(scaled));
+    }
+    bool G01ResponseSame(double a,double b) noexcept
+    { return a==b||(std::isnan(a)&&std::isnan(b)); }
+    const char* G01ResponseReason(std::uint32_t reason) noexcept
+    {
+        switch(reason){
+        case EDMG01ResponseTrace::Full:return "FULL";
+        case EDMG01ResponseTrace::Held:return "PARTIAL_HELD";
+        case EDMG01ResponseTrace::Terminal:return "PARTIAL_TERMINAL";
+        case EDMG01ResponseTrace::InputFault:return "PARTIAL_INPUT_FAULT";
+        case EDMG01ResponseTrace::ResetOrScopeEnd:return "PARTIAL_SCOPE_END";
+        default:return "UNKNOWN";
+        }
+    }
+    OSCARMAX_DIAG_NOINLINE void PrintG01ResponseTrace(MotionCore& motion)
+    {
+        static bool policy=false,reading=false,gainsKnown=false;
+        static EDMG01ResponseTrace::Header header{};
+        static EDMG01ResponseTrace::Sample row{};
+        static unsigned intro=0U,index=0U,part=0U;
+        static double kp=0.0,ki=0.0,kvff=0.0,ppu=0.0;
+        static unsigned reverse=0U;
+        if(!policy){
+            RtPrintf("[G01-RESP] event=POLICY_READY version=386R1 scope=PHYSICAL_Z_LINE_B0 capture=FIRST_NOMINAL_NEGATIVE maxRows=1536 preRows=512 postRows=1024 cadenceUs=250 print=HELD_OR_TERMINAL recordsPerPoll=1 authority=NONE\n");
+            policy=true;return;
+        }
+        // Recheck every poll, including during an already-owned dump. START
+        // pauses printing; the immutable capture remains owned until later.
+        if(!motion.G01ResponseDumpSafe())return;
+        if(!reading){
+            if(!motion.BeginReadG01Response(header))return;
+            reading=true;intro=index=part=0U;gainsKnown=false;
+        }
+        if(intro==0U){
+            RtPrintf("[G01-RESP] event=BEGIN s=%llu result=%s rows=%u pre=%u post=%u triggerIndex=%u triggerTick=%llu first=%llu last=%llu gaps=%llu overwrittenPre=%llu skippedAtFreeze=%llu adcTimestamp=PDO_RECEIPT feedback=POSITION_DIFFERENCE wireAck=0\n",
+                static_cast<unsigned long long>(header.session),G01ResponseReason(header.reason),header.count,
+                header.preCount,header.postCount,header.triggerIndex,static_cast<unsigned long long>(header.triggerTick),
+                static_cast<unsigned long long>(header.firstTick),static_cast<unsigned long long>(header.lastTick),
+                static_cast<unsigned long long>(header.gapCount),
+                static_cast<unsigned long long>(header.totalRows>=header.count?header.totalRows-header.count:0ULL),
+                static_cast<unsigned long long>(header.skippedSessions));
+            ++intro;return;
+        }
+        if(intro==1U){
+            RtPrintf("[G01-RESP] event=SCHEMA s=%llu row=gap_mV:new/used,use:curveTick/seq/captureUs,new:curveTick/seq/captureUs,dem_umMin:new/used,v_umMin:path/Zref/ZposDiff,p_nm:command/actual ad=signedRaw stages_hex=1input,2motion,4control,8local,10send,20return invalidInteger=-9223372036854775808\n",static_cast<unsigned long long>(header.session));
+            ++intro;return;
+        }
+        if(intro==2U){
+            RtPrintf("[G01-RESP] event=SCHEMA s=%llu ctrl=cp_nm:servoCommand,r_mPps:servoRef,csv:proposal_mPps/localPps/txProposedPps/txCopiedPps,tx:seq/sourceTick/frame/flags,ret:nextTick/pdoValid/combined,io:rawPos/status/mode,pi_mPps:P/I gains=microUnits ppu=pulsesPerMm\n",static_cast<unsigned long long>(header.session));
+            ++intro;return;
+        }
+        if(intro==3U){
+            RtPrintf("[G01-RESP] event=SCHEMA s=%llu flags_hex=1PDO,2combined,4source,8nominal,10collisionShort,20suspended,40gapApplied,80hold,100flush,200hardwareReverse,400rawAD,800newCurve,1000usedDemand,2000collisionValid txflags_hex=1attempt,2apiOK,4checked,8scrub,10idle,20scoped missingStage=UNOBSERVED retIsNotResponseToNewDemand=1\n",static_cast<unsigned long long>(header.session));
+            ++intro;return;
+        }
+        if(index>=header.count){
+            RtPrintf("[G01-RESP] event=END s=%llu rows=%u rowRecords=%u skippedNow=%llu authority=NONE\n",
+                static_cast<unsigned long long>(header.session),header.count,2U*header.count,
+                static_cast<unsigned long long>(motion.G01ResponseSkippedSessions()));
+            motion.EndReadG01Response(header.session);reading=false;return;
+        }
+        if(!motion.ReadG01ResponseRow(header.session,index,row)){
+            RtPrintf("[G01-RESP] event=INCONCLUSIVE s=%llu i=%u reason=IMMUTABLE_ROW_UNAVAILABLE authority=NONE\n",
+                static_cast<unsigned long long>(header.session),index);
+            motion.EndReadG01Response(header.session);reading=false;return;
+        }
+        const unsigned rowReverse=(row.flags&EDMG01ResponseTrace::HardwareReverse)?1U:0U;
+        if(part==0U&&(row.stages&EDMG01ResponseTrace::Control)&&
+           (!gainsKnown||!G01ResponseSame(kp,row.kp)||!G01ResponseSame(ki,row.ki)||
+            !G01ResponseSame(kvff,row.kvff)||!G01ResponseSame(ppu,row.ppu)||reverse!=rowReverse)){
+            RtPrintf("[G01-RESP] event=GAINS s=%llu i=%u t=%llu kpMicro=%lld kiMicro=%lld kvffMicro=%lld ppuMicro=%lld hardwareReverse=%u D=DISABLED\n",
+                static_cast<unsigned long long>(header.session),index,static_cast<unsigned long long>(row.tick),
+                G01ResponseScaled(row.kp,1.e6),G01ResponseScaled(row.ki,1.e6),
+                G01ResponseScaled(row.kvff,1.e6),G01ResponseScaled(row.ppu,1.e6),rowReverse);
+            kp=row.kp;ki=row.ki;kvff=row.kvff;ppu=row.ppu;reverse=rowReverse;gainsKnown=true;return;
+        }
+        const bool native=std::isfinite(row.ppu)&&row.ppu>0.0;
+        const double nmScale=native?1.e6/row.ppu:0.0;
+        const auto invalid=(std::numeric_limits<long long>::min)();
+        if(part==0U){
+            RtPrintf("[G01-RESP] event=ROW s=%llu i=%u t=%llu us=%llu st=%x f=%x ph=%u ad=%d gap=%lld/%lld use=%llu/%llu/%llu new=%llu/%llu/%llu dem=%lld/%lld v=%lld/%lld/%lld p=%lld/%lld\n",
+                static_cast<unsigned long long>(header.session),index,static_cast<unsigned long long>(row.tick),
+                static_cast<unsigned long long>(row.nowUs),row.stages,row.flags,row.phase,static_cast<int>(static_cast<std::int32_t>(row.rawAd)),
+                G01ResponseScaled(row.newVoltageV,1000.0),G01ResponseScaled(row.usedVoltageV,1000.0),
+                static_cast<unsigned long long>(row.usedCurveTick),static_cast<unsigned long long>(row.usedSequence),static_cast<unsigned long long>(row.usedCapturedUs),
+                static_cast<unsigned long long>(row.newCurveTick),static_cast<unsigned long long>(row.newSequence),static_cast<unsigned long long>(row.newCapturedUs),
+                G01ResponseScaled(row.nextDemandMmMin,1000.0),G01ResponseScaled(row.usedDemandMmMin,1000.0),
+                G01ResponseScaled(row.pathMmMin,1000.0),G01ResponseScaled(row.zReferenceMmMin,1000.0),
+                native?G01ResponseScaled(row.posDiffPps,60000.0/row.ppu):invalid,
+                native?G01ResponseScaled(row.commandPulse,nmScale):invalid,native?G01ResponseScaled(row.actualPulse,nmScale):invalid);
+            part=1U;return;
+        }
+        RtPrintf("[G01-RESP] event=CTRL s=%llu i=%u t=%llu cp=%lld r=%lld csv=%lld/%d/%d/%d tx=%llu/%llu/%llu/%x ret=%llu/%u/%u io=%d/%x/%d pi=%lld/%lld\n",
+            static_cast<unsigned long long>(header.session),index,static_cast<unsigned long long>(row.tick),
+            native?G01ResponseScaled(row.servoCommandPulse,nmScale):invalid,G01ResponseScaled(row.servoReferencePps,1000.0),
+            G01ResponseScaled(row.hardwareProposalPps,1000.0),row.localCsvPps,row.txProposedPps,row.txCopiedPps,
+            static_cast<unsigned long long>(row.txSequence),static_cast<unsigned long long>(row.txSourceTick),static_cast<unsigned long long>(row.txFrame),row.sendFlags,
+            static_cast<unsigned long long>(row.returnTick),row.returnPdoValid?1U:0U,row.returnCombined?1U:0U,
+            row.rawActualPosition,row.sourceStatus,row.sourceMode,G01ResponseScaled(row.pTerm,1000.0),G01ResponseScaled(row.iTerm,1000.0));
+        part=0U;++index;
+    }
+    // EDM386_G01_RESPONSE_TRACE_END
+    // EDM386_TERMINAL_RX_TRACE_BEGIN
+    // P50 observation only. Freeze the STOP exchange once, independently of
+    // the first-loss trace. No motion decision or EtherCAT transaction here.
+    struct G01TerminalRxEvidence
+    {
+        std::uint64_t session = 0ULL, pauseTick = 0ULL, faultTick = 0ULL;
+        std::uint64_t targetTick = 0ULL, firstId = 0ULL, lastId = 0ULL;
+        std::uint64_t lowerQpc = 0ULL, upperQpc = 0ULL, frequency = 0ULL;
+        unsigned unread = 0U, tickHits = 0U, scopedHits = 0U, recoveryHits = 0U;
+        unsigned gate = 0U;
+        bool eligible = false, clockBound = false, matched = false, recoveryMatched = false;
+        EtherCatRxIncidentRecord failure{}, recovery{};
+    };
+
+    bool G01TerminalSameIdentity(const MotionExecutionIdentity& a,
+        const MotionExecutionIdentity& b) noexcept
+    {
+        return a.epoch == b.epoch && a.segmentId == b.segmentId &&
+            a.sourceBlockId == b.sourceBlockId && a.source == b.source;
+    }
+
+    OSCARMAX_DIAG_NOINLINE void CaptureG01TerminalRxEvidence(
+        const MotionG76SphereFeedback& value, const MotionExecutionIdentity& identity,
+        const MotionOwnerLease& owner, std::uint64_t lowerQpc, std::uint64_t frequency,
+        G01TerminalRxEvidence& out)
+    {
+        out = G01TerminalRxEvidence{};
+        out.session = value.session;
+        out.pauseTick = value.transportPauseTick;
+        const auto& fault = value.firstInputFault;
+        out.faultTick = fault.tick;
+        out.gate = static_cast<unsigned>(fault.gate);
+        out.lowerQpc = lowerQpc;
+        out.frequency = frequency;
+        out.eligible = value.started && value.terminal && !value.completed && value.runtimeFault &&
+            value.transportPauseCount && out.pauseTick && fault.valid && fault.tick > out.pauseTick &&
+            fault.tick == fault.inputTick && fault.tick == fault.physicalSequence &&
+            fault.stage == MotionG76SphereInputStage::Observe &&
+            fault.gate == MotionG76SphereInputGate::PdoCycleInvalid &&
+            !(fault.flags & MotionG76SphereInputFlags::PdoCycleValid) &&
+            fault.inputSession == value.session && fault.expectedSession == value.session &&
+            G01TerminalSameIdentity(value.identity, identity) && value.owner.Matches(owner) &&
+            G01TerminalSameIdentity(fault.inputIdentity, value.identity);
+        if (out.eligible) out.targetTick = fault.tick - 1ULL;
+        LARGE_INTEGER upper{}, currentFrequency{};
+        out.clockBound = out.eligible && lowerQpc && frequency && fault.clockFrequency == frequency &&
+            RtQueryPerformanceFrequency(&currentFrequency) && currentFrequency.QuadPart > 0 &&
+            static_cast<std::uint64_t>(currentFrequency.QuadPart) == frequency &&
+            RtQueryPerformanceCounter(&upper) && upper.QuadPart > 0 &&
+            static_cast<std::uint64_t>(upper.QuadPart) > lowerQpc;
+        if (out.clockBound) out.upperQpc = static_cast<std::uint64_t>(upper.QuadPart);
+        // A missing session anchor or another fault gate cannot identify RX.
+        if (!out.eligible) return;
+        out.lastId = EtherCatRx4aIncidentLatestId();
+        const unsigned available = out.lastId < ETHERCAT_RX4A_INCIDENT_RING_CAPACITY ?
+            static_cast<unsigned>(out.lastId) : ETHERCAT_RX4A_INCIDENT_RING_CAPACITY;
+        out.firstId = available ? out.lastId - available + 1ULL : 0ULL;
+        static EtherCatRxIncidentRecord row{};
+        for (unsigned offset = 0U; offset < available; ++offset)
+        {
+            const auto id = out.lastId - offset;
+            if (!EtherCatRx4aIncidentRead(id, &row) || row.IncidentId != id)
+            { ++out.unread; continue; }
+            const auto kind = static_cast<EtherCatRxIncidentKind>(row.Kind);
+            const bool failureTick = row.PdoTick == out.targetTick &&
+                (kind == EtherCatRxIncidentKind::HardTimeout || kind == EtherCatRxIncidentKind::QueueStopped);
+            if (failureTick) ++out.tickHits;
+            if (!out.clockBound || row.QpcFrequency != frequency ||
+                row.Qpc <= lowerQpc || row.Qpc > out.upperQpc) continue;
+            if (failureTick) { out.failure = row; ++out.scopedHits; }
+            if (kind == EtherCatRxIncidentKind::Recovery && row.PdoTick == out.faultTick)
+            { out.recovery = row; ++out.recoveryHits; }
+        }
+        // A busy/unread slot may conceal another candidate. Report incomplete
+        // evidence instead of promoting a partial ring scan to an exact match.
+        out.matched = out.clockBound && !out.unread && out.scopedHits == 1U;
+        out.recoveryMatched = out.matched && out.recoveryHits == 1U &&
+            out.recovery.RelatedIncidentId == out.failure.IncidentId &&
+            out.recovery.IncidentId > out.failure.IncidentId && out.recovery.Qpc > out.failure.Qpc &&
+            out.recovery.BurstId == out.failure.BurstId;
+    }
+
+    OSCARMAX_DIAG_NOINLINE void PrintG01TerminalRxEvidence(MotionCore& motion)
+    {
+        static MotionG76SphereFeedback value{};
+        static G01TerminalRxEvidence frozen{};
+        static MotionExecutionIdentity identity{};
+        static MotionOwnerLease owner{};
+        static std::uint64_t session = 0ULL, lowerQpc = 0ULL, frequency = 0ULL;
+        static unsigned stage = 4U;
+        static bool captured = false;
+        // Finish a small immutable report before observing a subsequent one.
+        if (stage >= 4U)
+        {
+            if (!motion.ReadG76SphereFeedback(value) || !value.session) return;
+            if (session != value.session)
+            {
+                session = value.session; identity = value.identity; owner = value.owner;
+                lowerQpc = frequency = 0ULL; captured = false;
+                // First observed terminal state has no pre-terminal anchor.
+                // Do not fabricate one by timestamping an already-ended run.
+                LARGE_INTEGER qpc{}, hz{};
+                if (!value.terminal && value.identity.IsAssigned() && value.owner.IsValid() &&
+                    RtQueryPerformanceFrequency(&hz) && hz.QuadPart > 0 &&
+                    RtQueryPerformanceCounter(&qpc) && qpc.QuadPart > 0)
+                {
+                    lowerQpc = static_cast<std::uint64_t>(qpc.QuadPart);
+                    frequency = static_cast<std::uint64_t>(hz.QuadPart);
+                }
+            }
+            if (captured || !value.terminal || !value.runtimeFault || !value.transportPauseCount ||
+                value.nominalKind != NCG76SphereRuntimeGeometry::Kind::Line) return;
+            captured = true;
+            CaptureG01TerminalRxEvidence(value, identity, owner, lowerQpc, frequency, frozen);
+            stage = 0U;
+        }
+        const auto& r = frozen.failure;
+        if (stage == 0U)
+        {
+            RtPrintf("[G01-PDO-RX] event=STOP_CAPTURE session=%llu pauseTick=%llu faultTick=%llu rxTick=%llu gate=%u eligible=%u clockBound=%u retainedIds=%llu/%llu unread=%u tickHits=%u scopedHits=%u authority=NONE\n",
+                static_cast<unsigned long long>(frozen.session), static_cast<unsigned long long>(frozen.pauseTick),
+                static_cast<unsigned long long>(frozen.faultTick), static_cast<unsigned long long>(frozen.targetTick),
+                frozen.gate, frozen.eligible ? 1U : 0U, frozen.clockBound ? 1U : 0U,
+                static_cast<unsigned long long>(frozen.firstId), static_cast<unsigned long long>(frozen.lastId),
+                frozen.unread, frozen.tickHits, frozen.scopedHits);
+        }
+        else if (stage == 1U)
+        {
+            if (frozen.matched)
+                RtPrintf("[G01-PDO-RX] event=STOP_RX session=%llu result=MATCH id=%llu kind=%u reason=%u/%s class=%u/%s tx=DRIVER_ACCEPTED rxLen=%d rxNs=%llu callNs=%llu maxCallNs=%llu\n",
+                    static_cast<unsigned long long>(frozen.session), static_cast<unsigned long long>(r.IncidentId),
+                    static_cast<unsigned>(r.Kind), static_cast<unsigned>(r.Reason), FirstRxReason(r.Reason),
+                    static_cast<unsigned>(r.Classification), FirstRxClass(r.Classification), static_cast<int>(r.RxLength),
+                    static_cast<unsigned long long>(r.RxElapsedNs), static_cast<unsigned long long>(r.ReceiveCallNs),
+                    static_cast<unsigned long long>(r.ReceiveCallMaxNs));
+            else
+                RtPrintf("[G01-PDO-RX] event=STOP_RX session=%llu result=INCONCLUSIVE tx=UNKNOWN rx=UNKNOWN noMatchIsNotTxFailure=1\n",
+                    static_cast<unsigned long long>(frozen.session));
+        }
+        else if (stage == 2U)
+        {
+            if (!frozen.matched) { stage = 4U; return; }
+            RtPrintf("[G01-PDO-RX] event=STOP_NAL session=%llu id=%llu nalSeq=%llu outcome=%u ok=%u error=%u len=%u attempts=%u waits=%u signaled=%u timeout=%u failed=%u sleep=%u lastEvent=%u eventError=%u schedulerRecoveries=%llu\n",
+                static_cast<unsigned long long>(frozen.session), static_cast<unsigned long long>(r.IncidentId),
+                static_cast<unsigned long long>(r.NalCallSequence), static_cast<unsigned>(r.NalOutcome),
+                static_cast<unsigned>(r.NalCallSucceeded), static_cast<unsigned>(r.NalError),
+                static_cast<unsigned>(r.NalLength), static_cast<unsigned>(r.AttemptCount),
+                static_cast<unsigned>(r.CoarseWaitCount), static_cast<unsigned>(r.EventSignaledCount),
+                static_cast<unsigned>(r.EventTimeoutCount), static_cast<unsigned>(r.EventFailedCount),
+                static_cast<unsigned>(r.EventFallbackSleepCount), static_cast<unsigned>(r.LastEventResult),
+                static_cast<unsigned>(r.LastEventError), static_cast<unsigned long long>(r.SchedulerRecoveryTotal));
+        }
+        else
+        {
+            const auto& recovery = frozen.recovery;
+            if (frozen.recoveryMatched)
+                RtPrintf("[G01-PDO-RX] event=STOP_REC session=%llu result=MATCH id=%llu related=%llu rxTick=%llu class=%u/%s resync=%u drained=%u limit=%u lrw=%d/%d dc=%d\n",
+                    static_cast<unsigned long long>(frozen.session), static_cast<unsigned long long>(recovery.IncidentId),
+                    static_cast<unsigned long long>(recovery.RelatedIncidentId), static_cast<unsigned long long>(recovery.PdoTick),
+                    static_cast<unsigned>(recovery.Classification), FirstRxClass(recovery.Classification),
+                    static_cast<unsigned>(recovery.ResyncAttempted), static_cast<unsigned>(recovery.ResyncDrainCount),
+                    static_cast<unsigned>(recovery.ResyncDrainLimitHit), static_cast<int>(recovery.LrwWkc),
+                    static_cast<int>(recovery.ExpectedLrwWkc), static_cast<int>(recovery.DcWkc));
+            else
+                RtPrintf("[G01-PDO-RX] event=STOP_REC session=%llu result=INCONCLUSIVE candidates=%u recovery=UNKNOWN\n",
+                    static_cast<unsigned long long>(frozen.session), frozen.recoveryHits);
+        }
+        ++stage;
+    }
+    // EDM386_TERMINAL_RX_TRACE_END
 
     // EDM174_FIX6_LEAF_PRINTER_BEGIN
     // P50 owns this drain. Do not replace its immutable snapshot between rows.
@@ -6230,6 +6736,11 @@ int EtherCatMaster::RunRealTimeCycle_EDM_SINKER_MODE()//主要程式迴圈執行
         if(scopeNowNs) MachiningScope379::PublishNcState(static_cast<std::uint32_t>(m_NC->GetState()),scopeNowNs);
         MachiningScope379::Service(static_cast<std::uint32_t>(m_Axes.size()),scopeNowNs);
         PrintEDM174CommunicationTrace();
+        PrintG01TransportPause(m_Motion);
+        PrintG01TerminalRxEvidence(m_Motion);
+        // EDM386_G01_RESPONSE_TRACE_BEGIN
+        PrintG01ResponseTrace(m_Motion);
+        // EDM386_G01_RESPONSE_TRACE_END
         // EDM231 FIX4: keep first-fault communication evidence immediate;
         // defer periodic text only. RT collectors continue unchanged.
         if (!m_NC->IsEDM173DiagnosticQuietSameThread())

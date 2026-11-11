@@ -68,14 +68,47 @@ inline bool ResolveStoppedRecoveryStation(const Geometry& geometry,NCG76SphereRe
     // a station ULP is not a bound on three separately rounded XYZ axes.
     const double projectionBudget=budget;
     double projection=0.0;
+    bool mixedNativeLine=false;
+    if(geometry.kind==NCG76SphereRuntimeGeometry::Kind::Line)
+        for(unsigned axis=3U;axis<6U;++axis)
+            mixedNativeLine=mixedNativeLine||geometry.endMCS[axis]!=geometry.startMCS[axis];
     for(const Point8* candidate:{&endpoint,&interior,&projected}){
-        if(std::memcmp(candidate->data()+3U,anchor.data()+3U,5U*sizeof(double))!=0)return false;
-        Point3 error{};for(unsigned axis=0U;axis<3U;++axis)error[axis]=(*candidate)[axis]-anchor[axis];
-        if(!Detail::Finite(error))return false;
-        const double norm=Detail::Norm(error);
-        const double upper=norm==0.0?0.0:std::nextafter(std::nextafter(norm,infinity),infinity);
-        if(!std::isfinite(upper)||upper>projectionBudget)return false;
-        projection=(std::max)(projection,upper);
+        if(mixedNativeLine){
+            // EDM384: a line station is a millimetre metric over configured
+            // linear axes. Its C/U/V components may be millimetres or degrees;
+            // compare their own native arithmetic bounds, never a mixed norm.
+            const auto& identity=geometry.frame.translation.axisIdentity;
+            if(!Detail::Positive(geometry.travelMm))return false;
+            for(unsigned axis=0U;axis<8U;++axis){
+                const double delta=axis<6U?geometry.endMCS[axis]-geometry.startMCS[axis]:0.0;
+                if(axis>=6U||!identity.exists[axis]||delta==0.0){
+                    if(std::memcmp(&(*candidate)[axis],&anchor[axis],sizeof(double))!=0)return false;
+                    continue;
+                }
+                const double ratio=std::fabs(delta/geometry.travelMm);
+                const double nativeError=NCG76SphereRuntimeGeometry::NativeAxisErrorBound(geometry,axis);
+                const double error=std::fabs((*candidate)[axis]-anchor[axis]);
+                if(!Detail::Positive(ratio)||!std::isfinite(nativeError)||nativeError<0.0||!std::isfinite(error))return false;
+                const double nativeSpan=std::nextafter(projectionBudget*ratio,infinity);
+                const double nativeBudget=std::nextafter(nativeSpan+nativeError,infinity);
+                if(!std::isfinite(nativeBudget)||error>nativeBudget)return false;
+                // Only the part beyond independent native-coordinate rounding
+                // consumes the scalar station budget. Upper-round before adding
+                // the mapped residual so ordering cannot gain extra distance.
+                const double excess=error>nativeError?(error-nativeError)/ratio:0.0;
+                const double upper=excess==0.0?0.0:std::nextafter(std::nextafter(excess,infinity),infinity);
+                if(!std::isfinite(upper)||upper>projectionBudget)return false;
+                projection=(std::max)(projection,upper);
+            }
+        }else{
+            if(std::memcmp(candidate->data()+3U,anchor.data()+3U,5U*sizeof(double))!=0)return false;
+            Point3 error{};for(unsigned axis=0U;axis<3U;++axis)error[axis]=(*candidate)[axis]-anchor[axis];
+            if(!Detail::Finite(error))return false;
+            const double norm=Detail::Norm(error);
+            const double upper=norm==0.0?0.0:std::nextafter(std::nextafter(norm,infinity),infinity);
+            if(!std::isfinite(upper)||upper>projectionBudget)return false;
+            projection=(std::max)(projection,upper);
+        }
     }
     const double combinedUpper=std::nextafter(projection+mappedResidualUpper,infinity);
     if(!std::isfinite(combinedUpper)||combinedUpper>budget)return false;
@@ -124,7 +157,9 @@ inline bool Cycle::ConfigureHoldRecoveryAdmitted(const NCHoldRecovery::Config& c
         const auto& next=i+1U==completedCount?request_.geometry:completedOldestFirst[i+1U];
         if(std::memcmp(g.endMCS.data(),next.startMCS.data(),sizeof(Point8))!=0)return false;
         for(unsigned a=0U;a<8U;++a){
-            if(a>=3U&&(g.startMCS[a]!=request_.geometry.startMCS[a]||g.endMCS[a]!=request_.geometry.startMCS[a]))return false;
+            const bool mixedLine=g.kind==NCG76SphereRuntimeGeometry::Kind::Line&&
+                request_.geometry.kind==NCG76SphereRuntimeGeometry::Kind::Line;
+            if(a>=3U&&!mixedLine&&(g.startMCS[a]!=request_.geometry.startMCS[a]||g.endMCS[a]!=request_.geometry.startMCS[a]))return false;
             if((request_.travelMask&(1U<<a))&&(g.boundsMinMCS[a]<request_.travelMin[a]||g.boundsMaxMCS[a]>request_.travelMax[a]))return false;
         }
     }
@@ -199,15 +234,12 @@ inline bool Cycle::StartRecoveryLine(const Point8& end,bool returning,Phase phas
     const double feed=jog?c.jogRecoveryFeedMmMin:returning?c.resumeFeedMmMin:c.retreatFeedMmMin;
     const double acc=jog?c.jogAccelSeconds:returning?c.resumeAccelSeconds:c.retreatAccelSeconds;
     const double dec=jog?c.jogDecelSeconds:returning?c.resumeDecelSeconds:c.retreatDecelSeconds;
-    Leg next{};next.start=output_.commandMCS;next.end=end;
-    for(unsigned a=0U;a<3U;++a)next.direction[a]=end[a]-next.start[a];
-    for(unsigned a=3U;a<8U;++a)if(end[a]!=request_.geometry.startMCS[a]||next.start[a]!=end[a]){Fail(Fault::Numeric);return false;}
-    next.length=Detail::Norm(next.direction);
-    if(next.length>0.0)for(double& x:next.direction)x/=next.length;
+    Leg next{};
+    if(!InitializeLine(end,next))return false;
     next.speedLimit=(std::min)(feed/60.0,request_.velocityCapMmS);
     next.acceleration=(std::min)(request_.accelerationMmS2,next.speedLimit/acc);
     next.deceleration=(std::min)(request_.decelerationMmS2,next.speedLimit/dec);
-    if(!Detail::Positive(next.speedLimit)||!StartProfile(next)){Fail(Fault::Numeric);return false;}
+    if(!Detail::Positive(next.speedLimit)||!LimitNativeLine(next)||!StartProfile(next)){Fail(Fault::Numeric);return false;}
     leg_=next;recovery_.evaluationGeometry=nullptr;feedback_.phase=phase;
     output_.velocityNative.fill(0.0);output_.accelerationNative.fill(0.0);RefreshOutput();return true;
 }
@@ -241,7 +273,7 @@ inline bool Cycle::StartRecoveryPath(const NCG76SphereCycle::Geometry& g,double 
     const double budget=0.5*(std::min)(request_.accelerationMmS2,request_.decelerationMmS2);
     next.speedLimit=(std::min)((std::min)(feed/60.0,request_.velocityCapMmS),std::sqrt(budget)*std::sqrt(radius));
     next.acceleration=(std::min)(budget,next.speedLimit/acc);next.deceleration=(std::min)(budget,next.speedLimit/dec);
-    if(!InsideTravel(end)||!Detail::Positive(next.length)||!Detail::Positive(next.speedLimit)||!StartProfile(next)){Fail(Fault::Numeric);return false;}
+    if(!InsideTravel(end)||!Detail::Positive(next.length)||!Detail::Positive(next.speedLimit)||!LimitNativeLine(next,&g)||!StartProfile(next)){Fail(Fault::Numeric);return false;}
     leg_=next;recovery_.evaluationGeometry=&g;feedback_.phase=Phase::RecoveryMove;
     output_.velocityNative.fill(0.0);output_.accelerationNative.fill(0.0);RefreshOutput();return true;
 }
@@ -438,7 +470,8 @@ inline bool Cycle::BeginInspectionJog(unsigned axis,double signedVelocityMmMin) 
     next.speedLimit=(std::min)(std::fabs(signedVelocityMmMin)/60.0,request_.velocityCapMmS);
     next.acceleration=(std::min)(request_.accelerationMmS2,next.speedLimit/recovery_.config.jogAccelSeconds);
     next.deceleration=(std::min)(request_.decelerationMmS2,next.speedLimit/recovery_.config.jogDecelSeconds);
-    if(!Detail::Positive(next.speedLimit)||!Detail::Positive(next.acceleration)||!Detail::Positive(next.deceleration))return false;
+    if(!Detail::Positive(next.speedLimit)||!Detail::Positive(next.acceleration)||!Detail::Positive(next.deceleration)||
+       !LimitNativeLine(next))return false;
     recovery_.jogStart=output_.commandMCS;recovery_.inspectionFeed=next.speedLimit*60.0;
     recovery_.jogStop=false;recovery_.evaluationGeometry=nullptr;recovery_.stage=RecoveryStage::Jog;
     leg_=next;feedback_.phase=Phase::InspectionJog;RefreshOutput();return true;

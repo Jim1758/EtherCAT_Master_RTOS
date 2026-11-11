@@ -61,7 +61,10 @@ struct Cursor
 struct Sample
 {
     Point8 position{},center{};
-    Point3 tangent{}; // d(position)/d(physical nominal leg distance), unit length.
+    // XYZ projection of d(native position)/d(metric linear distance). A
+    // coordinated line may also move native C/U/V; its XYZ projection can be
+    // shorter than one or zero for an auxiliary-linear-only metric path.
+    Point3 tangent{};
     Cursor cursor{};
     bool terminal=false,valid=false;
 };
@@ -475,7 +478,9 @@ inline Status Evaluate(const Descriptor& p,const Cursor& cursor,Sample& output) 
     for(unsigned a=0U;a<8U;++a){
         if(sample.position[a]<p.geometry.boundsMinMCS[a]||sample.position[a]>p.geometry.boundsMaxMCS[a]||
             sample.center[a]<p.geometry.boundsMinMCS[a]||sample.center[a]>p.geometry.boundsMaxMCS[a])return Status::NumericRange;
-        if(a>=3U&&(!Detail::Bits(sample.position[a],p.geometry.startMCS[a])||
+        const bool movingNativeLine=p.geometry.kind==NCG76SphereRuntimeGeometry::Kind::Line&&
+            a<6U&&p.geometry.frame.translation.axisIdentity.exists[a]==1U;
+        if(a>=3U&&!movingNativeLine&&(!Detail::Bits(sample.position[a],p.geometry.startMCS[a])||
             !Detail::Bits(sample.center[a],p.geometry.startMCS[a])))return Status::InvalidGeometry;
     }
     sample.valid=true;output=sample;return Status::Ok;

@@ -37,7 +37,7 @@ constexpr double MaximumAbsoluteStartRoundTripErrorMm=1.e-9;
 // Other feed lanes retain their existing frame contracts.
 inline bool FrameSupported(const NCTranslationSnapshot& source) noexcept
 {
-    return NCG76::FrameSupported(source,true,true)&&IsNCXYZCUVFeedAxisScopeValid(source.axisIdentity)&&
+    return NCG76::FrameSupported(source,true,true)&&IsNCLegacyXYZCUVFeedAxisScopeValid(source.axisIdentity)&&
         source.axisIdentity.exists[6U]==0U&&source.axisIdentity.exists[7U]==0U&&
         source.unitsMode==21&&(source.distanceMode==90||source.distanceMode==91)&&
         (source.toolLengthMode==43||source.toolLengthMode==44||source.toolLengthMode==49)&&

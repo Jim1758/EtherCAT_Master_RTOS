@@ -42,6 +42,9 @@ namespace EDMGapInput
         std::uint32_t schemaVersion = 1U, profileRevision = 0U;
         EDMGap::Source source = EDMGap::Source::NONE;
         std::uint32_t adIndex = 0U, expectedDeviceId = 0U, calibrationRevision = 0U;
+        // Zero preserves legacy global AdIndex numbering. Schema 2 may select
+        // a 1-based EtherCAT station; adIndex then denotes its local AD channel.
+        std::uint32_t stationNumber = 0U;
         bool calibrationConfirmed = false;
         std::int32_t rawMin = 0, rawMax = 0, boardMvAtMin = 0, boardMvAtMax = 0;
         // Schema 2 separates transport bounds from the two board calibration
@@ -125,6 +128,7 @@ namespace EDMGapInput
         if ((p.schemaVersion != 1U && p.schemaVersion != 2U) || p.profileRevision == 0U || p.calibrationRevision == 0U ||
             (p.source != EDMGap::Source::SIMULATED && p.source != EDMGap::Source::PHYSICAL) ||
             p.adIndex == 0U || p.adIndex > 64U || p.expectedDeviceId > 65535U ||
+            p.stationNumber > 128U || (p.stationNumber != 0U && p.schemaVersion != 2U) ||
             p.rawMin < -32768 || p.rawMax > 65535 || p.rawMin >= p.rawMax ||
             p.boardMvAtMin < 0 || p.boardMvAtMax > 1000000 || p.boardMvAtMin >= p.boardMvAtMax ||
             p.voltageGainMillionths < 1LL || p.voltageGainMillionths > 1000LL * GainScale ||
@@ -141,7 +145,7 @@ namespace EDMGapInput
         else
         {
             if (p.calibrationRawMin < p.rawMin || p.calibrationRawMax > p.rawMax ||
-                p.calibrationRawMin >= p.calibrationRawMax || p.zeroClampBoardUv > 10000U ||
+                p.calibrationRawMin >= p.calibrationRawMax || p.zeroClampBoardUv > 20000U ||
                 (p.zeroClampBoardUv != 0U && p.boardMvAtMin != 0)) return false;
             std::int64_t denominator = 0;
             const std::int64_t low = Detail::BoardNumerator(p, p.rawMin, denominator);
@@ -288,6 +292,8 @@ namespace EDMGapInput
             if (!m_ready) { result.inputStatus = InputStatus::ConfigurationError; return FinishInvalid(result, EDMGap::Quality::CONFIG_ERROR); }
             if (!input.configured) result.inputStatus = MapReason(input.reason);
             else if (input.adIndex != m_profile.adIndex ||
+                (m_profile.stationNumber != 0U &&
+                    input.slaveIndex != static_cast<std::int32_t>(m_profile.stationNumber - 1U)) ||
                 (m_profile.expectedDeviceId != 0U && input.deviceId != m_profile.expectedDeviceId))
                 result.inputStatus = InputStatus::IdentityMismatch;
             else if (!input.transportValid) {

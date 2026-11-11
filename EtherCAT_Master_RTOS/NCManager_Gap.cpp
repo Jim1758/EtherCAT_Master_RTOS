@@ -2,6 +2,7 @@
 #include "EtherCatMaster.h"
 #include "NCManager_GapInternal.h"
 #include "EDMRuntimeLogPolicy.h"
+#include "EDMManualGapZConfig.h"
 
 using namespace NCGapDetail;
 
@@ -146,9 +147,15 @@ void NCManager::ValidateEDMRecipeSelectionSameThread() noexcept
         // Only a previously NC-bound selection can follow a legal resume.
         if (m_motion.HasPendingSafetyOrRecoveryRequests() ||
             !m_motion.IsMotionOwnerLeaseCurrent(m_programMotionLease)) return;
+        m_recipe.CopySnapshot(m_physicalLiveRecipeScratch);
+        const bool resumePhysicalCarry=m_physicalLiveRecipeRun==m_recipeRun&&
+            m_physicalLiveRecipeCache==m_recipeCache&&m_physicalLiveRecipeCatalog==m_recipe.GetCatalog()&&
+            m_physicalLiveRecipeEpoch==m_recipeEpoch&&m_physicalLiveRecipeOwner.Matches(m_recipeLease)&&
+            NCG76SphereGapBinding::SameActiveRecipe(m_physicalLiveRecipeSnapshot,m_physicalLiveRecipeScratch);
         m_recipeEpoch = m_motion.GetCurrentExecutionEpoch();
         m_recipeLease = m_programMotionLease;
         m_recipeHoldSeen = false;
+        if(resumePhysicalCarry){m_physicalLiveRecipeEpoch=m_recipeEpoch;m_physicalLiveRecipeOwner=m_recipeLease;}
     }
     else if (m_recipeEpoch != m_motion.GetCurrentExecutionEpoch() ||
         !m_recipeLease.Matches(m_programMotionLease))
@@ -249,6 +256,8 @@ bool NCManager::CommitEDMRecipeSelectionSameThread(const NCBlock& block)
         !m_recipePrepared.lease.Matches(m_programMotionLease) ||
         !IsEDMRecipeStoppedSelectionAllowedSameThread(block))
     { RejectEDMRecipeSelectionSameThread(line, "COMMIT_SCOPE"); return false; }
+    const bool physicalCarry=EDM382::Current().enabled&&IsEDM171AirGrantCurrentSameThread(true)&&
+        IsPhysicalLiveRecipeSelectionCurrentSameThread();
     m_recipePrepared.ready = false;
     const bool selectE1 = table && m_recipe.GetCatalog() && m_recipe.GetCatalog()->schemaVersion == 2U;
     const bool applied = table ? (selectE1 ? m_recipe.SelectTableAndE1(id) : m_recipe.SelectTable(id)) :
@@ -265,6 +274,12 @@ bool NCManager::CommitEDMRecipeSelectionSameThread(const NCBlock& block)
     // the next 100ms publisher. This queues atomic state only, never file I/O.
     const auto current = m_recipe.Current();
     if (table) RememberEDMConditionSelectionSameThread(*m_recipe.GetCatalog(), current);
+    if(physicalCarry){
+        auto& semantic=m_g76Sphere->liveRecipePreparedBinding;
+        semantic=NCG76SphereGapBinding::Capture(m_recipe,m_edmProcessProfile,m_edmProcessTuningGeneration,
+            m_edmProcessReady&&!m_recipeRecoveryDisplayOnly,true,false);
+        if(semantic.ready)RememberPhysicalLiveRecipeSameThread();
+    }
     RtPrintf("[EDM16] event=SELECT result=PASS kind=%s table=%u E=%u catalog=%u revision=%u fields=%u configured=%u generation=%llu mode=SHADOW_ONLY motion=0 physicalPermit=0 discharge=0\n",
         table ? "TABLE" : "E", static_cast<unsigned int>(current.tableId), static_cast<unsigned int>(current.eCode),
         static_cast<unsigned int>(current.catalogRevision), static_cast<unsigned int>(current.tableRevision),
@@ -419,6 +434,8 @@ bool NCManager::ApplyEDMRecipeEditSameThread(const EDMRecipeEditContext& context
     EDMRecipe::Summary summary{};
     if (!ReadEDMRecipeSummarySameThread(summary) || !IsEDMRecipeStoppedAuthorityCurrentSameThread())
     { result.reason = EDMRecipeControl::Reason::AuthorityUnavailable; return false; }
+    const bool physicalCarry=EDM382::Current().enabled&&IsEDM171AirGrantCurrentSameThread(true)&&
+        IsPhysicalLiveRecipeSelectionCurrentSameThread();
     if (!EDMRecipeControl::Apply(m_recipe, context.key, request, result)) return false;
     // Motion can revoke authority while this NC-thread operation is applied.
     // Recheck once, without a retry or refreshing the submitted context/key.
@@ -435,6 +452,12 @@ bool NCManager::ApplyEDMRecipeEditSameThread(const EDMRecipeEditContext& context
         result.after = m_recipe.Current();
         result.afterFieldValid = m_recipe.ReadField(request.fieldId, result.afterField);
         return false;
+    }
+    if(physicalCarry){
+        auto& semantic=m_g76Sphere->liveRecipePreparedBinding;
+        semantic=NCG76SphereGapBinding::Capture(m_recipe,m_edmProcessProfile,m_edmProcessTuningGeneration,
+            m_edmProcessReady&&!m_recipeRecoveryDisplayOnly,true,false);
+        if(semantic.ready)RememberPhysicalLiveRecipeSameThread();
     }
     return true;
 }
@@ -505,55 +528,96 @@ void NCManager::ReadEDMRecipeHmiContextSameThread(EDMRecipeControl::HmiContext& 
         IsEDMRecipeHmiEditAllowedSameThread();
 }
 
+namespace {
+bool ApplyLiveRecipeHmiOperation(EDMRecipe::Controller& recipe,const EDMRecipeControl::HmiCommand& command) noexcept
+{
+    using EDMRecipeControl::HmiOperation;
+    switch(command.operation){
+    case HmiOperation::SelectTable:return recipe.SelectTableAndE1(command.tableId);
+    case HmiOperation::SelectE:return recipe.SelectE(command.eCode);
+    case HmiOperation::SelectStage:return recipe.SelectStage(command.fieldId,command.stageId);
+    case HmiOperation::StepStage:return recipe.StepStage(command.fieldId,command.step);
+    case HmiOperation::SetActual:return command.stageId?recipe.SetActualFromStage(command.fieldId,command.stageId,command.actualValue):
+        recipe.SetActual(command.fieldId,command.actualValue);
+    case HmiOperation::ResetOverride:return recipe.ResetOverride(command.fieldId);
+    default:return false;
+    }
+}
+}
+
 bool NCManager::ApplyEDMRecipeHmiCommandSameThread(const EDMRecipeControl::HmiContext& expected,
     const EDMRecipeControl::HmiCommand& command, EDMRecipeControl::HmiResult& result) noexcept
 {
     using namespace EDMRecipeControl;
-    result = HmiResult{};
-    HmiContext current{};
-    ReadEDMRecipeHmiContextSameThread(current);
-    result.after = current;
-    if (!IsHmiCommandCanonical(command) || command.operation == HmiOperation::ReloadCatalog)
-    { result.status = HmiStatus::InvalidCommand; return false; }
-    if (!SameHmiKey(expected, current)) { result.status = HmiStatus::Stale; return false; }
-    if (!current.canEdit) { result.status = HmiStatus::NotAllowed; return false; }
-    bool applied = false;
-    switch (command.operation)
-    {
-    case HmiOperation::SelectTable: applied = m_recipe.SelectTableAndE1(command.tableId); break;
-    case HmiOperation::SelectE: applied = m_recipe.SelectE(command.eCode); break;
-    case HmiOperation::SelectStage: applied = m_recipe.SelectStage(command.fieldId, command.stageId); break;
-    case HmiOperation::StepStage: applied = m_recipe.StepStage(command.fieldId, command.step); break;
-    case HmiOperation::SetActual:
-        applied = command.stageId == 0U ? m_recipe.SetActual(command.fieldId, command.actualValue) :
-            m_recipe.SetActualFromStage(command.fieldId, command.stageId, command.actualValue);
-        break;
-    case HmiOperation::ResetOverride: applied = m_recipe.ResetOverride(command.fieldId); break;
-    default: result.status = HmiStatus::InvalidCommand; return false;
+    result=HmiResult{};HmiContext current{};ReadEDMRecipeHmiContextSameThread(current);result.after=current;
+    if(!IsHmiCommandCanonical(command)||command.operation==HmiOperation::ReloadCatalog)
+        {result.status=HmiStatus::InvalidCommand;return false;}
+    if(!SameHmiKey(expected,current)){result.status=HmiStatus::Stale;return false;}
+    if(!current.canEdit){result.status=HmiStatus::NotAllowed;return false;}
+    auto& parent=*m_g76Sphere;
+    const bool activeParent=parent.active;
+    const bool carryBoundary=!activeParent&&EDM382::Current().enabled&&EDM382::Valid(EDM382::Current())&&
+        IsEDM171AirGrantCurrentSameThread(true)&&IsPhysicalLiveRecipeSelectionCurrentSameThread();
+    const bool scopedUpdate=activeParent||carryBoundary;
+    if(scopedUpdate){
+        // Authenticate the complete old image first. An unrelated earlier edit
+        // cannot be legitimized by a later valid E-field or E-row command.
+        const bool oldCurrent=activeParent?parent.submitted&&parent.bound&&!parent.gapShadowRevoked&&
+            IsG76SphereScopeCurrentSameThread()&&IsG76SphereLiveRecipeCurrentSameThread():
+            IsPhysicalLiveRecipeSelectionCurrentSameThread();
+        if(!oldCurrent||!parent.liveRecipePreview.ForkPreviewFrom(m_recipe)){
+            result.status=HmiStatus::NotAllowed;return false;
+        }
+        if(!ApplyLiveRecipeHmiOperation(parent.liveRecipePreview,command)){
+            result.status=HmiStatus::DomainRejected;result.domainError=parent.liveRecipePreview.Current().lastError;
+            return false;
+        }
+        bool prepared=false;
+        if(activeParent)prepared=PrepareG76SphereLiveRecipeSameThread(parent.liveRecipePreview,m_edmProcessProfile,m_edmProcessTuningGeneration,
+            parent.liveRecipePreparedBinding,parent.liveOrbitPreparedBinding,parent.liveRecipePreparedConfig);
+        else{
+            // Between drained parents there is no old path envelope to lend.
+            // Prove semantic validity now; next admission proves its own travel.
+            parent.liveRecipePreparedBinding=NCG76SphereGapBinding::Capture(parent.liveRecipePreview,m_edmProcessProfile,
+                m_edmProcessTuningGeneration,m_edmProcessReady&&!m_recipeRecoveryDisplayOnly,true,false);
+            parent.liveOrbitPreparedBinding=NCOrbitCompletionBinding::Capture(parent.liveRecipePreview,0U);
+            parent.liveRecipePreparedConfig=parent.liveRecipePreparedBinding.config;
+            prepared=parent.liveRecipePreparedBinding.ready&&parent.liveOrbitPreparedBinding.ready&&
+                EDMGapServo::Evaluate(parent.liveRecipePreparedConfig.curve,0.0,parent.liveRecipePreparedConfig.referenceV,
+                    parent.liveRecipePreparedConfig.machiningOverridePercent).valid&&
+                EDMGapServo::Evaluate(parent.liveRecipePreparedConfig.curve,300.0,parent.liveRecipePreparedConfig.referenceV,
+                    parent.liveRecipePreparedConfig.machiningOverridePercent).valid;
+        }
+        if(!prepared){
+            result.status=HmiStatus::DomainRejected;result.domainError=EDMRecipe::Error::ValueRange;
+            RtPrintf("[EDM386-RECIPE-LIVE] event=REJECT_BEFORE_COMMIT session=%llu operation=%u field=%u requestedE=%u reason=RECIPE_OR_FROZEN_ENVELOPE activeUnchanged=1 alarm=0\n",
+                static_cast<unsigned long long>(parent.session),static_cast<unsigned>(command.operation),
+                command.fieldId,command.eCode);
+            return false;
+        }
+        parent.liveRecipePreview.CopySnapshot(parent.liveRecipePreparedSnapshot);
+        if(!IsEDMRecipeHmiEditAllowedSameThread()||expected.controlGeneration!=m_recipeControlGeneration||
+           !SameHmiKey(expected,current)){
+            result.status=HmiStatus::NotAllowed;return false;
+        }
     }
-    if (!applied)
-    {
-        result.status = HmiStatus::DomainRejected; result.domainError = m_recipe.Current().lastError;
-        ReadEDMRecipeHmiContextSameThread(result.after);
-        return false;
+    // The same NC owner executes the exact operation already proven on the
+    // private preview. No catalog exchange or second writer can intervene.
+    if(!ApplyLiveRecipeHmiOperation(m_recipe,command)){
+        result.status=HmiStatus::DomainRejected;result.domainError=m_recipe.Current().lastError;
+        ReadEDMRecipeHmiContextSameThread(result.after);return false;
     }
-    // Preserve an existing NC binding, but never manufacture one for a HMI
-    // selection. A retained/manual selection remains logical-only until G38/E
-    // establishes the ordinary stopped program receipt.
-    if (m_recipeRun == 0ULL) m_recipeIdleSelection = true;
-    // RESET/ALARM may revoke admission while this NC-owned operation executes.
-    // Do not accept the write under the old editing context after that boundary.
-    if (!IsEDMRecipeHmiEditAllowedSameThread() || expected.controlGeneration != m_recipeControlGeneration)
-    {
-        ClearEDMRecipeSelectionSameThread();
-        result.status = HmiStatus::NotAllowed;
-        ReadEDMRecipeHmiContextSameThread(result.after);
-        return false;
+    if(m_recipeRun==0ULL)m_recipeIdleSelection=true;
+    if(!IsEDMRecipeHmiEditAllowedSameThread()||expected.controlGeneration!=m_recipeControlGeneration){
+        ClearEDMRecipeSelectionSameThread();result.status=HmiStatus::NotAllowed;
+        ReadEDMRecipeHmiContextSameThread(result.after);return false;
     }
-    InvalidateEDMRecipeEditContextsSameThread();
-    result.status = HmiStatus::Success;
-    ReadEDMRecipeHmiContextSameThread(result.after);
-    return true;
+    if(scopedUpdate){
+        AcceptG76SphereLiveRecipeSameThread(parent.liveRecipePreparedBinding,parent.liveOrbitPreparedBinding,
+            m_edmProcessProfile,m_edmProcessTuningGeneration,parent.liveRecipePreparedConfig);
+    }
+    InvalidateEDMRecipeEditContextsSameThread();result.status=HmiStatus::Success;
+    ReadEDMRecipeHmiContextSameThread(result.after);return true;
 }
 
 bool NCManager::ReloadValidatedEDMRecipeCatalogSameThread(const EDMRecipeControl::HmiContext& expected,

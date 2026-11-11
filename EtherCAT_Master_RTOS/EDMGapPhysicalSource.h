@@ -74,6 +74,8 @@ inline bool ValidRoute(const Route&r,const EDMGapInput::Profile&p) noexcept
     return r.adIndex==p.adIndex && r.adIndex!=0U && r.adIndex<=64U && r.channelId==r.adIndex &&
         r.deviceId!=0U && r.deviceId<=65535U && (!p.expectedDeviceId || p.expectedDeviceId==r.deviceId) &&
         r.channelCount>=r.adIndex && r.slaveIndex>=0 && r.inputBitOffset>=0 &&
+        (!p.stationNumber || (p.stationNumber<=128U &&
+            r.slaveIndex==static_cast<std::int32_t>(p.stationNumber-1U))) &&
         r.producerGeneration && r.qpcFrequency &&
         r.qpcFrequency<=(std::numeric_limits<std::uint64_t>::max)()/1000000ULL &&
         (r.unsignedRaw ? p.rawMin>=0 && p.rawMax<=65535 : p.rawMin>=-32768 && p.rawMax<=32767);

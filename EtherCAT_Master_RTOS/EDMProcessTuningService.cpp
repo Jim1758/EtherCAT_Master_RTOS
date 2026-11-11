@@ -58,9 +58,9 @@ namespace
         // currentGeneration/profileRevision describe the current NC profile.
         // One bounded record per processed request, never on heartbeat scans.
         // RTX64 RtPrintf receives only a string, with no floating conversions.
-        char line[512]{};
+        char line[768]{};
         const int count = std::snprintf(line, sizeof(line),
-            "[EDM21] event=TUNING_ACK session=%llu request=%llu epoch=%llu requestEpoch=%llu generation=%llu currentGeneration=%llu profileRevision=%u selection=%u status=%s statusCode=%u replay=%u runtimeOnly=1 physicalApplied=0 persisted=0\n",
+            "[EDM21] event=TUNING_ACK session=%llu request=%llu epoch=%llu requestEpoch=%llu generation=%llu currentGeneration=%llu profileRevision=%u selection=%u status=%s statusCode=%u replay=%u runtimeOnly=1 rtParentSession=%llu rtCurveGeneration=%llu rtFlushGeneration=%llu liveFlags=%u editableMask=%u persisted=0\n",
             static_cast<unsigned long long>(g_ack.SessionId),
             static_cast<unsigned long long>(g_ack.RequestId),
             static_cast<unsigned long long>(g_ack.RuntimeEpoch),
@@ -69,9 +69,14 @@ namespace
             static_cast<unsigned long long>(g_data->Context.Generation),
             static_cast<unsigned>(g_data->Context.ProfileRevision),
             static_cast<unsigned>(g_ack.SelectionMask), StatusName(g_ack.Status),
-            static_cast<unsigned>(g_ack.Status), replay ? 1U : 0U);
+            static_cast<unsigned>(g_ack.Status), replay ? 1U : 0U,
+            static_cast<unsigned long long>(g_data->Context.ActiveParentSession),
+            static_cast<unsigned long long>(g_data->Context.RtCurveGeneration),
+            static_cast<unsigned long long>(g_data->Context.RtFlushGeneration),
+            static_cast<unsigned>(g_data->Context.LiveStatusFlags),
+            static_cast<unsigned>(g_data->Context.LiveEditableMask));
         if (count >= 0 && static_cast<std::size_t>(count) < sizeof(line)) RtPrintf("%s", line);
-        else RtPrintf("[EDM21] event=TUNING_ACK_FORMAT_ERROR runtimeOnly=1 physicalApplied=0 persisted=0\n");
+        else RtPrintf("[EDM21] event=TUNING_ACK_FORMAT_ERROR runtimeOnly=1 persisted=0\n");
     }
     void Ack(NCManager& nc, const EDMProcessTuningRequest& request,
         EDMProcessTuningStatus status, const char* detail, bool remember) noexcept
@@ -117,7 +122,7 @@ bool InitializeEDMProcessTuningService() noexcept
     g_data->Header.StructSize = EDM_PROCESS_TUNING_SIZE; g_data->Header.RuntimeEpoch = g_epoch;
     g_heartbeat = 0U; g_ack = EDMProcessTuningAck{}; g_history.Reset();
     MemoryBarrier(); Exchange(g_data->Header.Sequence, odd + 1U);
-    RtPrintf("[EDM20_FIX1] event=TUNING_SERVICE result=READY runtimeOnly=1 physicalApplied=0\n");
+    RtPrintf("[EDM20_FIX1] event=TUNING_SERVICE result=READY runtimeOnly=1 scopedRtReceipts=1\n");
     return true;
 }
 
@@ -160,5 +165,5 @@ void ProcessEDMProcessTuningServiceSameThread(NCManager& nc) noexcept
     }
     const EDMProcessTuningStatus status = nc.ApplyEDMProcessTuningSameThread(request);
     Ack(nc, request, status, status == EDMProcessTuningStatus::Success ?
-        "Runtime profile applied; collision thresholds active; disk unchanged." : "Rejected; active profile unchanged.", true);
+        "NC profile accepted; inspect RT generation receipts; disk unchanged." : "Rejected; active profile unchanged.", true);
 }

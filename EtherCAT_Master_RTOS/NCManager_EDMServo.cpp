@@ -200,8 +200,11 @@ bool NCManager::InstallEDMProcessProfileBeforeStart(const EDM20::ProcessProfile&
     if (!EDM20::ValidateProcessProfile(profile) || axes == nullptr || axisCount == 0U ||
         axisCount > EDM20::AxisGainSlotCount) return false;
     std::array<EDM20::GainResolution, 8> discharge{}, flush{};
+    std::uint32_t installedAxisMask=0U;
     for (std::size_t axis = 0U; axis < axisCount; ++axis)
     {
+        if(!axes[axis].isExist)continue;
+        installedAxisMask|=1U<<static_cast<unsigned>(axis);
         EDM20::AxisGains cnc{};
         cnc.Kp = axes[axis].Pid_G00.Kp; cnc.Ki = axes[axis].Pid_G00.Ki;
         cnc.Kd = axes[axis].Pid_G00.Kd; cnc.Kvff = axes[axis].Pid_G00.Kvff;
@@ -214,11 +217,11 @@ bool NCManager::InstallEDMProcessProfileBeforeStart(const EDM20::ProcessProfile&
     // EDM382 freezes the normally resolved INI/CNC banks once at startup.
     // No gain is applied until the RT owner enters this physical-only parent.
     if(EDM382::Current().enabled&&
-       !m_motion.ConfigureManualGapZAxisGainsBeforeStart(discharge,flush))return false;
+       !m_motion.ConfigureManualGapZAxisGainsBeforeStart(discharge,flush,installedAxisMask))return false;
     if (!m_motion.ConfigureCollisionProtection(profile.servo, true)) return false;
     m_edmProcessProfile = profile;
     m_edmDischargeGains = discharge; m_edmFlushGains = flush;
-    m_edmProcessActiveAxisMask = (1U << static_cast<unsigned>(axisCount)) - 1U;
+    m_edmProcessActiveAxisMask = installedAxisMask;
     m_edmProcessTuningGeneration = 1ULL;
     LogCollisionConfiguration(profile.servo);
     m_edmProcessReady = true;
@@ -480,8 +483,34 @@ void NCManager::ReadEDMProcessTuningSameThread(EDMProcessTuningContext& context,
     context.SchemaVersion = m_edmProcessProfile.schemaVersion;
     context.ActiveAxisMask = m_edmProcessActiveAxisMask;
     context.Flags = EDM_PROCESS_TUNING_READY;
+    context.LiveEditableMask=EDM_PROCESS_TUNING_EDIT_CURVE|EDM_PROCESS_TUNING_EDIT_FLUSH_SPEEDS;
+    const auto& parent=*m_g76Sphere;
+    const bool liveScope=parent.active&&parent.submitted&&parent.bound&&!parent.gapShadowRevoked&&
+        parent.gapBinding.ready&&((parent.sourceG>=1&&parent.sourceG<=3)||parent.sourceG==76)&&
+        !parent.feedback.terminal;
+    const auto owner=m_motion.GetMotionOwnerLease().owner;
+    const bool busyOperation=parent.active||parent.staged||
+        (owner!=MotionOwner::NONE&&owner!=MotionOwner::IDLE_HOLD);
+    if(liveScope){
+        context.ActiveParentSession=parent.session;
+        context.LiveStatusFlags=EDM_PROCESS_TUNING_LIVE_ACTIVE;
+        const bool specialGain=parent.liveRecipeBinding.ready?parent.liveRecipeBinding.specialGain.enabled:
+            parent.gapBinding.specialGain.enabled;
+        if(specialGain)context.LiveStatusFlags|=EDM_PROCESS_TUNING_LIVE_SPECIAL_E_GAIN;
+        const auto& feedback=parent.feedback;
+        if(feedback.session==parent.session&&feedback.identity.epoch==parent.identity.epoch&&
+           feedback.identity.segmentId==parent.identity.segmentId&&
+           feedback.identity.sourceBlockId==parent.identity.sourceBlockId&&
+           feedback.identity.source==parent.identity.source&&feedback.owner.Matches(parent.owner)){
+            context.RtCurveGeneration=feedback.liveCurveTuningGeneration;
+            context.RtFlushGeneration=feedback.liveFlushTuningGeneration;
+        }
+        if(context.RtCurveGeneration<context.Generation)context.LiveStatusFlags|=EDM_PROCESS_TUNING_LIVE_CURVE_PENDING;
+        if(context.RtFlushGeneration<context.Generation)context.LiveStatusFlags|=EDM_PROCESS_TUNING_LIVE_FLUSH_PENDING;
+    }
     if (!Close_System_Com_flag && m_edmProcessTuningGeneration != UINT64_MAX &&
-        m_edmProcessProfile.revision != UINT32_MAX) context.Flags |= EDM_PROCESS_TUNING_CAN_APPLY;
+        m_edmProcessProfile.revision != UINT32_MAX&&(!busyOperation||liveScope))
+        context.Flags |= EDM_PROCESS_TUNING_CAN_APPLY;
     EDMProcessTuning::Encode(m_edmProcessProfile, values);
 }
 
@@ -505,6 +534,14 @@ EDMProcessTuningStatus NCManager::ApplyEDMProcessTuningSameThread(
             static_cast<unsigned long long>(m_edmProcessTuningGeneration));
         return EDMProcessTuningStatus::NotAllowed;
     }
+    const auto owner=m_motion.GetMotionOwnerLease().owner;
+    auto& parent=*m_g76Sphere;
+    const bool busyOperation=parent.active||parent.staged||
+        (owner!=MotionOwner::NONE&&owner!=MotionOwner::IDLE_HOLD);
+    // Running machining accepts only the explicitly scoped curve/speed
+    // subset. All other edits reject before changing a generation or profile.
+    if(busyOperation&&!NCG76SphereGapBinding::OnlyLiveProcessChanges(m_edmProcessProfile,candidate))
+        return EDMProcessTuningStatus::NotAllowed;
     const bool collisionThresholdsChanged =
         !SameCollisionThresholds(candidate.servo, m_edmProcessProfile.servo);
     if (collisionThresholdsChanged) {
@@ -522,22 +559,36 @@ EDMProcessTuningStatus NCManager::ApplyEDMProcessTuningSameThread(
         if (discharge[axis].status != EDM20::GainResolveStatus::Ready ||
             flush[axis].status != EDM20::GainResolveStatus::Ready) return EDMProcessTuningStatus::DomainRejected;
     }
-    // Only the owning NC scan observes this all-or-nothing commit. No physical
-    // gain, CNC baseline, file, recipe, voltage calibration or mode is changed.
+    // Validate the entire candidate and the frozen physical envelope before
+    // the NC commit. RT receives only its independently scoped sidecar later.
     candidate.revision = m_edmProcessProfile.revision + 1U;
     candidate.servo.revision = candidate.revision;
-    // Publish before committing the NC view. A late owner change or occupied
-    // channel rejects the complete request without leaving HMI and RT apart.
+    const auto generation=m_edmProcessTuningGeneration+1ULL;
+    NCG76SphereGapProcess::Config liveConfig{};
+    if(busyOperation&&!PrepareG76SphereLiveTuningSameThread(candidate,generation,liveConfig))
+        return EDMProcessTuningStatus::NotAllowed;
+    // Protection changes publish before the idle commit. Running curve/feed
+    // changes remain scoped requests until their separate RT receipts arrive.
     if (collisionThresholdsChanged &&
         !m_motion.ConfigureCollisionProtection(candidate.servo, true))
         return EDMProcessTuningStatus::NotAllowed;
     m_edmProcessProfile = candidate;
     if (collisionThresholdsChanged) LogCollisionConfiguration(candidate.servo);
     m_edmDischargeGains = discharge; m_edmFlushGains = flush;
-    ++m_edmProcessTuningGeneration;
-    m_edmIdleShortDetector.Reset(); m_edmMachiningShortDetector.Reset();
-    m_edmIdleShortResult = EDMGapServo::ShortResult{};
-    m_edmMachiningShortResult = EDMGapServo::ShortResult{};
+    m_edmProcessTuningGeneration=generation;
+    if(busyOperation){
+        AcceptG76SphereLiveRecipeSameThread(parent.liveRecipePreparedBinding,parent.liveOrbitPreparedBinding,
+            candidate,generation,liveConfig);
+        RtPrintf("[EDM386-PROCESS-LIVE] event=QUEUED session=%llu generation=%llu curve=NEXT_RT flush=NEXT_FLUSH_BOUNDARY discharge=0\n",
+            static_cast<unsigned long long>(parent.session),static_cast<unsigned long long>(generation));
+    }
+    // Curve-only tuning must not reset any dwell or short-state history.
+    // Physical protection has its own RT detector; this covers NC previews.
+    if(!busyOperation){
+        m_edmIdleShortDetector.Reset(); m_edmMachiningShortDetector.Reset();
+        m_edmIdleShortResult = EDMGapServo::ShortResult{};
+        m_edmMachiningShortResult = EDMGapServo::ShortResult{};
+    }
     m_edmProcessNeedFreshSample = true;
     m_edmProcessShadow = EDMProcessShadowSnapshot{};
     return EDMProcessTuningStatus::Success;

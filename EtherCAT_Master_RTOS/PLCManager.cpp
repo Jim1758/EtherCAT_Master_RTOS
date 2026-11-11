@@ -2591,6 +2591,10 @@ double PLCManager::GetMemory(const std::string& prefix, int index) const {
 }
 
 void PLCManager::SetMemory(const std::string& prefix, int index, double value) {
+    if (prefix == "HBR") {
+        if (index == NCPLC::C::EDM_PROTECTION_BYPASS) m_hmiShortRequests.Write(value);
+        return;
+    }
     if (prefix == "I" && index >= 0 && index < MAX_PLC_I) m_I[index] = (value != 0);
     else if (prefix == "O" && index >= 0 && index < MAX_PLC_O) m_O[index] = (value != 0);
     else if (prefix == "A" && index >= 0 && index < MAX_PLC_A) m_A[index] = (value != 0); // 🌟 A 點

@@ -3987,12 +3987,13 @@ void EtherCatMaster::LinkCoordinateManager(CoordinateManager* pCoord)
 // or control motion/discharge. The PDO owner alone captures live process data.
 // ============================================================================
 bool EtherCatMaster::ConfigureGapAnalogInputBeforeStart(
-    std::uint32_t adIndex, std::uint32_t expectedDeviceId) noexcept
+    std::uint32_t adIndex, std::uint32_t expectedDeviceId, std::uint32_t stationNumber) noexcept
 {
     if (m_gapAnalogInputRouteBuilt) return false;
     m_gapAnalogInputRequestedIndex = adIndex;
     m_gapAnalogInputExpectedDeviceId = expectedDeviceId;
-    return adIndex != 0U;
+    m_gapAnalogInputStationNumber = stationNumber;
+    return adIndex != 0U && stationNumber <= 128U;
 }
 
 bool EtherCatMaster::BuildGapAnalogInputRouteBeforeStart(bool validatedCompositeContract)
@@ -4016,10 +4017,15 @@ bool EtherCatMaster::BuildGapAnalogInputRouteBeforeStart(bool validatedComposite
             layout.deviceId = m_slaveInfo[descriptor.slaveIndex].configAddr;
         layouts.push_back(layout);
     }
-    m_gapAnalogInputBinding = EDMAnalogInput::Resolve(layouts.data(), layouts.size(),
-        m_gapAnalogInputRequestedIndex, m_gapAnalogInputExpectedDeviceId,
-        m_IoMapSize > 0 ? static_cast<std::uint32_t>(m_IoMapSize) : 0U,
-        validatedCompositeContract);
+    const auto imageBytes = m_IoMapSize > 0 ? static_cast<std::uint32_t>(m_IoMapSize) : 0U;
+    if (m_gapAnalogInputStationNumber != 0U)
+        m_gapAnalogInputBinding = EDMAnalogInput::ResolveStation(layouts.data(), layouts.size(),
+            m_gapAnalogInputStationNumber, m_gapAnalogInputRequestedIndex,
+            m_gapAnalogInputExpectedDeviceId, imageBytes, validatedCompositeContract);
+    else
+        m_gapAnalogInputBinding = EDMAnalogInput::Resolve(layouts.data(), layouts.size(),
+            m_gapAnalogInputRequestedIndex, m_gapAnalogInputExpectedDeviceId,
+            imageBytes, validatedCompositeContract);
     m_gapAnalogInputPublisher.ConfigureBeforeStart(m_gapAnalogInputBinding);
     DEBUG_PRINT("[EDM18-AD] route=%s reason=%s AD=%u count=%u device=%u slave=%d inputBit=%d type=%s physicalDischarge=0\n",
         m_gapAnalogInputBinding.configured ? "READY" : "DISABLED",
@@ -4030,6 +4036,13 @@ bool EtherCatMaster::BuildGapAnalogInputRouteBeforeStart(bool validatedComposite
         static_cast<int>(m_gapAnalogInputBinding.slaveIndex),
         static_cast<int>(m_gapAnalogInputBinding.inputBitOffset),
         m_gapAnalogInputBinding.unsignedRaw ? "UInt16" : "Int16");
+    DEBUG_PRINT("[EDM386-AD-SELECT] mode=%s requestedStation=%u requestedChannel=%u resolvedStation=%u actualDevice=%u configured=%u\n",
+        m_gapAnalogInputStationNumber ? "STATION_CHANNEL" : "LEGACY_GLOBAL_AD",
+        static_cast<unsigned>(m_gapAnalogInputStationNumber),
+        static_cast<unsigned>(m_gapAnalogInputStationNumber ? m_gapAnalogInputRequestedIndex : 0U),
+        m_gapAnalogInputBinding.slaveIndex >= 0 ? static_cast<unsigned>(m_gapAnalogInputBinding.slaveIndex) + 1U : 0U,
+        static_cast<unsigned>(m_gapAnalogInputBinding.deviceId),
+        m_gapAnalogInputBinding.configured ? 1U : 0U);
     return m_gapAnalogInputBinding.configured;
 }
 
@@ -4061,6 +4074,10 @@ void EtherCatMaster::CaptureGapAnalogInputSnapshot(
     // The shadow has no Motion, safety-gate, planner or discharge authority.
     std::uint64_t nowUs = 0ULL;
     const bool shadowClockValid = EDMAnalogInput::Publisher::QpcMicroseconds(qpcTicks, qpcFrequency, nowUs);
+    // EDM386-FIX: the independent collision receipt must consume every runtime
+    // PDO sample, including invalid transport; it cannot use the diagnostic shadow.
+    m_Motion.ObserveCollisionPhysicalInputFromPdo(m_gapAnalogInputPublisher.SnapshotFromOwner(),
+        nowUs, shadowClockValid, qpcFrequency);
     m_gapPhysicalRTShadow.ObserveFromPdo(m_gapAnalogInputPublisher.SnapshotFromOwner(),
         nowUs, shadowClockValid, qpcFrequency);
     m_gapPhysicalRecipeRTShadow.ObserveFromPdo(m_gapPhysicalRTShadow.SnapshotFromOwner(),

@@ -18,6 +18,9 @@ inline bool ValidMode(const Geometry& geometry,unsigned mode) noexcept
 {
     if(geometry.kind==NCG76SphereRuntimeGeometry::Kind::OrbitContour)return mode==0U||mode==2U;
     if(geometry.kind==NCG76SphereRuntimeGeometry::Kind::Sphere)return ValidMode(mode);
+    // A straight G01 has no radial orbit offset: its B3/B4 center is the
+    // stopped machining anchor, so the zero center legs coalesce into B0's
+    // same native coupled line. G76 center geometry remains unchanged.
     if(geometry.kind==NCG76SphereRuntimeGeometry::Kind::Line)return mode<=4U;
     return geometry.kind==NCG76SphereRuntimeGeometry::Kind::Arc&&(mode==0U||mode==1U||mode==2U);
 }
@@ -288,6 +291,19 @@ inline bool AxisEnvelope(const Geometry& g,unsigned mode,double height,unsigned 
     minimum=g.boundsMinMCS[axis];maximum=g.boundsMaxMCS[axis];
     if(g.kind==NCG76SphereRuntimeGeometry::Kind::Line&&g.travelMm==0.0)
         return std::isfinite(minimum)&&std::isfinite(maximum)&&minimum<=maximum;
+    // A G01 B0 excursion follows the same native/mm ratio in every
+    // participating axis. Rotary degrees are scaled by that ratio, not by an
+    // XYZ tangent or an invented millimetre angular distance.
+    if(g.kind==NCG76SphereRuntimeGeometry::Kind::Line&&(mode==0U||mode==3U||mode==4U)&&height>0.0&&axis<6U){
+        const double ratio=(g.endMCS[axis]-g.startMCS[axis])/g.travelMm;
+        const double offset=-ratio*height;
+        if(!std::isfinite(ratio)||!std::isfinite(offset))return false;
+        if(offset!=0.0){
+            minimum=std::nextafter((std::min)(minimum,minimum+offset),-std::numeric_limits<double>::infinity());
+            maximum=std::nextafter((std::max)(maximum,maximum+offset),std::numeric_limits<double>::infinity());
+        }
+        return std::isfinite(minimum)&&std::isfinite(maximum)&&minimum<=maximum;
+    }
     // B0 freezes the current forward tangent at its stopped arc checkpoint.
     // Either tangent sign may occur over an arc, so admit the full physical
     // excursion independently of the particular sample that triggers E5.

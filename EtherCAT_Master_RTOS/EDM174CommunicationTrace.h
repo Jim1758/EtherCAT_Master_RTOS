@@ -15,6 +15,7 @@ namespace EDM174Comm
         ProcessValid = 1U << 0,
         MatchedTimingValid = 1U << 1,
         Injected = 1U << 2,
+        CleanReceiveDeadline = 1U << 3,
         CallbackTimingMissing = 1U << 8,
         CallbackTimingBackwards = 1U << 9,
         CommTimingMissing = 1U << 10,
@@ -37,7 +38,8 @@ namespace EDM174Comm
     enum FaultReason : std::uint32_t
     {
         InputFault = 1U << 0,
-        GuardFault = 1U << 1
+        GuardFault = 1U << 1,
+        TransportInvalid = 1U << 2
     };
     enum MaximumValid : std::uint32_t
     {
@@ -47,10 +49,32 @@ namespace EDM174Comm
         StartGapMaximum = 1U << 3
     };
 
+    enum class Domain : std::uint32_t { Legacy173 = 0U, PhysicalG01 = 1U };
+    enum GapFlag : std::uint32_t
+    {
+        GapObserverValid = 1U << 0, GapValueValid = 1U << 1,
+        GapEligible = 1U << 2, GapSuspended = 1U << 3,
+        FlushPending = 1U << 4, E5Allowed = 1U << 5,
+        E5Latched = 1U << 6, E5Paused = 1U << 7,
+        ParentPdoValid = 1U << 8, ParentRunning = 1U << 9,
+        E5Valid = 1U << 10
+    };
+    // GAP values are integer-scaled observations. gapTick identifies their
+    // observer update, not a receipt that this callback's frame was accepted.
+    struct GapObservation
+    {
+        std::uint64_t tick = 0U;
+        std::int32_t millivolts = 0, signedMicrometresPerMinute = 0;
+        std::uint32_t flags = 0U, e5State = 0U;
+    };
+    static_assert(sizeof(GapObservation) == 24U, "Bounded GAP trace size changed.");
+
     struct MotionObservation
     {
         std::uint64_t session = 0U, inputFaultTick = 0U, guardFaultTick = 0U;
         std::uint32_t phase = 0U, child = 0U;
+        Domain domain = Domain::Legacy173;
+        GapObservation gap{};
     };
 
     struct Cycle
@@ -63,8 +87,9 @@ namespace EDM174Comm
         std::int32_t lrwWkc = 0, dcWkc = 0, expectedWkc = 0;
         std::uint32_t phaseBefore = 0U, phaseAfter = 0U;
         std::uint32_t childBefore = 0U, childAfter = 0U, flags = 0U;
+        GapObservation gap{};
     };
-    static_assert(sizeof(Cycle) == 128U, "Communication trace cycle size changed.");
+    static_assert(sizeof(Cycle) == 152U, "Communication trace cycle size changed.");
 
     struct Snapshot
     {
@@ -73,6 +98,7 @@ namespace EDM174Comm
         std::uint64_t inputFaultTick = 0U, guardFaultTick = 0U;
         std::uint32_t reasonFlags = 0U, historyCount = 0U;
         std::uint32_t maxValid = 0U, invalidTimingCycles = 0U;
+        Domain domain = Domain::Legacy173;
         // Chronological at freeze; never includes firstBad.
         Cycle history[HistoryCapacity]{};
         Cycle firstBad{};
@@ -105,12 +131,12 @@ namespace EDM174Comm
         // an unpublished first fault. A new nonzero session starts cleanly.
         bool Record(std::uint64_t session, const Cycle& supplied,
             std::uint64_t inputFaultTick, std::uint64_t guardFaultTick,
-            std::uint64_t qpcFrequency) noexcept
+            std::uint64_t qpcFrequency, Domain domain = Domain::Legacy173) noexcept
         {
             if (session == 0U) return false;
-            if (snapshot_.session == session && frozen_) return false;
+            if (snapshot_.session == session && snapshot_.domain == domain && frozen_) return false;
             Cycle cycle = supplied;
-            if (snapshot_.session != session) Reset(session);
+            if (snapshot_.session != session || snapshot_.domain != domain) Reset(session, domain);
             cycle.flags &= ~DerivedFlags;
             cycle.prevStartNs = havePrevious_ ? previous_.startNs : 0U;
             cycle.prevEndNs = havePrevious_ ? previous_.endNs : 0U;
@@ -123,12 +149,17 @@ namespace EDM174Comm
             if ((cycle.flags & (DerivedFlags & ~PreviousCycleMissing)) != 0U)
                 Increment(snapshot_.invalidTimingCycles);
             UpdateMaxima(cycle);
-            if (inputFaultTick != 0U || guardFaultTick != 0U)
+            // Capture the first invalid physical PDO even if the controller
+            // contains it without ending the parent. Observation grants no motion.
+            const bool transportInvalid = domain == Domain::PhysicalG01 &&
+                (cycle.flags & ProcessValid) == 0U;
+            if (inputFaultTick != 0U || guardFaultTick != 0U || transportInvalid)
             {
                 snapshot_.inputFaultTick = inputFaultTick;
                 snapshot_.guardFaultTick = guardFaultTick;
                 snapshot_.reasonFlags = (inputFaultTick != 0U ? InputFault : 0U) |
-                    (guardFaultTick != 0U ? GuardFault : 0U);
+                    (guardFaultTick != 0U ? GuardFault : 0U) |
+                    (transportInvalid ? TransportInvalid : 0U);
                 snapshot_.firstBad = cycle;
                 OrderHistory();
                 frozen_ = true;
@@ -150,11 +181,12 @@ namespace EDM174Comm
         template<class Integer> static void Increment(Integer& value) noexcept
         { if (value != (std::numeric_limits<Integer>::max)()) ++value; }
 
-        void Reset(std::uint64_t session) noexcept
+        void Reset(std::uint64_t session, Domain domain) noexcept
         {
             // Only a session transition clears the complete fixed-size value.
             snapshot_ = EDM174Comm::Snapshot{};
             snapshot_.session = session;
+            snapshot_.domain = domain;
             previous_ = Cycle{};
             nextHistory_ = 0U;
             havePrevious_ = frozen_ = published_ = false;

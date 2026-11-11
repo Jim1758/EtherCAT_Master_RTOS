@@ -29,6 +29,8 @@ inline bool PolygonMode(double mode) noexcept
 inline bool AllowedAddress(int code,char a,double mode=0.0) noexcept
 {
     if(a=='N'||a=='F'||a=='B'||a==TotalAddress||a==AdditionalAddress||a=='X'||a=='Y'||a=='Z')return true;
+    // Auxiliary native position words belong only to a coordinated G01.
+    if(code==1&&(a=='C'||a=='U'||a=='V'))return true;
     return code==76?(a=='L'||a=='P'||a=='R'||a=='K'||(a=='Q'&&PolygonMode(mode))):
         (a=='L'||((code==2||code==3)&&(a=='I'||a=='J'||a=='K'||a=='R')));
 }

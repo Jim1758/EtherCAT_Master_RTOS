@@ -54,12 +54,14 @@ namespace EDMAnalogInput
         Reason reason = Reason::NotConfigured;
     };
 
-    // AD numbering is 1-based, in runtime slave/binding order. Array bindings
-    // contribute ChannelCount entries. Unsupported channels retain their index
-    // rather than silently shifting every subsequent AD number.
-    inline Binding Resolve(const Layout* layouts, std::size_t count,
+    namespace Detail
+    {
+    // A zero station retains the legacy global AD numbering. A selected
+    // station counts only its own AnalogInput descriptors, in binding order.
+    // Unsupported channels still occupy their number in either mode.
+    inline Binding ResolveSelected(const Layout* layouts, std::size_t count,
         std::uint32_t adIndex, std::uint32_t expectedDeviceId, std::uint32_t imageBytes,
-        bool validatedCompositeContract) noexcept
+        bool validatedCompositeContract, std::uint32_t stationNumber) noexcept
     {
         Binding result{};
         result.adIndex = result.channelId = adIndex;
@@ -71,7 +73,11 @@ namespace EDMAnalogInput
         {
             const auto& layout = layouts[i];
             if (!layout.analogInput) continue;
+            if (stationNumber != 0U &&
+                layout.slaveIndex != static_cast<std::int32_t>(stationNumber - 1U)) continue;
             const std::uint32_t channels = layout.channelCount == 0U ? 1U : layout.channelCount;
+            if (stationNumber != 0U && total > 0xFFFFFFFFULL - channels)
+            { result.reason = Reason::UnsupportedLayout; return result; }
             if (adIndex != 0U && adIndex > total && static_cast<std::uint64_t>(adIndex) <= total + channels)
             {
                 selected = &layout;
@@ -108,6 +114,37 @@ namespace EDMAnalogInput
         result.configured = true;
         result.reason = Reason::AwaitSample;
         return result;
+    }
+    }
+
+    // Legacy AD numbering is 1-based over all runtime slaves/bindings. Array
+    // bindings contribute ChannelCount entries, including unsupported ones.
+    inline Binding Resolve(const Layout* layouts, std::size_t count,
+        std::uint32_t adIndex, std::uint32_t expectedDeviceId, std::uint32_t imageBytes,
+        bool validatedCompositeContract) noexcept
+    {
+        return Detail::ResolveSelected(layouts, count, adIndex, expectedDeviceId,
+            imageBytes, validatedCompositeContract, 0U);
+    }
+
+    // Station 1 is runtime slaveIndex 0, counting every EtherCAT slave after
+    // the master. adChannel is 1-based within that station; other stations do
+    // not affect its numbering. An absent/invalid selection never falls back.
+    inline Binding ResolveStation(const Layout* layouts, std::size_t count,
+        std::uint32_t stationNumber, std::uint32_t adChannel,
+        std::uint32_t expectedDeviceId, std::uint32_t imageBytes,
+        bool validatedCompositeContract) noexcept
+    {
+        if (stationNumber == 0U || stationNumber > 128U ||
+            adChannel == 0U || adChannel > 64U)
+        {
+            Binding result{};
+            result.adIndex = result.channelId = adChannel;
+            result.reason = Reason::BindingMissing;
+            return result;
+        }
+        return Detail::ResolveSelected(layouts, count, adChannel, expectedDeviceId,
+            imageBytes, validatedCompositeContract, stationNumber);
     }
 
     // Byte and bit extraction avoids unaligned typed loads and preserves UInt16

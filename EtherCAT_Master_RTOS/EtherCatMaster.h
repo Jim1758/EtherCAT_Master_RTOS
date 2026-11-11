@@ -403,7 +403,8 @@ public:
         uint64_t* dcReferenceTime,
         int* dcWkc,
         int timeout,
-        EtherCatDcCycleTiming* dcCycleTiming = nullptr);
+        EtherCatDcCycleTiming* dcCycleTiming = nullptr,
+        bool* cleanReceiveDeadline = nullptr);
     int ecx_FPWR(uint16_t slaveAddr, uint16_t regAddr, void* data, int len, int timeout);//指定位址物理寫入
     int ecx_FPRD(uint16_t slaveAddr, uint16_t regAddr, void* data, int len, int timeout);//指定位址物理讀取
     int ecx_SDOwrite(int slave_pos, uint16_t index, uint8_t subindex, int CA, int size, void* data, int timeout);//服務資料物件寫入 (SDO Write / 寫入物件字典)
@@ -1176,8 +1177,9 @@ public:
 
     // EDM18 selected A/D channel. Configure is boot-thread-only; only the
     // PDO owner reads m_IoMap. NC/UI readers consume an atomic snapshot.
+    // stationNumber=0 retains legacy global AD numbering; otherwise adIndex is station-local.
     bool ConfigureGapAnalogInputBeforeStart(std::uint32_t adIndex,
-        std::uint32_t expectedDeviceId) noexcept;
+        std::uint32_t expectedDeviceId, std::uint32_t stationNumber = 0U) noexcept;
     bool BuildGapAnalogInputRouteBeforeStart(bool validatedCompositeContract);
     void CaptureGapAnalogInputSnapshot(std::int64_t qpcTicks,
         std::uint64_t qpcFrequency, bool processDataValid) noexcept;
@@ -2473,6 +2475,7 @@ public:
 
     std::uint32_t m_gapAnalogInputRequestedIndex = 0U;
     std::uint32_t m_gapAnalogInputExpectedDeviceId = 0U;
+    std::uint32_t m_gapAnalogInputStationNumber = 0U; // 1-based runtime slave order, 0=legacy.
     bool m_gapAnalogInputRouteBuilt = false;
     EDMAnalogInput::Binding m_gapAnalogInputBinding{};
     EDMAnalogInput::Publisher m_gapAnalogInputPublisher;

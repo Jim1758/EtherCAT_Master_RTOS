@@ -3162,7 +3162,7 @@ bool NCManager::CheckEDM146SelectionBoundarySameThread(int pc, EDM146::Failure& 
             (!step || source.generation == m_edm114.retained.source.scope.translationGeneration) :
         step == 0U && (s.gapHistoryMode ? m_edm126.initialBoundaryReady : c.initialBoundaryReady) && CoordSys.IsTranslationRunBound() &&
             CoordSys.IsTranslationAxisIdentityCurrent() && IsNCTranslationSnapshotValid(source) &&
-            source.runToken == s.run && IsNCXYZCUVFeedNeutralFrame(source) && source.distanceMode == 91 &&
+            source.runToken == s.run && IsNCLegacyXYZCUVFeedNeutralFrame(source) && source.distanceMode == 91 &&
             m_motion.GetActiveTranslationGeneration() == 0ULL;
     EDM94::Feedback guard{}; const auto epoch = m_motion.GetCurrentExecutionEpoch();
     if (!translation || (!step && !(s.gapHistoryMode ? m_edm126.initialBoundaryReady : c.initialBoundaryReady)))
@@ -3312,7 +3312,7 @@ bool NCManager::IsEDM116SelectorCurrentSameThread(const NCBlock& block) noexcept
             (!step || source.generation == m_edm114.retained.source.scope.translationGeneration)) :
         (step == 0U && c.initialBoundaryReady && CoordSys.IsTranslationRunBound() &&
             CoordSys.IsTranslationAxisIdentityCurrent() && IsNCTranslationSnapshotValid(source) &&
-            source.runToken == s.run && IsNCXYZCUVFeedNeutralFrame(source) && source.distanceMode == 91 &&
+            source.runToken == s.run && IsNCLegacyXYZCUVFeedNeutralFrame(source) && source.distanceMode == 91 &&
             m_motion.GetActiveTranslationGeneration() == 0ULL);
     return s.gapModeFlush && EDM116::ValidFixture(s.gapModeFixture) && s.gapPhysicalCurve && !s.gapCurveB2 && s.latched && s.ready &&
         !s.armPending && s.everArmed && !s.cancelled && !s.resetSeen && !s.resetCommitted &&
@@ -3966,7 +3966,7 @@ bool NCManager::GuardEDM114ArcSameThread(const NCBlock& block) noexcept
         s.cache != GetBaseProgramCache().GetGeneration() || s.run != m_pathCoreLiveBookkeeping.currentRunToken ||
         !m_motion.IsMotionOwnerLeaseCurrent(s.lease) ||
         !CoordSys.IsTranslationRunFrozen() || !CoordSys.IsTranslationRunCurrent() ||
-        !IsNCXYZCUVFeedNeutralFrame(CoordSys.GetTranslationSnapshot()) ||
+        !IsNCLegacyXYZCUVFeedNeutralFrame(CoordSys.GetTranslationSnapshot()) ||
         CoordSys.GetTranslationSnapshot().distanceMode != 91 || CoordSys.activePlane != 17 ||
         !IsXYZCUVFeedProfileCurrentSameThread() || !IsFixedTranslationTravelCurrentSameThread() ||
         !IsPathCoreLiveNativeConfigCurrentSameThread()) return false;
@@ -4232,7 +4232,7 @@ bool NCManager::WaitEDM114ArcBoundarySameThread()
         m_motion.IsMotionOwnerLeaseCurrent(r.ownerLease) && r.translationGeneration &&
         CoordSys.IsTranslationRunFrozen() && CoordSys.IsTranslationRunCurrent() &&
         CoordSys.GetTranslationSnapshot().generation == r.translationGeneration &&
-        IsNCXYZCUVFeedNeutralFrame(CoordSys.GetTranslationSnapshot()) &&
+        IsNCLegacyXYZCUVFeedNeutralFrame(CoordSys.GetTranslationSnapshot()) &&
         CoordSys.GetTranslationSnapshot().distanceMode == 91 && CoordSys.activePlane == 17 &&
         IsXYZCUVFeedProfileCurrentSameThread() && IsFixedTranslationTravelCurrentSameThread() &&
         IsPathCoreLiveNativeConfigCurrentSameThread();

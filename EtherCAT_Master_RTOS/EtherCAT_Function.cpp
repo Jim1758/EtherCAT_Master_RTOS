@@ -5480,8 +5480,12 @@ int EtherCatMaster::ecx_LRW_FRMW(
     uint64_t* dcReferenceTime,
     int* dcWkc,
     int timeout,
-    EtherCatDcCycleTiming* dcCycleTiming)
+    EtherCatDcCycleTiming* dcCycleTiming,
+    bool* cleanReceiveDeadline)
 {
+    // The output belongs only to this exact exchange, including early failures.
+    if (cleanReceiveDeadline) *cleanReceiveDeadline = false;
+
     // DC-RX.3D: never expose stale timing from a previous successful call.
     if (dcCycleTiming != nullptr)
     {
@@ -6701,6 +6705,7 @@ int EtherCatMaster::ecx_LRW_FRMW(
 
     NicRxCallDiagnostic rxLastCallDiagnostic{};
     bool rxLastCallDiagnosticValid = false;
+    bool onlyEmptyReceiveCalls = true;
     uint64_t rxCycleReceiveCallMaxNs = 0ULL;
     uint32_t rxCycleEventSignaledCount = 0u;
     uint32_t rxCycleEventTimeoutCount = 0u;
@@ -6710,15 +6715,23 @@ int EtherCatMaster::ecx_LRW_FRMW(
     DWORD rxCycleLastEventError = ERROR_SUCCESS;
 
     auto CaptureLastNicReceiveDiagnostic =
-        [&]()
+        [&](int receivedLength)
     {
         NicRxCallDiagnostic diagnostic{};
         if (m_pNic->GetLastReceiveCallDiagnostic(&diagnostic))
         {
+            // ReceivePacket publishes this synchronous result on every return.
+            // Any received frame (even unrelated), driver error or missing result
+            // disqualifies the complete exchange; a later empty poll cannot erase it.
+            if (receivedLength != 0 || diagnostic.Outcome != static_cast<uint32_t>(NicRxCallOutcome::NoData) ||
+                diagnostic.NalCallSucceeded || diagnostic.LastError != ERROR_NO_DATA || diagnostic.Length ||
+                (rxLastCallDiagnosticValid && diagnostic.CallSequence != rxLastCallDiagnostic.CallSequence + 1ULL))
+                onlyEmptyReceiveCalls = false;
             rxLastCallDiagnostic = diagnostic;
             rxLastCallDiagnosticValid = true;
             AccumulateRx4aNalOutcome(diagnostic);
         }
+        else onlyEmptyReceiveCalls = false;
     };
 
     auto ComputeRxElapsedNs =
@@ -6831,6 +6844,20 @@ int EtherCatMaster::ecx_LRW_FRMW(
             int rxLength,
             uint64_t rxElapsedNs)
     {
+        if (cleanReceiveDeadline) {
+            const bool clockDeadline = reason == EtherCatRxIncidentReason::PreReceiveDeadline ||
+                reason == EtherCatRxIncidentReason::PostReceiveLate ||
+                reason == EtherCatRxIncidentReason::PreWaitDeadline ||
+                reason == EtherCatRxIncidentReason::PreFallbackDeadline;
+            *cleanReceiveDeadline = isRuntimeProcessImage && sendSucceeded &&
+                txReceipt.reason == NicTxReason::Accepted && txReceipt.callSequence != 0ULL &&
+                txReceipt.nalInvoked == 1U && txReceipt.apiResult != 0 && txReceipt.submitted == 1U &&
+                !frameReservation.handoff.scrubbed && rxDeadlineValid && clockDeadline &&
+                rxAttemptNumber != 0U && rxLastCallDiagnosticValid && onlyEmptyReceiveCalls &&
+                rxLength == 0 && rxCycleEventFailedCount == 0U && rxCycleEventFallbackSleepCount == 0U &&
+                rxCycleReceiveCallMaxNs < ETHERCAT_RX4A_NAL_STALL_HINT_NS;
+        }
+
         rxResyncPending =
             true;
 
@@ -7345,7 +7372,7 @@ int EtherCatMaster::ecx_LRW_FRMW(
             ReceivePacket(
                 m_rxBuffer);
 
-        CaptureLastNicReceiveDiagnostic();
+        CaptureLastNicReceiveDiagnostic(rxLen);
 
 
         // =============================================================

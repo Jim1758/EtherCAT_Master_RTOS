@@ -1068,79 +1068,74 @@ namespace
     // millimetres and rotary degrees never form the programmed feed metric.
     bool IsMotionXYZCUVFeedGeometryValid(const MotionCommand& command,
         const std::vector<AxisContext>* contexts,
-        NCXYZCUVFeedLineValue* validatedGeometry = nullptr) noexcept
+        NCXYZCUVFeedLineValue* validatedGeometry=nullptr) noexcept
     {
-        if (validatedGeometry != nullptr) validatedGeometry->Clear();
-        if (!IsMotionXYZCUVFeedSourceAllowed(command) || contexts == nullptr ||
-            contexts->size() < 6U || contexts->size() > 8U ||
-            command.dir != 0 || command.startRadius != 0.0 || command.endRadius != 0.0 ||
-            command.centerPos[0] != 0.0 || command.centerPos[1] != 0.0 ||
-            command.cncPrefixVelocityPPS != 0.0) return false;
-        for (unsigned slot = 6U; slot < 8U; ++slot)
-            if (command.axisIndices[slot] != 0 || command.targetPos[slot] != 0.0 ||
-                (!command.sourceIsAbsoluteMode &&
-                    (command.mem_startPos[slot] != 0.0 || command.mem_ratio[slot] != 0.0))) return false;
-        NCXYZCUVFeedLineInput input{};
-        NCXYZCUVFeedLineValue geometry{};
-        input.axisIdentity = command.sourceTranslation.axisIdentity;
-        input.axisMask = 63U;
-        input.feedMMMin = command.mem_radius;
-        input.absolute = command.sourceIsAbsoluteMode;
-        input.zOnlyCommissioning = command.edm149ZOnlyCommissioning;
-        input.xyzOnlyCommissioning = command.edm150XYZOnlyCommissioning;
-        input.sparseCommissioning = command.edm154SparseCommissioning;
+        if(validatedGeometry)validatedGeometry->Clear();
+        if(!IsMotionXYZCUVFeedSourceAllowed(command)||!contexts||contexts->size()<3U||contexts->size()>8U||
+           command.dir!=0||command.startRadius!=0.0||command.endRadius!=0.0||command.centerPos[1]!=0.0||
+           command.cncPrefixVelocityPPS!=0.0)return false;
+        NCXYZCUVFeedLineInput input{};NCXYZCUVFeedLineValue geometry{};
+        input.axisIdentity=command.sourceTranslation.axisIdentity;
+        input.axisMask=MotionXYZCUVPresentMask(command);input.authoredAxisMask=MotionXYZCUVAuthoredMask(command);
+        input.feedMMMin=command.mem_radius;input.absolute=command.sourceIsAbsoluteMode;
+        input.zOnlyCommissioning=command.edm149ZOnlyCommissioning;
+        input.xyzOnlyCommissioning=command.edm150XYZOnlyCommissioning;
+        input.sparseCommissioning=command.edm154SparseCommissioning;
+        if(!input.absolute&&(command.mem_startPos[6]!=0.0||command.mem_startPos[7]!=0.0||
+            command.mem_ratio[6]!=0.0||command.mem_ratio[7]!=0.0))return false;
         NCXYZCUVAbsoluteFeedTarget resolved{};
-        if (input.absolute && !TryResolveMotionXYZCUVAbsoluteTarget(command, resolved)) return false;
-        for (unsigned selected = 0U; selected < 6U; ++selected)
-        {
-            const AxisContext& axis = (*contexts)[selected];
-            if (!axis.isExist || axis.axisIndex != static_cast<int>(selected) ||
-                axis.axisType != (selected < 3U ? AxisType::LINEAR : AxisType::ROTARY) ||
-                !std::isfinite(axis.resolution_PPR) || axis.resolution_PPR <= 0.0 ||
-                !std::isfinite(axis.finalLead) || axis.finalLead <= 0.0 ||
-                command.mem_ratio[selected] != axis.resolution_PPR / axis.finalLead ||
-                (selected >= 3U && (!std::isfinite(axis.rotaryModulo) || axis.rotaryModulo <= 0.0))) return false;
-            input.startPulse[selected] = command.mem_startPos[selected];
-            input.endPulse[selected] = command.targetPos[selected];
-            input.startMCS[selected] = MotionXYZCUVStartMCS(command, selected);
-            if (input.absolute)
-            {
-                input.absoluteTargetMCS[selected] = MotionXYZCUVRequestedMCS(command, selected);
-                input.deltaNative[selected] = resolved.deltaNative[selected];
-                input.endMCS[selected] = resolved.endMCS[selected];
-                if (!NCRotaryFeedDetail::SameBits(input.endPulse[selected], resolved.endPulse[selected])) return false;
-                if (selected >= 3U)
-                {
-                    const unsigned rotary = selected - 3U;
-                    const unsigned shortestMask = static_cast<unsigned>(command.mem_ratio[7U]); // validated above
-                    input.rotaryModulo[rotary] = MotionXYZCUVRotaryModulo(command, rotary);
-                    input.rotaryShortestPath[rotary] = (shortestMask & (1U << rotary)) != 0U;
-                    if (!NCRotaryFeedDetail::SameBits(input.rotaryModulo[rotary], axis.rotaryModulo) ||
-                        input.rotaryShortestPath[rotary] != axis.useShortestPath) return false;
+        if(input.absolute&&!TryResolveMotionXYZCUVAbsoluteTarget(command,resolved))return false;
+        for(unsigned axis=0U;axis<6U;++axis){
+            const bool exists=input.axisIdentity.exists[axis]!=0U;
+            const bool live=axis<contexts->size()&&(*contexts)[axis].isExist;
+            if(exists!=live)return false;
+            input.startMCS[axis]=input.endMCS[axis]=MotionXYZCUVStartMCS(command,axis);
+            input.startPulse[axis]=input.endPulse[axis]=command.mem_startPos[axis];
+            if(!std::isfinite(input.startMCS[axis])||!std::isfinite(input.startPulse[axis]))return false;
+            if(!exists){
+                if(command.mem_startPos[axis]!=0.0||command.mem_ratio[axis]!=0.0||
+                   MotionXYZCUVProgrammedValue(command,axis)!=0.0)return false;
+                if(input.absolute)input.absoluteTargetMCS[axis]=input.startMCS[axis];
+                continue;
+            }
+            const AxisContext& native=(*contexts)[axis];
+            if(native.axisIndex!=static_cast<int>(axis)||static_cast<unsigned>(native.axisType)!=input.axisIdentity.axisType[axis]||
+               !std::isfinite(native.resolution_PPR)||native.resolution_PPR<=0.0||
+               !std::isfinite(native.finalLead)||native.finalLead<=0.0||command.mem_ratio[axis]!=native.resolution_PPR/native.finalLead)return false;
+            input.endPulse[axis]=MotionXYZCUVTargetPulse(command,axis);
+            input.pulsePerUnit[axis]=command.mem_ratio[axis];input.maxVelocityPPS[axis]=native.maxVel_PPS;
+            input.axisAccTime[axis]=native.G00_acc_time;input.axisDecTime[axis]=native.G00_dec_time;
+            if(input.absolute){
+                if(!(input.authoredAxisMask&(1U<<axis))&&
+                   !NCRotaryFeedDetail::SameBits(MotionXYZCUVProgrammedValue(command,axis),
+                       input.startMCS[axis]-NCTranslationAxisOffsetMM(command.sourceTranslation,axis)))return false;
+                input.absoluteTargetMCS[axis]=MotionXYZCUVRequestedMCS(command,axis);
+                input.endMCS[axis]=resolved.endMCS[axis];input.deltaNative[axis]=resolved.deltaNative[axis];
+                if(!NCRotaryFeedDetail::SameBits(input.endPulse[axis],resolved.endPulse[axis]))return false;
+                if(axis>=3U&&input.axisIdentity.axisType[axis]==1U){
+                    const unsigned rotary=axis-3U;const unsigned shortest=static_cast<unsigned>(command.mem_ratio[7]);
+                    input.rotaryModulo[rotary]=MotionXYZCUVRotaryModulo(command,rotary);
+                    input.rotaryShortestPath[rotary]=(shortest&(1U<<rotary))!=0U;
+                    if(!NCRotaryFeedDetail::SameBits(input.rotaryModulo[rotary],native.rotaryModulo)||
+                       input.rotaryShortestPath[rotary]!=native.useShortestPath)return false;
                 }
+            }else{
+                input.deltaNative[axis]=MotionXYZCUVProgrammedValue(command,axis);
+                input.endMCS[axis]=input.deltaNative[axis]==0.0?input.startMCS[axis]:input.startMCS[axis]+input.deltaNative[axis];
             }
-            else
-            {
-                input.deltaNative[selected] = MotionXYZCUVProgrammedValue(command, selected);
-                input.endMCS[selected] = input.sparseCommissioning && input.deltaNative[selected] == 0.0 ?
-                    input.startMCS[selected] : input.startMCS[selected] + input.deltaNative[selected];
-            }
-            input.pulsePerUnit[selected] = command.mem_ratio[selected];
-            input.maxVelocityPPS[selected] = axis.maxVel_PPS;
-            input.axisAccTime[selected] = axis.G00_acc_time;
-            input.axisDecTime[selected] = axis.G00_dec_time;
         }
-        (void)BuildNCXYZCUVFeedLine(input, geometry);
-        const bool valid = geometry.valid && command.mem_totalDist == geometry.lengthPulse &&
-            command.mem_startAngle == geometry.nominalSeconds &&
-            command.mem_totalAngle == geometry.rotaryFeedDegMin[0] &&
-            command.mem_centerX == geometry.rotaryFeedDegMin[1] &&
-            command.mem_centerY == geometry.rotaryFeedDegMin[2] &&
-            command.targetVel == geometry.velocityPPS && command.accTime == geometry.accTime &&
-            command.decTime == geometry.decTime &&
-            std::isfinite(command.targetVel / command.accTime) &&
-            std::isfinite(command.targetVel / command.decTime);
-        if (valid && validatedGeometry != nullptr) *validatedGeometry = geometry;
+        for(unsigned axis=6U;axis<8U;++axis)if(axis<contexts->size()&&(*contexts)[axis].isExist)return false;
+        (void)BuildNCXYZCUVFeedLine(input,geometry);
+        const bool valid=geometry.valid&&command.mem_totalDist==geometry.lengthPulse&&
+            command.mem_startAngle==geometry.nominalSeconds&&command.mem_totalAngle==geometry.rotaryFeedDegMin[0]&&
+            command.mem_centerX==geometry.rotaryFeedDegMin[1]&&command.mem_centerY==geometry.rotaryFeedDegMin[2]&&
+            command.targetVel==geometry.velocityPPS&&command.accTime==geometry.accTime&&command.decTime==geometry.decTime&&
+            std::isfinite(command.targetVel/command.accTime)&&std::isfinite(command.targetVel/command.decTime);
+        if(valid&&validatedGeometry){
+            if(input.absolute)for(unsigned axis=0U;axis<6U;++axis)
+                geometry.absoluteTargetWCS[axis]=MotionXYZCUVProgrammedValue(command,axis);
+            *validatedGeometry=geometry;
+        }
         return valid;
     }
 
@@ -1149,9 +1144,27 @@ namespace
         const std::vector<AxisContext>* contexts) noexcept
     {
         if(!IsMotionEDMCommissioningMarkerEncodingValid(command))return false;
-        if(command.g76SphereAir)return contexts!=nullptr && contexts->size()>=6U &&
-            command.axisCount==6 && command.mode==InterpolationMode::LINEAR &&
-            command.commandPathMode==MotionCommandPathMode::EXACT_STOP;
+        if(command.g76SphereAir){
+            if(!contexts||command.axisCount<3||command.axisCount>6||command.mode!=InterpolationMode::LINEAR||
+               command.commandPathMode!=MotionCommandPathMode::EXACT_STOP)return false;
+            const auto& identity=command.sourceTranslation.axisIdentity;
+            const std::uint32_t mask=EDM384Axes::ExistingMask(identity);
+            if((mask&7U)!=7U||(mask&~0x3fU)!=0U||identity.exists[6]||identity.exists[7])return false;
+            unsigned count=0U;for(unsigned axis=0U;axis<6U;++axis)if(mask&(1U<<axis))++count;
+            if(command.axisCount!=static_cast<int>(count))return false;
+            std::uint32_t seen=0U;
+            for(int slot=0;slot<command.axisCount;++slot){
+                const int index=command.axisIndices[slot];
+                if(index<0||index>=6||static_cast<std::size_t>(index)>=contexts->size())return false;
+                const unsigned axis=static_cast<unsigned>(index);const std::uint32_t bit=1U<<axis;
+                const auto& native=(*contexts)[axis];
+                if(!(mask&bit)||(seen&bit)||!native.isExist||native.axisIndex!=index||
+                   static_cast<unsigned>(native.axisType)!=identity.axisType[axis]||
+                   identity.address[axis]!="XYZCUV"[axis]||(axis<3U&&identity.axisType[axis]!=0U))return false;
+                seen|=bit;
+            }
+            return seen==mask;
+        }
         if(!IsMotionPositioningOperationValid(command.positioningOperation)||
            (command.g80EdgeFind&&command.positioningOperation!=0U))return false;
         // BASE79F: generic probes are structural only. Full packet decode,
@@ -2164,9 +2177,9 @@ bool MotionCore::ConfigureManualGapZInputBeforeStart(const EDMGapInput::Profile&
 
 bool MotionCore::ConfigureManualGapZAxisGainsBeforeStart(
     const std::array<EDM20::GainResolution,8U>& discharge,
-    const std::array<EDM20::GainResolution,8U>& flush) noexcept
+    const std::array<EDM20::GainResolution,8U>& flush,std::uint32_t axisMask) noexcept
 {
-    return m_g76SphereGainBanks.Configure(discharge,flush);
+    return m_g76SphereGainBanks.Configure(discharge,flush,axisMask);
 }
 
 bool MotionCore::StartEDMPhysicalServoRT(const EDM69::Request& request) noexcept
@@ -2395,6 +2408,53 @@ bool MotionCore::CaptureEDM207Input(unsigned slot, EDM206::InputSource source,
 EDM174Comm::MotionObservation MotionCore::GetEDM174CommunicationObservation() const noexcept
 {
     EDM174Comm::MotionObservation observation{};
+    const auto& parent = m_g76SphereFrozen.request;
+    const auto& physical = m_g76SphereCurrent;
+    if (parent.physicalZManual && parent.geometry.kind == NCG76SphereRuntimeGeometry::Kind::Line &&
+        physical.session != 0ULL && physical.session == parent.session &&
+        m_g76SpherePhysicalClaim.load(std::memory_order_acquire) == physical.session &&
+        (m_g76SphereRunning || (physical.terminal && !physical.completed && physical.runtimeFault != 0U &&
+            ((physical.firstInputFault.valid && physical.firstInputFault.expectedSession == physical.session &&
+              physical.firstInputFault.tick == m_ncSettleRuntimeCycleTick) ||
+             physical.cycle.tick == m_ncSettleRuntimeCycleTick))))
+    {
+        observation.domain = EDM174Comm::Domain::PhysicalG01;
+        observation.session = physical.session;
+        observation.phase = static_cast<std::uint32_t>(m_g76SphereCycle.Current().phase);
+        observation.child = m_g76SphereCycle.Current().layerIndex;
+        if (physical.firstInputFault.valid &&
+            physical.firstInputFault.expectedSession == observation.session)
+            observation.inputFaultTick = physical.firstInputFault.tick;
+        else if (physical.terminal && !physical.completed && physical.runtimeFault != 0U)
+            observation.guardFaultTick = m_ncSettleRuntimeCycleTick;
+        const auto& process = m_g76SphereProcess.Current();
+        auto& gap = observation.gap;
+        const bool currentProcess = process.session == observation.session && process.tick != 0ULL;
+        gap.tick = currentProcess ? process.tick : 0ULL;
+        gap.e5State = currentProcess ? static_cast<std::uint32_t>(process.e5Timer.state) : 0U;
+        if (currentProcess && process.valid) gap.flags |= EDM174Comm::GapObserverValid;
+        if (currentProcess && process.eligible) gap.flags |= EDM174Comm::GapEligible;
+        if (currentProcess && process.suspended) gap.flags |= EDM174Comm::GapSuspended;
+        if (currentProcess && process.pending) gap.flags |= EDM174Comm::FlushPending;
+        if (currentProcess && process.e5Timer.allow) gap.flags |= EDM174Comm::E5Allowed;
+        if (currentProcess && process.e5Timer.latched) gap.flags |= EDM174Comm::E5Latched;
+        if (currentProcess && process.e5Timer.paused) gap.flags |= EDM174Comm::E5Paused;
+        if (currentProcess && process.e5Timer.valid) gap.flags |= EDM174Comm::E5Valid;
+        if (m_ncSettleRuntimeCycleValid) gap.flags |= EDM174Comm::ParentPdoValid;
+        if (m_g76SphereRunning) gap.flags |= EDM174Comm::ParentRunning;
+        const double minimum = static_cast<double>((std::numeric_limits<std::int32_t>::min)()) / 1000.0;
+        const double maximum = static_cast<double>((std::numeric_limits<std::int32_t>::max)()) / 1000.0;
+        if (currentProcess && process.valid &&
+            std::isfinite(process.voltageV) && std::isfinite(process.signedGapSpeedMmMin) &&
+            process.voltageV >= minimum && process.voltageV <= maximum &&
+            process.signedGapSpeedMmMin >= minimum && process.signedGapSpeedMmMin <= maximum)
+        {
+            gap.millivolts = static_cast<std::int32_t>(process.voltageV * 1000.0);
+            gap.signedMicrometresPerMinute = static_cast<std::int32_t>(process.signedGapSpeedMmMin * 1000.0);
+            gap.flags |= EDM174Comm::GapValueValid;
+        }
+        return observation;
+    }
     if (!m_edm173 || !IsEDM173Profile()) return observation;
     const auto& guard = m_edm94.Current();
     observation.session = guard.identity.session;
@@ -10245,7 +10305,7 @@ bool MotionCore::SealEDMZFixtureSerializedImage(ServoOutputFrameReservation& res
 
 void MotionCore::ObserveNCSettleRuntimeCycle(
     std::uint64_t runtimeCycleTick,
-    bool pdoCycleValid) noexcept
+    bool pdoCycleValid, bool cleanReceiveDeadline, bool confirmedCombinedReturn) noexcept
 {
     const bool hadPreviousObservation = m_ncSettleRuntimeObserved;
     const bool adjacentToPrevious =
@@ -10284,7 +10344,7 @@ void MotionCore::ObserveNCSettleRuntimeCycle(
     ObserveEDMZFixtureRuntimeClock(runtimeCycleTick, pdoCycleValid, adjacentToPrevious);
     ObserveCollisionProtectionRuntime(); // Always physical, including HOLD/Reset/invalid-PDO callbacks.
     ObserveG80RuntimeInput();
-    ObserveG76SphereRuntimeInput();
+    ObserveG76SphereRuntimeInput(cleanReceiveDeadline, confirmedCombinedReturn);
     ObserveRotarySpindleRuntimeInput(); // EDM289: includes invalid-PDO cancellation.
 
     // TUNE01: this source hook runs even when an invalid PDO skips Motion.
@@ -10954,6 +11014,42 @@ void MotionCore::ObservePbcXHomeCapture(const AxisContext& axis,
     PublishPbcXHomeCaptureSnapshot();
 }
 
+namespace {
+bool G76LineTransportZeroWire(const std::vector<EtherCatSlave>& slaves,
+    const std::vector<ENI_ServoDrive>& drives,const MotionServoHandoffSample& handoff,
+    const std::uint8_t* ioMap,std::size_t mapSize,const std::uint8_t* payload,std::size_t payloadSize) noexcept
+{
+    // Stage 7B built the drive list in XML slave order and checked these exact
+    // absolute byte spans. Do not infer the wire offset from pOutput alone.
+    if(!ioMap||!payload||mapSize!=payloadSize||!mapSize||slaves.empty()||slaves.size()>128U||
+       drives.size()<3U||drives.size()>handoff.copiedVelocity.size()||!handoff.finalChecked)return false;
+    const auto base=reinterpret_cast<std::uintptr_t>(ioMap);
+    std::size_t slot=0U,previousEnd=0U;
+    for(std::size_t slaveIndex=0U;slaveIndex<slaves.size();++slaveIndex){
+        const auto& slave=slaves[slaveIndex];
+        const auto& binding=slave.runtimeProcessImageBinding;
+        if(!binding.present)return false;
+        if(std::memcmp(binding.kind,"Servo",sizeof("Servo"))!=0)continue;
+        if(slot==drives.size()||std::memcmp(binding.abi,"ServoPDO_9_23",sizeof("ServoPDO_9_23"))!=0||
+           binding.outputOffset<0||binding.outputBytes!=sizeof(ServoOutput))return false;
+        const auto& drive=drives[slot];
+        const auto address=reinterpret_cast<std::uintptr_t>(drive.pOutput);
+        const auto offset=static_cast<std::size_t>(binding.outputOffset);
+        if(drive.slaveIndex!=static_cast<int>(slaveIndex)||drive.vendorId!=slave.vendorId||
+           drive.productCode!=slave.productCode||!drive.pOutput||address<base||address-base!=offset||
+           offset<previousEnd||offset>mapSize||sizeof(ServoOutput)>mapSize-offset)return false;
+        std::int32_t wire=0;
+        std::memcpy(&wire,payload+offset+offsetof(ServoOutput,TargetVelocity),sizeof(wire));
+        // A generic scrub may replace an old proposal. Only its actual zero
+        // bytes may pass; it cannot earn the unscrubbed qualification receipt.
+        if(wire||handoff.copiedVelocity[slot]||(!handoff.scrubbed&&handoff.proposedVelocity[slot]))return false;
+        previousEnd=offset+sizeof(ServoOutput);++slot;
+    }
+    const auto mask=static_cast<std::uint32_t>((1U<<drives.size())-1U);
+    return slot==drives.size()&&(handoff.scrubbed||(handoff.slotMask==mask&&handoff.observedMask==mask));
+}
+}
+
 bool MotionCore::SealPbcXHomeProbeSerializedImage(ServoOutputFrameReservation& reservation,
     const std::uint8_t* ioMapBase, std::size_t ioMapSize,
     const std::uint8_t* serializedPayload, std::size_t payloadSize) noexcept
@@ -10964,6 +11060,19 @@ bool MotionCore::SealPbcXHomeProbeSerializedImage(ServoOutputFrameReservation& r
         serializedPayload, payloadSize)) return false;
     if (!SealRotarySpindleSerializedImage(reservation, ioMapBase, ioMapSize,
         serializedPayload, payloadSize)) return false;
+    if(m_g76Dropout.active){
+        auto& pause=m_g76Dropout;
+        pause.wireZeroSequence=0ULL;
+        const auto* master=m_pEDMPhysicalSourceMaster;
+        if(!master||!master->m_pEni||!m_pDrives||!reservation.handoffPending||
+           master->m_IoMapSize<=0||static_cast<std::size_t>(master->m_IoMapSize)!=ioMapSize||
+           reinterpret_cast<const std::uint8_t*>(master->m_IoMap)!=ioMapBase||
+           !G76LineTransportZeroWire(master->m_pEni->GetSlaves(),*m_pDrives,reservation.handoff,
+               ioMapBase,ioMapSize,serializedPayload,payloadSize))return false;
+        // EndServoOutputFrameAfterSend still owns reservation release. No
+        // motion/epoch change is performed at this final pre-NIC boundary.
+        if(!reservation.handoff.scrubbed)pause.wireZeroSequence=reservation.handoff.sequence;
+    }
     if (!m_pbcXHomeProbeSendPending) return !reservation.homeProbe.pending;
     const ServoOutputFrameReservation& canonical = m_pbcXHomeProbeCanonicalSend;
     if (reservation.handoff.sequence != canonical.handoff.sequence) return false;
@@ -17110,6 +17219,10 @@ static std::uint64_t FoldCommandPathModeTransportFingerprint(
         fingerprint = FoldCommandPathModeTransportFingerprintValue(fingerprint, 0x434E433732ULL);
     if (command.pathCoreXYZCUVFeedExactStop)
         fingerprint = FoldCommandPathModeTransportFingerprintValue(fingerprint, 0x434E433733ULL);
+    if(command.pathCoreXYZCUVFeedExactStop&&!command.sourceIsAbsoluteMode&&command.centerPos[0]!=0.0){
+        std::uint64_t authoredBits=0ULL;std::memcpy(&authoredBits,&command.centerPos[0],sizeof(authoredBits));
+        fingerprint=FoldCommandPathModeTransportFingerprintValue(fingerprint,authoredBits);
+    }
     if (command.edm149ZOnlyCommissioning)
         fingerprint = FoldCommandPathModeTransportFingerprintValue(fingerprint, 0x45444D313439ULL);
     if (command.edm150XYZOnlyCommissioning)
@@ -17155,8 +17268,9 @@ static std::uint64_t FoldCommandPathModeTransportFingerprint(
             foldDouble(MotionXYZCUVStartMCS(command, axis));
             foldDouble(command.mem_startPos[axis]);
             foldDouble(command.mem_ratio[axis]);
-            foldDouble(command.targetPos[axis]);
+            foldDouble(command.sourceTranslation.axisIdentity.exists[axis]?MotionXYZCUVTargetPulse(command,axis):0.0);
         }
+        foldDouble(command.centerPos[0]);
         foldDouble(command.mem_startPos[6U]); foldDouble(command.mem_startPos[7U]);
         foldDouble(command.mem_ratio[6U]); foldDouble(command.mem_ratio[7U]);
     }
@@ -19344,6 +19458,16 @@ bool MotionCore::ReadLegacyMotionServoInputSnapshot(
 }
 
 
+// Only the PDO owner, after a complete matching exchange. The usual public
+// compatibility read can return the previous motion pass during this pre-pass.
+bool MotionCore::ReadG76DropoutCurrentServoInput(int slot, MotionServoInputSnapshot& sample) const noexcept
+{
+    if (m_pStructuredServoReadShadowMaster &&
+        m_pStructuredServoReadShadowMaster->IsLegacyMotionServoInputNormalPathRetired())
+        return m_pStructuredServoReadShadowMaster->TryReadRetiredMotionServoInputByAxisIndex(slot, sample);
+    return ReadLegacyMotionServoInputSnapshotBySlot(slot, sample);
+}
+
 bool MotionCore::ReadLegacyMotionServoInputSnapshotBySlot(
     int motionSlot,
     MotionServoInputSnapshot& snapshot) const
@@ -20883,6 +21007,15 @@ bool MotionCore::PublishServoOutputImageProof(
             drive.pOutput->TargetVelocity;
     }
 
+    // EDM385 checks the complete image after every member's PID and all
+    // ordinary output guards. Reject as one group before publication/send.
+    if (mode == ServoOutputImageProofMode::NORMAL &&
+        !GuardG76SphereOutputImage(proof.targetVelocity,proof.slotMask,proof.sourceRuntimeTick,proof.generation))
+    {
+        (void)ZeroAllServoTargetVelocityForFrame();
+        proof.targetVelocity.fill(0);proof.mode=ServoOutputImageProofMode::INVALID;
+        m_servoOutputImageProof=proof;return false;
+    }
     m_servoOutputImageProof = proof;
     return true;
 }
@@ -23204,6 +23337,15 @@ void MotionCore::UpdateAllMotion()//更新全部軸狀態 逐步激磁
     const std::uint32_t imageExitAlarmUpdateCount =
         motionAlarms.GetUpdateCount();
     const bool imageExitAlarmPresent = motionAlarms.HasAlarm();
+    // The missing-input callback skips the servo pass. On returning PDOs the
+    // ordinary drive/axis safety checks still run, then every mapped CSV is
+    // fenced before the final proof, including axes outside the paused group.
+    bool dropoutZeroComplete=false;
+    if(m_g76SphereRunning && m_g76Dropout.active){
+        m_g76Dropout.zeroPreparedTick=0ULL;
+        dropoutZeroComplete=ZeroAllServoTargetVelocityForFrame();
+        if(!dropoutZeroComplete)FailG76SphereRuntime(3U,true);
+    }
     bool imageHasNonZeroTargetVelocity = false;
     bool imageMappingComplete =
         m_pDrives->size() <= MAX_AXES &&
@@ -23356,13 +23498,19 @@ void MotionCore::UpdateAllMotion()//更新全部軸狀態 逐步激磁
     }
     else
     {
-        (void)PublishServoOutputImageProof(
+        const bool published=PublishServoOutputImageProof(
             imageExitOwnerState,
             imageExitExecutionPublication,
             imageExitSafetyIntentState,
             imageExitAlarmSafetyIntentState,
             imageExitAlarmUpdateCount,
             imageProofMode);
+        if(published&&dropoutZeroComplete&&imageProofMode==ServoOutputImageProofMode::ZERO_ONLY&&
+           m_ncSettleRuntimeCycleValid&&m_ncSettleRuntimeCycleContiguous&&
+           m_g76SphereInput.sourceValid&&m_g76SphereInput.pdoValid&&
+           (m_servoSourceInputMask&m_g76SphereFrozen.axisMask)==m_g76SphereFrozen.axisMask&&
+           G76DropoutOutputScopeCurrent())
+            m_g76Dropout.zeroPreparedTick=m_ncSettleRuntimeCycleTick;
     }
 
     // Stage NC-0.2J.4: the 250 us Motion owner is the only code allowed to
@@ -25219,8 +25367,8 @@ bool MotionCore::IsFixedPlanarLineEndpointScope() const noexcept
             !(*m_pContexts)[axis].isExist ||
             (nativeXYZCPositioning ? (axis != slot ||
                 (*m_pContexts)[axis].axisType != (axis < 3 ? AxisType::LINEAR : AxisType::ROTARY)) :
-             xyzcuv ? (!IsMotionXYZCUVFeedSourceAllowed(source) || axis != slot ||
-                (*m_pContexts)[axis].axisType != (axis < 3 ? AxisType::LINEAR : AxisType::ROTARY)) :
+             xyzcuv ? (!IsMotionXYZCUVFeedSourceAllowed(source) || axis>=6 ||
+                static_cast<unsigned>((*m_pContexts)[axis].axisType)!=source.sourceTranslation.axisIdentity.axisType[axis]) :
              xyzc ? (!IsMotionXYZCFeedSourceAllowed(source) || axis != slot ||
                 (*m_pContexts)[axis].axisType != (axis < 3 ? AxisType::LINEAR : AxisType::ROTARY)) :
              zc ? (!IsMotionZCFeedSourceAllowed(source) || axis != slot + 2 ||
@@ -26679,7 +26827,7 @@ bool MotionCore::IsEDM165FlushGainActive(const AxisContext& axis, EDM174Leaf::Sa
 void MotionCore::DetermineActiveGainSet(AxisContext& axis, bool* physicalFixtureIntegralHold, EDM174Leaf::Sample* edm174Trace)// PID 依照狀態切換
 {
     const bool edm165Flush=IsEDM165FlushGainActive(axis,edm174Trace);
-    if(axis.axisIndex>=0&&axis.axisIndex<3)m_g76SphereGainBank[static_cast<unsigned>(axis.axisIndex)]=EDM382Gains::Bank::None;
+    if(axis.axisIndex>=0&&axis.axisIndex<6)m_g76SphereGainBank[static_cast<unsigned>(axis.axisIndex)]=EDM382Gains::Bank::None;
     axis.edmFlushGainSelected=false;
     if (physicalFixtureIntegralHold != nullptr) *physicalFixtureIntegralHold = false;
     // =========================================================
@@ -27172,7 +27320,7 @@ void MotionCore::Run_Servo_Loop(DriveType& servo, AxisContext& axis, const AxisC
     // FIX10_GAIN_EDGE_BEGIN: capture before the configured gain selector.
     const double edm94KiBefore = axis.pid.Ki;
     const bool edm165HadFlushGains=axis.edmFlushGainSelected;
-    const auto edm382BankBefore=axis.axisIndex>=0&&axis.axisIndex<3?
+    const auto edm382BankBefore=axis.axisIndex>=0&&axis.axisIndex<6?
         m_g76SphereGainBank[static_cast<unsigned>(axis.axisIndex)]:EDM382Gains::Bank::None;
     const bool edm94HadMotionGains = m_edm94.Active() &&
         ((axis.pid.Kp == axis.Pid_G00.Kp && axis.pid.Ki == axis.Pid_G00.Ki &&
@@ -27185,7 +27333,7 @@ void MotionCore::Run_Servo_Loop(DriveType& servo, AxisContext& axis, const AxisC
         edm174Trace?edm174Trace->ForSite(EDM174Leaf::GainAuth):nullptr); // PID 依照狀態切換
     // Preserve bounded I output at a physical382 bank edge, including return
     // to the existing CNC/HOLD/IDLE bank. No legacy bank or limit is rewritten.
-    const auto edm382BankAfter=axis.axisIndex>=0&&axis.axisIndex<3?
+    const auto edm382BankAfter=axis.axisIndex>=0&&axis.axisIndex<6?
         m_g76SphereGainBank[static_cast<unsigned>(axis.axisIndex)]:EDM382Gains::Bank::None;
     if(edm382BankBefore!=edm382BankAfter&&edm94KiBefore!=axis.pid.Ki){
         double transferred=axis.pid.integralAcc;
@@ -27407,8 +27555,7 @@ void MotionCore::Run_Servo_Loop(DriveType& servo, AxisContext& axis, const AxisC
                 0);
             axis.state = MotionState::MotionState_ERROR;
 
-            // 🌟 修正：不要再轉 (int) 了，直接印 double
-            RtPrintf("ALARM! Lag:%d | Cmd:%d | Act:%d\n", (int)error, (int)cmd.instantCmdPos, (int)axis.currentActPos);
+            // NC publishes the latched axis alarm. Keep console I/O off the servo cycle.
             return;
         }
 
@@ -27696,9 +27843,12 @@ void MotionCore::Run_Servo_Loop(DriveType& servo, AxisContext& axis, const AxisC
     }
     if (G76SphereDemandsZero(axis)) { finalVel=0.0; axis.pid.integralAcc=0.0; }
 
-    // 5. [Output Clamp] 輸出限速保護
-    // 限制不超過最大速度的 1.2 倍
-    double limit = axis.maxVel_PPS * 1.2;
+    // Signed EDM keeps MAX_Speed as the exact machine velocity ceiling,
+    // including PID correction. Ordinary motion retains its existing policy.
+    const bool independentEdmSpeed=m_g76SphereRunning&&m_g76SphereFrozen.signedMotionEnabled&&
+        m_g76SphereProcessFrozen.config.enabled&&axis.axisIndex>=0&&axis.axisIndex<6&&
+        (m_g76SphereFrozen.axisMask&(1U<<static_cast<unsigned>(axis.axisIndex)))!=0U;
+    double limit = axis.maxVel_PPS * (independentEdmSpeed?1.0:1.2);
     if (finalVel > limit) finalVel = limit;
     if (finalVel < -limit) finalVel = -limit;
 
@@ -27949,12 +28099,25 @@ void MotionCore::Run_Servo_Loop(DriveType& servo, AxisContext& axis, const AxisC
             axis.pid.Kp, axis.pid.Ki, axis.pid.Kvff, p_term, i_term, finalVel,
             idleGains, motionGains, finalVel != edmZHardwareBeforeGuard);
     }
+    // EDM385 binds the last continuous proposal (including PID correction,
+    // zero demand and hardware signs) to the immediately following int32 write.
+    if (axis.axisIndex>=0 && axis.axisIndex<6)
+        ObserveG76SphereFinalVelocity(static_cast<unsigned>(axis.axisIndex),finalVel);
     // 6. [Write PDO] 寫入 EtherCAT
     WriteServoTargetVelocityCommand(
         servo.pOutput,
         axis.axisIndex,
         static_cast<int32_t>(
             finalVel),edm174Trace?edm174Trace->ForSite(EDM174Leaf::WriterAuth):nullptr);
+    // EDM386_G01_RESPONSE_TRACE_BEGIN
+    // Position-difference velocity uses the existing consumed feedback. The
+    // local image may still be replaced by later group/safety/send guards.
+    if(axis.axisIndex==2&&servo.pOutput!=nullptr)
+        ObserveG01ResponseControl(2U,control.servoCommandPulse,control.servoVelocityPPS,
+            axis.currentActPos,axis.currentActVel,input.ActualPosition,input.StatusWord,
+            input.ModesOfOperationDisplay,p_term,i_term,axis.pid.Kp,axis.pid.Ki,axis.pid.Kvff,
+            finalVel,servo.pOutput->TargetVelocity);
+    // EDM386_G01_RESPONSE_TRACE_END
     // EDM206_WRITTEN_OBSERVATION_BEGIN: actual axis PDO memory after the writer;
     // later group guarding/serialization may replace it. This is not a send receipt.
     if (m_edm173 && m_edm94.Active() && IsEDM173Profile() &&
@@ -28721,19 +28884,20 @@ bool MotionCore::TryLineMove(
                             NCTranslationAxisOffsetMM(m_pendingTranslation, slot))) :
                 NCRotaryFeedDetail::SameBits(xyzcGeometry->endMCS[slot],
                     xyzcGeometry->startMCS[slot] + xyzcGeometry->deltaNative[slot]));
-    bool xyzcuvScope = pathCoreXYZCUVFeedExactStop && !pathCoreZCFeedExactStop &&
-        !pathCoreXYZCFeedExactStop && xyzcGeometry == nullptr &&
-        !pathCoreRotaryFeedExactStop && rotaryGeometry == nullptr && zcGeometry == nullptr &&
-        xyzcuvGeometry != nullptr && xyzcuvGeometry->valid && xyzcuvGeometry->axisMask == 63U &&
-        axes.size() == 6U && targetPos.size() == 6U && targetVel == xyzcuvGeometry->velocityPPS &&
-        acc_time == xyzcuvGeometry->accTime && dec_time == xyzcuvGeometry->decTime &&
-        commandSource == MotionCommandSource::NC_MEMORY && plannedTailWellFormed &&
-        commandOwnerLease.owner == MotionOwner::AUTO && mode == BufferMode::ABORTING &&
-        commandPathMode == MotionCommandPathMode::EXACT_STOP && !pathCoreFeedExactStop &&
-        !cncFeedLookahead && cncCorner == nullptr && cncPrefixVelocityPPS == 0.0 &&
-        preparedCommand == nullptr && IsNCXYZCUVFeedNeutralFrame(m_pendingTranslation) &&
-        m_pendingIsAbsoluteMode == (m_pendingTranslation.distanceMode == 90) &&
-            xyzcuvGeometry->absolute == m_pendingIsAbsoluteMode;
+    const std::uint32_t xyzcuvPresent=xyzcuvGeometry?NCXYZFeedPresentMask(m_pendingTranslation.axisIdentity):0U;
+    unsigned xyzcuvCount=0U;for(unsigned axis=0U;axis<6U;++axis)if(xyzcuvPresent&(1U<<axis))++xyzcuvCount;
+    bool xyzcuvScope=pathCoreXYZCUVFeedExactStop&&!pathCoreZCFeedExactStop&&
+        !pathCoreXYZCFeedExactStop&&xyzcGeometry==nullptr&&!pathCoreRotaryFeedExactStop&&
+        rotaryGeometry==nullptr&&zcGeometry==nullptr&&xyzcuvGeometry&&xyzcuvGeometry->valid&&
+        xyzcuvGeometry->axisMask==xyzcuvPresent&&(xyzcuvPresent&7U)==7U&&(xyzcuvPresent&~0x3fU)==0U&&
+        xyzcuvGeometry->authoredAxisMask!=0U&&(xyzcuvGeometry->authoredAxisMask&~xyzcuvPresent)==0U&&
+        axes.size()==xyzcuvCount&&targetPos.size()==xyzcuvCount&&targetVel==xyzcuvGeometry->velocityPPS&&
+        acc_time==xyzcuvGeometry->accTime&&dec_time==xyzcuvGeometry->decTime&&
+        commandSource==MotionCommandSource::NC_MEMORY&&plannedTailWellFormed&&commandOwnerLease.owner==MotionOwner::AUTO&&
+        mode==BufferMode::ABORTING&&commandPathMode==MotionCommandPathMode::EXACT_STOP&&!pathCoreFeedExactStop&&
+        !cncFeedLookahead&&cncCorner==nullptr&&cncPrefixVelocityPPS==0.0&&preparedCommand==nullptr&&
+        IsNCXYZCUVFeedNeutralFrame(m_pendingTranslation)&&m_pendingIsAbsoluteMode==(m_pendingTranslation.distanceMode==90)&&
+        xyzcuvGeometry->absolute==m_pendingIsAbsoluteMode;
     const bool zOnlyAuthorization = edm94Authorization && edm94Authorization->session &&
         edm94Authorization->historyServo && edm94Authorization->historyModeFlush && edm94Authorization->workTimeFlush &&
         edm94Authorization->historyFixture == EDM149::ZHistoryFixture && EDM130::IsMotionTest(edm94Authorization->timerRecipe);
@@ -28747,17 +28911,23 @@ bool MotionCore::TryLineMove(
     if (xyzcuvScope && (xyzcuvGeometry->zOnlyCommissioning != zOnlyAuthorization ||
         xyzcuvGeometry->xyzOnlyCommissioning != xyzOnlyAuthorization ||
         xyzcuvGeometry->sparseCommissioning != sparseAuthorization)) xyzcuvScope = false;
-    for (unsigned slot = 0U; xyzcuvScope && slot < 6U; ++slot)
-        xyzcuvScope = axes[slot] == static_cast<int>(slot) &&
-            NCRotaryFeedDetail::SameBits(targetPos[slot], xyzcuvGeometry->endPulse[slot]) &&
-            (xyzcuvGeometry->absolute ?
-                (std::isfinite(xyzcuvGeometry->absoluteTargetWCS[slot]) &&
-                    NCRotaryFeedDetail::SameBits(xyzcuvGeometry->absoluteTargetMCS[slot],
-                        xyzcuvGeometry->absoluteTargetWCS[slot] +
-                            NCTranslationAxisOffsetMM(m_pendingTranslation, slot))) :
-                NCRotaryFeedDetail::SameBits(xyzcuvGeometry->endMCS[slot],
-                    xyzcuvGeometry->sparseCommissioning && xyzcuvGeometry->deltaNative[slot] == 0.0 ?
-                    xyzcuvGeometry->startMCS[slot] : xyzcuvGeometry->startMCS[slot] + xyzcuvGeometry->deltaNative[slot]));
+    unsigned xyzcuvSlot=0U;
+    for(unsigned axis=0U;xyzcuvScope&&axis<6U;++axis)if(xyzcuvPresent&(1U<<axis)){
+        if(xyzcuvSlot>=axes.size()||axes[xyzcuvSlot]!=static_cast<int>(axis)||
+           !NCRotaryFeedDetail::SameBits(targetPos[xyzcuvSlot],xyzcuvGeometry->endPulse[axis])){xyzcuvScope=false;break;}
+        const bool authored=(xyzcuvGeometry->authoredAxisMask&(1U<<axis))!=0U;
+        const double expected=xyzcuvGeometry->absolute?
+            (authored?xyzcuvGeometry->absoluteTargetWCS[axis]+NCTranslationAxisOffsetMM(m_pendingTranslation,axis):
+                xyzcuvGeometry->startMCS[axis]):
+            (xyzcuvGeometry->deltaNative[axis]==0.0?xyzcuvGeometry->startMCS[axis]:
+                xyzcuvGeometry->startMCS[axis]+xyzcuvGeometry->deltaNative[axis]);
+        xyzcuvScope=std::isfinite(expected)&&NCRotaryFeedDetail::SameBits(xyzcuvGeometry->absolute?
+            xyzcuvGeometry->absoluteTargetMCS[axis]:xyzcuvGeometry->endMCS[axis],expected)&&
+            (!xyzcuvGeometry->absolute||authored||NCRotaryFeedDetail::SameBits(xyzcuvGeometry->absoluteTargetWCS[axis],
+                xyzcuvGeometry->startMCS[axis]-NCTranslationAxisOffsetMM(m_pendingTranslation,axis)))&&
+            (authored||xyzcuvGeometry->deltaNative[axis]==0.0);
+        ++xyzcuvSlot;
+    }
     if ((pathCoreRotaryFeedExactStop ? !rotaryScope : rotaryGeometry != nullptr) ||
         (pathCoreZCFeedExactStop ? !zcScope : zcGeometry != nullptr) ||
         (pathCoreXYZCFeedExactStop ? !xyzcScope : xyzcGeometry != nullptr) ||
@@ -28823,7 +28993,7 @@ bool MotionCore::TryLineMove(
             !(*m_pContexts)[axisIndex].isExist ||
             (commandSource == MotionCommandSource::NC_MEMORY &&
                 !IsNCTranslationSnapshotEmpty(m_pendingTranslation) &&
-                (xyzcuvScope ? ((*m_pContexts)[axisIndex].axisType != (axisIndex < 3 ? AxisType::LINEAR : AxisType::ROTARY) ||
+                (xyzcuvScope ? (static_cast<unsigned>((*m_pContexts)[axisIndex].axisType)!=m_pendingTranslation.axisIdentity.axisType[axisIndex] ||
                     !NCRotaryFeedDetail::SameBits((*m_pContexts)[axisIndex].logicalCmdPos.Load(), xyzcuvGeometry->startPulse[static_cast<unsigned>(axisIndex)])) :
                  xyzcScope ? ((*m_pContexts)[axisIndex].axisType != (axisIndex < 3 ? AxisType::LINEAR : AxisType::ROTARY) ||
                     !NCRotaryFeedDetail::SameBits((*m_pContexts)[axisIndex].logicalCmdPos.Load(), xyzcGeometry->startPulse[static_cast<unsigned>(axisIndex)])) :
@@ -28863,6 +29033,10 @@ bool MotionCore::TryLineMove(
     cmd.edm154SparseCommissioning = xyzcuvScope && xyzcuvGeometry->sparseCommissioning;
     if (xyzcuvScope)
     {
+        // Native metadata stays index-addressed; targetPos/axisIndices use
+        // compact physical group slots. Zero preserves old commissioning packets.
+        cmd.centerPos[0]=(xyzcuvGeometry->zOnlyCommissioning||xyzcuvGeometry->xyzOnlyCommissioning||
+            xyzcuvGeometry->sparseCommissioning)?0.0:static_cast<double>(xyzcuvGeometry->authoredAxisMask);
         for (unsigned slot = 0U; slot < 6U; ++slot)
         {
             cmd.mem_startPos[slot] = xyzcuvGeometry->startPulse[slot];
@@ -29061,9 +29235,20 @@ bool MotionCore::TryLineMove(
         // The accepted native tail belongs to the canonical absolute target,
         // never start+delta reconstructed after cancellation. Validate the
         // producer receipt as well as its packed command before epoch commit.
-        for (unsigned slot = 0U; geometryValid && xyzcuvScope && slot < 6U; ++slot)
-            geometryValid = NCRotaryFeedDetail::SameBits(rebuiltSix.endMCS[slot], xyzcuvGeometry->endMCS[slot]) &&
-                NCRotaryFeedDetail::SameBits(rebuiltSix.deltaNative[slot], xyzcuvGeometry->deltaNative[slot]);
+        if (geometryValid && xyzcuvScope)
+        {
+            // Slots 6/7 are absent and have no pulse/configuration authority.
+            // Their unchanged software tail is not part of the six-axis packet.
+            for (unsigned axis = 6U; geometryValid && axis < 8U; ++axis)
+            {
+                geometryValid = std::isfinite(xyzcuvGeometry->startMCS[axis]) &&
+                    NCRotaryFeedDetail::SameBits(xyzcuvGeometry->startMCS[axis], xyzcuvGeometry->endMCS[axis]) &&
+                    NCRotaryFeedDetail::SameBits(xyzcuvGeometry->startPulse[axis], 0.0) &&
+                    NCRotaryFeedDetail::SameBits(xyzcuvGeometry->endPulse[axis], 0.0);
+                rebuiltSix.startMCS[axis] = rebuiltSix.endMCS[axis] = xyzcuvGeometry->startMCS[axis];
+            }
+            geometryValid = geometryValid && SameNCXYZCUVFeedLineValue(rebuiltSix, *xyzcuvGeometry);
+        }
         for (unsigned slot = 0U; geometryValid && xyzcScope && slot < 4U; ++slot)
             geometryValid = NCRotaryFeedDetail::SameBits(rebuiltFour.endMCS[slot], xyzcGeometry->endMCS[slot]) &&
                 NCRotaryFeedDetail::SameBits(rebuiltFour.deltaNative[slot], xyzcGeometry->deltaNative[slot]);
@@ -30191,19 +30376,17 @@ void MotionCore::LoadNextCommand(bool cncBoundaryCrossing)
             m_Group.jumpManager.state == JumpState::IDLE && !m_pathHold.sourceSeen &&
             std::isfinite(m_Group.feedrateOverride) && m_Group.feedrateOverride >= 0.0 &&
             m_Group.feedrateOverride <= 1.0 && m_pCoordMgr != nullptr;
-        for (unsigned slot = 0U; xyzcuvStartAndTravelValid && slot < 6U; ++slot)
-        {
-            const AxisContext& axis = (*m_pContexts)[slot];
-            const double endMCS = resolvedGeometry.endMCS[slot];
-            xyzcuvStartAndTravelValid = NCRotaryFeedDetail::SameBits(axis.logicalCmdPos.Load(), frontCommand.mem_startPos[slot]) &&
-                m_pCoordMgr->IsTargetWithinSoftwareTravelLimit(axis,
-                    frontCommand.mem_startPos[slot] / frontCommand.mem_ratio[slot]) &&
-                m_pCoordMgr->IsTargetWithinSoftwareTravelLimit(axis,
-                    frontCommand.targetPos[slot] / frontCommand.mem_ratio[slot]) &&
-                m_pCoordMgr->IsTargetWithinSoftwareTravelLimit(axis, MotionXYZCUVStartMCS(frontCommand, slot)) &&
-                m_pCoordMgr->IsTargetWithinSoftwareTravelLimit(axis, endMCS) &&
-                (!frontCommand.sourceIsAbsoluteMode ||
-                    m_pCoordMgr->IsTargetWithinSoftwareTravelLimit(axis, resolvedGeometry.absoluteTargetMCS[slot]));
+        for(int slot=0;xyzcuvStartAndTravelValid&&slot<frontCommand.axisCount;++slot){
+            const unsigned index=static_cast<unsigned>(frontCommand.axisIndices[slot]);
+            const AxisContext& axis=(*m_pContexts)[index];
+            const double ppu=frontCommand.mem_ratio[index];
+            xyzcuvStartAndTravelValid=NCRotaryFeedDetail::SameBits(axis.logicalCmdPos.Load(),frontCommand.mem_startPos[index])&&
+                m_pCoordMgr->IsTargetWithinSoftwareTravelLimit(axis,frontCommand.mem_startPos[index]/ppu)&&
+                m_pCoordMgr->IsTargetWithinSoftwareTravelLimit(axis,frontCommand.targetPos[slot]/ppu)&&
+                m_pCoordMgr->IsTargetWithinSoftwareTravelLimit(axis,MotionXYZCUVStartMCS(frontCommand,index))&&
+                m_pCoordMgr->IsTargetWithinSoftwareTravelLimit(axis,resolvedGeometry.endMCS[index])&&
+                (!frontCommand.sourceIsAbsoluteMode||
+                    m_pCoordMgr->IsTargetWithinSoftwareTravelLimit(axis,resolvedGeometry.absoluteTargetMCS[index]));
         }
     }
     bool xyzcStartAndTravelValid = true;
@@ -31449,8 +31632,10 @@ void MotionCore::LoadNextCommand(bool cncBoundaryCrossing)
             // Rotary shortest path
             // ----------------------------------------------
             if ((cmd.pathCoreRotaryFeedExactStop && m_Group.startPos[i] != cmd.mem_startPos[0]) ||
-                ((cmd.pathCoreZCFeedExactStop || cmd.pathCoreXYZCFeedExactStop || cmd.pathCoreXYZCUVFeedExactStop) &&
-                    !NCRotaryFeedDetail::SameBits(m_Group.startPos[i], cmd.mem_startPos[i])))
+                (cmd.pathCoreXYZCUVFeedExactStop&&
+                    !NCRotaryFeedDetail::SameBits(m_Group.startPos[i],cmd.mem_startPos[static_cast<unsigned>(idx)]))||
+                ((cmd.pathCoreZCFeedExactStop||cmd.pathCoreXYZCFeedExactStop)&&
+                    !NCRotaryFeedDetail::SameBits(m_Group.startPos[i],cmd.mem_startPos[i])))
             {
                 derivedGeometryValid = false;
                 break; // The admission start is immutable; never rebase a feed.
@@ -40047,7 +40232,8 @@ bool MotionCore::IsManualCollisionBlocked(const MotionOwnerLease& owner) const n
     if(owner.Matches(tripped))return true; // A cleared level/C20 never resurrects this manual lease.
     EDMShortCircuitProtection::Snapshot current{};
     if(!ReadCollisionProtection(current)||!current.valid)return true;
-    return current.shortActive&&!m_collisionManualBypass.load(std::memory_order_acquire);
+    return current.shortActive && !m_collisionManualBypass.load(std::memory_order_acquire) &&
+        !HmiManualShortReleaseActive();
 }
 
 bool MotionCore::RejectCollisionPositioningProducer(MotionCommand command,MotionExecutionEpoch epoch,
@@ -40083,6 +40269,63 @@ bool MotionCore::ContainCollisionPositioningRuntime(const MotionCommand& command
     return true;
 }
 
+// The PDO owner supplies the same acquired raw sample and clock as EDM64.
+// Collision detection has its own receipt so an ended diagnostic or machining
+// session cannot freeze manual protection. Only a transport loss is recoverable.
+void MotionCore::ObserveCollisionPhysicalInputFromPdo(const EDMAnalogInput::Snapshot& sample,
+    std::uint64_t nowUs, bool clockValid, std::uint64_t frequency) noexcept
+{
+    if (!m_g76SpherePhysicalProfileConfigured || m_collisionPhysicalClosed) return;
+    const auto& profile = m_g76SpherePhysicalProfile; // Boot-installed calibrated physical input.
+    const auto& receipt = m_collisionPhysicalInput.Snapshot();
+    const auto limits = EDM64::DiagnosticConfig(); // Preserve the established voltage and time bounds.
+    const auto generation = m_collisionPhysicalInput.GenerationHighWater();
+    if (generation) {
+        const auto& route = m_collisionPhysicalInput.FrozenAdmission().route;
+        const std::uint64_t profileAgeUs = profile.gap.maxAgeMs * 1000ULL;
+        const auto maxGapUs = (std::min)(profileAgeUs, limits.maxTickGapUs);
+        const auto maxAgeUs = (std::min)(profileAgeUs, EDM63::MaxReceiptAgeUs);
+        if (!clockValid || !nowUs || nowUs <= m_collisionPhysicalLastUs ||
+            nowUs - m_collisionPhysicalLastUs > maxGapUs ||
+            (receipt.state == EDM63::State::AwaitFresh && nowUs - receipt.admittedUs > maxGapUs) ||
+            (receipt.state == EDM63::State::Valid && nowUs - receipt.sample.capturedAtUs > maxAgeUs) ||
+            frequency != route.qpcFrequency ||
+            !EDM63::SameRoute(EDM63::ProducerRoute(sample), route)) {
+            m_collisionPhysicalInput.Cancel();
+            m_collisionPhysicalClosed = true;
+            return;
+        }
+    }
+    m_collisionPhysicalLastUs = nowUs;
+    const bool lostTransport = receipt.state == EDM63::State::Revoked &&
+        receipt.reason == EDM63::Reason::TransportInvalid;
+    if (receipt.state == EDM63::State::AwaitBegin || lostTransport) {
+        if (!clockValid || !nowUs || !frequency) return;
+        const auto status = EDM63::SampleStatus(sample, true);
+        if (status != EDM63::Reason::None) {
+            if (lostTransport && status != EDM63::Reason::TransportInvalid)
+                m_collisionPhysicalClosed = true;
+            return;
+        }
+        // Re-admission starts on the first newly acquired, same-route sample.
+        // Begin publishes an unusable baseline until another newer sample arrives.
+        if (lostTransport && (sample.sequence <= receipt.sample.sequence ||
+            sample.capturedAtUs <= receipt.sample.observedAtUs)) return;
+        if (generation == (std::numeric_limits<std::uint64_t>::max)()) return;
+        m_collisionPhysicalInput.Begin(EDM63::MakeAdmission(profile, sample,
+            generation + 1ULL, nowUs, frequency));
+        return;
+    }
+    if (receipt.state == EDM63::State::Revoked) return;
+    m_collisionPhysicalInput.Observe(sample, true, nowUs, clockValid, frequency);
+    const double voltageV = static_cast<double>(receipt.conversion.voltageMv) / 1000.0;
+    if (receipt.state == EDM63::State::Stale ||
+        (receipt.Usable() && (voltageV < limits.minVoltageV || voltageV > limits.maxVoltageV))) {
+        m_collisionPhysicalInput.Cancel();
+        m_collisionPhysicalClosed = true;
+    }
+}
+
 void MotionCore::ObserveCollisionProtectionRuntime() noexcept
 {
     CollisionProtectionConfiguration configured{};
@@ -40095,7 +40338,7 @@ void MotionCore::ObserveCollisionProtectionRuntime() noexcept
         m_collisionConfigurationValid=m_collisionDetector.Configure(config)&&configured.valid;
     }
     EDMShortCircuitProtection::Input input{};
-    const auto& receipt=m_edm129Physical.input;const auto& sample=receipt.sample;
+    const auto& receipt=m_collisionPhysicalInput.Snapshot();const auto& sample=receipt.sample;
     input.sequence=sample.sequence;input.nowUs=m_edmZMonotonicUs;input.capturedAtUs=sample.capturedAtUs;
     input.voltageV=static_cast<double>(receipt.conversion.voltageMv)/1000.0;
     const auto route=EDM63::ProducerRoute(sample);
@@ -40109,7 +40352,7 @@ void MotionCore::ObserveCollisionProtectionRuntime() noexcept
     input.sourceRevision=(static_cast<std::uint64_t>(receipt.expectedProfileRevision)<<32U)|receipt.expectedCalibrationRevision;
     input.valid=readConfiguration&&requested!=0ULL&&configured.generation==requested&&
         m_collisionRuntimeConfiguration==requested&&m_collisionConfigurationValid&&
-        m_ncSettleRuntimeCycleValid&&m_ncSettleRuntimeCycleContiguous&&m_edm129PhysicalStamp.Ready()&&
+        m_ncSettleRuntimeCycleValid&&m_ncSettleRuntimeCycleContiguous&&
         MotionG80RuntimeProof::FreshPhysicalInput(receipt,m_edmZMonotonicUs,m_edmZClockFrequency,0ULL,m_edmZClockValid);
     // One sequence denotes one immutable ADC reading. A repeated sequence
     // whose timestamp/raw/conversion was mutated is invalid, never a fresh
@@ -40126,10 +40369,14 @@ void MotionCore::ObserveCollisionProtectionRuntime() noexcept
         }
     }else m_collisionCurrent=m_collisionDetector.Current();
     m_collisionAcceptedShort.store(m_collisionCurrent.shortActive,std::memory_order_release);
-    const auto owner=GetMotionOwnerLease();
-    if(CollisionManualOwner(owner)&&IsMotionOwnerLeaseCurrent(owner)&&
-       (!m_collisionCurrent.valid||(m_collisionCurrent.shortActive&&
-        !m_collisionManualBypass.load(std::memory_order_acquire))))TripManualCollisionRuntime(owner);
+    const bool plcBypass = m_collisionManualBypass.load(std::memory_order_acquire);
+    const bool hmiEnded = m_hmiManualShortWindow.UpdateRT(m_edmZClockCounter,
+        m_edmZClockValid && m_collisionCurrent.valid && m_collisionCurrent.shortActive && !plcBypass);
+    const auto owner = GetMotionOwnerLease();
+    if (CollisionManualOwner(owner) && IsMotionOwnerLeaseCurrent(owner) &&
+        (hmiEnded || !m_collisionCurrent.valid ||
+         (m_collisionCurrent.shortActive && !plcBypass && !HmiManualShortReleaseActive())))
+        TripManualCollisionRuntime(owner);
     if(m_Group.isActive&&!m_Group.currentCmd.g80EdgeFind)
         (void)ContainCollisionPositioningRuntime(m_Group.currentCmd);
     m_collisionCurrent.manualStopSequence=m_collisionManualStopSequence.load(std::memory_order_acquire);

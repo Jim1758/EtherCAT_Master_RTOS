@@ -12,6 +12,7 @@
 #include "NCHoldTelemetry.h"
 #include "NCMachiningTelemetry.h"
 #include "EDMRuntimeLogPolicy.h"
+#include "EDMAnalogInput.h"
 #include "NCHoldInspectionCommand.h"
 
 #include <cmath>
@@ -2203,6 +2204,81 @@ namespace HMI_Bridge
             bool hasPreparedQueueTail{};
         };
 
+        // Same 1 s supervisory caller for the compact GAP and legacy detail paths.
+        bool LegacyConsoleDetailDue() noexcept
+        {
+            const auto& config = EDMRuntimeLogPolicy::Current();
+            if (!config.ShadowDetail) return false;
+            static LARGE_INTEGER frequency{};
+            if (frequency.QuadPart <= 0 &&
+                (!RtQueryPerformanceFrequency(&frequency) || frequency.QuadPart <= 0)) return false;
+            LARGE_INTEGER counter{};
+            std::uint64_t nowMs = 0ULL;
+            if (!RtQueryPerformanceCounter(&counter) ||
+                !EDMAnalogInput::Publisher::QpcMilliseconds(counter.QuadPart,
+                    static_cast<std::uint64_t>(frequency.QuadPart), nowMs)) return false;
+            static EDMRuntimeLogPolicy::RateGate gate{};
+            return gate.Due(nowMs, config.DetailIntervalSec);
+        }
+
+        // Emit at most one line per changed source per supervisory poll. Copy
+        // only identity fields, so diagnostic polling/repeated STOP cannot
+        // turn a latched alarm into a periodic multi-family console report.
+        HMI_DIAG_NOINLINE void PrintObservedFaultChanges(
+            const NCAlarmEmergencyStopSnapshot& alarm,
+            bool pdoCoherent, const EtherCatPdoRuntimeInvalidCorrelationSnapshot& pdo,
+            bool stopCoherent, const EtherCatPdoSafetyStopCauseSnapshot& stop) noexcept
+        {
+            static std::uint64_t alarmSequence = 0ULL;
+            static std::uint32_t alarmUpdates = 0U;
+            static int alarmCode = 0;
+            static bool alarmActive = false;
+            if (alarm.alarmCode != alarmCode || alarm.alarmActive != alarmActive ||
+                (alarm.alarmCode != 0 && (alarm.sequence != alarmSequence ||
+                    alarm.alarmUpdateCount != alarmUpdates)))
+            {
+                RtPrintf("[NC-ALARM] Seq:%llu Code:%d Axis:%d Active:%u Update:%u\n",
+                    static_cast<unsigned long long>(alarm.sequence), static_cast<int>(alarm.alarmCode),
+                    static_cast<int>(alarm.alarmAxisIndex), alarm.alarmActive ? 1U : 0U,
+                    static_cast<unsigned>(alarm.alarmUpdateCount));
+                alarmSequence = alarm.sequence;
+                alarmUpdates = alarm.alarmUpdateCount;
+                alarmCode = alarm.alarmCode;
+                alarmActive = alarm.alarmActive;
+            }
+
+            static std::uint64_t invalid = 0ULL;
+            static std::uint64_t recovered = 0ULL;
+            if (pdoCoherent && (pdo.invalidCycleCount != invalid ||
+                pdo.recoveryAfterInvalidCount != recovered))
+            {
+                RtPrintf("[PDO-QUALITY] Invalid:%llu Recovered:%llu LastInv:%llu Mask:%02X "
+                    "LRW:%d/%d DC:%d PathNs:%llu LastRec:%llu RecLRW:%d/%d RecDC:%d RecPathNs:%llu\n",
+                    static_cast<unsigned long long>(pdo.invalidCycleCount),
+                    static_cast<unsigned long long>(pdo.recoveryAfterInvalidCount),
+                    static_cast<unsigned long long>(pdo.lastInvalidRuntimeCycleTick),
+                    static_cast<unsigned>(pdo.lastInvalidReasonMask),
+                    static_cast<int>(pdo.lastInvalidActualLrwWkc), static_cast<int>(pdo.lastInvalidExpectedLrwWkc),
+                    static_cast<int>(pdo.lastInvalidDcWkc), static_cast<unsigned long long>(pdo.lastInvalidCombinedPathNs),
+                    static_cast<unsigned long long>(pdo.lastRecoveryRuntimeCycleTick),
+                    static_cast<int>(pdo.lastRecoveryActualLrwWkc), static_cast<int>(pdo.lastRecoveryExpectedLrwWkc),
+                    static_cast<int>(pdo.lastRecoveryDcWkc), static_cast<unsigned long long>(pdo.lastRecoveryCombinedPathNs));
+                invalid = pdo.invalidCycleCount;
+                recovered = pdo.recoveryAfterInvalidCount;
+            }
+
+            static std::uint64_t alarmRequests = 0ULL;
+            if (stopCoherent && stop.alarmRequestCount != alarmRequests)
+            {
+                RtPrintf("[PDO-STOP] Req:%llu Tick:%llu Code:%d Mask:%02X LRW:%d/%d DC:%d\n",
+                    static_cast<unsigned long long>(stop.alarmRequestCount),
+                    static_cast<unsigned long long>(stop.runtimeCycleTick), static_cast<int>(stop.alarmCode),
+                    static_cast<unsigned>(stop.reasonMask), static_cast<int>(stop.actualLrwWkc),
+                    static_cast<int>(stop.expectedLrwWkc), static_cast<int>(stop.dcWkc));
+                alarmRequests = stop.alarmRequestCount;
+            }
+        }
+
         HMI_DIAG_NOINLINE bool PrintGapActiveCompactDiagnosticSameThread(
             NCManager& nc, MotionCore& motion,
             Hmi1000msDiagnosticWorkspace& workspace) noexcept
@@ -2218,7 +2294,7 @@ namespace HMI_Bridge
             const MotionNCSettleSnapshot& snapshot = workspace.feedHoldNCSettleSnapshot;
             // Keep the sampled J5 workspace current without passive console IO
             // while P28 or a physical Z fixture requires prompt NC supervision.
-            if (nc.IsEDMDiagnosticQuietSameThread() || fixtureQuiet) return true;
+            if (nc.IsEDMDiagnosticQuietSameThread() || fixtureQuiet || !LegacyConsoleDetailDue()) return true;
             RtPrintf("[GAP-CO-FIX1-J5] Coh:%u Req:%llu Proof:%llu Epoch:%u Owner:%u/%u "
                 "Mask:%u Valid:%u Contig:%u Set:%u Dwell:%u/%u rtTick:%llu bulkDeferred=1\n",
                 coherent ? 1U : 0U,
@@ -3828,10 +3904,11 @@ namespace HMI_Bridge
         // or feedback rings.  It only reads atomic / snapshot counters.
         //
         // Output policy:
-        //   1. Print one full startup sample, then full reports on events.
+        //   1. Optional startup/event dumps share the ShadowDetail interval.
         //   2. Safety/transport/NC mode-state edges are events; an unchanged
         //      pending safety latch is NOT a reason to repeat the full dump.
-        //   3. After ten quiet samples print one compact integer-only heartbeat.
+        //   3. After ten quiet samples an optional compact heartbeat is eligible.
+        //   4. Observed alarm and PDO fault changes have separate concise output.
         // Snapshot capture, bounded event drains and error tracking still run
         // every second. Static snapshot storage/noinline output families stay
         // intact; this gate does not change NC, safety, motion or PDO state.
@@ -4850,15 +4927,39 @@ namespace HMI_Bridge
             errorCounterChanged ||
             operatingStateChanged;
 
+        PrintObservedFaultChanges(alarmEmergencyStopSnapshot, pdoInvalidCorrelationCoherent,
+            pdoInvalidCorrelation, pdoSafetyStopCauseCoherent, pdoSafetyStopCause);
+
         diagnosticSamples = AddDiagnosticCounterSaturating(diagnosticSamples, 1ULL);
-        if (shouldPrint)
+        if (shouldPrint) quietDiagnosticSamples = 0U;
+        else if (quietDiagnosticSamples < 10U) ++quietDiagnosticSamples;
+
+        // Coalesce detail requests so a transition between allowed reports
+        // still produces a current snapshot. The original event tokens below
+        // always advance, independently of the console configuration.
+        static bool pendingFull = false;
+        static bool pendingJ5 = false;
+        static bool pendingJ6 = false;
+        static bool pendingK78 = false;
+        const bool detailEnabled = EDMRuntimeLogPolicy::Current().ShadowDetail;
+        pendingFull = detailEnabled && (pendingFull || shouldPrint);
+        pendingJ5 = detailEnabled && (pendingJ5 || shouldPrintJ5);
+        pendingJ6 = detailEnabled && (pendingJ6 || shouldPrintJ6);
+        pendingK78 = detailEnabled && (pendingK78 || shouldPrintK78);
+        const bool detailDue = (pendingFull || quietDiagnosticSamples >= 10U) && LegacyConsoleDetailDue();
+        const bool printFull = detailDue && pendingFull;
+        const bool printJ5 = detailDue && pendingJ5;
+        const bool printJ6 = detailDue && pendingJ6;
+        const bool printK78 = detailDue && pendingK78;
+        if (detailDue)
         {
+            pendingFull = pendingJ5 = pendingJ6 = pendingK78 = false;
             quietDiagnosticSamples = 0U;
-            fullDiagnosticReports = AddDiagnosticCounterSaturating(fullDiagnosticReports, 1ULL);
         }
-        else if (++quietDiagnosticSamples >= 10U)
+        if (printFull)
+            fullDiagnosticReports = AddDiagnosticCounterSaturating(fullDiagnosticReports, 1ULL);
+        else if (detailDue)
         {
-            quietDiagnosticSamples = 0U;
             RunHmiDiagnosticOutputFamily([&]()
                 {
                     nc->PrintProgramStartDiagnostic();
@@ -4878,7 +4979,7 @@ namespace HMI_Bridge
                 });
         }
 
-        if (shouldPrint)
+        if (printFull)
         {
             RunHmiDiagnosticOutputFamily([&]()
                 {
@@ -7797,7 +7898,7 @@ namespace HMI_Bridge
                         ordinaryG00FeedHoldRollingRearmSnapshot.accountingValid
                         ? 1U : 0U);
 
-                    if (shouldPrintK78)
+                    if (printK78)
                     {
                         RtPrintf(
                             "[NC02K78-GATE] Pub:%llu RPub:%llu K74Pub:%llu "
@@ -8382,7 +8483,7 @@ namespace HMI_Bridge
                         static_cast<unsigned long long>(feedHoldGateCounters.superseded),
                         static_cast<unsigned long long>(feedHoldGateCounters.rollbackDisabled));
 
-                    if (shouldPrintJ6)
+                    if (printJ6)
                     {
                         RtPrintf(
                             "[NC02J6-ALM] Seq:%llu Code:%d Axis:%d Trigger:%s "
@@ -8983,7 +9084,7 @@ namespace HMI_Bridge
                 });
         }
 
-        if (shouldPrintJ5)
+        if (printJ5)
         {
             RunHmiDiagnosticOutputFamily([&]()
                 {

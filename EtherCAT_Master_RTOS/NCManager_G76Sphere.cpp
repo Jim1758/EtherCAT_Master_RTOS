@@ -9,6 +9,8 @@
 #include "NCG76TimedP11Source.h"
 #include "NCFinishPolicy.h"
 #include "EDMManualGapZConfig.h"
+#include "EDMCoordinatedAxes384.h"
+#include "NCRotaryFeedTarget.h"
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -35,21 +37,40 @@ bool SameDouble(double a,double b) noexcept {return std::memcmp(&a,&b,sizeof(dou
 // feeds and flush settings. It changes the GAP source, not generator authority.
 bool ManualGapZAuthored382(const NCBlock& block) noexcept
 {
-    if(block.gCode!=1||!block.has('Z')||!std::isfinite(block.val('Z')))return false;
+    if(block.gCode!=1||!(block.has('X')||block.has('Y')||block.has('Z')||
+        block.has('C')||block.has('U')||block.has('V')))return false;
     for(char word='A';word<='Z';++word)
-        if(block.has(word)&&word!='N'&&word!='Z'&&word!='B'&&word!='F'&&
-           word!='D'&&word!='H'&&word!='L')return false;
-    return !block.has('B')||block.val('B')==0.0;
+        if(block.has(word)&&(!std::isfinite(block.val(word))||
+           (word!='N'&&word!='X'&&word!='Y'&&word!='Z'&&word!='C'&&word!='U'&&word!='V'&&
+            word!='B'&&word!='F'&&word!='D'&&word!='H'&&word!='L')))return false;
+    return !block.has('B')||(block.val('B')>=0.0&&block.val('B')<=4.0&&std::floor(block.val('B'))==block.val('B'));
 }
 bool ManualGapZGeometry382(const NCG76SphereRuntimeGeometry::Geometry& geometry) noexcept
 {
     if(!geometry.valid||geometry.kind!=NCG76SphereRuntimeGeometry::Kind::Line||
-       !std::isfinite(geometry.travelMm)||geometry.travelMm<=0.0||
-       geometry.axis[0]!=0.0||geometry.axis[1]!=0.0||!std::isfinite(geometry.axis[2])||
-       std::fabs(std::fabs(geometry.axis[2])-1.0)>NCG76SphereRuntimeGeometry::OrthonormalTolerance)return false;
-    for(unsigned axis=0U;axis<8U;++axis)
-        if(!std::isfinite(geometry.startMCS[axis])||!std::isfinite(geometry.endMCS[axis])||
-           (axis!=2U&&geometry.startMCS[axis]!=geometry.endMCS[axis]))return false;
+       !std::isfinite(geometry.travelMm)||geometry.travelMm<=0.0)return false;
+    NCG76SphereCoordinates::Point8 ratio{};
+    return NCG76SphereRuntimeGeometry::LineNativeRatio(geometry,ratio);
+}
+struct ProcessAxisTargetPolicy384
+{
+    std::array<double,6U> startPulse{},pulsePerNative{},rotaryModulo{};
+    std::array<bool,6U> shortestPath{};
+};
+bool ProcessNativeLineLimits384(const NCG76SphereRuntimeGeometry::Geometry& geometry,
+    const EDM384Axes::Budget& axes,unsigned retreat,EDM384Axes::Limits& output) noexcept
+{
+    NCG76SphereCoordinates::Point8 ratio8{};
+    if(!NCG76SphereRuntimeGeometry::LineNativeRatio(geometry,ratio8))return false;
+    EDM384Axes::Native6 ratio{};for(unsigned i=0U;i<6U;++i)ratio[i]=ratio8[i];
+    if(!EDM384Axes::LimitsForRatio(axes,ratio,output))return false;
+    if(retreat==1U){ratio.fill(0.0);ratio[2]=1.0;EDM384Axes::Limits z{};
+        if(!EDM384Axes::LimitsForRatio(axes,ratio,z))return false;
+        output.velocity=(std::min)(output.velocity,z.velocity);
+        output.acceleration=(std::min)(output.acceleration,z.acceleration);
+        output.deceleration=(std::min)(output.deceleration,z.deceleration);
+        output.activeMask|=z.activeMask;
+    }
     return true;
 }
 bool Healthy(const NCBlockLifecycleLedger& ledger) noexcept {
@@ -163,11 +184,11 @@ bool DecodeProcessPath(const NCParsedBlock& parsed,const NCBlock& resolved,int p
     NCMachiningTime::Config machiningTime{};
     if(!NCMachiningTimePolicy::StripValidated(parsed,resolved,literal,machiningTime))return false;
     NCArcPlaneAxes axes{};if(!TryGetNCArcPlaneAxes(plane,axes))return false;
-    if(literal.gCode==1&&!(literal.has('X')||literal.has('Y')||literal.has('Z')))return false;
+    if(literal.gCode==1&&!(literal.has('X')||literal.has('Y')||literal.has('Z')||literal.has('C')||literal.has('U')||literal.has('V')))return false;
     for(char c='A';c<='Z';++c){
         if(!literal.has(c))continue;
         if(!std::isfinite(literal.val(c)))return false;
-        const bool allowed=c=='N'||c=='F'||c=='B'||c=='L'||(literal.gCode==1?(c=='X'||c=='Y'||c=='Z'):
+        const bool allowed=c=='N'||c=='F'||c=='B'||c=='L'||(literal.gCode==1?(c=='X'||c=='Y'||c=='Z'||c=='C'||c=='U'||c=='V'):
             (c==axes.uAddress||c==axes.vAddress||c==axes.uCenter||c==axes.vCenter||c=='R'));
         if(!allowed)return false;
     }
@@ -197,9 +218,26 @@ bool DecodeProcessPath(const NCParsedBlock& parsed,const NCBlock& resolved,int p
     return true;
 }
 bool BuildProcessPath(const NCBlock& block,const NCG76SphereCoordinates::FrozenFrame& frame,
-    double feed,NCG76SphereRuntimeGeometry::Geometry& output) noexcept
+    double feed,NCG76SphereRuntimeGeometry::Geometry& output,const ProcessAxisTargetPolicy384* policy=nullptr) noexcept
 {
     using namespace NCG76SphereCoordinates;
+    if(block.gCode==1){
+        Point8 authored=frame.programStart,target{};unsigned mask=0U;
+        for(unsigned axis=0U;axis<6U;++axis)if(block.has("XYZCUV"[axis])){
+            authored[axis]=block.val("XYZCUV"[axis]);mask|=1U<<axis;
+        }
+        if(MapCoordinatedPoint(frame,authored,mask,target)!=Status::Ok)return false;
+        if(frame.translation.distanceMode==90){
+            for(unsigned axis=3U;axis<6U;++axis)if((mask&(1U<<axis))&&frame.translation.axisIdentity.axisType[axis]==1U){
+                if(!policy)return false;
+                NCRotaryAbsoluteFeedTarget resolved{};
+                if(!TryResolveNCRotaryAbsoluteFeedTarget(frame.startMCS[axis],policy->startPulse[axis],target[axis],
+                    policy->pulsePerNative[axis],policy->shortestPath[axis],policy->rotaryModulo[axis],resolved))return false;
+                target[axis]=resolved.endMCS;
+            }
+        }
+        return NCG76SphereRuntimeGeometry::BuildNativeCoordinatedLine(frame,target,feed,output);
+    }
     Point3 targetProgram{{frame.programStart[0],frame.programStart[1],frame.programStart[2]}};
     for(unsigned a=0U;a<3U;++a)if(block.has(static_cast<char>('X'+a)))targetProgram[a]=block.val(static_cast<char>('X'+a));
     NCArcPlaneAxes plane{};if(!TryGetNCArcPlaneAxes(frame.translation.rotationPlane,plane))return false;
@@ -209,7 +247,6 @@ bool BuildProcessPath(const NCBlock& block,const NCG76SphereCoordinates::FrozenF
     // its bits across G90 inverse/forward transforms at a nonzero work origin.
     if(fullCircle)target=frame.startMCS;
     else if(MapPoint(frame,targetProgram,target)!=Status::Ok)return false;
-    if(block.gCode==1)return NCG76SphereRuntimeGeometry::BuildLine(frame,target,feed,output);
     Point3 offset{};
     if(block.has('R')){
         if(!TryResolveNCPathRadiusArcCenter(frame.programStart[plane.u],frame.programStart[plane.v],
@@ -485,22 +522,59 @@ void PrintSphereRuntimeFailure(const MotionG76SphereFeedback& report,
             static_cast<unsigned>(report.identity.source),static_cast<int>(input.inputIdentity.sourceBlockId),
             static_cast<int>(report.identity.sourceBlockId));
     }
+    // EDM386_GAP_FAULT_TRACE_BEGIN
+    const auto& gap=report.firstGapInputFault;
+    if(input.valid&&gap.captured){
+        const auto& sample=gap.sample;
+        const bool ageKnown=gap.readSucceeded&&sample.capturedAtUs&&input.nowUs>=sample.capturedAtUs;
+        const bool frameAgeKnown=gap.frameCapturedUs&&input.nowUs>=gap.frameCapturedUs;
+        PrintParent(sourceG,sourceP,"event=GAP_ADC_FAULT session=%llu tick=%llu read=%u raw=%d AD=%u device=%u seq=%llu capturedUs=%llu ageKnown=%u ageUs=%llu sampleReason=%s configured=%u hasSample=%u transport=%u clock=%u rtClock=%u rtSample=%u discharge=0\n",
+            static_cast<unsigned long long>(report.session),static_cast<unsigned long long>(input.tick),
+            gap.readSucceeded?1U:0U,sample.rawCode,sample.adIndex,sample.deviceId,
+            static_cast<unsigned long long>(sample.sequence),static_cast<unsigned long long>(sample.capturedAtUs),
+            ageKnown?1U:0U,static_cast<unsigned long long>(ageKnown?input.nowUs-sample.capturedAtUs:0ULL),
+            EDMAnalogInput::ReasonName(sample.reason),sample.configured?1U:0U,sample.hasSample?1U:0U,
+            sample.transportValid?1U:0U,sample.clockValid?1U:0U,sample.rtClockValid?1U:0U,sample.rtSampleValid?1U:0U);
+        PrintParent(sourceG,sourceP,"event=GAP_ADC_RECEIPT session=%llu ready=%u state=%s reason=%s adapterSeq=%llu adapterCapturedUs=%llu matchesCurrent=%u frameSeq=%llu frameCapturedUs=%llu frameAgeKnown=%u frameAgeUs=%llu maxAgeUs=1500 discharge=0\n",
+            static_cast<unsigned long long>(report.session),gap.sourceReady?1U:0U,
+            EDM63::StateName(gap.adapterState),EDM63::ReasonName(gap.adapterReason),
+            static_cast<unsigned long long>(gap.adapterSequence),static_cast<unsigned long long>(gap.adapterCapturedUs),
+            gap.readSucceeded&&sample.sequence&&sample.capturedAtUs&&gap.adapterSequence==sample.sequence&&
+                gap.adapterCapturedUs==sample.capturedAtUs?1U:0U,
+            static_cast<unsigned long long>(gap.frameSequence),static_cast<unsigned long long>(gap.frameCapturedUs),
+            frameAgeKnown?1U:0U,static_cast<unsigned long long>(frameAgeKnown?input.nowUs-gap.frameCapturedUs:0ULL));
+        const bool profileValid=gap.profileConfigured&&EDMGapInput::Validate(gap.profile);
+        const bool conversionObserved=gap.readSucceeded&&sample.hasSample&&profileValid;
+        const auto conversion=conversionObserved?EDMGapInput::ConvertRawValidated(gap.profile,sample.rawCode):EDMGapInput::ConversionResult{};
+        PrintParent(sourceG,sourceP,"event=GAP_ADC_CONVERSION session=%llu computed=%u profileValid=%u status=%s boardMv=%d gapMv=%d boardValid=%u zeroClamped=%u gapInRange=%u origin=FROZEN_FAULT_COPY acceptedBySource=UNCONFIRMED discharge=0\n",
+            static_cast<unsigned long long>(report.session),conversionObserved?1U:0U,profileValid?1U:0U,
+            conversionObserved?EDMGapInput::StatusName(conversion.inputStatus):"UNOBSERVED",conversion.boardVoltageMv,
+            conversion.voltageMv,conversion.boardVoltageValid?1U:0U,conversion.zeroClamped?1U:0U,conversion.gapInRange?1U:0U);
+        const auto& profile=gap.profile;
+        PrintParent(sourceG,sourceP,"event=GAP_ADC_CALIBRATION session=%llu installed=%u revision=%u calibration=%u rawMin=%d rawMax=%d calRawMin=%d calRawMax=%d boardMinMv=%d boardMaxMv=%d zeroClampBoardUv=%u gainMillionths=%lld offsetMv=%d minMv=%d maxMv=%d discharge=0\n",
+            static_cast<unsigned long long>(report.session),gap.profileConfigured?1U:0U,profile.profileRevision,profile.calibrationRevision,
+            profile.rawMin,profile.rawMax,profile.calibrationRawMin,profile.calibrationRawMax,profile.boardMvAtMin,profile.boardMvAtMax,
+            profile.zeroClampBoardUv,static_cast<long long>(profile.voltageGainMillionths),profile.voltageOffsetMv,profile.gap.minMv,profile.gap.maxMv);
+    }
+    // EDM386_GAP_FAULT_TRACE_END
     const auto& target=report.started?report.commandMCS:request.geometry.startMCS;
     for(unsigned axis=0U;axis<6U;++axis){
+        if(!request.geometry.frame.translation.axisIdentity.exists[axis])continue;
         // Motion may tighten both tolerances to the installed axis windows.
         // Report the actual frozen RT values, not the NC request defaults.
-        const double tolerance=axis<3U?report.positionToleranceMm:report.rotaryToleranceDeg;
+        const bool rotary=EDM384Axes::IsRotary(request.geometry.frame.translation.axisIdentity,axis);
+        const double tolerance=rotary?report.rotaryToleranceDeg:report.positionToleranceMm;
         const bool sampleValid=(report.inputValidAxisMask&(1U<<axis))!=0U;
         if(!sampleValid){
             PrintParent(sourceG,sourceP,"event=FAULT_AXIS session=%llu axis=%u actual=UNAVAILABLE target=%.12f error=UNAVAILABLE tolerance=%.12f unit=%s inWindow=UNKNOWN sampleValid=0 fallbackActual=%.12g discharge=0\n",
                 static_cast<unsigned long long>(report.session),axis,target[axis],tolerance,
-                axis<3U?"mm":"deg",report.actualMCS[axis]);
+                rotary?"deg":"mm",report.actualMCS[axis]);
             continue;
         }
         const double error=report.actualMCS[axis]-target[axis];
         PrintParent(sourceG,sourceP,"event=FAULT_AXIS session=%llu axis=%u actual=%.12f target=%.12f error=%.12f tolerance=%.12f unit=%s inWindow=%u sampleValid=1 discharge=0\n",
             static_cast<unsigned long long>(report.session),axis,report.actualMCS[axis],target[axis],
-            error,tolerance,axis<3U?"mm":"deg",std::isfinite(tolerance)&&tolerance>0.0&&
+            error,tolerance,rotary?"deg":"mm",std::isfinite(tolerance)&&tolerance>0.0&&
                 std::isfinite(error)&&std::fabs(error)<=tolerance?1U:0U);
     }
 }
@@ -605,9 +679,12 @@ void NCManager::ExportMachiningTelemetrySameThread(NCMachiningTelemetry::Image& 
         if(s.active)image.phase=T::Phase::Unavailable;
         return;
     }
+    if(report.started&&!UpdateG76SphereCompletionViewSameThread(report)){
+        image.phase=T::Phase::Unavailable;return;
+    }
     const auto& f=report.cycle;
-    const bool timed=MotionG76SphereMachiningTime::TimedCompletionQualified(f,s.request);
-    const bool exhausted=MotionG76SphereMachiningTime::RetryExhaustionQualified(f,s.request);
+    const bool timed=MotionG76SphereMachiningTime::TimedCompletionQualified(f,s.completionViewRequest);
+    const bool exhausted=MotionG76SphereMachiningTime::RetryExhaustionQualified(f,s.completionViewRequest);
     const bool timeLimit=f.fault==NCG76SphereCycle::Fault::TimeLimit||
         (f.totalLimitUs&&f.totalTimerState==static_cast<std::uint8_t>(NCMachiningTime::TimerState::Expired));
     const bool fault=report.runtimeFault||f.fault!=NCG76SphereCycle::Fault::None;
@@ -670,8 +747,8 @@ void NCManager::ExportMachiningTelemetrySameThread(NCMachiningTelemetry::Image& 
     };
     if(s.request.orbitInspectionRounds){
         if(s.sourceG!=76||f.orbitRequiredPasses!=s.request.orbitInspectionRounds||
-           f.orbitTargetPercentScaled!=s.request.orbitThresholdScaled||
-           f.orbitRetryLimit!=s.request.orbitRetryLimit){image=T::Image{};image.phase=T::Phase::Unavailable;return;}
+           f.orbitTargetPercentScaled!=s.completionViewRequest.orbitThresholdScaled||
+           f.orbitRetryLimit!=s.completionViewRequest.orbitRetryLimit){image=T::Image{};image.phase=T::Phase::Unavailable;return;}
         image.capabilities|=T::OrbitCompletion;
         image.orbitCompletionState=f.orbitCompletionState;
         image.orbitCompletionFlags=T::OrbitEnabledFlag|T::OrbitSimulationOnlyFlag|
@@ -814,7 +891,7 @@ bool NCManager::IsCompletedEDMProcessPathTerminalAllowedSameThread(const NCBlock
     // M00 is a nonpositioning checkpoint after this exact completed parent.
     // Timed contours also require their source-bound terminal proof for M30.
     const bool analytic=s.sourceG==1||s.sourceG==2||s.sourceG==3;
-    const bool timed=MotionG76SphereMachiningTime::TimedCompletionQualified(s.feedback.cycle,s.request);
+    const bool timed=MotionG76SphereMachiningTime::TimedCompletionQualified(s.feedback.cycle,s.completionViewRequest);
     const bool sphereCheckpoint=(expectedM==0||s.request.orbitInspectionRounds!=0U||timed)&&s.sourceG==76&&s.pathSource.has('P')&&
         s.pathSource.val('P')==50.0&&s.request.geometry.kind==NCG76SphereRuntimeGeometry::Kind::Sphere;
     const bool timedContour=s.sourceG==76&&NCG76TimedP11Source::SupportedMode(static_cast<double>(s.sourceP))&&
@@ -845,15 +922,16 @@ bool NCManager::IsCompletedEDMProcessPathTerminalAllowedSameThread(const NCBlock
         ((s.sourceG==2||s.sourceG==3)&&s.request.geometry.kind!=NCG76SphereRuntimeGeometry::Kind::Arc)||
         (sphereCheckpoint&&(!s.request.geometry.circleLayerCount||
             (!timed&&s.feedback.cycle.completedLayers!=s.request.geometry.circleLayerCount)))||
-        !OrbitTerminalQualified(s.feedback.cycle,s.request)||
+        !OrbitTerminalQualified(s.feedback.cycle,s.completionViewRequest)||
         !FinishTerminalQualified(s.feedback.cycle,s.finishRequiredCount)||
-        !MotionG76SphereMachiningTime::TerminalQualified(s.feedback.cycle,s.request)))return false;
+        !MotionG76SphereMachiningTime::TerminalQualified(s.feedback.cycle,s.completionViewRequest)))return false;
     if(s.request.orbitInspectionRounds){
         const auto* parent=GetBaseProgramCache().TryGetLine(s.pc);std::uint32_t rounds=0U;
         if(!parent||parent->sourceLineNumber!=s.line||!SameLiteral(s.orbitCompletionSource,s.pathSource)||
            !NCOrbitCompletionPolicy::Decode(parent->parsedBlock,s.pathSource,rounds)||rounds!=s.request.orbitInspectionRounds||
-           !s.orbitCompletionBinding.ready||s.orbitCompletionBinding.value!=s.request.orbitThresholdScaled||
-           s.orbitCompletionBinding.retryLimit!=s.request.orbitRetryLimit)return false;
+           !s.orbitCompletionBinding.ready||
+           s.feedback.cycle.orbitTargetPercentScaled!=s.completionViewRequest.orbitThresholdScaled||
+           s.feedback.cycle.orbitRetryLimit!=s.completionViewRequest.orbitRetryLimit)return false;
     }
     if(timedContour){
         const auto* parent=GetBaseProgramCache().TryGetLine(s.pc);
@@ -891,7 +969,7 @@ bool NCManager::IsCompletedEDMProcessPathTerminalAllowedSameThread(const NCBlock
         !IsG76SphereScopeCurrentSameThread()||m_motion.HasPendingSafetyOrRecoveryRequests()||
         !m_motion.IsGroupNCDrained()||!m_motion.IsGroupDone()||m_motion.GetCommandIngressSize()||m_motion.GetCommandReplaySize()||
         !m_motion.HasExactExecutionDrainAcknowledgement(s.epoch,s.owner))return false;
-    if(!MotionG76SphereMachiningTime::CompletedEndpointQualified(s.feedback,s.request))return false;
+    if(!MotionG76SphereMachiningTime::CompletedEndpointQualified(s.feedback,s.completionViewRequest))return false;
     for(unsigned a=0U;a<8U;++a)if(!SameDouble(CoordSys.commandedMCS[a],s.endpoint[a])||
         !SameDouble(s.endpoint[a],s.feedback.endpointMCS[a]))return false;
     auto& ledger=m_edm171Air->ledger; // Reuse persistent owner-thread scratch, not the NC stack.
@@ -993,18 +1071,22 @@ bool NCManager::PrepareG76SphereTranslationSameThread(const NCBlock& block)
     }
     const bool physicalZManual=EDM382::Current().enabled;
     if(physicalZManual&&(!EDM382::Valid(EDM382::Current())||!processPath||
-       !ManualGapZAuthored382(block)||m_recipe.Current().eCode!=EDM382::Current().requiredECode)){
-        RejectG76SphereSameThread("PHYSICAL_Z_REQUIRES_CONFIRMED_G01_Z_B0_E210",AlarmManager::G_Code_Invalid_parameter);
+       !ManualGapZAuthored382(block)||!IsPhysicalLiveRecipeSelectionCurrentSameThread())){
+        RejectG76SphereSameThread("PHYSICAL_MANUAL_REQUIRES_CONFIRMED_G01_B0_B4_E210",AlarmManager::G_Code_Invalid_parameter);
         return false;
     }
     if(physicalZManual){
         const auto& profile=m_edmGapChannel.GetProfile();
         bool axes=true;
-        for(unsigned axis=0U;axis<8U;++axis)
-            axes=axes&&(m_motion.GetAxisContext(static_cast<int>(axis)).isExist==(axis<3U));
+        for(unsigned index=0U;index<8U;++index){
+            const auto& axis=m_motion.GetAxisContext(static_cast<int>(index));
+            if(index<3U)axes=axes&&axis.isExist&&axis.axisType==AxisType::LINEAR;
+            else if(index>=6U)axes=axes&&!axis.isExist;
+            else if(axis.isExist)axes=axes&&static_cast<unsigned>(axis.axisType)<=2U;
+        }
         if(!axes||profile.source!=EDMGap::Source::PHYSICAL||!profile.calibrationConfirmed||
            !EDMGapInput::Validate(profile)){
-            RejectG76SphereSameThread("PHYSICAL_Z_REQUIRES_THREE_AXES_AND_CALIBRATED_AD",AlarmManager::PATH_EXECUTION_NOT_READY);
+            RejectG76SphereSameThread("PHYSICAL_MANUAL_REQUIRES_CONFIGURED_AXES_AND_CALIBRATED_AD",AlarmManager::PATH_EXECUTION_NOT_READY);
             return false;
         }
     }
@@ -1054,8 +1136,10 @@ bool NCManager::PrepareG76SphereTranslationSameThread(const NCBlock& block)
     s.dhBatch.Bind({s.run,s.cache,static_cast<std::uint64_t>(s.epoch),s.owner.generation,
         static_cast<std::uint32_t>(s.owner.owner)});
     CoordSys.CopyTranslationSnapshot(s.frame);
+    // Every admitted source in this owner uses a frozen signed GAP binding;
+    // unrelated rapid timing cannot invalidate its dimensional/travel scope.
     if(!CoordSys.IsTranslationRunBound()||!CoordSys.IsTranslationRunCurrent()||
-        !IsNCTranslationSnapshotValid(s.frame)||!IsPathCoreLiveNativeConfigCurrentSameThread())
+        !IsNCTranslationSnapshotValid(s.frame)||!IsPathCoreLiveNativeConfigCurrentSameThread(true))
         return reject("FRAME_OR_NATIVE_CONFIG",AlarmManager::MOTION_GROUP_MAPPING_INTEGRITY);
     NCG76SphereCoordinates::Point8 start{};
     for(unsigned a=0U;a<8U;++a)start[a]=CoordSys.commandedMCS[a];
@@ -1071,7 +1155,7 @@ bool NCManager::PrepareG76SphereTranslationSameThread(const NCBlock& block)
             m_edmProcessTuningGeneration,m_edmProcessReady&&!m_recipeRecoveryDisplayOnly,true);
         if(const char* typed=RejectTypedBinding(s.gapBinding,mode,s.sourceG,s.sourceP))return reject(typed,AlarmManager::G_Code_Invalid_parameter);
         if(physicalZManual){
-            if(mode!=0U)return reject("PHYSICAL_Z_REQUIRES_B0",AlarmManager::G_Code_Invalid_parameter);
+            if(mode>4U)return reject("PHYSICAL_MANUAL_REQUIRES_B0_B4",AlarmManager::G_Code_Invalid_parameter);
             s.request.physicalZManual=true;s.gapBinding.config.physicalZManual=true;
         }
         if(!s.gapBinding.ready||!s.gapBinding.config.enabled||!s.gapBinding.config.signedMotionEnabled||
@@ -1082,11 +1166,19 @@ bool NCManager::PrepareG76SphereTranslationSameThread(const NCBlock& block)
         }
         if(block.has('F')&&(!CaptureCncFeedValueSameThread(block,s.feed)||!s.feed.programmed||s.feed.feedMMMin>100.0))
             return reject("PROCESS_PATH_CURRENT_F_CAP",AlarmManager::G_Code_Invalid_parameter);
+        ProcessAxisTargetPolicy384 targetPolicy{};
+        for(unsigned axis=0U;axis<6U;++axis)if(s.frame.axisIdentity.exists[axis]){
+            const auto& configured=m_motion.GetAxisContext(static_cast<int>(axis));
+            targetPolicy.startPulse[axis]=configured.logicalCmdPos.Load();
+            targetPolicy.pulsePerNative[axis]=configured.resolution_PPR/configured.finalLead;
+            targetPolicy.rotaryModulo[axis]=configured.rotaryModulo;
+            targetPolicy.shortestPath[axis]=configured.axisType==AxisType::ROTARY&&configured.useShortestPath;
+        }
         if(NCG76SphereCoordinates::BuildFrame(s.frame,start,pathFrame,physicalZManual)!=NCG76SphereCoordinates::Status::Ok||
-            !BuildProcessPath(literal,pathFrame,s.processMotionCeiling,s.request.geometry))
+            !BuildProcessPath(literal,pathFrame,s.processMotionCeiling,s.request.geometry,&targetPolicy))
             return reject("PROCESS_PATH_GEOMETRY_OR_FEED",AlarmManager::G_Code_Invalid_parameter);
         if(physicalZManual&&!ManualGapZGeometry382(s.request.geometry))
-            return reject("PHYSICAL_Z_TRANSFORMED_GEOMETRY_NOT_Z_ONLY",AlarmManager::G_Code_Invalid_parameter);
+            return reject("PHYSICAL_MANUAL_REQUIRES_NONZERO_LINEAR_PATH_METRIC",AlarmManager::G_Code_Invalid_parameter);
         // These provenance fields are shared; no P50 preparation or sphere
         // descriptor is fabricated for a real line or circular source.
         s.prepared.requestedB=mode;s.prepared.explicitB=block.has('B');s.prepared.inheritedB=!block.has('B')&&modal.valid;
@@ -1198,7 +1290,7 @@ bool NCManager::PrepareG76SphereTranslationSameThread(const NCBlock& block)
     // B2 needs a canonical same-parent station. B3/B4 also retain this
     // original checkpoint for HOLD and diagnostics throughout their routes.
     if(s.request.retreatMode!=0U&&(!s.path.valid||!s.gapBinding.ready||
-        !s.gapBinding.config.enabled||(!s.gapBinding.config.flushMotionEnabled&&!StationaryProcessLine(s.sourceG,s.request.geometry))||
+        !s.gapBinding.config.enabled||
         !s.gapBinding.config.signedMotionEnabled)){
         PrintParent(s.sourceG,s.sourceP,"event=B_MODE_BINDING_REJECT B=%u reason=%s error=%s field=%u approachReason=%s approachError=%s approachField=%u discharge=0\n",
             s.request.retreatMode,NCG76SphereGapBinding::ReasonName(s.gapBinding.reason),
@@ -1217,30 +1309,36 @@ bool NCManager::PrepareG76SphereTranslationSameThread(const NCBlock& block)
     s.request.velocityCapMmS=(std::numeric_limits<double>::max)();
     s.request.accelerationMmS2=s.request.decelerationMmS2=(std::numeric_limits<double>::max)();
     s.request.settleSamples=200U;
+    const bool independentEdm=s.gapBinding.config.enabled&&s.gapBinding.config.signedMotionEnabled;
+    EDM384Axes::Budget installedAxisBudget{};installedAxisBudget.mask=EDM384Axes::ExistingMask(s.frame.axisIdentity);
     for(unsigned i=0U;i<8U;++i){
         const auto& axis=m_motion.GetAxisContext(static_cast<int>(i));
         s.request.travelMin[i]=-(std::numeric_limits<double>::max)();
         s.request.travelMax[i]=(std::numeric_limits<double>::max)();
-        if(i<3U){
+        if(i<6U&&axis.isExist){
             const double ppu=axis.resolution_PPR/axis.finalLead;
             const double velocity=axis.maxVel_PPS/ppu;
-            if(!axis.isExist||axis.axisIndex!=static_cast<int>(i)||axis.axisType!=AxisType::LINEAR||
-                !std::isfinite(ppu)||ppu<=0.0||!std::isfinite(velocity)||velocity<=0.0||
-                !std::isfinite(axis.G00_acc_time)||axis.G00_acc_time<0.0||
-                !std::isfinite(axis.G00_dec_time)||axis.G00_dec_time<0.0||
-                !std::isfinite(axis.Stop_dec_time)||axis.Stop_dec_time<0.0)
-                return reject("XYZ_PROFILE",AlarmManager::MOTION_GROUP_MAPPING_INTEGRITY);
-            // Installed zero means the existing Motion 0.2 s default; retain
-            // that policy rather than requiring a new parameter-file edit.
-            const double accTime=axis.G00_acc_time<0.001?0.2:axis.G00_acc_time;
-            const double decTime=(std::max)(axis.G00_dec_time<0.001?0.2:axis.G00_dec_time,
-                axis.Stop_dec_time<0.001?0.2:axis.Stop_dec_time);
-            const double accel=velocity/accTime,decel=velocity/decTime;
-            if(!std::isfinite(accel)||accel<=0.0||!std::isfinite(decel)||decel<=0.0)
-                return reject("XYZ_PROFILE_RANGE",AlarmManager::MOTION_GROUP_MAPPING_INTEGRITY);
-            s.request.velocityCapMmS=(std::min)(s.request.velocityCapMmS,velocity);
-            s.request.accelerationMmS2=(std::min)(s.request.accelerationMmS2,accel);
-            s.request.decelerationMmS2=(std::min)(s.request.decelerationMmS2,decel);
+            if(axis.axisIndex!=static_cast<int>(i)||static_cast<unsigned>(axis.axisType)!=s.frame.axisIdentity.axisType[i]||
+                (i<3U&&axis.axisType!=AxisType::LINEAR)||
+                !std::isfinite(ppu)||ppu<=0.0||!std::isfinite(velocity)||velocity<=0.0)
+                return reject("NATIVE_AXIS_PROFILE",AlarmManager::MOTION_GROUP_MAPPING_INTEGRITY);
+            installedAxisBudget.velocity[i]=velocity;
+            if(!independentEdm){
+                // AIR retains its original rapid/stop timing policy. An EDM
+                // process instead admits a MAX_Speed-only native envelope.
+                if(!std::isfinite(axis.G00_acc_time)||axis.G00_acc_time<0.0||
+                   !std::isfinite(axis.G00_dec_time)||axis.G00_dec_time<0.0||
+                   !std::isfinite(axis.Stop_dec_time)||axis.Stop_dec_time<0.0)
+                    return reject("NATIVE_AXIS_PROFILE",AlarmManager::MOTION_GROUP_MAPPING_INTEGRITY);
+                const double accTime=axis.G00_acc_time<0.001?0.2:axis.G00_acc_time;
+                const double decTime=(std::max)(axis.G00_dec_time<0.001?0.2:axis.G00_dec_time,
+                    axis.Stop_dec_time<0.001?0.2:axis.Stop_dec_time);
+                const double accel=velocity/accTime,decel=velocity/decTime;
+                if(!std::isfinite(accel)||accel<=0.0||!std::isfinite(decel)||decel<=0.0)
+                    return reject("NATIVE_AXIS_PROFILE_RANGE",AlarmManager::MOTION_GROUP_MAPPING_INTEGRITY);
+                installedAxisBudget.acceleration[i]=accel;
+                installedAxisBudget.deceleration[i]=decel;
+            }
         }
         if(!axis.isExist)continue;
         const bool enabled[3]={axis.travelLimit1Enable&&CoordSys.IsProgrammableTravelLimitEnabled(),axis.travelLimit2Enable,axis.travelLimit3Enable};
@@ -1258,6 +1356,37 @@ bool NCManager::PrepareG76SphereTranslationSameThread(const NCBlock& block)
             !CoordSys.IsTargetWithinSoftwareTravelLimit(axis,start[i]))
             return reject("WHOLE_CYCLE_TRAVEL_ENVELOPE",AlarmManager::PROGRAMMED_OVER_TRAVEL);
     }
+    if(independentEdm){
+        const auto nativeVelocity=installedAxisBudget.velocity;
+        if(!EDM385::BuildIndependentBudget(nativeVelocity,installedAxisBudget.mask,installedAxisBudget))
+            return reject("INDEPENDENT_EDM_NATIVE_BUDGET",AlarmManager::MOTION_GROUP_MAPPING_INTEGRITY);
+    }
+    EDM384Axes::Limits parentLimits{};
+    bool limitsReady=false;
+    if(s.request.geometry.kind==NCG76SphereRuntimeGeometry::Kind::Line&&s.request.geometry.travelMm>0.0)
+        limitsReady=ProcessNativeLineLimits384(s.request.geometry,installedAxisBudget,s.request.retreatMode,parentLimits);
+    else{
+        // Curved/G76 geometry continues to use its established conservative
+        // XYZ metric; auxiliary coordinates remain fixed in those parents.
+        parentLimits.velocity=parentLimits.acceleration=parentLimits.deceleration=(std::numeric_limits<double>::max)();
+        limitsReady=EDM384Axes::Valid(installedAxisBudget);
+        for(unsigned i=0U;i<3U;++i){
+            parentLimits.velocity=(std::min)(parentLimits.velocity,installedAxisBudget.velocity[i]);
+            parentLimits.acceleration=(std::min)(parentLimits.acceleration,installedAxisBudget.acceleration[i]);
+            parentLimits.deceleration=(std::min)(parentLimits.deceleration,installedAxisBudget.deceleration[i]);
+        }
+    }
+    if(!limitsReady)return reject("ACTIVE_NATIVE_AXIS_BUDGET",AlarmManager::MOTION_GROUP_MAPPING_INTEGRITY);
+    s.request.velocityCapMmS=parentLimits.velocity;
+    s.request.accelerationMmS2=parentLimits.acceleration;
+    s.request.decelerationMmS2=parentLimits.deceleration;
+    if(s.gapBinding.config.enabled){
+        s.gapBinding.config.flushAxisLimitsEnabled=true;
+        s.gapBinding.config.flushAxisMask=installedAxisBudget.mask;
+        s.gapBinding.config.flushAxisVelocityMmS=installedAxisBudget.velocity;
+        s.gapBinding.config.flushAxisAccelerationMmS2=installedAxisBudget.acceleration;
+        s.gapBinding.config.flushAxisDecelerationMmS2=installedAxisBudget.deceleration;
+    }
     if(!m_g76SphereNextSession||m_g76SphereNextSession==(std::numeric_limits<std::uint64_t>::max)())
         return reject("SESSION_EXHAUSTED",AlarmManager::MOTION_GROUP_MAPPING_INTEGRITY);
     s.session=m_g76SphereNextSession++;s.request.session=s.session;
@@ -1274,6 +1403,7 @@ bool NCManager::PrepareG76SphereTranslationSameThread(const NCBlock& block)
     if(!NCG76SphereCycle::ValidateFlushConfig(s.request,flush))
         return reject("FLUSH_TRAVEL_ENVELOPE",AlarmManager::PROGRAMMED_OVER_TRAVEL);
     if(flush.enabled)for(unsigned a=0U;a<6U;++a){
+        if(!s.frame.axisIdentity.exists[a])continue;
         double minimum=0.0,maximum=0.0;
         if(!MotionG76SphereFlush::AxisEnvelope(s.request.geometry,flush,a,minimum,maximum,s.request.retreatMode)||
             !CoordSys.IsTargetWithinSoftwareTravelLimit(m_motion.GetAxisContext(static_cast<int>(a)),minimum)||
@@ -1302,6 +1432,7 @@ bool NCManager::PrepareG76SphereTranslationSameThread(const NCBlock& block)
 bool NCManager::IsG76SphereScopeCurrentSameThread()
 {
     auto& s=*m_g76Sphere;
+    const bool independentEdm=s.gapBinding.config.enabled&&s.gapBinding.config.signedMotionEnabled;
     const auto reject=[&](const char* gate,int axis=-1){
         PrintParent(s.sourceG,s.sourceP,"event=SCOPE_REJECT session=%llu line=%d gate=%s axis=%d expectedEpoch=%llu actualEpoch=%llu discharge=0\n",
             static_cast<unsigned long long>(s.session),s.line,gate,axis,
@@ -1322,23 +1453,155 @@ bool NCManager::IsG76SphereScopeCurrentSameThread()
     TraceG76SphereStartupSameThread(G76SphereStartupFrameCompareEnd,"FRAME_COMPARE_END");
     if(!frameCurrent)return reject("FRAME");
     TraceG76SphereStartupSameThread(G76SphereStartupNativeConfigBegin,"NATIVE_CONFIG_BEGIN");
-    const bool nativeCurrent=IsPathCoreLiveNativeConfigCurrentSameThread();
+    const bool nativeCurrent=IsPathCoreLiveNativeConfigCurrentSameThread(independentEdm);
     TraceG76SphereStartupSameThread(G76SphereStartupNativeConfigEnd,"NATIVE_CONFIG_END");
     if(!nativeCurrent)return reject("NATIVE_CONFIG");
     TraceG76SphereStartupSameThread(G76SphereStartupTravelConfigBegin,"TRAVEL_CONFIG_BEGIN");
-    const bool travelCurrent=IsFixedTranslationTravelCurrentSameThread();
+    const bool travelCurrent=IsFixedTranslationTravelCurrentSameThread(independentEdm);
     TraceG76SphereStartupSameThread(G76SphereStartupTravelConfigEnd,"TRAVEL_CONFIG_END");
     if(!travelCurrent)return reject("TRAVEL_CONFIG");
     if(m_motion.GetMotionFeedbackOverflowCount()||m_motion.GetMotionFeedbackProducerNoticeOverflowCount()||
         m_motionFeedbackSequenceGapCount)return reject("FEEDBACK_TRANSPORT");
     if(!Healthy(m_blockLifecycleLedger))return reject("LEDGER_INTEGRITY");
-    // XYZ ramps and stop times belong to this complete native envelope as well.
+    // MAX_Speed remains frozen for every parent. Rapid/stop times are not
+    // part of an independent EDM process's acceleration envelope.
     for(unsigned i=0U;i<8U;++i){const auto& a=m_motion.GetAxisContext(static_cast<int>(i));
         const auto& c=m_fixedTranslationTravel[i];if(a.isExist&&
-            (!SameDouble(c.maximumVelocity,a.maxVel_PPS)||!SameDouble(c.accelerationTime,a.G00_acc_time)||
-             !SameDouble(c.decelerationTime,a.G00_dec_time)||!SameDouble(c.stopDecelerationTime,a.Stop_dec_time)))return reject("AXIS_PROFILE",static_cast<int>(i));
+            (!SameDouble(c.maximumVelocity,a.maxVel_PPS)||(!independentEdm&&
+             (!SameDouble(c.accelerationTime,a.G00_acc_time)||!SameDouble(c.decelerationTime,a.G00_dec_time)||
+              !SameDouble(c.stopDecelerationTime,a.Stop_dec_time)))))return reject("AXIS_PROFILE",static_cast<int>(i));
     }
     return true;
+}
+
+bool NCManager::IsG76SphereLiveRecipeCurrentSameThread() const noexcept
+{
+    auto& s=*m_g76Sphere;
+    if(!s.liveRecipeBinding.ready||!s.liveTuningAcceptedGeneration||
+       s.liveTuningAcceptedGeneration!=m_edmProcessTuningGeneration||
+       !NCG76SphereGapBinding::SameProcessProfile(s.liveTuningSourceProfile,m_edmProcessProfile))return false;
+    m_recipe.CopySnapshot(s.liveRecipeObservedSnapshot);
+    return NCG76SphereGapBinding::SameActiveRecipe(s.liveRecipeSnapshot,s.liveRecipeObservedSnapshot)&&
+        NCG76SphereGapBinding::IsCurrent(s.liveRecipeBinding,m_recipe,m_edmProcessProfile,
+            m_edmProcessTuningGeneration,m_edmProcessReady&&!m_recipeRecoveryDisplayOnly)&&
+        (s.sourceG!=76||NCOrbitCompletionBinding::IsCurrent(s.liveOrbitBinding,m_recipe,s.request.orbitInspectionRounds));
+}
+
+bool NCManager::IsG76SphereLiveProcessCurrentSameThread(std::uint64_t e5Generation,
+    std::uint64_t e5WorkTimeUs) const noexcept
+{
+    const auto& s=*m_g76Sphere;
+    return s.liveRecipeSnapshot.summary.generation==e5Generation&&
+        s.liveRecipeBinding.config.workTimeUs==e5WorkTimeUs&&IsG76SphereLiveRecipeCurrentSameThread();
+}
+
+bool NCManager::IsPhysicalLiveRecipeCarryScopeCurrentSameThread() const noexcept
+{
+    return m_physicalLiveRecipeRun&&m_physicalLiveRecipeCatalog==m_recipe.GetCatalog()&&
+        m_physicalLiveRecipeRun==m_pathCoreLiveBookkeeping.currentRunToken&&
+        m_physicalLiveRecipeCache==GetBaseProgramCache().GetGeneration()&&
+        m_physicalLiveRecipeEpoch==m_motion.GetCurrentExecutionEpoch()&&
+        m_physicalLiveRecipeOwner.Matches(m_programMotionLease)&&
+        m_motion.IsMotionOwnerLeaseCurrent(m_programMotionLease)&&IsEDM171AirGrantCurrentSameThread(true)&&
+        !m_recipeRecoveryDisplayOnly;
+}
+bool NCManager::IsPhysicalLiveRecipeSelectionCurrentSameThread() const noexcept
+{
+    if(m_recipe.Current().eCode==EDM382::Current().requiredECode)return true;
+    if(!IsPhysicalLiveRecipeCarryScopeCurrentSameThread())return false;
+    m_recipe.CopySnapshot(m_physicalLiveRecipeScratch);
+    return NCG76SphereGapBinding::SameActiveRecipe(m_physicalLiveRecipeSnapshot,m_physicalLiveRecipeScratch);
+}
+void NCManager::RememberPhysicalLiveRecipeSameThread() noexcept
+{
+    if(!EDM382::Current().enabled||!EDM382::Valid(EDM382::Current())||
+       !IsEDM171AirGrantCurrentSameThread(true))return;
+    m_recipe.CopySnapshot(m_physicalLiveRecipeSnapshot);m_physicalLiveRecipeCatalog=m_recipe.GetCatalog();
+    m_physicalLiveRecipeRun=m_pathCoreLiveBookkeeping.currentRunToken;
+    m_physicalLiveRecipeCache=GetBaseProgramCache().GetGeneration();
+    m_physicalLiveRecipeEpoch=m_motion.GetCurrentExecutionEpoch();m_physicalLiveRecipeOwner=m_programMotionLease;
+}
+
+bool NCManager::PrepareG76SphereLiveRecipeSameThread(const EDMRecipe::Controller& recipe,
+    const EDM20::ProcessProfile& profile,std::uint64_t tuningGeneration,
+    NCG76SphereGapBinding::Binding& binding,NCOrbitCompletionBinding::Binding& orbit,
+    NCG76SphereGapProcess::Config& output)
+{
+    auto& s=*m_g76Sphere;output=NCG76SphereGapProcess::Config{};
+    if(!s.gapBinding.ready||s.gapShadowRevoked||s.liveRecipeSequence==(std::numeric_limits<std::uint64_t>::max)()||
+       !((s.sourceG>=1&&s.sourceG<=3)||s.sourceG==76)||!profile.machineProfileId||
+       !m_edmProcessReady||m_recipeRecoveryDisplayOnly)return false;
+    binding=NCG76SphereGapBinding::Capture(recipe,profile,tuningGeneration,true,
+        s.gapBinding.parameterFeeds,s.gapBinding.orbitFeeds);
+    if(!binding.ready)return false;
+    orbit=NCOrbitCompletionBinding::Capture(recipe,s.request.orbitInspectionRounds);
+    if(!orbit.ready)return false;
+    output=binding.config;
+    output.physicalZManual=s.gapBinding.config.physicalZManual;
+    output.flushAxisLimitsEnabled=s.gapBinding.config.flushAxisLimitsEnabled;
+    output.flushAxisMask=s.gapBinding.config.flushAxisMask;
+    output.flushAxisVelocityMmS=s.gapBinding.config.flushAxisVelocityMmS;
+    output.flushAxisAccelerationMmS2=s.gapBinding.config.flushAxisAccelerationMmS2;
+    output.flushAxisDecelerationMmS2=s.gapBinding.config.flushAxisDecelerationMmS2;
+    if(s.finishRequiredCount&&!output.flushMotionEnabled)return false;
+    double ceiling=0.0;
+    if(output.parameterFeeds&&(!NCG76SphereGapProcess::ResolveParameterMotionCeiling(output,ceiling)||
+       ceiling>s.request.feedMmMin))return false;
+    if(!NCG76SphereGapProcess::Valid(output)||
+       !NCG76SphereGapProcess::EquivalentForLiveRecipe(s.gapBinding.config,output)||
+       !EDMGapServo::Evaluate(output.curve,0.0,output.referenceV,output.machiningOverridePercent).valid||
+       !EDMGapServo::Evaluate(output.curve,300.0,output.referenceV,output.machiningOverridePercent).valid)return false;
+    NCG76SphereCycle::FlushConfig flush{};
+    if(!NCG76SphereGapProcess::BuildFlushConfig(output,s.request.feedMmMin,flush))return false;
+    s.liveRecipeValidationRequest=s.request;
+    // Periodic E5 enable is independent of the source-authored GAP B mode.
+    // Validate the original B route, including a disabled periodic flush.
+    return NCG76SphereCycle::ValidateFlushConfig(s.liveRecipeValidationRequest,flush);
+}
+
+void NCManager::AcceptG76SphereLiveRecipeSameThread(const NCG76SphereGapBinding::Binding& binding,
+    const NCOrbitCompletionBinding::Binding& orbit,const EDM20::ProcessProfile& profile,
+    std::uint64_t tuningGeneration,const NCG76SphereGapProcess::Config& config) noexcept
+{
+    auto& s=*m_g76Sphere;s.liveRecipeBinding=binding;s.liveOrbitBinding=orbit;
+    s.liveRecipeConfig=config;s.liveTuningSourceProfile=profile;s.liveTuningAcceptedGeneration=tuningGeneration;
+    m_recipe.CopySnapshot(s.liveRecipeSnapshot);++s.liveRecipeSequence;
+    s.e5LiveAcceptedGeneration=s.liveRecipeSnapshot.summary.generation;s.e5LiveWorkTimeUs=config.workTimeUs;
+    RememberPhysicalLiveRecipeSameThread();
+    RtPrintf("[EDM386-RECIPE-LIVE] event=QUEUED session=%llu sequence=%llu COND=%u E=%u recipeGeneration=%llu tuningGeneration=%llu workTimeUs=%llu apply=%s discharge=0\n",
+        static_cast<unsigned long long>(s.session),static_cast<unsigned long long>(s.liveRecipeSequence),
+        s.liveRecipeSnapshot.summary.tableId,s.liveRecipeSnapshot.summary.eCode,
+        static_cast<unsigned long long>(config.recipeGeneration),static_cast<unsigned long long>(tuningGeneration),
+        static_cast<unsigned long long>(config.workTimeUs),s.active?"SCOPED_RT_RECIPE":"NEXT_PARENT");
+}
+
+bool NCManager::PrepareG76SphereLiveTuningSameThread(const EDM20::ProcessProfile& candidate,
+    std::uint64_t generation,NCG76SphereGapProcess::Config& output)
+{
+    auto& s=*m_g76Sphere;
+    return s.active&&s.submitted&&s.bound&&!s.feedback.terminal&&
+        generation==m_edmProcessTuningGeneration+1ULL&&IsG76SphereScopeCurrentSameThread()&&
+        IsG76SphereLiveRecipeCurrentSameThread()&&
+        PrepareG76SphereLiveRecipeSameThread(m_recipe,candidate,generation,
+            s.liveRecipePreparedBinding,s.liveOrbitPreparedBinding,output);
+}
+
+bool NCManager::UpdateG76SphereCompletionViewSameThread(const MotionG76SphereFeedback& feedback) const noexcept
+{
+    auto& s=*m_g76Sphere;const auto sequence=feedback.liveOrbitRecipeSequence;
+    if(feedback.session!=s.session||!SameIdentity(feedback.identity,s.identity)||!feedback.owner.Matches(s.owner)||
+       feedback.liveRecipeSequence>s.liveRecipePublishedSequence||
+       feedback.liveRecipeSequence<s.liveRecipeObservedSequence||
+       feedback.liveFlushRecipeSequence>feedback.liveRecipeSequence||
+       feedback.liveFlushRecipeSequence<s.liveFlushObservedSequence||
+       sequence>feedback.liveRecipeSequence||sequence>s.liveRecipePublishedSequence||sequence<s.liveOrbitObservedSequence||
+       !NCG76OrbitCompletion::ValidConfig(s.request.orbitInspectionRounds,
+           feedback.cycle.orbitTargetPercentScaled,feedback.cycle.orbitRetryLimit))return false;
+    if(!sequence&&(feedback.cycle.orbitTargetPercentScaled!=s.request.orbitThresholdScaled||
+       feedback.cycle.orbitRetryLimit!=s.request.orbitRetryLimit))return false;
+    s.completionViewRequest.orbitThresholdScaled=feedback.cycle.orbitTargetPercentScaled;
+    s.completionViewRequest.orbitRetryLimit=feedback.cycle.orbitRetryLimit;
+    s.liveOrbitObservedSequence=sequence;return true;
 }
 
 WaitConditionFunc NCManager::StartG76SphereSameThread(const NCBlock& block)
@@ -1394,8 +1657,8 @@ WaitConditionFunc NCManager::StartG76SphereSameThread(const NCBlock& block)
         RejectG76SphereSameThread("SUBMIT_SCOPE",AlarmManager::MOTION_GROUP_MAPPING_INTEGRITY);return nullptr;
     }
     if(s.request.physicalZManual&&(!EDM382::Current().enabled||
-       !EDM382::Valid(EDM382::Current())||m_recipe.Current().eCode!=EDM382::Current().requiredECode||
-       s.sourceG!=1||s.request.retreatMode!=0U||!ManualGapZAuthored382(block)||
+       !EDM382::Valid(EDM382::Current())||!IsPhysicalLiveRecipeSelectionCurrentSameThread()||
+       s.sourceG!=1||s.request.retreatMode>4U||!ManualGapZAuthored382(block)||
        !ManualGapZGeometry382(s.request.geometry)||!s.gapBinding.config.physicalZManual)){
         RejectG76SphereSameThread("PHYSICAL_Z_SOURCE_CHANGED",AlarmManager::G_Code_Invalid_parameter);return nullptr;
     }
@@ -1464,7 +1727,6 @@ WaitConditionFunc NCManager::StartG76SphereSameThread(const NCBlock& block)
         }
     }
     if(s.request.retreatMode!=0U&&(!s.gapBinding.ready||!s.gapBinding.config.enabled||
-        (!s.gapBinding.config.flushMotionEnabled&&!StationaryProcessLine(s.sourceG,s.request.geometry))||
         !s.gapBinding.config.signedMotionEnabled)){
         RejectG76SphereSameThread("B_MODE_SIM_FLUSH_BINDING_CHANGED",AlarmManager::G_Code_Invalid_parameter);return nullptr;
     }
@@ -1480,8 +1742,29 @@ WaitConditionFunc NCManager::StartG76SphereSameThread(const NCBlock& block)
         RejectG76SphereSameThread("MOTION_ADMISSION",AlarmManager::PATH_MOTION_NOT_ADMITTED);return nullptr;
     }
     s.active=s.submitted=true;s.staged=false;
-    if(s.request.physicalZManual)RtPrintf("[EDM382] event=BEGIN session=%llu E=%u source=PHYSICAL_AD axes=XYZ motion=Z_ONLY B=0 parameterFeeds=NORMAL optionalF=SOURCE_BLOCK E5=%.6f E6=%.6f E7=%.6f E8=%.6f E9=%.6f maxFeedMmMin=%.6f maxRetreatMmMin=%.6f flushAccSeconds=%.6f flushDecSeconds=%.6f generatorControl=EXTERNAL softwareS92=0 softwareS93=0 externalPowerOff=UNCONFIRMED\n",
+    s.liveTuningSourceProfile=m_edmProcessProfile;
+    s.liveTuningAcceptedGeneration=m_edmProcessTuningGeneration;
+    s.liveTuningPublishedGeneration=m_edmProcessTuningGeneration;
+    s.liveRecipeBinding=s.gapBinding;s.liveOrbitBinding=s.orbitCompletionBinding;
+    s.liveRecipeConfig=s.gapBinding.config;m_recipe.CopySnapshot(s.liveRecipeSnapshot);
+    s.completionViewRequest=s.request;s.liveRecipeValidationRequest=s.request;
+    if(s.gapBinding.config.enabled&&s.gapBinding.config.signedMotionEnabled)
+        PrintParent(s.sourceG,s.sourceP,"event=EDM_ACCEL_POLICY session=%llu nativeEnvelope=MAX_SPEED_ONLY rapidRampCoupled=0 stopRampCoupled=0 zeroModeCap=NO_EXTRA_CEILING explicitModeCaps=EDM_ONLY flushRamp=OWN_PROFILE discharge=0\n",
+            static_cast<unsigned long long>(s.session));
+    if(s.gapBinding.config.flushAxisLimitsEnabled)for(unsigned axis=0U;axis<6U;++axis){
+        if(!(s.gapBinding.config.flushAxisMask&(1U<<axis)))continue;
+        PrintParent(s.sourceG,s.sourceP,"event=AXIS_NATIVE_LIMITS session=%llu axis=%c type=%u unit=%s rawVelocity=%.9f rawAcc=%.9f rawDec=%.9f commonCurve=1 discharge=0\n",
+            static_cast<unsigned long long>(s.session),"XYZCUV"[axis],s.frame.axisIdentity.axisType[axis],
+            s.frame.axisIdentity.nativeUnit[axis]==1U?"mm":"deg",s.gapBinding.config.flushAxisVelocityMmS[axis],
+            s.gapBinding.config.flushAxisAccelerationMmS2[axis],s.gapBinding.config.flushAxisDecelerationMmS2[axis]);
+        const auto& limits=s.gapBinding.config.flushProfile.axisModeLimits;
+        PrintParent(s.sourceG,s.sourceP,"event=AXIS_MODE_ACCEL_LIMITS version=385 session=%llu axis=%c unit=%s/s2 machiningAcc=%.9f machiningDec=%.9f flushAcc=%.9f flushDec=%.9f zero=INHERIT sharedCurve=1 finalPidGuard=1 quantizationPpsLessThan=1 discharge=0\n",
+            static_cast<unsigned long long>(s.session),"XYZCUV"[axis],s.frame.axisIdentity.nativeUnit[axis]==1U?"mm":"deg",
+            limits.machiningAcceleration[axis],limits.machiningDeceleration[axis],limits.flushAcceleration[axis],limits.flushDeceleration[axis]);
+    }
+    if(s.request.physicalZManual)RtPrintf("[EDM384] event=BEGIN session=%llu E=%u source=PHYSICAL_AD axisMask=%u motion=COORDINATED_NATIVE B=%u parameterFeeds=NORMAL optionalF=SOURCE_BLOCK E5=%.6f E6=%.6f E7=%.6f E8=%.6f E9=%.6f maxFeedMmMin=%.6f maxRetreatMmMin=%.6f flushAccSeconds=%.6f flushDecSeconds=%.6f generatorControl=EXTERNAL softwareS92=0 softwareS93=0 externalPowerOff=UNCONFIRMED\n",
         static_cast<unsigned long long>(s.session),m_recipe.Current().eCode,
+        EDM384Axes::ExistingMask(s.frame.axisIdentity),s.request.retreatMode,
         static_cast<double>(s.gapBinding.config.workTimeUs)/1000000.0,s.gapBinding.config.jumpHeightMm,
         s.gapBinding.config.jumpSpeedPercent,s.gapBinding.config.machiningOverridePercent,s.gapBinding.config.referenceV,
         s.gapBinding.config.curve.maxFeedMmPerMin,s.gapBinding.config.curve.maxRetreatMmPerMin,
@@ -1925,10 +2208,13 @@ void NCManager::ServiceG76SphereSameThread()
     const bool matching=m_motion.ReadG76SphereFeedback(observed)&&observed.session==s.session&&
         SameIdentity(observed.identity,s.identity)&&observed.owner.Matches(s.owner);
     TraceG76SphereStartupSameThread(G76SphereStartupFeedbackReadEnd,"FEEDBACK_READ_END");
+    if(matching&&observed.started&&!UpdateG76SphereCompletionViewSameThread(observed)){
+        RejectG76SphereSameThread("LIVE_ORBIT_RECEIPT",AlarmManager::MOTION_GROUP_MAPPING_INTEGRITY);return;
+    }
     // Preserve the original RT failure before a resulting alarm/epoch change
     // invalidates the NC scope. All original scope checks still run below.
     if(matching&&FailedSphereFeedback(observed))PrintSphereRuntimeFailure(observed,s.request,s.line,s.sourceG,s.sourceP);
-    if(matching&&MotionG76SphereMachiningTime::TimeLimitStoppedQualified(observed,s.request)){
+    if(matching&&MotionG76SphereMachiningTime::TimeLimitStoppedQualified(observed,s.completionViewRequest)){
         s.feedback=observed;
         RecordDHTerminal(s,NCG76DHBatchDiagnostic::Result::TimeLimit);
         PrintParent(s.sourceG,s.sourceP,"event=TIME_LIMIT session=%llu tick=%llu totalElapsedUs=%llu totalLimitUs=%llu endpointCommitted=0 alarm=4040 discharge=0\n",
@@ -1943,20 +2229,62 @@ void NCManager::ServiceG76SphereSameThread()
         RejectG76SphereSameThread("LIVE_SOURCE_FRAME_OR_TRANSPORT",AlarmManager::MOTION_GROUP_MAPPING_INTEGRITY);return;
     }
     TraceG76SphereStartupSameThread(G76SphereStartupRecipeCheckBegin,"RECIPE_CHECK_BEGIN");
-    const bool recipeChanged=s.gapBinding.ready&&!s.gapShadowRevoked&&!NCG76SphereGapBinding::IsCurrent(s.gapBinding,m_recipe,
-        m_edmProcessProfile,m_edmProcessTuningGeneration,m_edmProcessReady&&!m_recipeRecoveryDisplayOnly);
+    const bool liveRecipeScope=s.submitted&&s.bound&&s.liveRecipeBinding.ready;
+    const bool recipeCurrent=liveRecipeScope?IsG76SphereLiveRecipeCurrentSameThread():
+        NCG76SphereGapBinding::IsCurrent(s.gapBinding,m_recipe,m_edmProcessProfile,
+            m_edmProcessTuningGeneration,m_edmProcessReady&&!m_recipeRecoveryDisplayOnly);
+    const bool recipeChanged=s.gapBinding.ready&&!s.gapShadowRevoked&&!recipeCurrent;
     TraceG76SphereStartupSameThread(G76SphereStartupRecipeCheckEnd,"RECIPE_CHECK_END");
-    const bool completionRecipeChanged=s.sourceG==76&&!s.gapShadowRevoked&&!NCOrbitCompletionBinding::IsCurrent(
-        s.orbitCompletionBinding,m_recipe,s.request.orbitInspectionRounds);
-    if(recipeChanged||completionRecipeChanged){
+    if(recipeChanged){
         s.gapShadowRevoked=true;s.gapBinding.ready=false;
         (void)m_motion.RevokeG76SphereProcessShadow(s.session,s.identity,s.owner);
-        PrintParent(s.sourceG,s.sourceP,"event=%s session=%llu reason=RECIPE_OR_TUNING_CHANGED rearm=NEXT_PARENT motionApplied=0 discharge=0\n",
-            s.request.physicalZManual?"PHYSICAL_GAP_WITHDRAWN":"SIM_GAP_WITHDRAWN",
-            static_cast<unsigned long long>(s.session));
+        PrintParent(s.sourceG,s.sourceP,"event=%s session=%llu reason=UNAUTHENTICATED_RECIPE_OR_TUNING_CHANGE rearm=NEXT_PARENT motionApplied=0 discharge=0\n",
+            s.request.physicalZManual?"PHYSICAL_GAP_WITHDRAWN":"SIM_GAP_WITHDRAWN",static_cast<unsigned long long>(s.session));
+    }
+    // Every accepted recipe/tuning edit shares one monotonically scoped page.
+    // Work-time, curve and flush settings cannot overtake each other through
+    // independent channels. Publication may retry without withdrawing control.
+    if(liveRecipeScope&&!s.gapShadowRevoked&&recipeCurrent&&s.liveRecipeSequence>s.liveRecipePublishedSequence&&
+       m_motion.UpdateG76SphereLiveRecipe(s.session,s.identity,s.owner,s.liveRecipeSequence,
+           s.gapBinding.config.recipeGeneration,s.gapBinding.config.tuningGeneration,s.liveRecipeConfig,
+           s.request.orbitInspectionRounds?static_cast<std::uint32_t>(s.liveOrbitBinding.value):0U,
+           s.request.orbitInspectionRounds?s.liveOrbitBinding.retryLimit:0U)){
+        s.liveRecipePublishedSequence=s.liveRecipeSequence;
+        PrintParent(s.sourceG,s.sourceP,"event=LIVE_RECIPE_PUBLISHED session=%llu sequence=%llu COND=%u E=%u recipeGeneration=%llu tuningGeneration=%llu discharge=0\n",
+            static_cast<unsigned long long>(s.session),static_cast<unsigned long long>(s.liveRecipePublishedSequence),
+            s.liveRecipeSnapshot.summary.tableId,s.liveRecipeSnapshot.summary.eCode,
+            static_cast<unsigned long long>(s.liveRecipeConfig.recipeGeneration),
+            static_cast<unsigned long long>(s.liveRecipeConfig.tuningGeneration));
     }
     if(!matching){
         TraceG76SphereStartupSameThread(G76SphereStartupServiceDone,"SERVICE_DONE");return;
+    }
+    if(liveRecipeScope&&!s.gapShadowRevoked&&
+       (s.liveRecipeObservedSequence!=observed.liveRecipeSequence||s.liveFlushObservedSequence!=observed.liveFlushRecipeSequence)){
+        s.liveRecipeObservedSequence=observed.liveRecipeSequence;s.liveFlushObservedSequence=observed.liveFlushRecipeSequence;
+        PrintParent(s.sourceG,s.sourceP,"event=LIVE_RECIPE_OBSERVED session=%llu requested=%llu applied=%llu flush=%llu orbit=%llu workTimeUs=%llu referenceV=%.6f overridePercent=%.6f evidence=RT_FEEDBACK discharge=0\n",
+            static_cast<unsigned long long>(s.session),static_cast<unsigned long long>(s.liveRecipeSequence),
+            static_cast<unsigned long long>(observed.liveRecipeSequence),static_cast<unsigned long long>(observed.liveFlushRecipeSequence),
+            static_cast<unsigned long long>(observed.liveOrbitRecipeSequence),static_cast<unsigned long long>(observed.processShadow.workTimeUs),
+            s.liveRecipeConfig.referenceV,s.liveRecipeConfig.machiningOverridePercent);
+    }
+    if(liveRecipeScope&&!s.gapShadowRevoked&&
+       (s.liveTuningCurveObserved!=observed.liveCurveTuningGeneration||
+        s.liveTuningFlushObserved!=observed.liveFlushTuningGeneration)){
+        s.liveTuningCurveObserved=observed.liveCurveTuningGeneration;
+        s.liveTuningFlushObserved=observed.liveFlushTuningGeneration;
+        PrintParent(s.sourceG,s.sourceP,"event=PROCESS_LIVE_OBSERVED session=%llu accepted=%llu curveGeneration=%llu flushGeneration=%llu evidence=RT_FEEDBACK discharge=0\n",
+            static_cast<unsigned long long>(s.session),static_cast<unsigned long long>(s.liveTuningAcceptedGeneration),
+            static_cast<unsigned long long>(observed.liveCurveTuningGeneration),
+            static_cast<unsigned long long>(observed.liveFlushTuningGeneration));
+    }
+    if(liveRecipeScope&&!s.gapShadowRevoked&&s.e5LivePublishedSequence&&observed.processShadow.enabled&&
+       observed.processShadow.session==s.session&&observed.processShadow.workTimeUs==s.e5LiveWorkTimeUs&&
+       s.e5LiveObservedWorkTimeUs!=observed.processShadow.workTimeUs){
+        s.e5LiveObservedWorkTimeUs=observed.processShadow.workTimeUs;
+        PrintParent(s.sourceG,s.sourceP,"event=E5_LIVE_TIME_OBSERVED session=%llu workTimeUs=%llu intervalUs=%llu pendingFlush=%u evidence=RT_FEEDBACK_VALUE discharge=0\n",
+            static_cast<unsigned long long>(s.session),static_cast<unsigned long long>(observed.processShadow.workTimeUs),
+            static_cast<unsigned long long>(observed.processShadow.intervalWorkUs),observed.processShadow.pending?1U:0U);
     }
     const bool flushLegChanged=s.feedback.cycle.flushLegSequence!=observed.cycle.flushLegSequence;
     const bool approachChanged=s.feedback.cycle.flushApproachActive!=observed.cycle.flushApproachActive;
@@ -1979,14 +2307,14 @@ void NCManager::ServiceG76SphereSameThread()
     }
     if(observed.started&&observed.cycle.session==s.session){
         const auto& f=observed.cycle;
-        if(f.orbitRequiredPasses!=s.request.orbitInspectionRounds||f.orbitTargetPercentScaled!=s.request.orbitThresholdScaled||
+        if(f.orbitRequiredPasses!=s.request.orbitInspectionRounds||f.orbitTargetPercentScaled!=s.completionViewRequest.orbitThresholdScaled||
            f.orbitQualifiedPasses>f.orbitRequiredPasses||f.orbitAttemptCount<f.orbitQualifiedPasses||
            f.orbitPercentScaled>NCOrbitCompletionPolicy::MaximumPercentScaled||f.orbitCompletionState>7U||
-           f.orbitRetryLimit!=s.request.orbitRetryLimit||
-           (f.orbitCompletionState==7U&&!MotionG76SphereMachiningTime::RetryExhaustionQualified(f,s.request))||
-           (f.orbitCompletionState==6U&&!MotionG76SphereMachiningTime::TimeLimitReachedQualified(f,s.request))||
+           f.orbitRetryLimit!=s.completionViewRequest.orbitRetryLimit||
+           (f.orbitCompletionState==7U&&!MotionG76SphereMachiningTime::RetryExhaustionQualified(f,s.completionViewRequest))||
+           (f.orbitCompletionState==6U&&!MotionG76SphereMachiningTime::TimeLimitReachedQualified(f,s.completionViewRequest))||
            f.orbitCompletionActive!=(f.orbitCompletionState==2U||f.orbitCompletionState==3U)||
-           (observed.completed&&!OrbitTerminalQualified(f,s.request))){
+           (observed.completed&&!OrbitTerminalQualified(f,s.completionViewRequest))){
             RejectG76SphereSameThread("ORBIT_COMPLETION_FEEDBACK_SCOPE",AlarmManager::MOTION_GROUP_MAPPING_INTEGRITY);return;
         }
         if(s.request.orbitInspectionRounds&&(!s.orbitLogInitialized||s.orbitLoggedState!=f.orbitCompletionState||
@@ -2065,13 +2393,14 @@ void NCManager::ServiceG76SphereSameThread()
     if(observed.started&&cycle.session==s.session){
         const auto printEvent=[&](const char* event,std::uint64_t sequence){
             if(s.flushDiagnosticEvents++<192U)
-                PrintParent(s.sourceG,s.sourceP,"event=%s session=%llu request=%llu tick=%llu phase=%s completed=%llu checkpoint=%u B=%u leg=%llu selectionRequest=%llu selectionCurrent=%u ordinal=%llu heightMm=%.12f deep=%u source=SOFTWARE_SIMULATION discharge=0\n",
+                PrintParent(s.sourceG,s.sourceP,"event=%s session=%llu request=%llu tick=%llu phase=%s completed=%llu checkpoint=%u B=%u leg=%llu selectionRequest=%llu selectionCurrent=%u ordinal=%llu heightMm=%.12f deep=%u source=%s discharge=0\n",
                     event,static_cast<unsigned long long>(s.session),static_cast<unsigned long long>(sequence),
                     static_cast<unsigned long long>(cycle.tick),PhaseName(cycle.phase,s.sourceG),
                     static_cast<unsigned long long>(cycle.flushCount),cycle.flushCheckpointSaved?1U:0U,s.request.retreatMode,
                     static_cast<unsigned long long>(cycle.flushLegSequence),
                     static_cast<unsigned long long>(cycle.flushRequestSequence),sequence==cycle.flushRequestSequence?1U:0U,
-                    static_cast<unsigned long long>(cycle.flushOrdinal),cycle.flushSelectedHeightMm,cycle.flushDeepActive?1U:0U);
+                    static_cast<unsigned long long>(cycle.flushOrdinal),cycle.flushSelectedHeightMm,cycle.flushDeepActive?1U:0U,
+                    s.request.physicalZManual?"PHYSICAL_AD":"SOFTWARE_SIMULATION");
         };
         if(cycle.flushRequestSequence>s.flushAcceptedLogged){
             s.flushAcceptedLogged=cycle.flushRequestSequence;printEvent("FLUSH_START",cycle.flushRequestSequence);
@@ -2093,6 +2422,60 @@ void NCManager::ServiceG76SphereSameThread()
         const bool gapApplied=valid&&s.gapBinding.config.signedMotionEnabled&&
             cycle.session==s.session&&cycle.gapMotionEnabled&&cycle.gapApplied;
         if(valid)s.gapShadow=shadow;
+        // E5 diagnostics are formatted only here on the NC thread. Event
+        // counters survive a slower reader without adding a servo-tick queue.
+        if(coherent){
+            const auto& e5=s.gapBinding.config.e5WorkTimer;const auto& timer=shadow.e5Timer;
+            if(!s.e5ConfigLogged){
+                s.e5ConfigLogged=true;
+                const double shortFloor=s.gapBinding.config.curve.shortMachiningEnabled?
+                    (std::max)(s.gapBinding.config.curve.shortIdleV,s.gapBinding.config.curve.shortMachiningV):
+                    s.gapBinding.config.curve.shortIdleV;
+                PrintParent(s.sourceG,s.sourceP,"event=E5_TIMER_CONFIG session=%llu mode=%u lowV=%.3f highV=%.3f filterMs=%u confirmMs=%u abnormalPauseMs=%u shortFloorV=%.3f E9referenceV=%.3f E5us=%llu credit=%s abnormalPauseActive=0 hold=RESET_ROUND estimator=GAP_VOLTAGE_ONLY discharge=0\n",
+                    static_cast<unsigned long long>(s.session),e5.mode,e5.gapLowVoltageV,e5.gapHighVoltageV,
+                    e5.gapFilterTimeMs,e5.startConfirmTimeMs,e5.abnormalGapPauseTimeMs,shortFloor,
+                    s.gapBinding.config.referenceV,static_cast<unsigned long long>(shadow.workTimeUs),
+                    e5.mode==1U?"ELAPSED_AFTER_FIRST_DISCHARGE":"EXISTING_FORWARD_CONDITIONS");
+            }
+            const auto event=[&](const char* name,std::uint64_t count,std::uint64_t& logged){
+                if(count<=logged)return;
+                const auto delta=count-logged;logged=count;
+                PrintParent(s.sourceG,s.sourceP,"event=%s session=%llu tick=%llu mode=%u seq=%llu newEvents=%llu state=%s rawV=%.3f filteredV=%.3f intervalUs=%llu coreEligible=%u e5Eligible=%u gate=%u latched=%u shortBlocked=%u pending=%u source=%s discharge=0\n",
+                    name,static_cast<unsigned long long>(s.session),static_cast<unsigned long long>(shadow.tick),e5.mode,
+                    static_cast<unsigned long long>(count),static_cast<unsigned long long>(delta),EDM386E5::StateName(timer.state),
+                    shadow.voltageV,timer.filteredVoltageV,static_cast<unsigned long long>(shadow.intervalWorkUs),
+                    shadow.eligible?1U:0U,shadow.e5Eligible?1U:0U,timer.allow?1U:0U,timer.latched?1U:0U,
+                    shadow.e5ShortBlocked?1U:0U,shadow.pending?1U:0U,s.request.physicalZManual?"PHYSICAL_AD":"SOFTWARE_SIMULATION");
+            };
+            if(e5.mode==0U){
+                // Debug mode reports the NC reader's observed legacy work
+                // eligibility edges, not a new RT eligibility prerequisite.
+                const bool reset=shadow.completedFlushes!=s.e5LegacyCompleteLogged||
+                    shadow.abortedFlushes!=s.e5LegacyAbortLogged;
+                if(!s.e5LegacyInitialized||reset){
+                    s.e5LegacyInitialized=true;s.e5LegacyStarted=s.e5LegacyEligible=false;
+                    s.e5LegacyCompleteLogged=shadow.completedFlushes;s.e5LegacyAbortLogged=shadow.abortedFlushes;
+                    if(s.e5WaitLogged!=(std::numeric_limits<std::uint64_t>::max)())
+                        event("E5_WAIT_START",s.e5WaitLogged+1ULL,s.e5WaitLogged);
+                }
+                if(!s.e5LegacyStarted&&(shadow.eligible||shadow.intervalWorkUs!=0ULL)){
+                    s.e5LegacyStarted=true;
+                    if(s.e5StartLogged!=(std::numeric_limits<std::uint64_t>::max)())
+                        event("E5_START",s.e5StartLogged+1ULL,s.e5StartLogged);
+                }else if(s.e5LegacyStarted&&!shadow.pending&&s.e5LegacyEligible!=shadow.eligible){
+                    auto& count=shadow.eligible?s.e5ResumeLogged:s.e5PauseLogged;
+                    if(count!=(std::numeric_limits<std::uint64_t>::max)())
+                        event(shadow.eligible?"E5_RESUME":"E5_PAUSE",count+1ULL,count);
+                }
+                s.e5LegacyEligible=shadow.eligible;
+            }else{
+                event("E5_WAIT_START",timer.waitEvents,s.e5WaitLogged);
+                event("E5_START",timer.startEvents,s.e5StartLogged);
+                event("E5_PAUSE",timer.pauseEvents,s.e5PauseLogged);
+                event("E5_RESUME",timer.resumeEvents,s.e5ResumeLogged);
+            }
+            event("E5_TIME_DUE",shadow.e5DueEvents,s.e5DueLogged);
+        }
         if(valid&&s.gapBinding.config.orbitFeedsEnabled&&feedSelectionChanged&&s.orbitFeedDiagnosticEvents++<96U)
             PrintParent(s.sourceG,s.sourceP,"event=FEED_SELECTION session=%llu tick=%llu nextGapRole=%s scale=%.9f overridePct=%.6f nextSignedTargetMmMin=%.6f phase=%s layer=%u history=%u flush=%u hold=%u discharge=0\n",
                 static_cast<unsigned long long>(s.session),static_cast<unsigned long long>(shadow.tick),
@@ -2183,21 +2566,22 @@ void NCManager::ServiceG76SphereSameThread()
                 static_cast<unsigned long long>(cycle.heldRequalificationSequence),observed.positionToleranceMm,observed.rotaryToleranceDeg,cycle.flushActive?1U:0U,
                 static_cast<unsigned long long>(cycle.flushRequestSequence),static_cast<unsigned long long>(cycle.flushCount));
             if(cycle.holdRecoveryEnabled&&cycle.holdActive)
-                PrintParent(s.sourceG,s.sourceP,"event=HOLD_ROUTE session=%llu hold=%llu stage=%u declared=%u effective=%u available=%u jog=%u trace=%u anchorX=%.9f anchorY=%.9f anchorZ=%.9f processX=%.9f processY=%.9f processZ=%.9f E5=SUSPENDED discharge=0\n",
+                PrintParent(s.sourceG,s.sourceP,"event=HOLD_ROUTE session=%llu hold=%llu stage=%u declared=%u effective=%u available=%u jog=%u trace=%u anchorX=%.9f anchorY=%.9f anchorZ=%.9f processX=%.9f processY=%.9f processZ=%.9f E5=RESET_ROUND discharge=0\n",
                     static_cast<unsigned long long>(s.session),static_cast<unsigned long long>(cycle.holdSequence),
                     static_cast<unsigned>(cycle.holdRecoveryPhase),cycle.holdDeclaredCount,cycle.holdEffectiveCount,
                     cycle.holdAvailableCount,cycle.inspectionJogActive?1U:0U,cycle.inspectionTraceCount,
                     observed.holdRetreatAnchorMCS[0],observed.holdRetreatAnchorMCS[1],observed.holdRetreatAnchorMCS[2],
                     observed.holdProcessPointMCS[0],observed.holdProcessPointMCS[1],observed.holdProcessPointMCS[2]);
             if(cycle.gapHistoryActive||cycle.historyBoundarySequence||cycle.historyReturnSequence)
-                PrintParent(s.sourceG,s.sourceP,"event=HISTORY_STATE session=%llu tick=%llu phase=%s active=%u boundary=%llu returned=%llu nominal=%s layer=%u X=%.9f Y=%.9f Z=%.9f scope=%s depth=1 previousProgressMm=%.9f previousLengthMm=%.9f E5=SUSPENDED_WHILE_ACTIVE discharge=0\n",
+                PrintParent(s.sourceG,s.sourceP,"event=HISTORY_STATE session=%llu tick=%llu phase=%s active=%u boundary=%llu returned=%llu nominal=%s layer=%u X=%.9f Y=%.9f Z=%.9f scope=%s depth=1 previousProgressMm=%.9f previousLengthMm=%.9f E5=%s discharge=0\n",
                     static_cast<unsigned long long>(s.session),static_cast<unsigned long long>(cycle.tick),
                     PhaseName(cycle.phase,s.sourceG),cycle.gapHistoryActive?1U:0U,
                     static_cast<unsigned long long>(cycle.historyBoundarySequence),
                     static_cast<unsigned long long>(cycle.historyReturnSequence),PhaseName(cycle.nominalPhase,s.sourceG),
                     cycle.layerIndex,observed.commandMCS[0],observed.commandMCS[1],observed.commandMCS[2],
                     cycle.previousParentHistoryReady?"PREVIOUS_PARENT":"SAME_PARENT",
-                    cycle.previousParentProgressMm,cycle.previousParentLengthMm);
+                    cycle.previousParentProgressMm,cycle.previousParentLengthMm,
+                    s.gapBinding.config.e5WorkTimer.mode==1U?"ELAPSED_AFTER_FIRST_DISCHARGE":"SUSPENDED_WHILE_ACTIVE");
             // Nominal station stays at its saved machining checkpoint during
             // return/resume; it is deliberately not the excursion's position.
             const auto& p=s.process;
@@ -2233,10 +2617,10 @@ bool NCManager::PollG76SphereSameThread()
     auto& s=*m_g76Sphere;if(!s.active)return s.completed;
     ServiceG76SphereSameThread();if(!s.active)return false;
     if(!s.bound||m_state!=NCState::RUN||s.resumePending||!s.feedback.terminal)return false;
-    const bool timed=MotionG76SphereMachiningTime::TimedCompletionQualified(s.feedback.cycle,s.request);
+    const bool timed=MotionG76SphereMachiningTime::TimedCompletionQualified(s.feedback.cycle,s.completionViewRequest);
     if(!s.feedback.completed||s.feedback.cycle.phase!=NCG76SphereCycle::Phase::Complete||
         (!timed&&s.feedback.cycle.completedLayers!=s.request.geometry.circleLayerCount)||
-        !MotionG76SphereMachiningTime::CompletedEndpointQualified(s.feedback,s.request)){
+        !MotionG76SphereMachiningTime::CompletedEndpointQualified(s.feedback,s.completionViewRequest)){
         RejectG76SphereSameThread("TERMINAL_STATE",AlarmManager::MOTION_GROUP_MAPPING_INTEGRITY);return false;
     }
     auto& ledger=m_edm171Air->ledger;
@@ -2248,9 +2632,9 @@ bool NCManager::PollG76SphereSameThread()
     const auto& segment=ledger.motionSegments[0U];
     if(!segment.completed||!segment.terminal||!ledger.terminalSuccess||ledger.motionCompletedCount!=1U||
         ledger.motionTerminalCount!=1U||m_motion.HasPendingSafetyOrRecoveryRequests())return false;
-    if(!OrbitTerminalQualified(s.feedback.cycle,s.request)||
+    if(!OrbitTerminalQualified(s.feedback.cycle,s.completionViewRequest)||
         !FinishTerminalQualified(s.feedback.cycle,s.finishRequiredCount)||
-       !MotionG76SphereMachiningTime::TerminalQualified(s.feedback.cycle,s.request)){
+       !MotionG76SphereMachiningTime::TerminalQualified(s.feedback.cycle,s.completionViewRequest)){
         RejectG76SphereSameThread("FINISH_TERMINAL_NOT_QUALIFIED",AlarmManager::MOTION_GROUP_MAPPING_INTEGRITY);return false;
     }
     if(!s.endpointCommitted){
@@ -2262,14 +2646,14 @@ bool NCManager::PollG76SphereSameThread()
     }
     if(!m_motion.ReleaseG76SphereBarrier(s.session,s.identity,s.owner))return false;
     s.active=false;s.completed=true;s.submitted=false;UpdateSystemVariables();
-    const bool exhausted=MotionG76SphereMachiningTime::RetryExhaustionQualified(s.feedback.cycle,s.request);
+    const bool exhausted=MotionG76SphereMachiningTime::RetryExhaustionQualified(s.feedback.cycle,s.completionViewRequest);
     RecordDHTerminal(s,exhausted?NCG76DHBatchDiagnostic::Result::RetryExhausted:
         timed?NCG76DHBatchDiagnostic::Result::TimedComplete:NCG76DHBatchDiagnostic::Result::Complete);
     if(exhausted)PrintParent(s.sourceG,s.sourceP,"event=ORBIT_COMPLETION_EXHAUSTED session=%llu retryLimit=%u failedAttempts=%llu attempts=%llu percent=%.6f targetPercent=%.6f requiredPasses=%u qualifiedPasses=%u processResult=UNQUALIFIED endpointCommitted=1 continueNext=1 alarm=0 discharge=0\n",
-        static_cast<unsigned long long>(s.session),static_cast<unsigned>(s.request.orbitRetryLimit),
+        static_cast<unsigned long long>(s.session),static_cast<unsigned>(s.completionViewRequest.orbitRetryLimit),
         static_cast<unsigned long long>(s.feedback.cycle.orbitEvaluation.failedAttempts),
         static_cast<unsigned long long>(s.feedback.cycle.orbitAttemptCount),
-        s.feedback.cycle.orbitPercentScaled/1000000.0,s.request.orbitThresholdScaled/1000000.0,
+        s.feedback.cycle.orbitPercentScaled/1000000.0,s.completionViewRequest.orbitThresholdScaled/1000000.0,
         static_cast<unsigned>(s.request.orbitInspectionRounds),s.feedback.cycle.orbitQualifiedPasses);
     if(timed)PrintParent(s.sourceG,s.sourceP,"event=D_COMPLETE session=%llu totalElapsedUs=%llu totalLimitUs=%llu X=%.9f Y=%.9f Z=%.9f returnedCenter=%u endpointCommitted=1 Hfulfilled=%u Lfulfilled=%u alarm=0 discharge=0\n",
         static_cast<unsigned long long>(s.session),static_cast<unsigned long long>(s.feedback.cycle.totalElapsedUs),
@@ -2280,7 +2664,7 @@ bool NCManager::PollG76SphereSameThread()
         PrintParent(s.sourceG,s.sourceP,"event=ORBIT_COMPLETION_COMPLETE build=EDM355 session=%llu requiredPasses=%u qualifiedPasses=%u attempts=%llu percent=%.6f targetPercent=%.6f endpointCommitted=1 source=SOFTWARE_SIMULATION discharge=0\n",
             static_cast<unsigned long long>(s.session),static_cast<unsigned>(s.request.orbitInspectionRounds),
             s.feedback.cycle.orbitQualifiedPasses,static_cast<unsigned long long>(s.feedback.cycle.orbitAttemptCount),
-            s.feedback.cycle.orbitPercentScaled/1000000.0,s.request.orbitThresholdScaled/1000000.0);
+            s.feedback.cycle.orbitPercentScaled/1000000.0,s.completionViewRequest.orbitThresholdScaled/1000000.0);
     if(exhausted){
         PrintParent(s.sourceG,s.sourceP,"event=COMPLETE session=%llu P=%u X=%.9f Y=%.9f Z=%.9f endpointCommitted=1 processResult=UNQUALIFIED retryExhausted=1 returnedCenter=1 alarm=0 discharge=0\n",
             static_cast<unsigned long long>(s.session),s.sourceP,s.endpoint[0],s.endpoint[1],s.endpoint[2]);
@@ -2487,7 +2871,7 @@ void NCManager::CancelG76SphereSameThread(const char* reason)
     // batch. All other cancellation is containment, never an automatic return.
     const bool deadlineAlreadyStopped=reportFailure&&
         observed.translationGeneration==s.request.geometry.frame.translation.generation&&
-        MotionG76SphereMachiningTime::TimeLimitStoppedQualified(observed,s.request);
+        MotionG76SphereMachiningTime::TimeLimitStoppedQualified(observed,s.completionViewRequest);
     if(submitted&&!reset&&!deadlineAlreadyStopped)m_motion.RequestEmergencyStopAllAxes();
     if(reportFailure)PrintSphereRuntimeFailure(observed,s.request,s.line,s.sourceG,s.sourceP);
     PrintParent(s.sourceG,s.sourceP,"event=CANCEL session=%llu reason=%s observerWithdraw=%s automaticReturn=0 discharge=0\n",
